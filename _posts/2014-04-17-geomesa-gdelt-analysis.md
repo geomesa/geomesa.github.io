@@ -28,7 +28,7 @@ You can download the GDELT data at [here](http://data.gdeltproject.org/events/in
 Clone geomesa and geomesa-gdelt projects:
 {% highlight bash %}
 git clone git@github.com:locationtech/geomesa.git
-git clone git@github.com:ccri/geomesa-gdelt.git
+git clone git@github.com:geomesa/geomesa-gdelt.git
 {% endhighlight %}
 
 Build the projects using
