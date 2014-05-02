@@ -57,17 +57,17 @@
                 opacity="0" />
               <ColorMapEntry color="#00007F" quantity="0.001"
                 label="Lowest" />
-              <ColorMapEntry color="#0000FF" quantity="0.01"
+              <ColorMapEntry color="#0000FF" quantity="0.003"
                 label="Very Low" />
-              <ColorMapEntry color="#00FFFF" quantity="0.05"
+              <ColorMapEntry color="#00FFFF" quantity="0.005"
                 label="Low" />
-              <ColorMapEntry color="#00FF00" quantity="0.1"
+              <ColorMapEntry color="#00FF00" quantity="0.01"
                 label="Medium-Low" />
-              <ColorMapEntry color="#FFFF00" quantity="0.15"
+              <ColorMapEntry color="#FFFF00" quantity="0.02"
                 label="Medium" />
-              <ColorMapEntry color="#FF7F00" quantity="0.2"
+              <ColorMapEntry color="#FF7F00" quantity="0.05"
                 label="Medium-High" />
-              <ColorMapEntry color="#FF6600" quantity="0.25"
+              <ColorMapEntry color="#FF6600" quantity="0.1"
                 label="High" />
               <ColorMapEntry color="#FF0000" quantity="0.35"
                 label="Very High" />

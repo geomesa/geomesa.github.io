@@ -116,15 +116,27 @@ try {
 
 ### ANALYZE
 
-#### Register the GeoMesa DataStore with Geoserver
+#### Geoserver Setup
 
-Deploy the GeoMesa geoserver plugin to Geoserver and restart the server
+Expand the tar ball below:
 
-If you are using tomcat, it goes here:
+{% highlight bash %}
+tar -xvf geomesa-dist/target/geomesa-dist-1.0.0-SNAPSHOT-distribution.tar.gz
+{% endhighlight %}
+
+Deploy the lib/*.jar files to Geoserver.
+Do not move the geomesa-distributed-runtime or geomesa-utils jars to Geoserver - they go to the tablet servers.
+Be sure to move the GeoMesa Geoserver plugin (geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar)
+
+If you are using tomcat, the files go here:
 
 {% highlight bash %}
 /path/to/tomcat/webapps/geoserver/WEB-INF/lib/geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar
 {% endhighlight %}
+
+Restart the server.
+
+#### Register the GeoMesa DataStore with Geoserver
 
 Click "Stores" and "Add new Store".
 If you do not see the Accumulo Feature Data Store listed under Vector Data Sources, ensure the plugin is in the right directory and restart Geoserver.
@@ -164,8 +176,11 @@ Let's narrow our results. GDELT codes events using the CAMEO (Conflict and Media
 
 !["Enter CQL Filter into Toolbar"](/img/tutorials/2014-04-17-geomesa-gdelt-analysis/Geoserver_Layer_Preview_Drop_Down.png)
 
+Let's use a custom icon to display THREATEN events. Add [this SLD file](/assets/tutorials/2014-04-17-geomesa-gdelt-analysis/threat.sld) to Geoserver, call it threat.sld
+For the ExternalGraphic in the SLD to work, move the image file to the specified location in your geoserver installation.
+
 {% highlight bash %}
-http://localhost:8080/geoserver/wms?service=WMS&version=1.1.0&request=GetMap&layers=geomesa:gdelt&CQL_FILTER=EventRootCode=13&styles=&bbox=31.6,44,37.4,47.75&width=1200&height=600&srs=EPSG:4326&format=application/openlayers&TIME=2013-01-01T00:00:00.000Z/2014-04-30T23:00:00.000Z
+http://localhost:8080/geoserver/wms?service=WMS&version=1.1.0&request=GetMap&layers=geomesa:gdelt&CQL_FILTER=EventRootCode=13&styles=threat&bbox=31.6,44,37.4,47.75&width=1200&height=600&srs=EPSG:4326&format=application/openlayers&TIME=2013-01-01T00:00:00.000Z/2014-04-30T23:00:00.000Z
 {% endhighlight %}
 
 !["Showing GDELT events with CAMEO root code THREATEN from Jan 1, 2013 to April 30, 2014"](/img/tutorials/2014-04-17-geomesa-gdelt-analysis/Ukraine_Event_RootCode_Threaten.png)
@@ -179,7 +194,7 @@ In the request below, the heatmap is before the points layer so that the points 
 Notice the &env=radiusPixels:30, this is SLD variable substitution and will replace the default value assigned in the SLD.
 
 {% highlight bash %}
-http://localhost:8080/geoserver/wms?service=WMS&version=1.1.0&request=GetMap&layers=geomesa:gdelt,geomesa:gdelt&CQL_FILTER=EventRootCode=13;EventRootCode=13&styles=heatmap,&bbox=31.6,44,37.4,47.75&width=1200&height=600&srs=EPSG:4326&format=application/openlayers&TIME=2013-01-01T00:00:00.000Z/2014-04-30T23:00:00.000Z&env=radiusPixels:30
+http://localhost:8080/geoserver/wms?service=WMS&version=1.1.0&request=GetMap&layers=geomesa:gdelt,geomesa:gdelt&CQL_FILTER=include;EventRootCode=13&styles=heatmap,threat&bbox=31.6,44,37.4,47.75&width=1200&height=600&srs=EPSG:4326&format=application/openlayers&TIME=2013-01-01T00:00:00.000Z/2014-04-30T23:00:00.000Z&env=radiusPixels:30
 {% endhighlight %}
 
 !["Showing heatmap with event overlay of GDELT events with CAMEO root code THREATEN from Jan 1, 2013 to April 30, 2014"](/img/tutorials/2014-04-17-geomesa-gdelt-analysis/Heatmap_Ukraine_EventRootCode_Threaten.png)
