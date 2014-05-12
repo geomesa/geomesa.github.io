@@ -19,11 +19,13 @@ layout: tutorial
 ### INGEST
 
 #### Obtaining GDELT
-You can download the GDELT data at [here](http://data.gdeltproject.org/events/index.html).  Use the following command to unpack the data and upload it to HDFS.
+You can download the GDELT data [here](http://data.gdeltproject.org/events/index.html).  Use the following command to unpack the data and upload it to HDFS.
 
 {% highlight bash %}
 (ls -1 | xargs -n 1 zcat) | hadoop fs -put - /gdelt/uncompressed/gdelt.tsv
 {% endhighlight %}
+
+Note: The reduced GDELT data set -- that has fewer columns than the fully-described GDELT data set -- is not supported via this ingest.
 
 Clone geomesa and geomesa-gdelt projects:
 {% highlight bash %}
@@ -49,6 +51,8 @@ hadoop jar /path/to/geomesa-gdelt-1.0-SNAPSHOT.jar \
    -tableName gdelt -featureName event             \
    -ingestFile hdfs:///gdelt/uncompressed/gdelt.tsv
 {% endhighlight %}
+
+Note that authorizations are optional.  Unless you know that your table already exists with explicit authorizations, or that it will be created with default authorizations, you probably want to omit this parameter.
 
 ### DataStore Initialization
 
@@ -128,11 +132,19 @@ Deploy the lib/*.jar files to Geoserver.
 Do not move the geomesa-distributed-runtime or geomesa-utils jars to Geoserver - they go to the tablet servers.
 Be sure to move the GeoMesa Geoserver plugin (geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar)
 
-If you are using tomcat, the files go here:
+If you are using tomcat:
 
 {% highlight bash %}
-/path/to/tomcat/webapps/geoserver/WEB-INF/lib/geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar
+cp geomesa-plugin/target/geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar
 {% endhighlight %}
+
+If you are using GeoServer's built in Jetty web server:
+
+{% highlight bash %}
+cp geomesa-plugin/target/geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5/webapps/geoserver/WEB-INF/lib/
+{% endhighlight %}
+
+Your local Accumulo and Zookeepers JARs also need to be available within your GeoServer's `lib` directory.
 
 Restart the server.
 
