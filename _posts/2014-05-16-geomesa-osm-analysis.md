@@ -213,7 +213,7 @@ If you do not see the Accumulo Feature Data Store listed under Vector Data Sourc
 Register the newly created Accumulo table using the same parameters specified in the command line above.
 (If you use a workspace:layer name other than geomesa:gdelt, you will need to change the WMS requests that follow.)
 
-!["Registering new Accumulo Feature Data Store"](/img/tutorials/2014-05-16-geomesa-osm-analysis/Geoserver_Accumulo_Store_Registration.png)
+!["Registering new Accumulo Feature Data Store"](/img/tutorials/2014-05-16-geomesa-osm-analysis/GeoserverAccumuloStoreRegistration.png)
 
 #### PUBLISH LAYER
 
