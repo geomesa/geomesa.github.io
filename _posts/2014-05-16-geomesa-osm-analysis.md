@@ -148,7 +148,6 @@ public void execute(Tuple tuple) {
     .
     .
     featureBuilder.reset();
-    featureBuilder.addAll(attributes);
     final SimpleFeature simpleFeature = featureBuilder.buildFeature(String.valueOf(UUID.randomUUID().getMostSignificantBits()));
     simpleFeature.setDefaultGeometry(getGeometry(attributes));
 
