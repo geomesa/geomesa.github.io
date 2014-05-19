@@ -8,8 +8,8 @@ layout: tutorial
 
 ### This tutorial shows how to:
 
-1. quickly and easily ingest big OSM (Open Street Map) data files into a GeoMesa Accumulo table via a Kafka/Storm stream.
-2. leverage Geoserver to query and visualize the data.
+1. Quickly and easily ingest big OSM (Open Street Map) data files into a GeoMesa Accumulo table via a Kafka/Storm stream.
+2. Leverage Geoserver to query and visualize the data.
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
@@ -25,7 +25,7 @@ You can download the OSM data [here](http://planet.openstreetmap.org/gps/simple-
 xz filename.xz
 {% endhighlight %}
 
-Note: The complete OSM data set -- that has more columns than the latitude and longitude -- is not supported via this ingest.
+Note: In this demonstration, we will use the simple-gps-points OSM data that contains only the location of an observation.
 
 Clone geomesa and geomesa-osm projects:
 {% highlight bash %}
@@ -58,17 +58,10 @@ Note that authorizations are optional.  Unless you know that your table already 
 
 ### DataStore Initialization
 
-Geotools uses a ```SimpleFeatureType``` to represent the schema for a feature source.  We can easily create a schema for the GDELT feature type using the DataUtilities class.  The schema string is a comma separated list of `<ATTRIBUTE_NAME>:<ATTRIBUTE_CLASSNAME>`, e.g. "lat:Integer".
-Specify the default geometry attribute with an asterisk, e.g. "&#42;geom:Point:srid=4326".
+Geotools uses a ```SimpleFeatureType``` to represent the schema for a feature source.  We can easily create a schema for the OSM feature type using the DataUtilities class.  The schema string is a comma separated list of `<ATTRIBUTE_NAME>:<ATTRIBUTE_CLASSNAME>`, e.g. "&#42;geom:Point:srid=4326".
 
 {% highlight java linenos %}
-static List<String> attributes = Lists.newArrayList(
-            "lat:Integer",
-            "lon:Integer",
-            "&#42;geom:Point:srid=4326"
-            );
-String spec = Joiner.on(",").join(attributes);
-SimpleFeatureType featureType = DataUtilities.createType(name, spec);
+SimpleFeatureType featureType = DataUtilities.createType(featureName, "geom:Point:srid=4326");
 {% endhighlight %}
 
 Finally, we create the new feature type in GeoMesa as follows.
@@ -79,7 +72,7 @@ ds.createSchema(featureType);
 
 ### KAFKA
 
-Create Kafka topic.
+Now we are going to create a Kafka topic. Kafka serves as the entry point into our Storm topology. We create a topic with several partitions to parallelize the ingest both from the producer side as well as from the consumer side
 
 {% highlight bash %}
 kafka-create-topic.sh       \
@@ -99,23 +92,20 @@ java -cp geomesa-osm-1.0.0.jar     \
    -brokers <kafka broker list>    \
 {% endhighlight %}
 
-Note that Kafka's default partitioner class assigns message partition based on a hash of the provided Key. 
+Note that Kafka's default partitioner class assigns a message partition based on a hash of the provided Key. 
 If no key is provided, all messages are assigned the same partition.
 
-In our example, we combine 40 records into a single Kafka message to increase performance.
-
 {% highlight java linenos %}
-agglomeratedData.add(x);
-if (agglomeratedData.size() == 40) {
-    producer.send(new KeyedMessage<String, String>(topic, String.valueOf(rnd.nextInt()), Joiner.on("%").join(agglomeratedData)));
-    agglomeratedData = new ArrayList<String>();
+for (String x = bufferedReader.readLine();
+    x != null;
+    x = bufferedReader.readLine()) {
+    producer.send(new KeyedMessage<String, String>(topic, String.valueOf(rnd.nextInt()), x));
 }
 {% endhighlight %}
 
 ### SPOUTS and BOLTS
 
-Spouts consume messages from a Kafka queue.
-They operate in parallel, each on a different partition, converting messages into streams of Tuples that are read from Bolts.
+In our example, the Storm spouts will consume messages from a Kafka topic and send them through the ingest topology.
 
 {% highlight java linenos %}
 public void nextTuple() {
@@ -127,7 +117,7 @@ public void nextTuple() {
 }
 {% endhighlight %}
 
-The Bolts parse the message, create and write Features.
+In our example, the Bolts parse the message, create and write Features.
 In the `prepare` method of the Bolt class, we grab the connection params that were initialized in the constructor and get a handle on a `FeatureWriter`.
 
 {% highlight java linenos %}
@@ -183,7 +173,8 @@ Expand the tar ball below:
 tar -xvf geomesa-dist/target/geomesa-dist-1.0.0-SNAPSHOT-distribution.tar.gz
 {% endhighlight %}
 
-Deploy the lib/*.jar files to Geoserver.
+Deploy the lib/*.jar files to Geoserver: slf4j-api, accumulo-core, guava, hadoop-client
+
 Do not move the geomesa-distributed-runtime or geomesa-utils jars to Geoserver - they go to the tablet servers.
 Be sure to move the GeoMesa Geoserver plugin (geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar)
 
