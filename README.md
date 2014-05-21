@@ -5,10 +5,11 @@ Very much in progress...
 This site is built with [ jekyll ](http://jekyllrb.com), a static site generator.
 
 ### Installing jekyll, etc.
-1. Make sure Ruby is installed
-2. Install jekyll: `sudo gem install jekyll`
+1. Make sure Ruby and rubygems are installed (preferrably ruby1.9.3)
+2. Install jekyll: `sudo gem install jekyll`(requires ruby > 1.9.2 on ubuntu)
 3. Install [ kramdown ](http://kramdown.gettalong.org/): `sudo gem install kramdown`
-4. Install [ Pygments ](http://pygments.org/): `sudo apt-get install pygments`
+4. Install [ Pygments ](http://pygments.org/): `sudo apt-get install pygments`(or python-pygments)
+5. Install nodejs which needed by newer versions of jekyll for a javascript/coffeescript runtime
 
 The command `jekyll serve --watch` will generate the site in the `_site` directory, watch source files for changes, and serve it locally on port 4000.
 
