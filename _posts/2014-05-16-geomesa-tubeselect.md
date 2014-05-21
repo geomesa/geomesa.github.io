@@ -32,7 +32,7 @@ You'll also need to install the Geomesa geoserver-plugin. Clone the locationtech
 git clone git@github.com:locationtech/geomesa.git
 {% endhighlight %}
 
-Build the project, unzip the distribution tarball, and install the plugin to the geoserver lib directory:
+Build the project, extract the distribution tarball, and install the plugin to the geoserver lib directory:
 {% highlight bash %}
 mvn clean install
 mkdir /tmp/geomesa-dist
@@ -55,6 +55,147 @@ bin/startup.sh
 
 Once everything is installed you should see "vec:TubeSelect" appear in the [WPS Request Builder](http://docs.geoserver.org/stable/en/user/extensions/wps/requestbuilder.html)
 !["vec:TubeSelect WPS plugin"](/img/tutorials/2014-05-16-geomesa-tubeselect/wps_builder1.png)
+
+### Ingesting Twitter Data
+
+We'll be using Twitter data from the public twitter API for this tutorial and ingesting it using a single node ingester that uses a [GeoTools](http://www.geotools.org/) based FeatureSource to ingest into Geomesa. Step one is checkout the code and take a look at it:
+
+{% highlight bash %}
+git clone ....my repo
+{% endhighlight %}
+
+There are three classes in the package **geomesa.example.ingest.twitter**
+
+* **Runner.java** - Main method to handle command line argument parsing
+* **TwitterFeatureIngester.java** - Inserts features into Geomesa using Geotools FeatureSource
+* **TwitterParser.java** - Parses Twitter JSON files and turns them into SimpleFeatures
+
+Build the project to create a shaded jar file with an executable main method:
+
+{% highlight bash %}
+mvn clean install
+{% endhighlight %}
+
+To see a list of arguments, run the jar file:
+{% highlight bash %}
+$ java -jar ~/.m2/repository/geomesa/example/ingest/twitter-ingest/1.0-SNAPSHOT/twitter-ingest-1.0-SNAPSHOT.jar
+0 [main] INFO geomesa.example.ingest.twitter.Runner  - Error parsing arguments: The following options are required:     --featureName     --user     --instanceId     --zookeepers     --password     --tableName 
+Usage: <main class> [options] files
+  Options:
+  *     --featureName
+       featureName to assign to the data
+  *     --instanceId
+       Name of the Accumulo Instance
+  *     --password
+       Accumulo password
+  *     --tableName
+       Accumulo table name
+  *     --user
+       Accumulo user name
+  *     --zookeepers
+       Comma separated list of zookeepers
+
+{% endhighlight %}
+
+#### More About Parsing Twitter JSON
+
+The JSON object returned from the tweets stream is documented on the [Twitter developer site](https://dev.twitter.com/docs/platform-objects/tweets) and describes each parameter in the json object. For this tutorial we'll be interested in these fields:
+
+* **"coordinates"** - a [geoJSON](http://www.geojson.org/) object with lat/lon (do not use the deprecated geo field)
+* **"user"** - the user object
+  * **"id"** - the user id
+  * **"name"** - the user name
+* **"id"** - the tweet id
+* **"created_at"** - time when the tweet was created
+* **"text"** - the text of the tweet
+
+The twitter JSON looks a something like this: 
+{% highlight json %}
+{
+  "retweeted" : false,
+  "source" : "web",
+  "favorited" : false,
+  "coordinates" : {
+    "coordinates" : [
+      -75.14310264,
+      40.05701649
+    ],
+    "type" : "Point"
+  },
+  "place" : null,
+  "retweet_count" : 0,
+  "entities" : {
+    "hashtags" : [],
+    "user_mentions" : [
+      {
+        "name" : "Twitter API",
+        "indices" : [
+          19,
+          30
+        ],
+        "id" : 6253282,
+        "id_str" : "6253282",
+        "screen_name" : "twitterapi"
+      }
+    ],
+    "urls" : []
+  },
+  "truncated" : false,
+  "in_reply_to_status_id_str" : null,
+  "created_at" : "Wed Feb 29 19:42:02 +0000 2012",
+  "contributors" : null,
+  "text" : "Man I like me some @twitterapi",
+  "in_reply_to_user_id" : null,
+  "user" : {
+    "friends_count" : 5,
+    "follow_request_sent" : null,
+    "profile_sidebar_fill_color" : "ffffff",
+    "profile_image_url" : "http://a1.twimg.com/profile_images/1540298033/phatkicks_normal.jpg",
+    "profile_background_image_url_https" : "https://si0.twimg.com/profile_background_images/365782739/doof.jpg",
+    "profile_background_color" : "C0DEED",
+    "notifications" : null,
+    "url" : "http://blog.roomanna.com",
+    "id" : 370773112,
+    "is_translator" : false,
+    "following" : null,
+    "screen_name" : "fakekurrik",
+    "lang" : "en",
+    "location" : "",
+    "followers_count" : 8,
+    "statuses_count" : 142,
+    "name" : "fakekurrik",
+    "description" : "I am just a testing account, following me probably won't gain you very much",
+    "favourites_count" : 1,
+    "profile_background_tile" : true,
+    "listed_count" : 0,
+    "contributors_enabled" : false,
+    "profile_link_color" : "0084B4",
+    "profile_image_url_https" : "https://si0.twimg.com/profile_images/1540298033/phatkicks_normal.jpg",
+    "profile_sidebar_border_color" : "C0DEED",
+    "created_at" : "Fri Sep 09 16:13:20 +0000 2011",
+    "utc_offset" : -28800,
+    "verified" : false,
+    "show_all_inline_media" : false,
+    "profile_background_image_url" : "http://a3.twimg.com/profile_background_images/365782739/doof.jpg",
+    "default_profile" : false,
+    "protected" : false,
+    "id_str" : "370773112",
+    "profile_text_color" : "333333",
+    "default_profile_image" : false,
+    "time_zone" : "Pacific Time (US & Canada)",
+    "geo_enabled" : true,
+    "profile_use_background_image" : true
+  },
+  "id" : 174942523154894848,
+  "in_reply_to_status_id" : null,
+  "geo" : null,
+  "in_reply_to_user_id_str" : null,
+  "id_str" : "174942523154894848",
+  "in_reply_to_screen_name" : null
+}
+{% endhighlight %}
+
+We parse this object manually with [GSON (google-json)](https://code.google.com/p/google-gson/). Optionally, you can create Java Object bindings for GSON and parse the entire tweet into an object. For more information about connecting to the twitter public stream check out the [Twitter Public Stream website](https://dev.twitter.com/docs/streaming-apis/streams/public).
 
 ### Creating a WPS Request
 The WPS builder will provide us with a sample XML document as a starting point to perform a tube select. Entering the values we want and clicking the "Generate XML" button gives us a sample XML document that we'll save off as "tube-select.xml" for usage later.
