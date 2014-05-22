@@ -213,20 +213,20 @@ In the Data pane, enter values for the bounding boxes. For the whole world, use 
 
 #### QUERY
 
-Let's look at events in Christchurch, New Zealand. The red squares are the default styling that Geoserver applies to point data.
+Let's look at events in Chicago.  The default point style is a red square that does not suit our purposes.  Add [this SLD file](/assets/tutorials/2014-05-16-geomesa-osm-analysis/OSMPoint.sld) to Geoserver, call it OSMPoint.sld
 
 {% highlight bash %}
-http://localhost:8080/geoserver/wms?service=WMS&version=1.1.0&request=GetMap&layers=geomesa:OSM&styles=&bbox=172.5,-43.95,173.15,-43.5&width=440&height=440&srs=EPSG:4326&format=application/openlayers
+http://localhost:8080/geoserver/wms?service=WMS&version=1.1.0&request=GetMap&layers=geomesa:OSM&styles=OSMPoint&bbox=-87.63,41.88,-87.61,41.9&width=1400&height=600&srs=EPSG:4326&format=application/openlayers
 {% endhighlight %}
 
-!["Showing all OSM events in Christchurch, New Zealand"](/img/tutorials/2014-05-16-geomesa-osm-analysis/ChristchurchDefault.png)
+!["Showing all OSM events in Chicago before Mar 12, 2012"](/img/tutorials/2014-05-16-geomesa-osm-analysis/ChicagoPoint.png)
 
-#### DENSITY HEATMAPS
+#### HEATMAPS
 
 Use a heatmap to more clearly visualize multiple events in the same location or high volume of data in general. Add [this SLD file](/assets/tutorials/2014-04-17-geomesa-gdelt-analysis/heatmap.sld) to Geoserver, call it heatmap.sld
 
 {% highlight bash %}
-http://localhost:8080/geoserver/wms?service=WMS&version=1.1.0&request=GetMap&layers=geomesa:OSM&styles=heatmap&density=true&bbox=172.5,-43.95,173.15,-43.5&width=440&height=440&srs=EPSG:4326&format=application/openlayers
+http://localhost:8080/geoserver/wms?service=WMS&version=1.1.0&request=GetMap&layers=geomesa:OSM&styles=heatmap&bbox=-87.63,41.88,-87.61,41.9&width=1400&height=600&srs=EPSG:4326&format=application/openlayers
 {% endhighlight %}
 
-!["Showing density heatmap of OSM events in Christchurch"](/img/tutorials/2014-05-16-geomesa-osm-analysis/ChristchurchDensity.png)
+!["Showing heatmap of OSM events in Chicago before Mar 12, 2012"](/img/tutorials/2014-05-16-geomesa-osm-analysis/ChicagoDensity.png)
