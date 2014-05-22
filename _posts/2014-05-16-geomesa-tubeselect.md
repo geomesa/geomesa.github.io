@@ -99,7 +99,7 @@ Usage: <main class> [options] files
 
 #### More About Parsing Twitter JSON
 
-The JSON object returned from the tweets stream is documented on the [Twitter developer site](https://dev.twitter.com/docs/platform-objects/tweets) and describes each parameter in the json object. For this tutorial we'll be interested in these fields:
+The JSON object returned from the tweets stream is documented on the [Twitter developer site](https://dev.twitter.com/docs/platform-objects/tweets).  For this tutorial we'll be interested in the following fields:
 
 * **"coordinates"** - a [geoJSON](http://www.geojson.org/) object with lat/lon (do not use the deprecated geo field)
 * **"user"** - the user object
@@ -109,7 +109,7 @@ The JSON object returned from the tweets stream is documented on the [Twitter de
 * **"created_at"** - time when the tweet was created
 * **"text"** - the text of the tweet
 
-The twitter JSON looks a something like this: 
+The twitter JSON looks something like this: 
 {% highlight json %}
 {
   "retweeted" : false,
@@ -198,12 +198,12 @@ The twitter JSON looks a something like this:
 We parse this object manually with [GSON (google-json)](https://code.google.com/p/google-gson/). Optionally, you can create Java Object bindings for GSON and parse the entire tweet into an object. For more information about connecting to the twitter public stream check out the [Twitter Public Stream website](https://dev.twitter.com/docs/streaming-apis/streams/public).
 
 ### Creating a WPS Request
-The WPS builder will provide us with a sample XML document as a starting point to perform a tube select. Entering the values we want and clicking the "Generate XML" button gives us a sample XML document that we'll save off as "tube-select.xml" for usage later.
+The WPS builder will provide us with a sample XML document as a starting point to perform a tube select. Entering the values we want and clicking the "Generate XML" button produces the request document that we'll save off as "tube-select.xml" for usage later.
 
 !["Generating XML from inputs"](/img/tutorials/2014-05-16-geomesa-tubeselect/generate_xml.png)
 
 #### Chaining Processes
-WPS supports chaining other WPS processes. This is most useful when selecting data from an existing layer or storing data back into geoserver to create a new layer. The Geoserver User Guide has a section on [Process Chaining](http://docs.geoserver.org/stable/en/user/extensions/wps/processes.html#process-chaining) that we use in creating our requests in the rest of the tutorial.
+WPS supports chaining other WPS processes. This is most useful when selecting data from an existing layer or storing data back into geoserver to create a new layer. The Geoserver User Guide has a section on [Process Chaining](http://docs.geoserver.org/stable/en/user/extensions/wps/processes.html#process-chaining).
 
 ### Tube Selecting
 
@@ -214,7 +214,7 @@ For this demonstration, let's assume someone is traveling from Wilmington, DE to
 
 #### Using JSON as Input
 
-Instead of using a layer as input, you can manually define an input FeatureCollection track with JSON using [GeoJSON](http://geojson.org/). They features need a unique **_id_**, a **_geometry_** object, and a property named **_geomesa\_index\_start\_time_**. A sample of two of our input track points is shown below:
+Instead of using a layer as input, you can manually define an input FeatureCollection track with JSON using [GeoJSON](http://geojson.org/). The features need a unique **_id_**, a **_geometry_** object, and a property named **_geomesa\_index\_start\_time_**. A sample of two of our input track points is shown below:
 
 {% highlight xml %}
  <wps:Input>
