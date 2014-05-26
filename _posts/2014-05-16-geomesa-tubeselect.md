@@ -61,7 +61,7 @@ Once everything is installed you should see "vec:TubeSelect" appear in the [WPS 
 We'll be using Twitter data from the public twitter API for this tutorial and ingesting it using a single node ingester that uses a [GeoTools](http://www.geotools.org/) based FeatureSource to ingest into GeoMesa. First, checkout the code and take a look at it:
 
 {% highlight bash %}
-git clone ....my repo
+git clone git@github.com:geomesa/geomesa-twitter
 {% endhighlight %}
 
 There are three classes in the package **geomesa.example.ingest.twitter**
