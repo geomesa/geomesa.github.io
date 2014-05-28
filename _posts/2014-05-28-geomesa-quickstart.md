@@ -176,7 +176,7 @@ Once you see your layer, click on the "OpenLayers" link, which will open a new t
 
 !["Visualizing quick-start data"](/img/tutorials/2014-05-28-geomesa-quickstart/geoserver-layer-preview.png)
 
-##### Tweaking the display
+#### Tweaking the display
 
 Here are just a few simple ways you can play with the visualization:
 
