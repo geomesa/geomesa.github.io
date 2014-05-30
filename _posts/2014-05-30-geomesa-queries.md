@@ -28,26 +28,11 @@ layout: tutorial
 
 Before you begin, you should also have these:
 
+* a locally-built version of GeoMesa - see [GeoMesa Quickstart](/2014/05/28/geomesa-quickstart/) (DOWNLOAD AND BUILD GEOMESA)
 * an Accumulo user that has appropriate permissions to query your data
 * a local copy of the Java Development Kit 1.7.x
 * Apache Maven installed
 * a GitHub client installed
-
-### DOWNLOAD AND BUILD GEOMESA
-
-Pick a reasonable directory on your machine, and run:
-
-```
-git clone git@github.com:locationtech/geomesa.git
-```
-
-From that newly-created directory, run
-
-```
-mvn clean install
-```
-
-NB: This step is only required, because the GeoMesa artifacts have not yet been published to a public Maven repository. With the upcoming 1.0 release of GeoMesa, these artifacts will be available at LocationTech's Nexus server, and this download-and-build step will become obsolete.
 
 ### DOWNLOAD AND BUILD THE TUTORIAL CODE
 
