@@ -131,7 +131,12 @@ If you are using GeoServer's built in Jetty web server:
 cp geomesa/geomesa-plugin/target/geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
-Your local Accumulo and Zookeepers JARs also need to be available within your GeoServer's `lib` directory.
+There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `lib` directory.  These may include:
+
+* Accumulo
+* Zookeeper
+* Hadoop core
+* Thrift
 
 Restart GeoServer.
 
@@ -152,7 +157,7 @@ Click "Save", and GeoServer will search your Accumulo table for any GeoMesa-mana
 
 #### Publish the layer
 
-GeoServer should recognize the `QuickStart` feature type, and should present that as a layer that could be published.  Click on the "Public" link.
+GeoServer should recognize the `QuickStart` feature type, and should present that as a layer that could be published.  Click on the "Publish" link.
 
 You will be taken to the Edit Layer screen.  Two of the tabs need to be updated:  Data and Dimensions.
 
@@ -164,7 +169,7 @@ Click on the "Save" button when you are done.
 
 #### Take a look
 
-Click on the "Layer Preview" link in the left-hand gutter.  If you don't see the quick-start layer on the first page of results, enter the name of the layer you just created into the search box, and press <Enter>.
+Click on the "Layer Preview" link in the left-hand gutter.  If you don't see the quick-start layer on the first page of results, enter the name of the layer you just created into the search box, and press &lt;Enter&gt;.
  
 Once you see your layer, click on the "OpenLayers" link, which will open a new tab.  By default, the display that opens will be empty, because we have enabled the time dimension for this layer, but the preview does not specify a time.  In the URL bar for the visualization, add the following to the end:
  
@@ -172,7 +177,7 @@ Once you see your layer, click on the "OpenLayers" link, which will open a new t
  &TIME=2014-01-01T00:00:00.000Z/2014-12-31T23:59:59.999Z
  ```
  
- That tells GeoServer to display the records for the entire calendar year 2014.  Once you press <Enter>, the display will update, and you should see a collection of red dots similar to the following image.
+ That tells GeoServer to display the records for the entire calendar year 2014.  Once you press &lt;Enter&gt;, the display will update, and you should see a collection of red dots similar to the following image.
 
 !["Visualizing quick-start data"](/img/tutorials/2014-05-28-geomesa-quickstart/geoserver-layer-preview.png)
 
@@ -184,4 +189,4 @@ Here are just a few simple ways you can play with the visualization:
 * Shift-click to highlight a region within the map that you would like to zoom into.
 * Alter the `TIME=` parameter in the URL to a different date range, and you can filter to see only the records that satisfy the temporal constraint.
 * Click on the "Toggle options toolbar" icon in the upper-left corner of the preview window.  The right-hand side of the screen will include a "Filter" text box.  Enter `Who = 'Bierce'`, and press on the "play" icon.  The display will now show only those points matching your filter criterion.  This is a CQL filter, and you can make these very complex.
-* In the URL, change `styles=` to be `styles=heatmap&amp;density=true`.  Once you press <Enter>, the display will change to a density heat-map.
+* In the URL, change `styles=` to be `styles=heatmap&amp;density=true`.  Once you press &lt;Enter&gt;, the display will change to a density heat-map.  (NB:  For this to work, you will have to first install the WPS module for GeoServer.  See the official web site for a download.)
