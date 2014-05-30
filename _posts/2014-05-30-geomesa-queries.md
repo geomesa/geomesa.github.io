@@ -57,7 +57,7 @@ When this is complete, it will have built a JAR file that contains all of the co
 On the command-line, run:
 
 ```
-java -cp ./target/geomesa-tutorial-queries-1.0-SNAPSHOT.jar org.geomesa.tutorial.QueryTutorial -instanceId <instance> -zookeepers <zoos> -user <user> -password <pwd> -tableName <table> -featureName <feature>
+java -cp ./target/geomesa-tutorial-queries-1.0.jar org.geomesa.tutorial.QueryTutorial -instanceId <instance> -zookeepers <zoos> -user <user> -password <pwd> -tableName <table> -featureName <feature>
 ```
 
 where you provide the following arguments:
