@@ -115,19 +115,28 @@ The following code snippets show the basic aspects of querying GeoMesa.
 
 #### Create a basic query with no projections
 
-    Query query = new Query(simpleFeatureTypeName, cqlFilter);
+{% highlight java %}
+Query query = new Query(simpleFeatureTypeName, cqlFilter);
+{% endhighlight %}
 
 #### Create a query with a projection for attributes 'a' and 'b'
 
-    String[] properties = new String[] {"a", "b"};
-    Query query = new Query(simpleFeatureTypeName, cqlFilter, properties);
+{% highlight java %}
+String[] properties = new String[] {"a", "b"};
+Query query = new Query(simpleFeatureTypeName, cqlFilter, properties);
+{% endhighlight %}
 
 #### Create a query with a transformation for attribute 'a'
 
-    String[] properties = new String[] {"a=strConcat('hello ', a)"};
-    Query query = new Query(simpleFeatureTypeName, cqlFilter, properties);
+{% highlight java %}
+String[] properties = new String[] {"a=strConcat('hello ', a)"};
+Query query = new Query(simpleFeatureTypeName, cqlFilter, properties);
+{% endhighlight %}
 
 #### Create a query with a derived attribute 'c'
 
-    String[] properties = new String[] {"c=strConcat('hello ', a)"};
-    Query query = new Query(simpleFeatureTypeName, cqlFilter, properties);
+{% highlight java %}
+String[] properties = new String[] {"c=strConcat('hello ', a)"};
+Query query = new Query(simpleFeatureTypeName, cqlFilter, properties);
+{% endhighlight %}
+
