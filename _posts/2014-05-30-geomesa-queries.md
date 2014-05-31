@@ -6,13 +6,23 @@ layout: tutorial
 
 {% include tutorial-header.html %}
 
+### Background
+
+GeoMesa allows users to perform [relational projections](http://en.wikipedia.org/wiki/Projection_%28relational_algebra%29) on query results.  We call these 'transformations' to distinguish them from the overloaded term 'projection' which has a different meaning in a spatial context.  These transformations have the following uses and advantages
+
+1. Subset to specified columns - reduces network overhead of returning results
+2. Rename specified columns - alters the schema of data on the fly
+3. Compute new attributes from one or more original attributes - adds derived fields to results
+
+The transformations are applied in parallel across the cluster thus making them very fast.  They are analogous to the map tasks in a map-reduce job.  Transformations are also extensible; developers can implement new functions and plug them into the system using standard mechanisms from Geotools.  
+
 ### This tutorial will show you how to:
 
 1. Check out and build GeoMesa source
 2. Write custom Java code using GeoMesa to do the following:
     1.  query previously-ingested data
-    2.  apply projections to your queries
-    3.  apply transformations to your queries
+    2.  apply relational projections to your query results
+    3.  apply transformations to your query results
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
