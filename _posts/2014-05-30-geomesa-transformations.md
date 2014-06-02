@@ -48,7 +48,7 @@ Before you begin, you should also have these:
 * Apache Maven installed
 * a GitHub client installed
 
-### DOWNLOAD AND BUILD THE TUTORIAL CODE
+### Download and Build the Tutorial Code
 
 Pick a reasonable directory on your machine, and run:
 
@@ -66,7 +66,7 @@ mvn clean install
 
 When this is complete, it will have built a JAR file that contains all of the code you need to run the tutorial.
 
-### RUN THE TUTORIAL
+### Run the Tutorial
 
 On the command-line, run:
 
@@ -85,7 +85,7 @@ where you provide the following arguments:
 
 You should see several queries run and the results printed out to your console.
 
-### INSIGHT INTO HOW THE TUTORIAL WORKS
+### Insight Into How the Tutorial Works
 
 The code for querying and projections is available in the following class:
 
@@ -108,7 +108,7 @@ Additionally, there are two helper classes included in the tutorial:
 * ```geomesa.tutorial.GdeltFeature``` - Contains the properties (attributes) available in the GDELT data set.
 * ```geomesa.tutorial.SetupUtil``` - Handles reading command-line arguments
 
-### SAMPLE CODE
+### Sample Code
 
 The following code snippets show the basic aspects of creating queries for GeoMesa.
 
