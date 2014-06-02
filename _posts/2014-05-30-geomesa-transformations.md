@@ -6,13 +6,23 @@ layout: tutorial
 
 {% include tutorial-header.html %}
 
+### Background
+
+GeoMesa allows users to perform [relational projections](http://en.wikipedia.org/wiki/Projection_%28relational_algebra%29) on query results.  We call these 'transformations' to distinguish them from the overloaded term 'projection' which has a different meaning in a spatial context.  These transformations have the following uses and advantages
+
+1. Subset to specified columns - reduces network overhead of returning results
+2. Rename specified columns - alters the schema of data on the fly
+3. Compute new attributes from one or more original attributes - adds derived fields to results
+
+The transformations are applied in parallel across the cluster thus making them very fast.  They are analogous to the map tasks in a map-reduce job.  Transformations are also extensible; developers can implement new functions and plug them into the system using standard mechanisms from Geotools.  
+
 ### This tutorial will show you how to:
 
 Write custom Java code using GeoMesa to do the following:
 
 1.  query previously-ingested data
-2.  apply projections to your queries
-3.  apply transformations to your queries
+2.  apply relational projections to your query results
+3.  apply transformations to your query results
 
 **Note:** when this tutorial refers to ```projections```, it means in the relational sense - see [Projection - Relational Algebra](http://en.wikipedia.org/wiki/Projection_(relational_algebra)). Projection also has [many other meanings](http://en.wikipedia.org/wiki/Projection_(disambiguation)) in spatial discussions - they are not used in this tutorial.
 
@@ -61,7 +71,7 @@ When this is complete, it will have built a JAR file that contains all of the co
 On the command-line, run:
 
 ```
-java -cp ./target/geomesa-tutorial-transformations-1.0.jar geomesa.tutorial.QueryTutorial -instanceId <instance> -zookeepers <zoos> -user <user> -password <pwd> -tableName <table> -featureName <feature>
+java -cp ./target/geomesa-tutorial-queries-1.0-SNAPSHOT.jar org.geomesa.tutorial.QueryTutorial -instanceId <instance> -zookeepers <zoos> -user <user> -password <pwd> -tableName <table> -featureName <feature>
 ```
 
 where you provide the following arguments:
@@ -79,7 +89,7 @@ You should see several queries run and the results printed out to your console.
 
 The code for querying and projections is available in the following class:
 
-* ```geomesa.tutorial.QueryTutorial```
+* ```org.geomesa.tutorial.QueryTutorial```
 
 The source code is meant to be accessible, but here is a high-level breakdown of the relevant methods:
 
