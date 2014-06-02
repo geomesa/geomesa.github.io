@@ -1,5 +1,5 @@
 ---
-title: GeoMesa Queries
+title: GeoMesa Transformations
 author: emilio
 layout: tutorial
 ---
@@ -8,11 +8,15 @@ layout: tutorial
 
 ### This tutorial will show you how to:
 
-1. Check out and build GeoMesa source
-2. Write custom Java code using GeoMesa to do the following:
-    1.  query previously-ingested data
-    2.  apply projections to your queries
-    3.  apply transformations to your queries
+Write custom Java code using GeoMesa to do the following:
+
+1.  query previously-ingested data
+2.  apply projections to your queries
+3.  apply transformations to your queries
+
+**Note:** when this tutorial refers to ```projections```, it means in the relational sense - see [Projection - Relational Algebra](http://en.wikipedia.org/wiki/Projection_(relational_algebra)). Projection also has [many other meanings](http://en.wikipedia.org/wiki/Projection_(disambiguation)) in spatial discussions - they are not used in this tutorial.
+
+Although projections can also modify an attribute's value, in this tutorial we will refer to such modifications as ```transformations``` to keep things clearer.
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
@@ -28,7 +32,7 @@ layout: tutorial
 
 Before you begin, you should also have these:
 
-* a locally-built version of GeoMesa - see [GeoMesa Quickstart](/2014/05/28/geomesa-quickstart/) (DOWNLOAD AND BUILD GEOMESA)
+* a locally-built version of GeoMesa - see [GeoMesa Quickstart](/2014/05/28/geomesa-quickstart/) - (DOWNLOAD AND BUILD GEOMESA)
 * an Accumulo user that has appropriate permissions to query your data
 * a local copy of the Java Development Kit 1.7.x
 * Apache Maven installed
@@ -39,7 +43,7 @@ Before you begin, you should also have these:
 Pick a reasonable directory on your machine, and run:
 
 ```
-git clone git@github.com:geomesa/geomesa-tutorial-projections.git
+git clone git@github.com:geomesa/geomesa-tutorial-transformations.git
 ```
 
 The ```pom.xml``` file contains an explicit list of dependent libraries that will be bundled together into the final tutorial. You should confirm that the versions of Accumulo and Hadoop match what you are running; if it does not match, change the value in the POM. (NB: The only reason these libraries are bundled into the final JAR is that this is easier for most people to do this than it is to set the classpath when running the tutorial. If you would rather not bundle these dependencies, mark them as provided in the POM, and update your classpath as appropriate.)
@@ -57,7 +61,7 @@ When this is complete, it will have built a JAR file that contains all of the co
 On the command-line, run:
 
 ```
-java -cp ./target/geomesa-tutorial-queries-1.0.jar org.geomesa.tutorial.QueryTutorial -instanceId <instance> -zookeepers <zoos> -user <user> -password <pwd> -tableName <table> -featureName <feature>
+java -cp ./target/geomesa-tutorial-transformations-1.0.jar geomesa.tutorial.QueryTutorial -instanceId <instance> -zookeepers <zoos> -user <user> -password <pwd> -tableName <table> -featureName <feature>
 ```
 
 where you provide the following arguments:
@@ -75,7 +79,7 @@ You should see several queries run and the results printed out to your console.
 
 The code for querying and projections is available in the following class:
 
-* ```org.geomesa.tutorial.QueryTutorial```
+* ```geomesa.tutorial.QueryTutorial```
 
 The source code is meant to be accessible, but here is a high-level breakdown of the relevant methods:
 
@@ -91,12 +95,12 @@ Additional transformation functions are listed [here](http://docs.geotools.org/l
 
 Additionally, there are two helper classes included in the tutorial:
 
-* ```org.geomesa.tutorial.GdeltFeature``` - Contains the properties (attributes) available in the GDELT data set.
-* ```org.geomesa.tutorial.SetupUtil``` - Handles reading command-line arguments
+* ```geomesa.tutorial.GdeltFeature``` - Contains the properties (attributes) available in the GDELT data set.
+* ```geomesa.tutorial.SetupUtil``` - Handles reading command-line arguments
 
 ### SAMPLE CODE
 
-The following code snippets show the basic aspects of querying GeoMesa.
+The following code snippets show the basic aspects of creating queries for GeoMesa.
 
 #### Create a basic query with no projections
 
