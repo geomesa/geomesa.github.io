@@ -71,7 +71,7 @@ When this is complete, it will have built a JAR file that contains all of the co
 On the command-line, run:
 
 ```
-java -cp ./target/geomesa-tutorial-queries-1.0-SNAPSHOT.jar org.geomesa.tutorial.QueryTutorial -instanceId <instance> -zookeepers <zoos> -user <user> -password <pwd> -tableName <table> -featureName <feature>
+java -cp ./target/geomesa-tutorial-transformations-1.0.jar geomesa.tutorial.QueryTutorial -instanceId <instance> -zookeepers <zoos> -user <user> -password <pwd> -tableName <table> -featureName <feature>
 ```
 
 where you provide the following arguments:
@@ -89,7 +89,7 @@ You should see several queries run and the results printed out to your console.
 
 The code for querying and projections is available in the following class:
 
-* ```org.geomesa.tutorial.QueryTutorial```
+* ```geomesa.tutorial.QueryTutorial```
 
 The source code is meant to be accessible, but here is a high-level breakdown of the relevant methods:
 
