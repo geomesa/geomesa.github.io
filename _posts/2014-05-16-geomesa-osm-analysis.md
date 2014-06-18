@@ -169,7 +169,7 @@ public void execute(Tuple tuple) {
 Expand the tar ball below:
 
 {% highlight bash %}
-tar -xvf geomesa-dist/target/geomesa-dist-1.0.0-SNAPSHOT-distribution.tar.gz
+tar -xvf geomesa-dist/target/geomesa-dist-accumulo1.5-1.0.0-SNAPSHOT-distribution.tar.gz
 {% endhighlight %}
 
 Deploy the lib/*.jar files to Geoserver: slf4j-api, accumulo-core, guava, hadoop-client

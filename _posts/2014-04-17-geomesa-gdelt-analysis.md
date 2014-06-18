@@ -125,23 +125,23 @@ try {
 Expand the tar ball below:
 
 {% highlight bash %}
-tar -xvf geomesa-dist/target/geomesa-dist-1.0.0-SNAPSHOT-distribution.tar.gz
+tar -xvf geomesa-dist/target/geomesa-accumulo1.5-dist-1.0.0-SNAPSHOT-distribution.tar.gz
 {% endhighlight %}
 
 Deploy the lib/*.jar files to Geoserver.
 Do not move the geomesa-distributed-runtime or geomesa-utils jars to Geoserver - they go to the tablet servers.
-Be sure to move the GeoMesa Geoserver plugin (geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar)
+Be sure to move the GeoMesa Geoserver plugin (geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar)
 
 If you are using tomcat:
 
 {% highlight bash %}
-cp geomesa-plugin/target/geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar
+cp geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar
 {% endhighlight %}
 
 If you are using GeoServer's built in Jetty web server:
 
 {% highlight bash %}
-cp geomesa-plugin/target/geomesa-plugin-1.0.0-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5/webapps/geoserver/WEB-INF/lib/
+cp geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 Your local Accumulo and Zookeepers JARs also need to be available within your GeoServer's `lib` directory.
