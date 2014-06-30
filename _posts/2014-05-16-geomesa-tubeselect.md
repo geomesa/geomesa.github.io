@@ -11,7 +11,7 @@ layout: tutorial
 3. Query from and save results to GeoServer layers
 
 #### Required Software
-* Hadoop 2.2
+* Hadoop 2.2.x
 * Accumulo 1.5.x
 * GeoMesa 1.0.x
 * Geoserver 2.5.x
@@ -53,8 +53,8 @@ cd $GEOSERVER_HOME
 bin/startup.sh
 {% endhighlight %}
 
-Once everything is installed you should see "vec:TubeSelect" appear in the [WPS Request Builder](http://docs.geoserver.org/stable/en/user/extensions/wps/requestbuilder.html)
-!["vec:TubeSelect WPS plugin"](/img/tutorials/2014-05-16-geomesa-tubeselect/wps_builder1.png)
+Once everything is installed you should see "geomesa:TubeSelect" appear in the [WPS Request Builder](http://docs.geoserver.org/stable/en/user/extensions/wps/requestbuilder.html)
+!["geomesa:TubeSelect WPS plugin"](/img/tutorials/2014-05-16-geomesa-tubeselect/wps_builder1.png)
 
 ### Ingesting Twitter Data
 
@@ -214,7 +214,7 @@ For this demonstration, let's assume someone is traveling from Wilmington, DE to
 
 #### Using JSON as Input
 
-Instead of using a layer as input, you can manually define an input FeatureCollection track with JSON using [GeoJSON](http://geojson.org/). The features need a unique **_id_**, a **_geometry_** object, and a dtg property (which we've named **_geomesa\_index\_start\_time_**). A sample of two of our input track points is shown below:
+Instead of using a layer as input, you can manually define an input FeatureCollection track with JSON using [GeoJSON](http://geojson.org/). The features need a unique **_id_**, a **_geometry_** object, and a property named **_dtg_** representing the observation time of the feature. A sample of two of our input track points is shown below:
 
 {% highlight xml %}
  <wps:Input>
@@ -232,7 +232,7 @@ Instead of using a layer as input, you can manually define an input FeatureColle
                         },
                         "type" : "Feature",
                         "properties" : {
-                            "geomesa_index_start_time" : "2014-05-17T15:33:16.000+0000",
+                            "dtg" : "2014-05-17T15:33:16.000+0000",
                         }
                     }, {
                         "id" : "1",
@@ -242,7 +242,7 @@ Instead of using a layer as input, you can manually define an input FeatureColle
                         },
                         "type" : "Feature",
                         "properties" : {
-                            "geomesa_index_start_time" : "2014-05-17T15:39:28.000+0000",
+                            "dtg" : "2014-05-17T15:39:28.000+0000",
                         }
                     }
                ],
