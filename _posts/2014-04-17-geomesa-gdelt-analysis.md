@@ -42,7 +42,7 @@ mvn clean install
 Use hadoop jar to launch the Map/Reduce ingest job
 
 {% highlight bash %}
-hadoop jar /path/to/geomesa-gdelt-1.0-SNAPSHOT.jar \
+hadoop jar /path/to/geomesa-gdelt-accumulo1.5-1.0-SNAPSHOT.jar \
    geomesa.gdelt.GDELTIngest                       \
    -instanceId <accumulo-instance-id>              \
    -zookeepers <zookeeper-hosts-string>            \

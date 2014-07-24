@@ -71,7 +71,7 @@ When this is complete, it will have built a JAR file that contains all of the co
 On the command-line, run:
 
 {% highlight bash %}
-java -cp ./target/geomesa-tutorial-transformations-1.0.jar \
+java -cp ./target/geomesa-tutorial-transformations-accumulo1.5-1.0-SNAPSHOT.jar \
    geomesa.tutorial.QueryTutorial \
    -instanceId <instance> \
    -zookeepers <zoos> \
