@@ -44,7 +44,7 @@ mvn clean install
 Use storm jar to submit the topology to your Storm Nimbus.
 
 {% highlight bash %}
-storm jar geomesa-osm-1.0.0.jar                  \
+storm jar geomesa-osm-accumulo1.5-1.0-SNAPSHOT.jar \
    geomesa.osm.OSMIngest                         \
    -instanceId <accumulo-instance-id>            \
    -zookeepers <zookeeper-hosts-string>          \   
@@ -85,7 +85,7 @@ kafka-create-topic.sh       \
 Create a Kafka producer to convert the ingest file into kafka messages.
 
 {% highlight bash %}
-java -cp geomesa-osm-1.0.0.jar     \
+java -cp geomesa-osm-accumulo1.5-1.0-SNAPSHOT.jar     \
    geomesa.osm.OSMIngestProducer   \
    -ingestFile <ingestFile>        \
    -topic OSM                      \
@@ -169,7 +169,7 @@ public void execute(Tuple tuple) {
 Expand the tar ball below:
 
 {% highlight bash %}
-tar -xvf geomesa-dist/target/geomesa-dist-1.0.0-SNAPSHOT-distribution.tar.gz
+tar -xvf geomesa-dist/target/geomesa-dist-accumulo1.5-1.0.0-SNAPSHOT-distribution.tar.gz
 {% endhighlight %}
 
 Deploy the lib/*.jar files to Geoserver: slf4j-api, accumulo-core, guava, hadoop-client

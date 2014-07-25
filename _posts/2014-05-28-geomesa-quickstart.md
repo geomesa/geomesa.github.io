@@ -70,7 +70,7 @@ When this is complete, it should have built a JAR file that contains all of the 
 On the command-line, run:
 
 ```
-java -cp ./target/geomesa-quickstart-1.0-SNAPSHOT.jar org.geomesa.QuickStart -instanceId somecloud -zookeepers "zoo1:2181,zoo2:2181,zoo3:2181" -user someuser -password somepwd -tableName sometable
+java -cp ./target/geomesa-quickstart-accumulo1.5-1.0-SNAPSHOT.jar org.geomesa.QuickStart -instanceId somecloud -zookeepers "zoo1:2181,zoo2:2181,zoo3:2181" -user someuser -password somepwd -tableName sometable
 ```
 
 where you provide your own values for the following place-holder arguments:

@@ -78,7 +78,7 @@ mvn clean install
 
 To see a list of arguments, run the jar file:
 {% highlight bash %}
-$ java -jar ~/.m2/repository/geomesa/example/ingest/twitter-ingest/1.0-SNAPSHOT/twitter-ingest-1.0-SNAPSHOT.jar
+$ java -jar ~/.m2/repository/geomesa/example/ingest/twitter-ingest-accumulo1.5/1.0-SNAPSHOT/twitter-ingest-accumulo1.5-1.0-SNAPSHOT.jar
 0 [main] INFO geomesa.example.ingest.twitter.Runner  - Error parsing arguments: The following options are required:     --featureName     --user     --instanceId     --zookeepers     --password     --tableName 
 Usage: <main class> [options] files
   Options:
