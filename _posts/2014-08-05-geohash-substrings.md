@@ -44,9 +44,11 @@ might intuit that a query plan is really a list of contiguous cell ranges
 that fall inside the desired geographic area and time interval.  As an
 example, assume we had this query:
 
-* -180 &le; longitude &lt; 225
-* -90 &le; latitude &lt; 112.5
-* 0 &lt; time &lt; 9 (on an arbitrary scale of 0 to 16 for this illustration)
+<ul>
+  <li>-180 &le; longitude &lt; 225</li>
+  <li>-90 &le; latitude &lt; 112.5</li>
+  <li>0 &lt; time &lt; 9 (on an arbitrary scale of 0 to 16 for this illustration)</li>
+</ul>
 
 This corresponds to just over half of the lowest values in each of the 
 three dimensions.  The visual selection of cells and their locations 
@@ -77,7 +79,7 @@ In Scala-esque pseudo code, the algorithm is:
 def getGeohashPrefixes(gh: Geohash): Set = {
   // if this Geohash is at the maximum precision,
   // simply return it
-  if (gh.precision &ge; precision) gh
+  if (gh.precision >= precision) gh
   else {
     // if the Geohash is wholly contained in the target
     // polygon, we need look no further:  all of its 
@@ -90,7 +92,7 @@ def getGeohashPrefixes(gh: Geohash): Set = {
       // centroid is closer to that of the target
       val leftChild = GeoHash(gh.binaryString + "0")
       val rightChild = GeoHash(gh.binaryString + "1")
-      if (distance(polygon, leftChild) &le; distance(polygon, rightChild) {
+      if (distance(polygon, leftChild) <= distance(polygon, rightChild) {
         // the left child is closer, so start there
         (if (polygon.intersects(leftChild) getGeohashPrefixes(leftChild) else Nil) +
         (if (polygon.intersects(rightChild) getGeohashPrefixes(rightChild) else Nil)
