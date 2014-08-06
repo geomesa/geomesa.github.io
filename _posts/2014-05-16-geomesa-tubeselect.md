@@ -1,5 +1,5 @@
 ---
-title: Time-Interpolated Queries
+title: WPS -- Tube Select
 author: andrew
 layout: tutorial
 ---

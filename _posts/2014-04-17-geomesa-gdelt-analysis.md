@@ -1,5 +1,5 @@
 ---
-title: GeoMesa GDELT Analysis
+title: Map-Reduce Ingest -- GDELT
 author: hunter
 layout: tutorial
 ---

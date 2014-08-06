@@ -1,5 +1,5 @@
 ---
-title: GeoMesa OSM (Open Street Map) Analysis
+title: Streaming Ingest -- Open Street Map (OSM)
 author: hunter
 layout: tutorial
 ---
