@@ -199,11 +199,12 @@ myuser@mycloud> getauths
 user,admin
 {% endhighlight %}
 
-Once the GDELT data is ingested, you should see a visibility label in square brackets when you scan the table through the Accumulo shell:
+Once the GDELT data is ingested, you should see a visibility label in square brackets when you scan
+the spatio-temporal index table through the Accumulo shell:
 
 {% highlight bash %}
-myuser@mycloud> table gdelt_auths
-myuser@mycloud gdelt_auths> scan
+myuser@mycloud> table gdelt_auths_gdelt_st_idx
+myuser@mycloud gdelt_auths_gdelt_st_idx> scan
 00~gdelt~04e~20080125 169881494:SimpleFeatureAttribute [user]    \x02\x12169881494\x00\xAC\xBE...
 {% endhighlight %}
 
