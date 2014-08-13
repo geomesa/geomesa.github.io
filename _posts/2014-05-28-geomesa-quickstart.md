@@ -117,6 +117,8 @@ You should have an instance of GeoServer, version 2.5, running somewhere that ha
 
 #### Geoserver Setup
 
+Be sure that you have installed the optional [WPS](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html) package installed for your version of GeoServer.
+
 Copy the the `geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar` library file from the GeoMesa directory you built into your GeoServer's library directory.
 
 If you are using tomcat:
@@ -131,12 +133,34 @@ If you are using GeoServer's built in Jetty web server:
 cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
-There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `lib` directory.  These may include:
+There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `lib` directory.  These may include (the specific JARs
+are included only for reference, and only apply if you are using Accumulo 1.5.1 and Hadoop 2.2):
 
 * Accumulo
+    * accumulo-core-1.5.1.jar  
+    * accumulo-fate-1.5.1.jar  
+    * accumulo-trace-1.5.1.jar
 * Zookeeper
+    * zookeeper-3.4.5.jar
 * Hadoop core
+    * hadoop-auth-2.2.0.jar
+    * hadoop-client-2.2.0.jar
+    * hadoop-common-2.2.0.jar
+    * hadoop-hdfs-2.2.0.jar
+    * hadoop-mapreduce-client-app-2.2.0.jar
+    * hadoop-mapreduce-client-common-2.2.0.jar
+    * hadoop-mapreduce-client-core-2.2.0.jar
+    * hadoop-mapreduce-client-jobclient-2.2.0.jar
+    * hadoop-mapreduce-client-shuffle-2.2.0.jar
 * Thrift
+    * libthrift-0.9.1.jar
+    
+There are also GeoServer JARs that need to be updated for GeoMesa:
+    
+* commons-codec:  GeoServer ships with commons-codec 1.2, but GeoMesa requires
+  replacing that with version 1.8
+* commons-lang:  GeoServer ships with commons-lang 2.1, but GeoMesa requires
+  replacing that with version 2.5
 
 Restart GeoServer.
 
