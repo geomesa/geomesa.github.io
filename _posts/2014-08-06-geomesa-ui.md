@@ -18,9 +18,10 @@ The GeoMesa UI provides status on your GeoMesa data stores and will eventually p
 features, such as building indices on your data or calculating statistics on your common queries.
 
 This post outlines some of the features currently available through the GeoMesa UI.
+<!--more-->
 
 Instructions for installing the GeoMesa plugin in GeoServer are available
-[here](/2014/04/17/geomesa-gdelt-analysis/), under 'GeoServer Setup'
+[here](/2014/04/17/geomesa-gdelt-analysis/), under 'GeoServer Setup'.
 
 ## Access to the User Interface
 
