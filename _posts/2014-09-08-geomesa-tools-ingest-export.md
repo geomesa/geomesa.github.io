@@ -20,7 +20,7 @@ to ingest and export features using GeoMesa-Tools
 
 ##Prerequistes
 
-If you haven't already [read through this post]{% post_url 2014-09-08-geomesa-tools-feature %} and 
+If you haven't already [read through this post]{% post_url 2014-09-08-geomesa-tools-features %} and 
 gone through the initial setup of GeoMesa-Tools, please finish that tutorial first and return back 
 to this page.
 
