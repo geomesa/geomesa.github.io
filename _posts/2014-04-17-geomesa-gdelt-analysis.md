@@ -29,8 +29,8 @@ Note: The reduced GDELT data set -- that has fewer columns than the fully-descri
 
 Clone geomesa and geomesa-gdelt projects:
 {% highlight bash %}
-git clone git@github.com:locationtech/geomesa.git
-git clone git@github.com:geomesa/geomesa-gdelt.git
+git clone https://github.com/locationtech/geomesa.git
+git clone https://github.com/geomesa/geomesa-gdelt.git
 {% endhighlight %}
 
 Build the projects using

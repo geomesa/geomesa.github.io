@@ -29,8 +29,8 @@ Note: In this demonstration, we will use the simple-gps-points OSM data that con
 
 Clone geomesa and geomesa-osm projects:
 {% highlight bash %}
-git clone git@github.com:locationtech/geomesa.git
-git clone git@github.com:geomesa/geomesa-osm.git
+git clone https://github.com/locationtech/geomesa.git
+git clone https://github.com/geomesa/geomesa-osm.git
 {% endhighlight %}
 
 Build the projects using

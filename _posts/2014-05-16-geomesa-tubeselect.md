@@ -29,7 +29,7 @@ To get started, install the latest stable release of [2.5.x Geoserver](http://ge
 
 You'll also need to install the GeoMesa geoserver-plugin. Clone the locationtech/geomesa repo:
 {% highlight bash %}
-git clone git@github.com:locationtech/geomesa.git
+git clone https://github.com/locationtech/geomesa.git
 {% endhighlight %}
 
 Build the project, extract the distribution tarball, and copy the plugin to the geoserver lib directory:
@@ -61,7 +61,7 @@ Once everything is installed you should see "geomesa:TubeSelect" appear in the [
 We'll be using Twitter data from the public twitter API for this tutorial and ingesting it using a single node ingester that uses a [GeoTools](http://www.geotools.org/) based FeatureSource to ingest into GeoMesa. First, checkout the code and take a look at it:
 
 {% highlight bash %}
-git clone git@github.com:geomesa/geomesa-twitter
+git clone https://github.com/geomesa/geomesa-twitter
 {% endhighlight %}
 
 There are three classes in the package **geomesa.example.ingest.twitter**

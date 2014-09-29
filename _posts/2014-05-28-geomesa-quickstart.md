@@ -36,7 +36,7 @@ Before you begin, you should also have these:
 Pick a reasonable directory on your machine, and run:
 
 ```
-git clone git@github.com:locationtech/geomesa.git
+git clone https://github.com/locationtech/geomesa.git
 ```
 
 From that newly-created directory, run
@@ -52,7 +52,7 @@ NB: This step is only required, because the GeoMesa artifacts have not yet been 
 Pick a reasonable directory on your machine, and run:
 
 ```
-git clone git@github.com:geomesa/geomesa-quickstart.git
+git clone https://github.com/geomesa/geomesa-quickstart.git
 ```
 
 The ```pom.xml``` file contains an explicit list of dependent libraries that will be bundled together into the final tutorial. You should confirm that the versions of Accumulo and Hadoop match what you are running; if it does not match, change the value in the POM. (NB: The only reason these libraries are bundled into the final JAR is that this is easier for most people to do this than it is to set the classpath when running the tutorial. If you would rather not bundle these dependencies, mark them as provided in the POM, and update your classpath as appropriate.)

@@ -213,7 +213,7 @@ myuser@mycloud gdelt_auths_gdelt_st_idx> scan
 Pick a reasonable directory on your machine, and run:
 
 {% highlight bash %}
-git clone git@github.com:geomesa/geomesa-tutorial-authorizations.git
+git clone https://github.com/geomesa/geomesa-tutorial-authorizations.git
 {% endhighlight %}
 
 The ```pom.xml``` file contains an explicit list of dependent libraries that will be bundled together
