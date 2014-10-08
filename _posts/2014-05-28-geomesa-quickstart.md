@@ -113,7 +113,7 @@ The source code is meant to be accessible for this tutorial, but here is a high-
 
 ### VISUALIZE DATA WITH GEOSERVER
 
-You should have an instance of GeoServer, version 2.5, running somewhere that has access to your Accumulo instance.
+You should have an instance of GeoServer, version 2.5.2, running somewhere that has access to your Accumulo instance.
 
 #### Geoserver Setup
 
@@ -130,7 +130,7 @@ cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geose
 If you are using GeoServer's built in Jetty web server:
 
 {% highlight bash %}
-cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5/webapps/geoserver/WEB-INF/lib/
+cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `lib` directory.  These may include (the specific JARs
