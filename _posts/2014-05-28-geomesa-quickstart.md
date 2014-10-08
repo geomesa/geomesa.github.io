@@ -155,12 +155,10 @@ are included only for reference, and only apply if you are using Accumulo 1.5.1 
 * Thrift
     * libthrift-0.9.1.jar
     
-There are also GeoServer JARs that need to be updated for GeoMesa:
+There are also GeoServer JARs that need to be updated for Accumulo (also in the lib directory):
     
-* commons-codec:  GeoServer ships with commons-codec 1.2, but GeoMesa requires
-  replacing that with version 1.8
-* commons-lang:  GeoServer ships with commons-lang 2.1, but GeoMesa requires
-  replacing that with version 2.5
+* commons-configuration: Accumulo requires connoms-configuration 1.6 and previous versions should be replaced
+* commons-lang: GeoServer ships with commons-lang 2.1, but Accumulo requires replacing that with version 2.4
 
 Restart GeoServer.
 
