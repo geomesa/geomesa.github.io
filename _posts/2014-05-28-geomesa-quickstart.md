@@ -157,7 +157,7 @@ are included only for reference, and only apply if you are using Accumulo 1.5.1 
     
 There are also GeoServer JARs that need to be updated for Accumulo (also in the lib directory):
     
-* commons-configuration: Accumulo requires connoms-configuration 1.6 and previous versions should be replaced
+* commons-configuration: Accumulo requires commons-configuration 1.6 and previous versions should be replaced
 * commons-lang: GeoServer ships with commons-lang 2.1, but Accumulo requires replacing that with version 2.4
 
 Restart GeoServer.
