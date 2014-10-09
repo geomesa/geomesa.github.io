@@ -9,6 +9,7 @@ layout: tutorial
 1. Use GeoServer Web Processing Services (WPS)
 2. Use time-interpolated queries
 3. Query from and save results to GeoServer layers
+<!--more-->
 
 #### Required Software
 * Hadoop 2.2.x

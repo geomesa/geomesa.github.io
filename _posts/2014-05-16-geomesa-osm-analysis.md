@@ -10,6 +10,7 @@ layout: tutorial
 
 1. Quickly and easily ingest big OSM (Open Street Map) data files into a GeoMesa Accumulo table via a Kafka/Storm stream.
 2. Leverage Geoserver to query and visualize the data.
+<!--more-->
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>

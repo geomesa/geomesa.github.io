@@ -16,6 +16,7 @@ layout: tutorial
     4.  write these new records to the GeoMesa-managed table
     5.  query your data
 3. visualize data within GeoServer
+<!--more-->
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
