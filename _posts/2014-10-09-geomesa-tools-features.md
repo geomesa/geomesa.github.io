@@ -51,7 +51,18 @@ different directory and run:
 geomesa
 {% endhighlight %}
 
-This should print out the following usage text: 
+Note: if you receive an SLF4J error like this:
+
+    SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
+    SLF4J: Defaulting to no-operation (NOP) logger implementation
+    SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
+    
+Please download the SLF4J TAR-ball [found here](http://www.slf4j.org/download.html). Extract 
+slf4j-log4j12-1.7.7.jar and place it in the geomesa-${version}/lib directory. Try running
+    
+    geomesa
+
+once more. This should print out the following usage text: 
 
 {% highlight bash %}
 GeoMesa Tools 1.0
@@ -79,6 +90,16 @@ Throughout this tutorial, be aware that all commands will require `-u` or `--use
 the username is your Accumulo username. The password for the Accumulo user can also be given on the 
 command line with `-p` or `--password`, or geomesa-tools can prompt you for your password after 
 entering a command, ensuring your password won't enter shell history.
+
+If you run into issues with Hadoop JARs not being found, try appending your commands with
+    
+    --instance-name {accumulo-instance-name} --zookeepers {accumulo-zookeepers-string}
+
+where `accumulo-instance-name` and `accumulo-zookeepers-string` are specific to your Accumulo setup.
+This will override GeoMesa-Tools attempting to automatically find your Accumulo and Hadoop configurations.
+
+Additionally, if you need visibilities or authorizations on your Accumulo tables, every command accepts
+`--visibilities` and `--auths` for Accumulo connection parameters.
 
 ## Feature Management
 
