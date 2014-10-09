@@ -15,7 +15,7 @@ GeoMesa allows users to perform [relational projections](http://en.wikipedia.org
 3. Compute new attributes from one or more original attributes - adds derived fields to results
 
 The transformations are applied in parallel across the cluster thus making them very fast.  They are analogous to the map tasks in a map-reduce job.  Transformations are also extensible; developers can implement new functions and plug them into the system using standard mechanisms from Geotools.  
-
+<!--more-->
 ### This tutorial will show you how to:
 
 Write custom Java code using GeoMesa to do the following:

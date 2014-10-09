@@ -10,6 +10,7 @@ layout: tutorial
 
 1. quickly and easily ingest big GDELT data files into a GeoMesa Accumulo table via a Hadoop Map/Reduce job.
 2. leverage Geoserver to query and visualize the data.
+<!--more-->
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
