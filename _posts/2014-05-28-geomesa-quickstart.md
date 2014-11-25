@@ -186,8 +186,6 @@ You will be taken to the Edit Layer screen.  Two of the tabs need to be updated:
 
 In the Data pane, enter values for the bounding boxes.  In this case, you can click on the link to compute these values from the data.
 
-In the Dimensions pane, enable Time and select the "When" field.  You will also need to specify a presentation for time - use List as a default.
-
 Click on the "Save" button when you are done.
 
 #### Take a look
