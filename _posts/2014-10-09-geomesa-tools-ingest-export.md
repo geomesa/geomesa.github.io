@@ -142,10 +142,12 @@ The created files should now be under the "export" directory in your root GeoMes
 these files to ensure your data was properly exported (and if it wasn't, be sure to 
 [submit a bug to our listserv](mailto:geomesa-users@locationtech.org)).
 
+<!--
 ## Explaining Queries
 
 One last command in the GeoMesa Command Line Tools module is the `explain` command, which is covered 
 in detail in the post [Understanding Queries by James Hughes](no-link-yet).
+-->
 
 ## Conclusion
 In this tutorial, you learned about the how to run ingests and exports using the GeoMesa Command 
