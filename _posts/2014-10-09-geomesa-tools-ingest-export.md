@@ -20,7 +20,7 @@ to ingest and export features using GeoMesa-Tools
 
 ##Prerequistes
 
-If you haven't already [read through this post]{% post_url 2014-10-09-geomesa-tools-features %} and 
+If you haven't already [read through this post](http://www.geomesa.org/2014/05/28/geomesa-quickstart/) and 
 gone through the initial setup of GeoMesa-Tools, please finish that tutorial first and return back 
 to this page.
 
@@ -57,23 +57,21 @@ of coordinates.
 The `ingest` command has the following required flags in addition to accumulo user and password:
 
 `-c` or `--catalog` to specify the name of the catalog table  
-`-f` or `--feature-name` to give the name of the feature to ingest  
+`-fn` or `--feature-name` to give the name of the feature to ingest  
 
 Additionally for CSV/TSV ingest there are several optional parameters that can be used:  
-`-s` or `--sftspec` The Simple Feature Type of the CSV or TSV file, each column in the file must have a corresponding attributed in the SimpleFeatureType. This is not required for SHP ingest.  
-`--datetime` The name of the field in the SFT that corresponds to the *time* column (default timezone is UTC).  
-`--dtformat` The Joda DateTimeFormat quote-wrapped string for the date-time field, e.g.: "MM/dd/yyyy HH:mm:ss".  
-`--idfields` The set of attributes of each feature used to encode the feature name.  
-`-h` or `--hash` A flag to optionally md5 hash the resulting id created from the `--idfields` flag.  
-`--lon` The name of the attribute in the SFT corresponding to the longitude data column in the file.    
-`--lat` The name of the attribute in the SFT corresponding to the latitude data column in the file. 
+`-s` or `--spec` The Simple Feature Type of the CSV or TSV file, each column in the file must have a corresponding attributed in the SimpleFeatureType. This is not required for SHP ingest.  
+`-dt` or `--dtg` The name of the field in the SFT that corresponds to the *time* column (default timezone is UTC).  
+`-dtf` or `--dt-format` The Joda DateTimeFormat quote-wrapped string for the date-time field, e.g.: "MM/dd/yyyy HH:mm:ss".  
+`-id` or `--id-fields` The set of attributes of each feature used to encode the feature name.  
+`-h` or `--hash` A flag to optionally md5 hash the resulting id created from the `--id-fields` flag.  
+`-lon` The name of the attribute in the SFT corresponding to the longitude data column in the file.    
+`-lat` The name of the attribute in the SFT corresponding to the latitude data column in the file. 
  
 If you are attempting to ingest a file with longitude and latitude columns, you must append to the end of the Simple Feature Type an addition attribute for the point geometry that will be constructed, e.g.: `*geom:Point:srid=4326`.
-Ingesting a file with a column of WKT geometries the `--lon` and `--lat` parameters are no longer necessary and that column can be directly referenced in the sft as some geom e.g.: `*geom:Geometry:srid=4326` or `*geom:Point:srid=4326`. 
+Ingesting a file with a column of WKT geometries the `-lon` and `-lat` parameters are no longer necessary and that column can be directly referenced in the sft as some geom e.g.: `*geom:Geometry:srid=4326` or `*geom:Point:srid=4326`. 
 
-The last argument that is required for all ingest commands is the path to the file to ingest.
-
-`--file` The path to the file that will be ingested. If ingesting CSV/TSV data this can be an HDFS path by prefixing it with `hdfs://`
+The last argument that is required for all ingest commands is the path to the file to ingest. Simply list the path after all the other options as the main parameter to the program. The path to the file that will be ingested. If ingesting CSV/TSV data this can be an HDFS path by prefixing it with `hdfs://`
 
 ### Running an Ingest
 
@@ -88,27 +86,27 @@ Actor2Type1Code:String,ActionGeo_Long:Float,ActionGeo_Lat:Float,ActionGeo_FullNa
 {% endhighlight  %}
 
 Again note the extra `*geom:Point:srid=4326` at the end of the Simple Feature Type, since we are constructing a default geometry from the latitude and longitude coordinates we must give the feature a geometry attribute.
-Looking at the SQLDATE column the date time format is simply `"yyyMMdd"`, for more complicated formats please refer to the [JODA documentation](http://joda-time.sourceforge.net/apidocs/org/joda/time/format/DateTimeFormat.html)
+Looking at the SQLDATE column the date time format is simply `"yyyyMMdd"`, for more complicated formats please refer to the [JODA documentation](http://joda-time.sourceforge.net/apidocs/org/joda/time/format/DateTimeFormat.html)
 The final things we need to set are the id fields, the date time field, and the names of the longitude and latitude columns. This is all fairly straight forward as they all correspond directly to the names we put in the simple feature type above:
 
 {% highlight bash %}
---datetime SQLDATE
---lon ActionGeo_Long
---lat ActionGeo_Lat
+-dt SQLDATE
+-lon ActionGeo_Long
+-lat ActionGeo_Lat
 {% endhighlight %}
 
 We are also going to set the id fields parameter to contain the `GLOBALEVENTID`.  
 Now that we have everything ready, we will now combine the various parameters into the following complete ingest command:
 
 {% highlight bash %}
-geomesa ingest -u username -p password -c gdelt_Ukraine -f gdelt
- -s GLOBALEVENTID:Integer,SQLDATE:Date,EventCode:String,Actor1Name:String,Actor1Type1Code:String,Actor2Name:String,Actor2Type1Code:String,ActionGeo_Long:Double,ActionGeo_Lat:Double,ActionGeo_FullName:String,*geom:Point:srid=4326
- --datetime SQLDATE
- --dtformat "yyyyMMdd"
- --idfields GLOBALEVENTID
- --lon ActionGeo_Long
- --lat ActionGeo_Lat
- --file ./ukraineNovToMar.csv
+geomesa ingest -u username -p password -c gdelt_Ukraine -f gdelt \
+ -s GLOBALEVENTID:Integer,SQLDATE:Date,EventCode:String,Actor1Name:String,Actor1Type1Code:String,Actor2Name:String,Actor2Type1Code:String,ActionGeo_Long:Double,ActionGeo_Lat:Double,ActionGeo_FullName:String,*geom:Point:srid=4326 \
+ -dt SQLDATE \
+ -dtf "yyyyMMdd" \
+ -id GLOBALEVENTID \
+ -lon ActionGeo_Long \
+ -lat ActionGeo_Lat \
+ ./ukraineNovToMar.csv
 {% endhighlight %}
 
 ## Exporting Features
@@ -120,22 +118,21 @@ this next section.
 The `export` command has 3 required flags:  
  
 `-c` or `--catalog` to specify the name of the catalog table  
-`-f` or `--feature-name` to give the name of the feature to export  
-`-o` or `--format` to specify the output format (csv, tsv, shp, geojson, or gml)
+`-fn` or `--feature-name` to give the name of the feature to export  
+`-fmt` or `--format` to specify the output format (csv, tsv, shp, geojson, or gml)
 
 Additionally, you can specify more details about the kind of export you would like to perform with 
 `export`'s optional flags. Those are:
  
-`-a` or `--attributes` - the attributes of the feature to return  
-`-m` or `--maxFeatures` - the maximum number of features to return in an export  
+`-at` or `--attributes` - the attributes of the feature to return  
+`-max` or `--max-features` - the maximum number of features to return in an export  
 `-q` or `--query` - a CQL query to perform on the features to return only subset of features matching the query   
-`-s` or `--stdout` - add to export to STDOUT; useful for piping output to other commands
 
-We'll use the `--maxFeatures` flag to ensure our dataset is small and quick to export. First, we'll 
+We'll use the `--max-features` flag to ensure our dataset is small and quick to export. First, we'll 
 export to CSV with the following command:
 
 {% highlight bash %}
-geomesa export -u username -p password -c gdelt_Ukraine -f gdelt -o csv -m 50
+geomesa export -u username -p password -c gdelt_Ukraine -fn gdelt -fmt csv -m 50
 {% endhighlight %}
 
 Now, run the above command four additional times, changing the `--format` flag to `tsv`, `shp`, 

@@ -44,6 +44,14 @@ with the . prefix will set this for you, add $GEOMESA_HOME/bin to your PATH, and
 environment variables in your current shell session. Additionally, make sure that $ACCUMULO_HOME and 
 $HADOOP_CONF_DIR environment variables are set.
 
+The next step is to install the Java Advanced Imaging (jai) libraries to the `$GEOMESA_HOME/lib` folder.
+These libraries are required for shapefile support. A script is provided that attempts to wget the jai
+jars and install them:
+
+{% highlight bash %}
+geomesa-install-jai
+{% endhighlight %}
+
 Now, you should be able to use GeoMesa from any directory on your computer. To test, `cd` to a 
 different directory and run:
 
@@ -51,42 +59,42 @@ different directory and run:
 geomesa
 {% endhighlight %}
 
-Note: if you receive an SLF4J error like this:
+GeoMesa tools comes with a bundled SLF4j implementation...if you receive an SLF4J error like this:
 
     SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
     SLF4J: Defaulting to no-operation (NOP) logger implementation
     SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
     
 Please download the SLF4J TAR-ball [found here](http://www.slf4j.org/download.html). Extract 
-slf4j-log4j12-1.7.7.jar and place it in the geomesa-${version}/lib directory. Try running
+slf4j-log4j12-1.7.7.jar and place it in the geomesa-${version}/lib directory. 
+
+If this conflicts with another SLF4J implementation it may need to be removed from the lib directory.
+
+Try running
     
     geomesa
 
 once more. This should print out the following usage text: 
 
 {% highlight bash %}
-GeoMesa Tools 1.0
-Required for each command:
-        -u, --username: the Accumulo username : required
-Optional parameters:
-        -p, --password: the Accumulo password. This can also be provided after entering a command.
-        help, -help, --help: show this help dialog or the help dialog for a specific command (e.g. geomesa create help)
-Supported commands are:
-        create: Create a feature in GeoMesa
-        delete: Delete a feature from the specified Catalog Table in GeoMesa
-        describe: Describe the attributes of a specified feature
-        explain: Explain and plan a query in GeoMesa
-        export: Export all or a set of features in CSV, TSV, GeoJSON, GML, or SHP format
-        ingest: Ingest features into GeoMesa    
-        list: List the features in the specified Catalog Table
-        tableconf: List, describe, and update table configuration parameters
+Usage: geomesa [command] [command options]
+  Commands:
+    create       Create a feature definition in a GeoMesa catalog
+    delete       Delete a feature's data and definition from a GeoMesa catalog
+    describe     Describe the attributes of a given feature in GeoMesa
+    explain      Explain how a GeoMesa query will be executed
+    export       Export a GeoMesa feature
+    help         Show help
+    ingest       Ingest a file of various formats into GeoMesa
+    list         List GeoMesa features for a given catalog
+    tableconf    Perform table configuration operations
 {% endhighlight %}
 
 This usage text gives a brief overview of how to use each command. To learn more about each command 
 the the flags associated with them, take a look at the 
 [Github Tools README](https://github.com/locationtech/geomesa/tree/accumulo1.5.x/1.x/geomesa-tools#geomesa-tools).
 
-Throughout this tutorial, be aware that all commands will require `-u` or `--username` flags, where 
+Throughout this tutorial, be aware that all commands will require `-u` or `--user` flags, where 
 the username is your Accumulo username. The password for the Accumulo user can also be given on the 
 command line with `-p` or `--password`, or geomesa-tools can prompt you for your password after 
 entering a command, ensuring your password won't enter shell history.
@@ -107,15 +115,15 @@ To begin, let's start by creating a new feature in GeoMesa with the `create` com
 command takes three required flags and one optional:  
 #### Required  
 `-c` or `--catalog` for the name of the catalog table  
-`-f` or `--feature-name` for the name of the feature  
+`-fn` or `--feature-name` for the name of the feature  
 `-s` or `--spec` for the SimpleFeatureType specification  
 #### Optional
-`-d` or `--dt-field` for the default date attribute of the SFT
+`-dt` or `--dt-field` for the default date attribute of the SFT
 
 From the root GeoMesa directory, run the command: 
 
 {% highlight bash %}
-geomesa create -u username -p password -c cmd_tutorial -f feature -s id:String:index=true,dtg:Date,geom:Point:srid=4326 -d dtg
+geomesa create -u username -p password -c cmd_tutorial -fn feature -s id:String:index=true,dtg:Date,geom:Point:srid=4326 -dt dtg
 {% endhighlight %}
 
 This will create a new feature, named "feature," on catalog table "cmd_tutorial." The catalog table 
@@ -156,12 +164,12 @@ To find out more about the attributes of a feature, we'll use the `describe` com
 takes 2 flags:
 
 `-c` or `--catalog` for the name of the catalog table  
-`-f` or `--feature-name` for the name of the feature   
+`-fn` or `--feature-name` for the name of the feature   
 
 Let's find out more about the attributes on our first feature. Run the command
 
 {% highlight bash %}
-geomesa describe -u username -p password -c cmd_tutorial -f feature
+geomesa describe -u username -p password -c cmd_tutorial -fn feature
 {% endhighlight %}
 
 The output should look like:
@@ -177,12 +185,12 @@ Continuing on, let's delete the first feature we created with the `delete` comma
 command takes two flags:  
 
 `-c` or `--catalog` for the name of the catalog table  
-`-f` or `--feature-name` for the name of the feature to delete.  
+`-fn` or `--feature-name` for the name of the feature to delete.  
 
 Run the following command:
 
 {% highlight bash %}
-geomesa delete -u username -p password -c cmd_tutorial -f feature
+geomesa delete -u username -p password -c cmd_tutorial -fn feature
 {% endhighlight %}
 
 NOTE: Running this command will take a bit longer than the previous two, as it will delete three 
