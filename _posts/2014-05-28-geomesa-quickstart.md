@@ -66,6 +66,12 @@ mvn clean install
 
 When this is complete, it should have built a JAR file that contains all of the code you need to run the tutorial.
 
+### INSTALL GEOMESA ACCUMULO ITERATORS
+
+After 'mvn clean install' finishes, you should have a jar in geomesa-distributed-runtime/target/ named geomesa-distributed-runtime-accumulo1.5-VERSION.jar.  
+
+This jar contains the GeoMesa Accumulo Iterators which are necessary to query GeoMesa.  This jar needs to be copied to $ACCUMULO_HOME/lib/ext on each tablet server.
+
 ### RUN THE TUTORIAL
 
 On the command-line, run:
@@ -210,4 +216,7 @@ Here are just a few simple ways you can play with the visualization:
 * Shift-click to highlight a region within the map that you would like to zoom into.
 * Alter the `TIME=` parameter in the URL to a different date range, and you can filter to see only the records that satisfy the temporal constraint.
 * Click on the "Toggle options toolbar" icon in the upper-left corner of the preview window.  The right-hand side of the screen will include a "Filter" text box.  Enter `Who = 'Bierce'`, and press on the "play" icon.  The display will now show only those points matching your filter criterion.  This is a CQL filter, and you can make these very complex.
-* In the URL, change `styles=` to be `styles=heatmap&amp;density=true`.  Once you press &lt;Enter&gt;, the display will change to a density heat-map.  (NB:  For this to work, you will have to first install the WPS module for GeoServer.  See the official web site for a download.)
+
+Generating Heatmaps:
+* To try out the DensityIterator, you can install the Heatmap SLD from the [GDELT tutorial](http://geomesa.org/2014/04/17/geomesa-gdelt-analysis/#heatmaps).  
+* After configuring the SLD, in the URL, change `styles=` to be `styles=heatmap&amp;density=true`.  Once you press &lt;Enter&gt;, the display will change to a density heat-map.  (NB:  For this to work, you will have to first install the WPS module for GeoServer.  See the official web site for a download.)
