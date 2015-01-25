@@ -48,12 +48,6 @@ We will call the CSV file we just downloaded from BigQuery `ukraineNovToMar.csv`
 
 The ingest command currently supports three formats: CSV, TSV, and SHP.
  
-The CSV and TSV file ingest can ingest geometries in two different ways: a column in the file can represent
-the geometry in [WKT](http://en.wikipedia.org/wiki/Well-known_text), or the file can also contain two columns 
-(one for latitude and one for longitude). 
-For the latter case, a Point geometry is constructed from the resulting pair
-of coordinates. 
-
 The `ingest` command has the following required flags in addition to accumulo user and password:
 
 `-c` or `--catalog` to specify the name of the catalog table  
@@ -65,13 +59,22 @@ Additionally for CSV/TSV ingest there are several optional parameters that can b
 `-dtf` or `--dt-format` The Joda DateTimeFormat quote-wrapped string for the date-time field, e.g.: "MM/dd/yyyy HH:mm:ss".  
 `-id` or `--id-fields` The set of attributes of each feature used to encode the feature name.  
 `-h` or `--hash` A flag to optionally md5 hash the resulting id created from the `--id-fields` flag.  
-`-lon` The name of the attribute in the SFT corresponding to the longitude data column in the file.    
-`-lat` The name of the attribute in the SFT corresponding to the latitude data column in the file. 
- 
-If you are attempting to ingest a file with longitude and latitude columns, you must append to the end of the Simple Feature Type an addition attribute for the point geometry that will be constructed, e.g.: `*geom:Point:srid=4326`.
-Ingesting a file with a column of WKT geometries the `-lon` and `-lat` parameters are no longer necessary and that column can be directly referenced in the sft as some geom e.g.: `*geom:Geometry:srid=4326` or `*geom:Point:srid=4326`. 
+`-lon` or `--lon-attribute` The name of the longitude field in the SimpleFeature if longitude is kept in the SFT spec; otherwise defines the csv field index used to create the default geometry.  
+`-lat` or `--lat-attribute` The name of the latitude field in the SimpleFeature if longitude is kept in the SFT spec; otherwise defines the csv field index used to create the default geometry.  
+`-ld` or `--list-delimiter` The character(s) to delimit list features.  
+`-cols` or `--columns` The set of numerical column indexes to be ingested. These must match (in number and order) the SimpleFeatureType spec. (zero-indexed).  
 
 The last argument that is required for all ingest commands is the path to the file to ingest. Simply list the path after all the other options as the main parameter to the program. The path to the file that will be ingested. If ingesting CSV/TSV data this can be an HDFS path by prefixing it with `hdfs://`
+
+### Geometries for CSV/TSV files
+Each feature/line of delimited data is required to contain a valid geometry. This geometry may be supplied in one of two ways:
+
+* A [Well-Known-Text (WKT)](http://en.wikipedia.org/wiki/Well-known_text) geometry field
+* Longitude and Latitude columns used to create a Point geoemtry
+
+If you are attempting to ingest a file with longitude and latitude columns, you must append to the end of the Simple Feature Type an addition attribute for the point geometry that will be constructed, e.g.: `*geom:Point:srid=4326`.
+
+When Ingesting a file with a WKT geometry column, the `-lon` and `-lat` parameters should not be provided. Instead, the geometry column can be directly referenced in the SFT as the default geometry. e.g.: `*geom:Geometry:srid=4326` or `*geom:Point:srid=4326`. 
 
 ### Running an Ingest
 
@@ -99,14 +102,34 @@ We are also going to set the id fields parameter to contain the `GLOBALEVENTID`.
 Now that we have everything ready, we will now combine the various parameters into the following complete ingest command:
 
 {% highlight bash %}
-geomesa ingest -u username -p password -c gdelt_Ukraine -f gdelt \
- -s GLOBALEVENTID:Integer,SQLDATE:Date,EventCode:String,Actor1Name:String,Actor1Type1Code:String,Actor2Name:String,Actor2Type1Code:String,ActionGeo_Long:Double,ActionGeo_Lat:Double,ActionGeo_FullName:String,*geom:Point:srid=4326 \
+geomesa ingest -u username -p password -c gdelt_Ukraine -fn gdelt \
+ -s 'GLOBALEVENTID:Integer,SQLDATE:Date,EventCode:String,Actor1Name:String,Actor1Type1Code:String,Actor2Name:String,Actor2Type1Code:String,ActionGeo_Long:Double,ActionGeo_Lat:Double,ActionGeo_FullName:String,*geom:Point:srid=4326' \
  -dt SQLDATE \
  -dtf "yyyyMMdd" \
  -id GLOBALEVENTID \
  -lon ActionGeo_Long \
  -lat ActionGeo_Lat \
- ./ukraineNovToMar.csv
+ /path/to/ukraineNovToMar.csv
+{% endhighlight %}
+
+#### Customizing Ingest Fields
+GeoMesa ingest supports customizing which fields are ingested from a CSV or TSV file. If we decide to drop the fields `ActionGeo_Long` and `ActionGeo_Lat` from our SFT spec in favor of just a geometry field we must do three things:
+
+1. Use the `-cols` attribute to indicate which positional fields from the csv file we want to ingest (0-6 and 9). 
+2. Provide numerical indexes from the original csv file for `-lon` and `-lat` (7 and 8)
+3. Remove the lon/lat fields from our SFT spec. 
+
+Notice that the total number of ingest fields (0-6,9) selected using `-cols` is 8 while we have 9 in our SFT. The 9th field is the geometry that will be set from the dropped fields (7 and 8). The order of the fields (0-6,9) matches the first 8 fields of the SFT.
+{% highlight bash %}
+geomesa ingest -u username -p password -c gdelt_Ukraine -fn gdelt \
+ -s 'GLOBALEVENTID:Integer,SQLDATE:Date,EventCode:String,Actor1Name:String,Actor1Type1Code:String,Actor2Name:String,Actor2Type1Code:String,ActionGeo_FullName:String,*geom:Point:srid=4326' \
+ -dt SQLDATE
+ -dtf "yyyyMMdd" \
+ -id GLOBALEVENTID \
+ -lon 7 \
+ -lat 8 \
+ -cols 0-6,9 \
+ /path/to/ukraineNovToMar.csv
 {% endhighlight %}
 
 ## Exporting Features
@@ -132,11 +155,11 @@ We'll use the `--max-features` flag to ensure our dataset is small and quick to 
 export to CSV with the following command:
 
 {% highlight bash %}
-geomesa export -u username -p password -c gdelt_Ukraine -fn gdelt -fmt csv -m 50
+geomesa export -u username -p password -c gdelt_Ukraine -fn gdelt -fmt csv -max 50
 {% endhighlight %}
 
 Now, run the above command four additional times, changing the `--format` flag to `tsv`, `shp`, 
-`geojson`, and `gml`. 
+`json`, and `gml`. 
 
 The created files should now be under the "export" directory in your root GeoMesa directory. Inspect 
 these files to ensure your data was properly exported (and if it wasn't, be sure to 
