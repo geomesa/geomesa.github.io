@@ -27,6 +27,7 @@ layout: tutorial
 
 Before you begin, you should also have these:
 
+* basic knowledge of GeoTools, GeoServer, and Accumulo
 * an Accumulo user that has both create-table and write permissions
 * a local copy of the Java Development Kit 1.7.x
 * Apache Maven installed
@@ -68,9 +69,9 @@ When this is complete, it should have built a JAR file that contains all of the 
 
 ### INSTALL GEOMESA ACCUMULO ITERATORS
 
-After 'mvn clean install' finishes, you should have a jar in geomesa-distributed-runtime/target/ named geomesa-distributed-runtime-accumulo1.5-VERSION.jar.  
+After 'mvn clean install' finishes, you should have a JAR in geomesa-distributed-runtime/target/ named geomesa-distributed-runtime-accumulo1.5-VERSION.JAR.  
 
-This jar contains the GeoMesa Accumulo Iterators which are necessary to query GeoMesa.  This jar needs to be copied to $ACCUMULO_HOME/lib/ext on each tablet server.
+This JAR contains the GeoMesa Accumulo Iterators which are necessary to query GeoMesa.  This JAR needs to be copied to $ACCUMULO_HOME/lib/ext on each tablet server.
 
 ### RUN THE TUTORIAL
 
@@ -126,18 +127,18 @@ You should have an instance of GeoServer, version 2.5.2, running somewhere that 
 
 Be sure that you have installed the optional [WPS](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html) package installed for your version of GeoServer.
 
-Copy the the `geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar` library file from the GeoMesa directory you built into your GeoServer's library directory.
+Copy the the `geomesa-plugin-accumulo1.5-1.0.0-rc.4-SNAPSHOT-geoserver-plugin.jar` library file from the GeoMesa directory you built into your GeoServer's library directory.
 
 If you are using tomcat:
 
 {% highlight bash %}
-cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
+cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-rc.4-SNAPSHOT-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 If you are using GeoServer's built in Jetty web server:
 
 {% highlight bash %}
-cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
+cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-rc.4-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `lib` directory.  These may include (the specific JARs
@@ -171,7 +172,7 @@ Restart GeoServer.
 
 #### Register the GeoMesa store with GeoServer
 
-Click "Stores" and "Add new Store".
+Log into GeoServer using your user and password credentials.  Click "Stores" and "Add new Store".
 If you do not see the Accumulo Feature Data Store listed under Vector Data Sources, ensure the plugin is in the right directory and restart GeoServer.
 
 Select the `Accumulo Feature Data Store` vector data source, and enter the following parameters:
@@ -188,9 +189,11 @@ Click "Save", and GeoServer will search your Accumulo table for any GeoMesa-mana
 
 GeoServer should recognize the `QuickStart` feature type, and should present that as a layer that could be published.  Click on the "Publish" link.
 
-You will be taken to the Edit Layer screen.  Two of the tabs need to be updated:  Data and Dimensions.
+You will be taken to the Edit Layer screen. Two of the tabs need to be updated: Data and Dimensions.
 
 In the Data pane, enter values for the bounding boxes.  In this case, you can click on the link to compute these values from the data.
+
+In the Dimensions tab, check the "Enabled" checkbox under Time. Then select "When" in the Attribute and End Attribute dropdowns, and "Continuous Interval" in the Presentation dropdown.
 
 Click on the "Save" button when you are done.
 
@@ -198,13 +201,15 @@ Click on the "Save" button when you are done.
 
 Click on the "Layer Preview" link in the left-hand gutter.  If you don't see the quick-start layer on the first page of results, enter the name of the layer you just created into the search box, and press &lt;Enter&gt;.
  
-Once you see your layer, click on the "OpenLayers" link, which will open a new tab.  By default, the display that opens will be empty, because we have enabled the time dimension for this layer, but the preview does not specify a time.  In the URL bar for the visualization, add the following to the end:
+Once you see your layer, click on the "OpenLayers" link, which will open a new tab.  By default, the display that opens will not show all the data, because we have enabled the time dimension for this layer, but the preview does not specify a time.  In the URL bar for the visualization, add the following to the end:
  
  ```
  &TIME=2014-01-01T00:00:00.000Z/2014-12-31T23:59:59.999Z
  ```
  
- That tells GeoServer to display the records for the entire calendar year 2014.  Once you press &lt;Enter&gt;, the display will update, and you should see a collection of red dots similar to the following image.
+That tells GeoServer to display the records for the entire calendar year 2014.  You can find more information about the TIME parameter from here: http://docs.geoserver.org/latest/en/user/services/wms/time.html.
+
+Once you press &lt;Enter&gt;, the display will update, and you should see a collection of red dots similar to the following image.
 
 !["Visualizing quick-start data"](/img/tutorials/2014-05-28-geomesa-quickstart/geoserver-layer-preview.png)
 
@@ -215,8 +220,9 @@ Here are just a few simple ways you can play with the visualization:
 * Click on one of the red points in the display, and GeoServer will report the detail records underneath the map area.
 * Shift-click to highlight a region within the map that you would like to zoom into.
 * Alter the `TIME=` parameter in the URL to a different date range, and you can filter to see only the records that satisfy the temporal constraint.
-* Click on the "Toggle options toolbar" icon in the upper-left corner of the preview window.  The right-hand side of the screen will include a "Filter" text box.  Enter `Who = 'Bierce'`, and press on the "play" icon.  The display will now show only those points matching your filter criterion.  This is a CQL filter, and you can make these very complex.
+* Click on the "Toggle options toolbar" icon in the upper-left corner of the preview window.  The right-hand side of the screen will include a "Filter" text box.  Enter `Who = 'Bierce'`, and press on the "play" icon.  The display will now show only those points matching your filter criterion.  This is a CQL filter, and you can make these however complex in order to satisfy queries.
 
 Generating Heatmaps:
+
 * To try out the DensityIterator, you can install the Heatmap SLD from the [GDELT tutorial](http://geomesa.org/2014/04/17/geomesa-gdelt-analysis/#heatmaps).  
 * After configuring the SLD, in the URL, change `styles=` to be `styles=heatmap&amp;density=true`.  Once you press &lt;Enter&gt;, the display will change to a density heat-map.  (NB:  For this to work, you will have to first install the WPS module for GeoServer.  See the official web site for a download.)
