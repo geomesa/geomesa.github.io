@@ -127,7 +127,7 @@ You should have an instance of GeoServer, version 2.5.2, running somewhere that 
 
 Be sure that you have installed the optional [WPS](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html) package installed for your version of GeoServer.
 
-Copy the the `geomesa-plugin-accumulo1.5-1.0.0-rc.4-SNAPSHOT-geoserver-plugin.jar ` library file from the GeoMesa directory you built into your GeoServer's library directory.
+Copy the the `geomesa-plugin-accumulo1.5-1.0.0-rc.4-SNAPSHOT-geoserver-plugin.jar` library file from the GeoMesa directory you built into your GeoServer's library directory.
 
 If you are using tomcat:
 
@@ -193,7 +193,7 @@ You will be taken to the Edit Layer screen. Two of the tabs need to be updated: 
 
 In the Data pane, enter values for the bounding boxes.  In this case, you can click on the link to compute these values from the data.
 
-In the Dimensions tab, check the "Enabled" checkbox. Then select "When" in the Attribute and End Attribute dropdowns, and "Continuous Interval" in the Presentation dropdown.
+In the Dimensions tab, check the "Enabled" checkbox under Time. Then select "When" in the Attribute and End Attribute dropdowns, and "Continuous Interval" in the Presentation dropdown.
 
 Click on the "Save" button when you are done.
 
@@ -207,7 +207,9 @@ Once you see your layer, click on the "OpenLayers" link, which will open a new t
  &TIME=2014-01-01T00:00:00.000Z/2014-12-31T23:59:59.999Z
  ```
  
- That tells GeoServer to display the records for the entire calendar year 2014.  Once you press &lt;Enter&gt;, the display will update, and you should see a collection of red dots similar to the following image.
+That tells GeoServer to display the records for the entire calendar year 2014.  You can find more information about the TIME parameter from here: http://docs.geoserver.org/latest/en/user/services/wms/time.html.
+
+Once you press &lt;Enter&gt;, the display will update, and you should see a collection of red dots similar to the following image.
 
 !["Visualizing quick-start data"](/img/tutorials/2014-05-28-geomesa-quickstart/geoserver-layer-preview.png)
 
