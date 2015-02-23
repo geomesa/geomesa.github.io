@@ -181,6 +181,8 @@ http://localhost:8080/geoserver/wms?service=WMS&version=1.1.0&request=GetMap&lay
 
 !["Showing all  GDELT events from Jan 1, 2013 to April 30, 2014"](/img/tutorials/2014-04-17-geomesa-gdelt-analysis/Ukraine_Unfiltered.png)
 
+(The above map is using the [Stamen Toner](http://maps.stamen.com/toner) layer as a base layer.  For more information about adding multiple layer into one group see the GeoServer [documentation](http://docs.geoserver.org/stable/en/user/webadmin/data/layergroups.html).
+
 #### FILTER
 
 Let's narrow our results. GDELT codes events using the CAMEO (Conflict and Mediation Event Observations).  The CAMEO code for events of type 'THREATEN' starts with '13'.  We can filter down to these events using the drop down in Geoserver's OpenLayers preview.
