@@ -57,7 +57,7 @@ Pick a reasonable directory on your machine, and run:
 git clone https://github.com/geomesa/geomesa-quickstart.git
 ```
 
-The ```pom.xml``` file contains an explicit list of dependent libraries that will be bundled together into the final tutorial. You should confirm that the versions of Accumulo and Hadoop match what you are running; if it does not match, change the value in the POM. (NB: The only reason these libraries are bundled into the final JAR is that this is easier for most people to do this than it is to set the classpath when running the tutorial. If you would rather not bundle these dependencies, mark them as provided in the POM, and update your classpath as appropriate.)
+The ```pom.xml``` file contains an explicit list of dependent libraries that will be bundled together into the final tutorial. You should confirm that the versions of Accumulo and Hadoop match what you are running; if it does not match, change the value in the POM. (NB: The only reason these libraries are bundled into the final jar is that this is easier for most people to do this than it is to set the classpath when running the tutorial. If you would rather not bundle these dependencies, mark them as provided in the POM, and update your classpath as appropriate.)
 
 From within the root of the cloned tutorial, run:
 
@@ -65,13 +65,13 @@ From within the root of the cloned tutorial, run:
 mvn clean install
 ```
 
-When this is complete, it should have built a JAR file that contains all of the code you need to run the tutorial.
+When this is complete, it should have built a jar file that contains all of the code you need to run the tutorial.
 
 ### INSTALL GEOMESA ACCUMULO ITERATORS
 
-After 'mvn clean install' finishes, you should have a JAR in geomesa-distributed-runtime/target/ named geomesa-distributed-runtime-accumulo1.5-VERSION.JAR.  
+After 'mvn clean install' finishes, you should have a jar in geomesa-distributed-runtime/target/ named geomesa-distributed-runtime-accumulo1.5-VERSION.jar.  
 
-This JAR contains the GeoMesa Accumulo Iterators which are necessary to query GeoMesa.  This JAR needs to be copied to $ACCUMULO_HOME/lib/ext on each tablet server.
+This jar contains the GeoMesa Accumulo Iterators which are necessary to query GeoMesa.  This jar needs to be copied to $ACCUMULO_HOME/lib/ext on each tablet server.
 
 ### RUN THE TUTORIAL
 
@@ -141,7 +141,7 @@ If you are using GeoServer's built in Jetty web server:
 cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-rc.4-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
-There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `lib` directory.  These may include (the specific JARs
+There are additional jars that are specific to your installation that you will also need to copy to GeoServer's `lib` directory.  These may include (the specific jars
 are included only for reference, and only apply if you are using Accumulo 1.5.1 and Hadoop 2.2):
 
 * Accumulo
@@ -163,7 +163,7 @@ are included only for reference, and only apply if you are using Accumulo 1.5.1 
 * Thrift
     * libthrift-0.9.1.jar
     
-There are also GeoServer JARs that need to be updated for Accumulo (also in the lib directory):
+There are also GeoServer jars that need to be updated for Accumulo (also in the lib directory):
     
 * commons-configuration: Accumulo requires commons-configuration 1.6 and previous versions should be replaced
 * commons-lang: GeoServer ships with commons-lang 2.1, but Accumulo requires replacing that with version 2.4
@@ -220,7 +220,7 @@ Here are just a few simple ways you can play with the visualization:
 * Click on one of the red points in the display, and GeoServer will report the detail records underneath the map area.
 * Shift-click to highlight a region within the map that you would like to zoom into.
 * Alter the `TIME=` parameter in the URL to a different date range, and you can filter to see only the records that satisfy the temporal constraint.
-* Click on the "Toggle options toolbar" icon in the upper-left corner of the preview window.  The right-hand side of the screen will include a "Filter" text box.  Enter `Who = 'Bierce'`, and press on the "play" icon.  The display will now show only those points matching your filter criterion.  This is a CQL filter, and you can make these however complex in order to satisfy queries.
+* Click on the "Toggle options toolbar" icon in the upper-left corner of the preview window.  The right-hand side of the screen will include a "Filter" text box.  Enter `Who = 'Bierce'`, and press on the "play" icon.  The display will now show only those points matching your filter criterion.  This is a CQL filter, which can be constructed in various ways to query our data.  You can find more information about CQL from [GeoServer's CQL tutorial](http://docs.geoserver.org/latest/en/user/tutorials/cql/cql_tutorial.html).
 
 Generating Heatmaps:
 
