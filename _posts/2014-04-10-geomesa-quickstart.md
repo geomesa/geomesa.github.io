@@ -211,7 +211,7 @@ That tells GeoServer to display the records for the entire calendar year 2014.  
 
 Once you press &lt;Enter&gt;, the display will update, and you should see a collection of red dots similar to the following image.
 
-!["Visualizing quick-start data"](/img/tutorials/2014-05-28-geomesa-quickstart/geoserver-layer-preview.png)
+!["Visualizing quick-start data"](/img/tutorials/2014-04-10-geomesa-quickstart/geoserver-layer-preview.png)
 
 #### Tweaking the display
 
