@@ -2,6 +2,8 @@
 title: GeoMesa GeoServer UI
 author: emilio
 layout: tutorial
+redirect_from:
+    - /2014/08/06/geomesa-ui/
 ---
 
 {% include tutorial-header.html %}
@@ -21,7 +23,7 @@ This post outlines some of the features currently available through the GeoMesa 
 <!--more-->
 
 Instructions for installing the GeoMesa plugin in GeoServer are available
-[here](/2014/04/17/geomesa-gdelt-analysis/), under 'GeoServer Setup'.
+[here](/geomesa-gdelt-analysis/), under 'GeoServer Setup'.
 
 ## Access to the User Interface
 

@@ -2,6 +2,9 @@
 title: GeoMesa Quick Start
 author: chris
 layout: tutorial
+redirect_from:
+    - /2014/05/28/geomesa-quickstart/
+    - /2014/04/10/geomesa-quickstart/
 ---
 
 {% include tutorial-header.html %}
@@ -224,5 +227,5 @@ Here are just a few simple ways you can play with the visualization:
 
 Generating Heatmaps:
 
-* To try out the DensityIterator, you can install the Heatmap SLD from the [GDELT tutorial](http://geomesa.org/2014/04/17/geomesa-gdelt-analysis/#heatmaps).  
+* To try out the DensityIterator, you can install the Heatmap SLD from the [GDELT tutorial](http://www.geomesa.org/geomesa-gdelt-analysis/#heatmaps).
 * After configuring the SLD, in the URL, change `styles=` to be `styles=heatmap&amp;density=true`.  Once you press &lt;Enter&gt;, the display will change to a density heat-map.  (NB:  For this to work, you will have to first install the WPS module for GeoServer.  See the official web site for a download.)

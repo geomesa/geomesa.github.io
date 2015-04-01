@@ -2,6 +2,8 @@
 title: Geohash Ranges
 author: cne1x
 layout: tutorial
+redirect_from:
+    - /2014/08/05/geohash-substrings/
 ---
 
 {% include tutorial-header.html %}

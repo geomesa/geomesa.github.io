@@ -2,6 +2,8 @@
 title: Map-Reduce Ingest -- GDELT
 author: hunter
 layout: tutorial
+redirect_from:
+    - /2014/04/17/geomesa-gdelt-analysis/
 ---
 
 {% include tutorial-header.html %}

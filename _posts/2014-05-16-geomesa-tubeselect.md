@@ -2,6 +2,8 @@
 title: WPS -- Tube Select
 author: andrew
 layout: tutorial
+redirect_from:
+    - /2014/05/16/geomesa-tubeselect/
 ---
 {% include tutorial-header.html %}
 

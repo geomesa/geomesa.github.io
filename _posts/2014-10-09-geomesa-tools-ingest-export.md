@@ -2,6 +2,8 @@
 title: Ingest and Export with GeoMesa Tools
 author: andrew-and-jake
 layout: tutorial
+redirect_from:
+    - /2014/10/09/geomesa-tools-ingest-export/
 ---
 
 {% include tutorial-header.html %}
@@ -20,7 +22,7 @@ to ingest and export features using GeoMesa-Tools
 
 ##Prerequistes
 
-If you haven't already [read through this post](http://www.geomesa.org/2014/04/10/geomesa-quickstart/) and
+If you haven't already [read through this post](http://www.geomesa.org/geomesa-quickstart/) and
 gone through the initial setup of GeoMesa-Tools, please finish that tutorial first and return back 
 to this page.
 

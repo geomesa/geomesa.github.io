@@ -2,6 +2,8 @@
 title: GeoMesa Transformations
 author: emilio
 layout: tutorial
+redirect_from:
+    - /2014/05/30/geomesa-transformations/
 ---
 
 {% include tutorial-header.html %}
@@ -35,14 +37,14 @@ Although projections can also modify an attribute's value, in this tutorial we w
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
-    You will need to have ingested the GDELT data set using GeoMesa. Instructions are available <a href="/2014/04/17/geomesa-gdelt-analysis/">here</a>.
+    You will need to have ingested the GDELT data set using GeoMesa. Instructions are available <a href="/geomesa-gdelt-analysis/">here</a>.
 </div>
 
 #### Other prerequisites
 
 Before you begin, you should also have these:
 
-* a locally-built version of GeoMesa - see [GeoMesa Quickstart](/2014/04/10/geomesa-quickstart/) - (DOWNLOAD AND BUILD GEOMESA)
+* a locally-built version of GeoMesa - see [GeoMesa Quickstart](/geomesa-quickstart/) - (DOWNLOAD AND BUILD GEOMESA)
 * an Accumulo user that has appropriate permissions to query your data
 * a local copy of the Java Development Kit 1.7.x
 * Apache Maven installed

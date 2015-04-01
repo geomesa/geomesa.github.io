@@ -2,6 +2,8 @@
 title: GeoMesa Authorizations
 author: emilio
 layout: tutorial
+redirect_from:
+    - /2014/06/04/geomesa-authorizations/
 ---
 
 {% include tutorial-header.html %}
@@ -57,7 +59,7 @@ authenticate with GeoServer and LDAP to store authorizations
 
 Before you begin, you should also have these:
 
-* a locally-built version of GeoMesa - see [GeoMesa Quickstart](/2014/04/10/geomesa-quickstart/) - (DOWNLOAD AND BUILD GEOMESA)
+* a locally-built version of GeoMesa - see [GeoMesa Quickstart](/geomesa-quickstart/) - (DOWNLOAD AND BUILD GEOMESA)
 * an Accumulo user that has appropriate permissions to query your data
 * a local copy of the Java Development Kit 1.7.x
 * Apache Maven installed
@@ -146,7 +148,7 @@ In addition, please note that the authorizations used in any scenario cannot exc
 The rest of this tutorial will use the GDELT data set.
 
 If you have never ingested GDELT data, or you have previously ingested it **without** visibilities, you will need to ingest it again.
-Follow the instructions [here](/2014/04/17/geomesa-gdelt-analysis/), with the following changes:
+Follow the instructions [here](/geomesa-gdelt-analysis/), with the following changes:
 
 * ensure that you have the latest version of the GDELT tutorial code from github
 * when executing the map/reduce job, include the following parameter:
@@ -338,7 +340,7 @@ Once we have a user's authentication and authorizations, we will apply them to t
 a custom AuthorizationsProvider implementation.
 
 ```Note:``` **It is assumed for the rest of the tutorial that you have created the GeoServer
-data stores and layers outlined in the [GDELT tutorial](/2014/04/17/geomesa-gdelt-analysis/)**
+data stores and layers outlined in the [GDELT tutorial](/geomesa-gdelt-analysis/)**
 
 #### Run GeoServer in Tomcat
 
@@ -394,7 +396,7 @@ Start tomcat, either as a service or through the start scripts, and ensure that 
 #### Create the Accumulo Data Store and Layer in GeoServer
 
 If you haven't already, create an AccumuloDataStore and associated Layer pointing to the data with
-visibilities, as described in the [GDELT tutorial](/2014/04/17/geomesa-gdelt-analysis/).
+visibilities, as described in the [GDELT tutorial](/geomesa-gdelt-analysis/).
 
 When configuring the DataStore, leave the 'auths' field empty and set the 'visibilities' field to what
 you used when ingesting data above.

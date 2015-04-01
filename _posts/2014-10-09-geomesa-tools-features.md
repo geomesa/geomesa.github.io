@@ -2,6 +2,8 @@
 title: Feature Management with GeoMesa Tools
 author: jake
 layout: tutorial
+redirect_from:
+    - /2014/10/09/geomesa-tools-features/
 ---
 
 {% include tutorial-header.html %}

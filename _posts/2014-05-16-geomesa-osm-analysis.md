@@ -2,6 +2,8 @@
 title: Streaming Ingest -- Open Street Map (OSM)
 author: hunter
 layout: tutorial
+redirect_from:
+    - /2014/05/16/geomesa-osm-analysis/
 ---
 
 {% include tutorial-header.html %}
