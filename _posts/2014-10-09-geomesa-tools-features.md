@@ -1,5 +1,5 @@
 ---
-title: Feature Management with GeoMesa Tools
+title: Management with GeoMesa Tools
 author: jake
 layout: tutorial
 redirect_from:
@@ -22,36 +22,38 @@ setup of GeoMesa Tools and the feature management commands included with the mod
 
 ## Configuration
 
-To begin using the command line tools, first build the full GeoMesa project with `mvn clean install`. 
+To begin using the command line tools, first follow the [GeoMesa Deployment Tutorial](/geomesa-deployment/) to download and build the full GeoMesa project. 
+
 This will build the project and GeoMesa TAR-ball.  
 The TAR-ball can be found under `geomesa/geomesa-assemble/target`. Untar this file with:
 
 {% highlight bash %}
-tar xvfz geomesa-assemble/target/geomesa-${version}-bin.tar.gz
+tar xvfz geomesa-assemble/target/geomesa-{{ site.stableVersion }}-bin.tar.gz
 {% endhighlight %}
  
 Next, cd into the newly created directory with:
 
 {% highlight bash %}
-cd geomesa-${version}
+cd geomesa-{{ site.stableVersion }}
 {% endhighlight %}
 
 GeoMesa Tools relies on a GEOMESA_HOME environment variable. Running:
 
 {% highlight bash %}
-. bin/geomesa configure
+source bin/geomesa configure
 {% endhighlight %}
 
-with the . prefix will set this for you, add $GEOMESA_HOME/bin to your PATH, and source your new 
+will set this for you, add $GEOMESA_HOME/bin to your PATH, and source your new 
 environment variables in your current shell session. Additionally, make sure that $ACCUMULO_HOME and 
 $HADOOP_CONF_DIR environment variables are set.
 
-The next step is to install the Java Advanced Imaging (jai) libraries to the `$GEOMESA_HOME/lib` folder.
-These libraries are required for shapefile support. A script is provided that attempts to wget the jai
+The next steps are to install the Java Advanced Imaging (JAI) and JLine libraries to the `$GEOMESA_HOME/lib` folder.
+These libraries are necessary for full functionality in the GeoMesa command line tools. Scripts are provided that attempt to `wget` the JAI and JLine
 jars and install them:
 
 {% highlight bash %}
-geomesa-install-jai
+bin/install-jai
+bin/install-jline
 {% endhighlight %}
 
 Now, you should be able to use GeoMesa from any directory on your computer. To test, `cd` to a 
@@ -61,35 +63,43 @@ different directory and run:
 geomesa
 {% endhighlight %}
 
-GeoMesa tools comes with a bundled SLF4j implementation...if you receive an SLF4J error like this:
+GeoMesa Tools comes with a bundled SLF4j implementation. However, if you receive an SLF4J error like this:
 
-    SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
-    SLF4J: Defaulting to no-operation (NOP) logger implementation
-    SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
+{% highlight bash %}
+SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
+SLF4J: Defaulting to no-operation (NOP) logger implementation
+SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
+{% endhighlight %}
     
-Please download the SLF4J TAR-ball [found here](http://www.slf4j.org/download.html). Extract 
-slf4j-log4j12-1.7.7.jar and place it in the geomesa-${version}/lib directory. 
+download the SLF4J TAR-ball [found here](http://www.slf4j.org/download.html). Extract 
+slf4j-log4j12-1.7.7.jar and place it in the geomesa-{{ site.stableVersion }}/lib directory. 
 
-If this conflicts with another SLF4J implementation it may need to be removed from the lib directory.
+If this conflicts with another SLF4J implementation, it may need to be removed from the lib directory.
 
 Try running
-    
-    geomesa
+
+{% highlight bash %}
+geomesa
+{% endhighlight %}
 
 once more. This should print out the following usage text: 
 
 {% highlight bash %}
+Using GEOMESA_HOME = /home/jkenneally/geomesa/geomesa-1.0.0-rc.6
 Usage: geomesa [command] [command options]
   Commands:
-    create       Create a feature definition in a GeoMesa catalog
-    delete       Delete a feature's data and definition from a GeoMesa catalog
-    describe     Describe the attributes of a given feature in GeoMesa
-    explain      Explain how a GeoMesa query will be executed
-    export       Export a GeoMesa feature
-    help         Show help
-    ingest       Ingest a file of various formats into GeoMesa
-    list         List GeoMesa features for a given catalog
-    tableconf    Perform table configuration operations
+    create           Create a feature definition in a GeoMesa catalog
+    deletecatalog    Delete a GeoMesa catalog completely (and all features in it)
+    describe         Describe the attributes of a given feature in GeoMesa
+    explain          Explain how a GeoMesa query will be executed
+    export           Export a GeoMesa feature
+    help             Show help
+    ingest           Ingest a file of various formats into GeoMesa
+    list             List GeoMesa features for a given catalog
+    removeschema     Remove a schema and associated features from a GeoMesa catalog
+    tableconf        Perform table configuration operations
+    version          GeoMesa Version
+
 {% endhighlight %}
 
 This usage text gives a brief overview of how to use each command. To learn more about each command 
@@ -103,7 +113,9 @@ entering a command, ensuring your password won't enter shell history.
 
 If you run into issues with Hadoop JARs not being found, try appending your commands with
     
-    --instance-name {accumulo-instance-name} --zookeepers {accumulo-zookeepers-string}
+{% highlight bash %}    
+--instance-name {accumulo-instance-name} --zookeepers {accumulo-zookeepers-string}
+{% endhighlight %}
 
 where `accumulo-instance-name` and `accumulo-zookeepers-string` are specific to your Accumulo setup.
 This will override GeoMesa-Tools attempting to automatically find your Accumulo and Hadoop configurations.

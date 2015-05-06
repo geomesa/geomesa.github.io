@@ -11,14 +11,13 @@ redirect_from:
 
 ### This tutorial will introduce how to:
 
-1. check out and build GeoMesa source
-2. write custom Java code using GeoMesa to do the following:
+1. write custom Java code using GeoMesa to do the following:
     1.  create a custom ```FeatureType```
     2.  prepare a GeoMesa-managed table to accept your new type
     3.  create a collection of new records
     4.  write these new records to the GeoMesa-managed table
     5.  query your data
-3. visualize data within GeoServer
+2. visualize data within GeoServer
 <!--more-->
 
 <div class="callout callout-warning">
@@ -28,29 +27,8 @@ redirect_from:
 
 #### Other prerequisites
 
-Before you begin, you should also have these:
-
-* basic knowledge of GeoTools, GeoServer, and Accumulo
-* an Accumulo user that has both create-table and write permissions
-* a local copy of the Java Development Kit 1.7.x
-* Apache Maven installed
-* a GitHub client installed
-
-### DOWNLOAD AND BUILD GEOMESA
-
-Pick a reasonable directory on your machine, and run:
-
-```
-git clone https://github.com/locationtech/geomesa.git
-```
-
-From that newly-created directory, run
-
-```
-mvn clean install
-```
-
-NB: This step is only required, because the GeoMesa artifacts have not yet been published to a public Maven repository. With the upcoming 1.0 release of GeoMesa, these artifacts will be available at LocationTech's Nexus server, and this download-and-build step will become obsolete.
+Before you begin, it is assumed that at this point you have successfully completed the [GeoMesa-Deployment](/geomesa-deployment/) tutorial.
+The deployment tutorial provides instructions for building and deploying GeoMesa to Accumulo and GeoServer, and is a prerequisite to the quickstart.  
 
 ### DOWNLOAD AND BUILD THE TUTORIAL CODE
 
@@ -70,19 +48,13 @@ mvn clean install
 
 When this is complete, it should have built a JAR file that contains all of the code you need to run the tutorial.
 
-### INSTALL GEOMESA ACCUMULO ITERATORS
-
-After 'mvn clean install' finishes, you should have a JAR in geomesa-distributed-runtime/target/ named geomesa-distributed-runtime-accumulo1.5-VERSION.jar.  
-
-This JAR contains the GeoMesa Accumulo Iterators which are necessary to query GeoMesa.  This JAR needs to be copied to $ACCUMULO_HOME/lib/ext on each tablet server.
-
 ### RUN THE TUTORIAL
 
 On the command-line, run:
 
-```
+{% highlight bash %}
 java -cp ./target/geomesa-quickstart-1.0-SNAPSHOT.jar org.geomesa.QuickStart -instanceId somecloud -zookeepers "zoo1:2181,zoo2:2181,zoo3:2181" -user someuser -password somepwd -tableName sometable
-```
+{% endhighlight %}
 
 where you provide your own values for the following place-holder arguments:
 
@@ -94,84 +66,37 @@ where you provide your own values for the following place-holder arguments:
 
 You should see output similar to the following (not including some of Maven's output and log4j's warnings):
 
-    Creating feature-type (schema):  QuickStart
-    Creating new features
-    Inserting new features
-    Submitting query
-    1.  Bierce|640|Sun Sep 14 15:48:25 EDT 2014|POINT (-77.36222958792739 -37.13013846773835)|null
-    2.  Bierce|886|Tue Jul 22 14:12:36 EDT 2014|POINT (-76.59795732474399 -37.18420917493149)|null
-    3.  Bierce|925|Sun Aug 17 23:28:33 EDT 2014|POINT (-76.5621106573523 -37.34321201566148)|null
-    4.  Bierce|589|Sat Jul 05 02:02:15 EDT 2014|POINT (-76.88146600670152 -37.40156607152168)|null
-    5.  Bierce|394|Fri Aug 01 19:55:05 EDT 2014|POINT (-77.42555615743139 -37.26710898726304)|null
-    6.  Bierce|931|Fri Jul 04 18:25:38 EDT 2014|POINT (-76.51304097832912 -37.49406125975311)|null
-    7.  Bierce|322|Tue Jul 15 17:09:42 EDT 2014|POINT (-77.01760098223343 -37.30933767159561)|null
-    8.  Bierce|343|Wed Aug 06 04:59:22 EDT 2014|POINT (-76.66826220670282 -37.44503877750368)|null
-    9.  Bierce|259|Thu Aug 28 15:59:30 EDT 2014|POINT (-76.90122194030118 -37.148525741002466)|null
+{% highlight bash %}
+Creating feature-type (schema):  QuickStart
+Creating new features
+Inserting new features
+Submitting query
+1.  Bierce|640|Sun Sep 14 15:48:25 EDT 2014|POINT (-77.36222958792739 -37.13013846773835)|null
+2.  Bierce|886|Tue Jul 22 14:12:36 EDT 2014|POINT (-76.59795732474399 -37.18420917493149)|null
+3.  Bierce|925|Sun Aug 17 23:28:33 EDT 2014|POINT (-76.5621106573523 -37.34321201566148)|null
+4.  Bierce|589|Sat Jul 05 02:02:15 EDT 2014|POINT (-76.88146600670152 -37.40156607152168)|null
+5.  Bierce|394|Fri Aug 01 19:55:05 EDT 2014|POINT (-77.42555615743139 -37.26710898726304)|null
+6.  Bierce|931|Fri Jul 04 18:25:38 EDT 2014|POINT (-76.51304097832912 -37.49406125975311)|null
+7.  Bierce|322|Tue Jul 15 17:09:42 EDT 2014|POINT (-77.01760098223343 -37.30933767159561)|null
+8.  Bierce|343|Wed Aug 06 04:59:22 EDT 2014|POINT (-76.66826220670282 -37.44503877750368)|null
+9.  Bierce|259|Thu Aug 28 15:59:30 EDT 2014|POINT (-76.90122194030118 -37.148525741002466)|null
+{% endhighlight %}
 
 ### INSIGHT INTO HOW THE TUTORIAL WORKS
 
 The source code is meant to be accessible for this tutorial, but here is a high-level breakdown of the sections that are relevant:
 
-* lines 3-30:  package imports
-* lines 65-109:  helper code to establish the command-line parser for Accumulo options
-* lines 111-118:  create a `HashMap` of Accumulo parameters that will be used to fetch a `DataStore`
-* lines 120-142:  defines the custom `FeatureType` used in the tutorial.  There are five fields:  Who, What, When, Where, and Why.
-* lines 144-192:  creates a collection of new features, each of which is initialized to some randomized set of values
-* lines 194-201:  instructs the `DataStore` to write the collection of new features to the GeoMesa-managed Accumulo table
-* lines 203-226:  given a set of geometric bounds, temporal bounds, and an optional attribute-only expression, construct a common query language (CQL) filter that embodies these constraints.  This filter will be used to query data.
-* lines 228-256:  query for records; for each, print out the five field (attribute) values
-* lines 258-293:  this is the main entry point; it collects command-line parameters, builds the `DataStore`, creates and inserts new records, and then kicks off a single query
+* lines 3-31:  package imports
+* lines 65-110:  helper code to establish the command-line parser for Accumulo options
+* lines 112-119:  create a `HashMap` of Accumulo parameters that will be used to fetch a `DataStore`
+* lines 121-143:  defines the custom `FeatureType` used in the tutorial.  There are five fields:  Who, What, When, Where, and Why.
+* lines 145-193:  creates a collection of new features, each of which is initialized to some randomized set of values
+* lines 195-202:  instructs the `DataStore` to write the collection of new features to the GeoMesa-managed Accumulo table
+* lines 204-227:  given a set of geometric bounds, temporal bounds, and an optional attribute-only expression, construct a common query language (CQL) filter that embodies these constraints.  This filter will be used to query data.
+* lines 229-257:  query for records; for each, print out the five field (attribute) values
+* lines 259-294:  this is the main entry point; it collects command-line parameters, builds the `DataStore`, creates and inserts new records, and then kicks off a single query
 
 ### VISUALIZE DATA WITH GEOSERVER
-
-You should have an instance of GeoServer, version 2.5.2, running somewhere that has access to your Accumulo instance.
-
-#### Geoserver Setup
-
-Be sure that you have installed the optional [WPS](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html) package installed for your version of GeoServer.
-
-Copy the the `geomesa-plugin-accumulo1.5-1.0.0-rc.4-SNAPSHOT-geoserver-plugin.jar` library file from the GeoMesa directory you built into your GeoServer's library directory.
-
-If you are using tomcat:
-
-{% highlight bash %}
-cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-rc.4-SNAPSHOT-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
-{% endhighlight %}
-
-If you are using GeoServer's built in Jetty web server:
-
-{% highlight bash %}
-cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-1.0.0-rc.4-SNAPSHOT-geoserver-plugin.jar ~/dev/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
-{% endhighlight %}
-
-There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `lib` directory.  These may include (the specific JARs
-are included only for reference, and only apply if you are using Accumulo 1.5.1 and Hadoop 2.2):
-
-* Accumulo
-    * accumulo-core-1.5.1.jar  
-    * accumulo-fate-1.5.1.jar  
-    * accumulo-trace-1.5.1.jar
-* Zookeeper
-    * zookeeper-3.4.5.jar
-* Hadoop core
-    * hadoop-auth-2.2.0.jar
-    * hadoop-client-2.2.0.jar
-    * hadoop-common-2.2.0.jar
-    * hadoop-hdfs-2.2.0.jar
-    * hadoop-mapreduce-client-app-2.2.0.jar
-    * hadoop-mapreduce-client-common-2.2.0.jar
-    * hadoop-mapreduce-client-core-2.2.0.jar
-    * hadoop-mapreduce-client-jobclient-2.2.0.jar
-    * hadoop-mapreduce-client-shuffle-2.2.0.jar
-* Thrift
-    * libthrift-0.9.1.jar
-    
-There are also GeoServer JARs that need to be updated for Accumulo (also in the lib directory):
-    
-* commons-configuration: Accumulo requires commons-configuration 1.6 and previous versions should be replaced
-* commons-lang: GeoServer ships with commons-lang 2.1, but Accumulo requires replacing that with version 2.4
-
-Restart GeoServer.
 
 #### Register the GeoMesa store with GeoServer
 

@@ -44,7 +44,7 @@ Although projections can also modify an attribute's value, in this tutorial we w
 
 Before you begin, you should also have these:
 
-* a locally-built version of GeoMesa - see [GeoMesa Quickstart](/geomesa-quickstart/) - (DOWNLOAD AND BUILD GEOMESA)
+* a locally-built version of GeoMesa - see [GeoMesa Deployment](/geomesa-deployment/) - (DOWNLOAD AND BUILD GEOMESA)
 * an Accumulo user that has appropriate permissions to query your data
 * a local copy of the Java Development Kit 1.7.x
 * Apache Maven installed

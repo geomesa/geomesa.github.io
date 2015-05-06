@@ -1,5 +1,5 @@
 ---
-title: WPS -- Tube Select
+title: WPS Tube Select
 author: andrew
 layout: tutorial
 redirect_from:
@@ -26,35 +26,9 @@ Imagine you are traveling from Washington, DC to New York City and are intereste
 
 Time-interpolated queries are more complex than normal spatial or temporal queries as the input is a sequence of points or lines with an increasing time attribute. Time-interpolated queries are colloquially known as **_tube-selects_**.
 
-### Configuring Geoserver
-To get started, install the latest stable release of [2.5.x Geoserver](http://geoserver.org/release/stable/). You'll also need to install the [WPS Plugin](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html). Depending on your hardware, it may be important to set the limits for your WMS plugin to be higher or disable them completely by clicking "WMS" under "Services" on the left side of the admin page of Geoserver. Check with your server administrator to determine the correct settings. For massive queries, the standard 60 second timeout may be too short.
-!["Disable limits"](/img/tutorials/2014-05-16-geomesa-tubeselect/wms_limits.png)
+### Using the GeoServer Plugin
 
-You'll also need to install the GeoMesa geoserver-plugin. Clone the locationtech/geomesa repo:
-{% highlight bash %}
-git clone https://github.com/locationtech/geomesa.git
-{% endhighlight %}
-
-Build the project, extract the distribution tarball, and copy the plugin to the geoserver lib directory:
-{% highlight bash %}
-mvn clean install
-mkdir /tmp/geomesa-dist
-tar -C /tmp/geomesa-dist -xvf geomesa-dist/target/geomesa-dist-accumulo1.5-1.0.0-SNAPSHOT-distribution.tar.gz
-cd /tmp/geomesa-dist
-cp geoserver/WEB-INF/lib/geomesa-plugin-accumulo1.5-1.0.0-SNAPSHOT-geoserver-plugin.jar $GEOSERVER_HOME/webapps/geoserver/WEB-INF/lib/
-{% endhighlight %}
-
-You'll also need to install various provided dependencies that are needed by GeoMesa but are marked provided. This allows your server administrators to manage dependencies and upgrade for bugfixes. We have tried to include all the necessary jars. Be careful that you don't stomp any other dependencies when installing provided jars:
-{% highlight bash %}
-cd /tmp/geomesa-dist
-cp dev/lib/* $GEOSERVER_HOME/webapps/geoserver/WEB-INF/lib
-{% endhighlight %}
-
-Start geoserver!
-{% highlight bash %}
-cd $GEOSERVER_HOME
-bin/startup.sh
-{% endhighlight %}
+To complete this tutorial you will have needed to follow the instructions in the [geomesa-deployment](http://www.geomesa.org/geomesa-deployment/) tutorial first to deploy GeoMesa and the GeoServer Plugin.
 
 Once everything is installed you should see "geomesa:TubeSelect" appear in the [WPS Request Builder](http://docs.geoserver.org/stable/en/user/extensions/wps/requestbuilder.html)
 !["geomesa:TubeSelect WPS plugin"](/img/tutorials/2014-05-16-geomesa-tubeselect/wps_builder1.png)
