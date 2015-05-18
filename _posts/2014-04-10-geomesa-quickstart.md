@@ -135,7 +135,7 @@ Once you see your layer, click on the "OpenLayers" link, which will open a new t
  &TIME=2014-01-01T00:00:00.000Z/2014-12-31T23:59:59.999Z
  ```
  
-That tells GeoServer to display the records for the entire calendar year 2014.  You can find more information about the TIME parameter from here: http://docs.geoserver.org/latest/en/user/services/wms/time.html.
+That tells GeoServer to display the records for the entire calendar year 2014.  You can find more information about the TIME parameter from [GeoServer's documentation](http://docs.geoserver.org/latest/en/user/services/wms/time.html).
 
 Once you press &lt;Enter&gt;, the display will update, and you should see a collection of red dots similar to the following image.
 
