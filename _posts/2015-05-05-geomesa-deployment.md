@@ -74,6 +74,7 @@ Install GPL software:
 {% highlight bash %}
 $ bin/install-jai
 $ bin/install-jline
+$ bin/install-vecmath
 {% endhighlight %}
 
 Finally, test your installation:
@@ -90,13 +91,16 @@ Usage: geomesa [command] [command options]
   Commands:
     create           Create a feature definition in a GeoMesa catalog
     deletecatalog    Delete a GeoMesa catalog completely (and all features in it)
+    deleteraster     Delete a raster table
     describe         Describe the attributes of a given feature in GeoMesa
     explain          Explain how a GeoMesa query will be executed
     export           Export a GeoMesa feature
     help             Show help
     ingest           Ingest a file of various formats into GeoMesa
+    ingestraster     Ingest a raster file or raster files in a directory into GeoMesa
     list             List GeoMesa features for a given catalog
     metadata         Write out the metadata for a feature or catalog
+    querystats       Export queries and statistics about the last X number of queries to a CSV file.
     removeschema     Remove a schema and associated features from a GeoMesa catalog
     tableconf        Perform table configuration operations
 {% endhighlight %}

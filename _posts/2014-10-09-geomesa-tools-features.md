@@ -48,12 +48,14 @@ environment variables in your current shell session. Additionally, make sure tha
 $HADOOP_CONF_DIR environment variables are set.
 
 The next steps are to install the Java Advanced Imaging (JAI) and JLine libraries to the `$GEOMESA_HOME/lib` folder.
-These libraries are necessary for full functionality in the GeoMesa command line tools. Scripts are provided that attempt to `wget` the JAI and JLine
+These libraries are necessary for full functionality in the GeoMesa command line tools. In particular, the raster support needs the vecmath and jai jars.
+Scripts are provided that attempt to `wget` the JAI and JLine
 jars and install them:
 
 {% highlight bash %}
 bin/install-jai
 bin/install-jline
+bin/install-vecmath
 {% endhighlight %}
 
 Now, you should be able to use GeoMesa from any directory on your computer. To test, `cd` to a 
