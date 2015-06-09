@@ -36,7 +36,7 @@ The ```pom.xml``` file in the root geomesa directory contains an explicit list o
 Navigate to the directory where GeoMesa was installed and run:
 
 ```
-cd geomesa-examples/accumulo-quickstart && mvn clean install && cd ../..
+mvn clean install -f geomesa-examples/accumulo-quickstart/pom.xml
 ```
 
 When this is complete, it should have built a JAR file that contains all of the code you need to run the tutorial with the correct dependencies.
