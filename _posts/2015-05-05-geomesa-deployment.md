@@ -13,18 +13,19 @@ redirect_from:
 1. Check out and build GeoMesa source.
 2. Deploy the Distributed Runtime Jar to your Accumulo Cluster.
 3. Deploy the GeoServer Plugin.
+4. Deploy necessary dependencies for GeoMesa's GeoServer plugin for Accumulo and/or Kafka.
 <!--more-->
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
-    You will need access to a Hadoop 2.2 installation as well as an Accumulo 1.5.x database.
+    For Accumulo deployment, you will need access to a Hadoop 2.2 installation as well as an Accumulo 1.5.x database.
 </div>
 
 #### Other prerequisites
 
 Before you begin, you should also have these:
 
-* basic knowledge of GeoTools, GeoServer, and Accumulo
+* basic knowledge of [GeoTools](http://www.geotools.org), [GeoServer](http://geoserver.org), [Accumulo](http://accumulo.apache.org), and/or [Kafka](http://kafka.apache.org)
 * an Accumulo user that has both create-table and write permissions
 * a local copy of the Java Development Kit 1.7.x
 * Apache Maven installed
@@ -54,7 +55,7 @@ You should have an instance of GeoServer, version 2.5.2, running somewhere that 
 
 In addition to our GeoServer plugin, you will also need to install the WPS plugin to your GeoServer instance. The [WPS Plugin](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html) must also match the version of GeoServer instance.
 
-Copy the the `geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar` jar file from the GeoMesa directory you built into your GeoServer's library directory.
+Copy the `geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar` jar file from the GeoMesa directory you built into your GeoServer's library directory.
 
 If you are using tomcat:
 
@@ -100,11 +101,46 @@ There are also GeoServer JARs that need to be updated for Accumulo (also in the 
 * commons-configuration: Accumulo requires commons-configuration 1.6 and previous versions should be replaced
 * commons-lang: GeoServer ships with commons-lang 2.1, but Accumulo requires replacing that with version 2.4
 
-Once all of the dependencies for the GeoServer plugin are in place you will need to restart GeoServer for the changes to take effect.
+Once all of the dependencies for the GeoServer plugin are in place you will need to restart GeoServer for the changes to take effect. 
 
 #### Verify Deployment
 
-To verify that the deployment worked you can follow the [Quickstart tutorial](/geomesa-quickstart/) to ingest test data and view the data in GeoServer.  
+To verify that the deployment worked you can follow the [GeoMesa Quick Start tutorial](/geomesa-quickstart/) to ingest test data and view the data in GeoServer.  
+
+### KAFKA DEPLOYMENT
+
+Getting GeoMesa set up with Kafka is a bit easier than with Accumulo (see the [Kafka Quickstart tutorial](/geomesa-kafka-quickstart/) to see what GeoMesa can do with Kafka). First build GeoMesa. GeoMesa's capabilities using Kafka were recently added features so be sure to build the latest branch.
+
+{% highlight bash %}
+git clone https://github.com/locationtech/geomesa/ && cd geomesa && mvn clean install -DskipTests
+{% endhighlight %}
+
+Copy the GeoMesa Kafka plugin jar files from the GeoMesa directory you built into your GeoServer's library directory.
+
+Tomcat:
+{% highlight bash %}
+cp geomesa/geomesa-kafka/geomesa-kafka-geoserver-plugin/target/geomesa-kafka-geoserver-plugin-{{ site.developmentVersion }}-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
+{% endhighlight %}
+
+Jetty:
+
+{% highlight bash %}
+cp geomesa/geomesa-kafka/geomesa-kafka-geoserver-plugin/target/geomesa-kafka* ~/dev/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
+{% endhighlight %}
+
+Then copy these dependencies to your `WEB-INF/lib` directory.
+
+* Kafka
+    * kafka-clients-0.8.2.1.jar
+    * kafka_2.10-0.8.2.1.jar
+    * metrics-core-2.2.0.jar
+    * zkclient-0.3.jar
+* Zookeeper
+    * zookeeper-3.4.5.jar
+
+Note: when using the Kafka Data Store with GeoServer in Tomcat it will most likely be necessary to increase the memory settings for Tomcat, `export CATALINA_OPTS="-Xms512M -Xmx1024M -XX:PermSize=256m -XX:MaxPermSize=256m"`.
+
+After placing the dependencies in the correct folder, be sure to restart GeoServer for changes to take place.
 
 ### Configuring Geoserver
 Depending on your hardware, it may be important to set the limits for your WMS plugin to be higher or disable them completely by clicking "WMS" under "Services" on the left side of the admin page of Geoserver. Check with your server administrator to determine the correct settings. For massive queries, the standard 60 second timeout may be too short.

@@ -13,7 +13,7 @@ redirect_from:
 
 1. write custom Java code using GeoMesa to do the following:
     1.  create a custom ```FeatureType```
-    2.  prepare a GeoMesa-managed table to accept your new type
+    2.  prepare a GeoMesa-managed table backed by Accumulo to accept your new type
     3.  create a collection of new records
     4.  write these new records to the GeoMesa-managed table
     5.  query your data
@@ -27,33 +27,26 @@ redirect_from:
 
 #### Other prerequisites
 
-Before you begin, it is assumed that at this point you have successfully completed the [GeoMesa-Deployment](/geomesa-deployment/) tutorial.
-The deployment tutorial provides instructions for building and deploying GeoMesa to Accumulo and GeoServer, and is a prerequisite to the quickstart.  
+You must go through the [GeoMesa Deployment tutorial](http://geomesa.org/geomesa-deployment/) first, completing the tasks relevant to Accumulo.
 
-### DOWNLOAD AND BUILD THE TUTORIAL CODE
+Afterwards, it may be necessary to change the versions of Accumulo and Hadoop that the quickstart tutorial uses.
 
-Pick a reasonable directory on your machine, and run:
+The ```pom.xml``` file in the root geomesa directory contains an explicit list of dependent libraries that will be bundled together into the final tutorial. You should confirm that the versions of Accumulo and Hadoop match what you are running; if it does not match, change the value in the POM. (NB: The only reason these libraries are bundled into the final JAR is that this is easier for most people to do this than it is to set the classpath when running the tutorial. If you would rather not bundle these dependencies, mark them as provided in the POM, and update your classpath as appropriate.)
 
-```
-git clone https://github.com/geomesa/geomesa-quickstart.git
-```
-
-The ```pom.xml``` file contains an explicit list of dependent libraries that will be bundled together into the final tutorial. You should confirm that the versions of Accumulo and Hadoop match what you are running; if it does not match, change the value in the POM. (NB: The only reason these libraries are bundled into the final JAR is that this is easier for most people to do this than it is to set the classpath when running the tutorial. If you would rather not bundle these dependencies, mark them as provided in the POM, and update your classpath as appropriate.)
-
-From within the root of the cloned tutorial, run:
+Navigate to the directory where GeoMesa was installed and run:
 
 ```
-mvn clean install
+cd geomesa-examples/accumulo-quickstart && mvn clean install && cd ../..
 ```
 
-When this is complete, it should have built a JAR file that contains all of the code you need to run the tutorial.
+When this is complete, it should have built a JAR file that contains all of the code you need to run the tutorial with the correct dependencies.
 
 ### RUN THE TUTORIAL
 
 On the command-line, run:
 
 {% highlight bash %}
-java -cp ./target/geomesa-quickstart-1.0-SNAPSHOT.jar org.geomesa.QuickStart -instanceId somecloud -zookeepers "zoo1:2181,zoo2:2181,zoo3:2181" -user someuser -password somepwd -tableName sometable
+java -cp ./geomesa-examples/accumulo-quickstart/target/accumulo-quickstart-{{ site.stableVersion }}.jar org.locationtech.geomesa.examples.AccumuloQuickStart -instanceId somecloud -zookeepers "zoo1:2181,zoo2:2181,zoo3:2181" -user someuser -password somepwd -tableName sometable
 {% endhighlight %}
 
 where you provide your own values for the following place-holder arguments:
@@ -67,7 +60,7 @@ where you provide your own values for the following place-holder arguments:
 You should see output similar to the following (not including some of Maven's output and log4j's warnings):
 
 {% highlight bash %}
-Creating feature-type (schema):  QuickStart
+Creating feature-type (schema):  AccumuloQuickStart
 Creating new features
 Inserting new features
 Submitting query
