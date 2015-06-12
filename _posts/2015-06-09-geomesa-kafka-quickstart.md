@@ -34,7 +34,7 @@ Ensure your Kafka and Zookeeper instances are running. You can use [Kafka's quic
 Navigate to your geomesa directory. On the command-line run the quickstart program:
 
 {% highlight bash %}
-java -cp ./geomesa-examples/kafka-quickstart/target/kafka-quickstart-{{ site.developmentVersion }}.jar org.locationtech.geomesa.examples.KafkaQuickStart -brokers "localhost:9092" -zookeepers "localhost:2181"
+java -cp ./geomesa-examples/geomesa-kafka-quickstart/target/geomesa-kafka-quickstart-{{ site.developmentVersion }}.jar org.locationtech.geomesa.examples.KafkaQuickStart -brokers "localhost:9092" -zookeepers "localhost:2181"
 {% endhighlight %}
 
 where you provide your own values for the following arguments:

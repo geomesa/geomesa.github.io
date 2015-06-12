@@ -36,7 +36,7 @@ The ```pom.xml``` file in the root geomesa directory contains an explicit list o
 Navigate to the directory where GeoMesa was installed and run:
 
 ```
-mvn clean install -f geomesa-examples/accumulo-quickstart/pom.xml
+mvn clean install -f geomesa-examples/geomesa-accumulo-quickstart/pom.xml
 ```
 
 When this is complete, it should have built a JAR file that contains all of the code you need to run the tutorial with the correct dependencies.
@@ -46,7 +46,7 @@ When this is complete, it should have built a JAR file that contains all of the 
 On the command-line, run:
 
 {% highlight bash %}
-java -cp ./geomesa-examples/accumulo-quickstart/target/accumulo-quickstart-{{ site.stableVersion }}.jar org.locationtech.geomesa.examples.AccumuloQuickStart -instanceId somecloud -zookeepers "zoo1:2181,zoo2:2181,zoo3:2181" -user someuser -password somepwd -tableName sometable
+java -cp ./geomesa-examples/geomesa-accumulo-quickstart/target/geomesa-accumulo-quickstart-{{ site.stableVersion }}.jar org.locationtech.geomesa.examples.AccumuloQuickStart -instanceId somecloud -zookeepers "zoo1:2181,zoo2:2181,zoo3:2181" -user someuser -password somepwd -tableName sometable
 {% endhighlight %}
 
 where you provide your own values for the following place-holder arguments:
