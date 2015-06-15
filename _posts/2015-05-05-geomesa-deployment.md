@@ -1,6 +1,6 @@
 ---
 title: GeoMesa Deployment
-author: chris-and-aannex
+author: the-trio 
 layout: tutorial
 redirect_from:
     - /2015/05/05/geomesa-deployment/
@@ -10,9 +10,9 @@ redirect_from:
 
 ### This tutorial will introduce how to:
 
-1. Check out and build GeoMesa source.
-2. Deploy the Distributed Runtime Jar to your Accumulo Cluster.
-3. Deploy the GeoServer Plugin.
+1. Install GeoMesa Command Line Tools
+2. Deploy the Distributed Runtime Jar to your Accumulo Cluster
+3. Deploy the GeoServer Plugin
 <!--more-->
 
 <div class="callout callout-warning">
@@ -26,25 +26,90 @@ Before you begin, you should also have these:
 
 * basic knowledge of GeoTools, GeoServer, and Accumulo
 * an Accumulo user that has both create-table and write permissions
-* a local copy of the Java Development Kit 1.7.x
-* Apache Maven installed
-* a GitHub client installed
+* a Java 1.7 or higher runtime 
 
-### DOWNLOAD AND BUILD GEOMESA
+### DOWNLOAD GEOMESA
 
-Pick a reasonable directory on your machine, and run:
+GeoMesa artifacts are available for download or can be build from source. The easiest way to get started is to [download the most recent stable version ({{ site.stableVersion }})](http://repo.locationtech.org/content/repositories/geomesa-releases/org/locationtech/geomesa/geomesa-assemble/{{ site.stableVersion }}/geomesa-assemble-{{ site.stableVersion }}-bin.tar.gz) and untar it somewhere convenient:
 
 {% highlight bash %}
-git clone --branch geomesa-accumulo1.5-{{ site.stableVersion }} https://github.com/locationtech/geomesa/ && cd geomesa && mvn clean install -DskipTests
+# cd to a directory convenient for installing geomesa 
+$ cd ~/tools
+
+# download and unpackge the most recent distribution
+$ wget http://repo.locationtech.org/content/repositories/geomesa-releases/org/locationtech/geomesa/geomesa-assemble/{{ site.stableVersion }}/geomesa-assemble-{{ site.stableVersion }}-bin.tar.gz
+$ tar xvf geomesa-assemble-{{ site.stableVersion }}-bin.tar.gz
+$ cd geomesa-{{ site.stableVersion }}
+$ ls
+bin  dist  docs  lib  LICENSE.txt  README.md
 {% endhighlight %}
 
-Note: This step is required because the GeoMesa artifacts have not yet been published to a public Maven repository. With the upcoming 1.0 release of GeoMesa, these artifacts will be available at LocationTech's Nexus server, and this download-and-build step will become obsolete.
+### INSTALL THE GEOMESA TOOLS
+
+GeoMesa comes with a set of command line tools for managing features. To complete the setup of the tools, cd into the bin directory and execute geomesa configure:
+
+{% highlight bash %}
+$ cd ~/tools/geomesa-{{ site.stableVersion }}
+$ ./geomesa configure
+$ ./geomesa configure
+Warning: GEOMESA_HOME is not set, using ~/tools/geomesa-{{ site.stableVersion }}
+Using GEOMESA_HOME as set: ~/tools/geomesa-{{ site.stableVersion }}
+Is this intentional? Y\n Y
+Warning: GEOMESA_LIB already set, probably by a prior configuration.
+ Current value is ~/tools/geomesa-{{ site.stableVersion }}/lib.
+
+Is this intentional? Y\n Y
+
+To persist the configuration please update your bashrc file to include: 
+export GEOMESA_HOME=/tools/geomesa-{{ site.stableVersion }}
+export PATH=${GEOMESA_HOME}/bin:$PATH
+
+{% endhighlight %}
+
+Update and resource your bashrc to include the GEOMESA_HOME and PATH updates
+
+Install GPL software:
+
+{% highlight bash %}
+$ bin/install-jai
+$ bin/install-jline
+{% endhighlight %}
+
+Finally, test your installation:
+
+{% highlight bash %}
+$ bin/test-geomesa
+{% endhighlight %}
+
+Test the GeoMesa Tools:
+
+{% highlight bash %}
+$ geomesa
+Usage: geomesa [command] [command options]
+  Commands:
+    create           Create a feature definition in a GeoMesa catalog
+    deletecatalog    Delete a GeoMesa catalog completely (and all features in it)
+    describe         Describe the attributes of a given feature in GeoMesa
+    explain          Explain how a GeoMesa query will be executed
+    export           Export a GeoMesa feature
+    help             Show help
+    ingest           Ingest a file of various formats into GeoMesa
+    list             List GeoMesa features for a given catalog
+    metadata         Write out the metadata for a feature or catalog
+    removeschema     Remove a schema and associated features from a GeoMesa catalog
+    tableconf        Perform table configuration operations
+{% endhighlight %}
+
+For more information on the tools check out the  [GeoMesa Tools tutorial](/geomesa-tools-features/) after you're done with this tutorial
 
 ### DEPLOY GEOMESA TO ACCUMULO
 
-After `mvn clean install` finishes, you should have a JAR in geomesa-distributed-runtime/target/ named `geomesa-distributed-runtime-accumulo1.5-{{ site.stableVersion }}.jar`.  
+The $GEOMESA_HOME/dist directory contains the distributed runtime jar that should be copied into the $ACCUMULO_HOME/lib/ext folder on each tablet server. This jar contains the GeoMesa Accumulo iterators that are necessary to query GeoMesa.
 
-This JAR contains the GeoMesa Accumulo Iterators which are necessary to query GeoMesa.  This JAR needs to be copied into $ACCUMULO_HOME/lib/ext on each tablet server. 
+{% highlight bash %}
+# something like this for each tablet server
+scp $GEOMESA_HOME/dist/geomesa-distributed-runtime-{{ site.stableVersion }}.jar tserver1:$ACCUMULO_HOME/lib/ext/
+{% endhighlight %}
 
 ### DEPLOY GEOMESA PLUGIN TO GEOSERVER
 
@@ -54,18 +119,18 @@ You should have an instance of GeoServer, version 2.5.2, running somewhere that 
 
 In addition to our GeoServer plugin, you will also need to install the WPS plugin to your GeoServer instance. The [WPS Plugin](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html) must also match the version of GeoServer instance.
 
-Copy the the `geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar` jar file from the GeoMesa directory you built into your GeoServer's library directory.
+Copy the the `geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar` jar file from the GeoMesa dist directory into your GeoServer's library directory.
 
 If you are using tomcat:
 
 {% highlight bash %}
-cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
+cp $GEOMESA_HOME/dist/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 If you are using GeoServer's built in Jetty web server:
 
 {% highlight bash %}
-cp geomesa/geomesa-plugin/target/geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar ~/dev/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
+cp $GEOMESA_HOME/dist/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar ~/dev/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 #### ADDITIONAL DEPENDENCIES
@@ -77,28 +142,28 @@ There are additional JARs that are specific to your installation that you will a
 are included only for reference, and only apply if you are using Accumulo 1.5.1 and Hadoop 2.2):
 
 * Accumulo
-    * accumulo-core-1.5.1.jar  
-    * accumulo-fate-1.5.1.jar  
-    * accumulo-trace-1.5.1.jar
+    * accumulo-core-1.5.1.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-core/1.5.1/accumulo-core-1.5.1.jar)  
+    * accumulo-fate-1.5.1.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-fate/1.5.1/accumulo-fate-1.5.1.jar) 
+    * accumulo-trace-1.5.1.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-trace/1.5.1/accumulo-trace-1.5.1.jar)
 * Zookeeper
-    * zookeeper-3.4.5.jar
+    * zookeeper-3.4.5.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/zookeeper/zookeeper/3.4.5/zookeeper-3.4.5.jar)
 * Hadoop core
-    * hadoop-auth-2.2.0.jar
-    * hadoop-client-2.2.0.jar
-    * hadoop-common-2.2.0.jar
-    * hadoop-hdfs-2.2.0.jar
-    * hadoop-mapreduce-client-app-2.2.0.jar
-    * hadoop-mapreduce-client-common-2.2.0.jar
-    * hadoop-mapreduce-client-core-2.2.0.jar
-    * hadoop-mapreduce-client-jobclient-2.2.0.jar
-    * hadoop-mapreduce-client-shuffle-2.2.0.jar
+    * hadoop-auth-2.2.0.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/hadoop/hadoop-auth/2.2.0/hadoop-auth-2.2.0.jar)
+    * hadoop-client-2.2.0.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/hadoop/hadoop-client/2.2.0/hadoop-client-2.2.0.jar)
+    * hadoop-common-2.2.0.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/hadoop/hadoop-common/2.2.0/hadoop-common-2.2.0.jar)
+    * hadoop-hdfs-2.2.0.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/hadoop/hadoop-hdfs/2.2.0/hadoop-hdfs-2.2.0.jar)
+    * hadoop-mapreduce-client-app-2.2.0.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/hadoop/hadoop-mapreduce-client-app/2.2.0/hadoop-mapreduce-client-app-2.2.0.jar)
+    * hadoop-mapreduce-client-common-2.2.0.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/hadoop/hadoop-mapreduce-client-common/2.2.0/hadoop-mapreduce-client-common-2.2.0.jar)
+    * hadoop-mapreduce-client-core-2.2.0.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/hadoop/hadoop-mapreduce-client-core/2.2.0/hadoop-mapreduce-client-core-2.2.0.jar)
+    * hadoop-mapreduce-client-jobclient-2.2.0.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/hadoop/hadoop-mapreduce-client-jobclient/2.2.0/hadoop-mapreduce-client-jobclient-2.2.0.jar)
+    * hadoop-mapreduce-client-shuffle-2.2.0.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/hadoop/hadoop-mapreduce-client-shuffle/2.2.0/hadoop-mapreduce-client-shuffle-2.2.0.jar)
 * Thrift
-    * libthrift-0.9.1.jar
+    * libthrift-0.9.1.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/thrift/libthrift/0.9.1/libthrift-0.9.1.jar)
     
 There are also GeoServer JARs that need to be updated for Accumulo (also in the lib directory):
     
-* commons-configuration: Accumulo requires commons-configuration 1.6 and previous versions should be replaced
-* commons-lang: GeoServer ships with commons-lang 2.1, but Accumulo requires replacing that with version 2.4
+* commons-configuration: Accumulo requires commons-configuration 1.6 and previous versions should be replaced [[download]](https://search.maven.org/remotecontent?filepath=commons-configuration/commons-configuration/1.6/commons-configuration-1.6.jar)
+* commons-lang: GeoServer ships with commons-lang 2.1, but Accumulo requires replacing that with version 2.4 [[download]](https://search.maven.org/remotecontent?filepath=commons-lang/commons-lang/2.4/commons-lang-2.4.jar)
 
 Once all of the dependencies for the GeoServer plugin are in place you will need to restart GeoServer for the changes to take effect.
 
