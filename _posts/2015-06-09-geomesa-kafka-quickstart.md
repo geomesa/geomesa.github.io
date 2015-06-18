@@ -94,7 +94,7 @@ You should see two SimpleFeatures that start on the left side gradually move to 
 
 #### Consumers explained
 
-GeoMesa's wraps Kafka consumers in two different ways; as a LiveKafkaConsumerFeatureSource or ReplayKafkaConsumerFeatureSource (which implement GeoTools' [FeatureSource](http://docs.geotools.org/latest/javadocs/org/geotools/data/FeatureSource.html) API).
+GeoMesa wraps Kafka consumers in two different ways; as a LiveKafkaConsumerFeatureSource or ReplayKafkaConsumerFeatureSource (which implement GeoTools' [FeatureSource](http://docs.geotools.org/latest/javadocs/org/geotools/data/FeatureSource.html) API).
 
 The LiveKafkaConsumerFeatureSource will consume messages as they are being produced and maintain the real time state of SimpleFeatures pertaining to a Kafka topic. 
 
