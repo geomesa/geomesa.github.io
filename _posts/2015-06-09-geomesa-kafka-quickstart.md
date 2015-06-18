@@ -13,6 +13,7 @@ redirect_from:
 [Apache Kafka](http://kafka.apache.org/) is "publish-subscribe messaging rethought as a distributed commit log." In the context of GeoMesa, Kafka is a useful tool for working with streams of geospatial data. Interaction with Kafka in GeoMesa occurs with the KafkaDataStore which implements the [GeoTools DataStore interface](http://docs.geotools.org/latest/userguide/library/data/datastore.html).
 
 This quickstart tutorial is bundled as a Java program which will introduce how to produce and consume messages in Kafka using GeoMesa. The tutorial will also show how to query the data and replay the messages in a Kafka topic to achieve an earlier state. The tutorial uses GeoServer as a quick way to visualize the changes being made in Kafka.
+<!--more-->
 
 ## Prerequisites
 
