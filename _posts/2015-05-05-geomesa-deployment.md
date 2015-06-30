@@ -178,10 +178,10 @@ To verify that the deployment worked you can follow the [GeoMesa Quick Start tut
 
 ### KAFKA DEPLOYMENT
 
-Getting GeoMesa set up with Kafka is a bit easier than with Accumulo (see the [Kafka Quickstart tutorial](/geomesa-kafka-quickstart/) to see what GeoMesa can do with Kafka). First build GeoMesa. GeoMesa's capabilities using Kafka were recently added features so be sure to build the latest branch.
+To set up GeoMesa with Kafka, first build the geomesa-kafka submodule (see the [Kafka Quickstart tutorial](/geomesa-kafka-quickstart/) to see what GeoMesa can do with Kafka).
 
 {% highlight bash %}
-git clone https://github.com/locationtech/geomesa/ && cd geomesa && mvn clean install -DskipTests
+git clone --branch geomesa-{{ site.stableVersion }} https://github.com/locationtech/geomesa/ && mvn clean install -f geomesa/geomesa-kafka/pom.xml -DskipTests
 {% endhighlight %}
 
 Copy the GeoMesa Kafka plugin jar files from the GeoMesa directory you built into your GeoServer's library directory.
