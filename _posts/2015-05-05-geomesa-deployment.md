@@ -81,7 +81,7 @@ $ bin/install-jline
 $ bin/install-vecmath
 {% endhighlight %}
 
-** Note: The install-jai download location in the version of GeoMesa used in this tutorial is no longer available. This script has been fixed in later versions of GeoMesa. Hosts for these files can be found at the [Osgeo](http://download.osgeo.org/webdav/geotools/javax/media/) and [Maven](http://repo1.maven.org/maven2/org/jaitools/jt-utils/1.3.1/) repositories.
+** Note: The download location used by `install-jai` in this tutorial's version of GeoMesa is no longer available. Hosts for these files can be found at the [Osgeo](http://download.osgeo.org/webdav/geotools/javax/media/) and [Maven](http://repo1.maven.org/maven2/org/jaitools/jt-utils/1.3.1/) repositories. An updated version of the `install-jai` script can be found [here](https://github.com/locationtech/geomesa/blob/master/geomesa-tools/bin/install-jai).
 
 Next, edit the `test-geomesa` script and modify the initial variables to reflect your current deployment. Test your installation:
 
