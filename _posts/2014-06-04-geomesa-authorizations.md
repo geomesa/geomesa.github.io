@@ -28,6 +28,7 @@ If you are not familiar with Accumulo authorizations, you should review the rele
 [documentation](http://accumulo.apache.org/1.5/accumulo_user_manual.html#_security), with more
 examples [here](http://accumulo.apache.org/1.5/examples/visibility.html).
 <!--more-->
+
 #### PKI
 
 Public key infrastructure can be used to securely authenticate end users. In PKI, a ```certificate
