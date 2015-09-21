@@ -31,7 +31,9 @@ make sure you have gone through the initial setup of GeoMesa. We'll be using a c
 
 Additionally, you should be familiar with [Accumulo's Security Label Expression Syntax](https://accumulo.apache.org/1.4/user_manual/Security.html#Security_Label_Expression_Syntax), which we make use of when writing a visibility label to features in GeoMesa.
 
-## Switching to the "feature_level_visibility" branch
+## Switching to the Quickstart's "feature_level_visibility" branch
+
+Please note that you will be checking out a feature-branch of the Quickstart project; *not* a feature-branch of the GeoMesa project.  Security is a part of the GeoMesa core distribution.
 
 In your geomesa-quickstart directory, checkout the branch "feature_level_visibility" and build with Maven:
 
