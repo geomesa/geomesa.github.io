@@ -18,7 +18,7 @@ redirect_from:
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
-    For Accumulo deployment, you will need access to a Hadoop 2.2 installation as well as an Accumulo 1.5.x database.
+    For Accumulo deployment, you will need access to a Hadoop 2.2 installation as well as an Accumulo 1.6.x database.
 </div>
 
 #### Other prerequisites
@@ -124,7 +124,7 @@ You should have an instance of GeoServer, version 2.5.2, running somewhere that 
 
 In addition to our GeoServer plugin, you will also need to install the WPS plugin to your GeoServer instance. The [WPS Plugin](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html) must also match the version of GeoServer instance.
 
-Copy the `geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar` jar file from the GeoMesa dist directory into your GeoServer's library directory.
+Copy the `geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar` jar file from the GeoMesa dist directory into your GeoServer's library directory.
 
 If you are using tomcat:
 
@@ -139,17 +139,32 @@ cp $GEOMESA_HOME/dist/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.j
 {% endhighlight %}
 
 #### ADDITIONAL DEPENDENCIES
-<!---
-You'll also need to install additional dependencies, marked as "provided" in the GeoMesa pom.xml file, that are needed by GeoMesa to function. This allows your server administrators to manage dependencies and upgrade for bugfixes. We have tried to include all the necessary JARs in the [GeoMesa Quick Start tutorial](/geomesa-quickstart/). 
--->
 
-There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `WEB-INF/lib` directory.  These may include (the specific JARs
-are included only for reference, and only apply if you are using Accumulo 1.5.1 and Hadoop 2.2):
+There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `WEB-INF/lib` directory.
+There is a script located at `$GEOMESA_HOME/bin/install-hadoop-accumulo.sh` which will install these dependencies to a target directory
+using wget which will require an internet connection.
+For example:
+{% highlight bash %}
+$> $GEOMESA_HOME/bin/install-hadoop-accumulo.sh /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
+Install accumulo and hadoop dependencies to /path/to/tomcat/webapps/geoserver/WEB-INF/lib/?
+Confirm? [Y/n]y
+fetching https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-core/1.6.2/accumulo-core-1.6.2.jar
+--2015-09-29 15:06:48--  https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-core/1.6.2/accumulo-core-1.6.2.jar
+Resolving search.maven.org (search.maven.org)... 207.223.241.72
+Connecting to search.maven.org (search.maven.org)|207.223.241.72|:443... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 4646545 (4.4M) [application/java-archive]
+Saving to: ‘/path/to/tomcat/webapps/geoserver/WEB-INF/lib/accumulo-core-1.6.2.jar’
+...
+{% endhighlight %}
+
+If you do no have an internet connection you can download the jars manually. These may include (the specific JARs are included 
+only for reference, and only apply if you are using Accumulo 1.6.2 and Hadoop 2.2):
 
 * Accumulo
-    * accumulo-core-1.5.1.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-core/1.5.1/accumulo-core-1.5.1.jar)  
-    * accumulo-fate-1.5.1.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-fate/1.5.1/accumulo-fate-1.5.1.jar) 
-    * accumulo-trace-1.5.1.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-trace/1.5.1/accumulo-trace-1.5.1.jar)
+    * accumulo-core-1.6.2.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-core/1.6.2/accumulo-core-1.6.2.jar)  
+    * accumulo-fate-1.6.2.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-fate/1.6.2/accumulo-fate-1.6.2.jar) 
+    * accumulo-trace-1.6.2.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-trace/1.6.2/accumulo-trace-1.6.2.jar)
 * Zookeeper
     * zookeeper-3.4.5.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/zookeeper/zookeeper/3.4.5/zookeeper-3.4.5.jar)
 * Hadoop core
