@@ -15,8 +15,8 @@ redirect_from:
 
 #### Required Software
 * Hadoop 2.2.x
-* Accumulo 1.5.x
-* GeoMesa 1.0.x
+* Accumulo 1.5+
+* GeoMesa 1.1.x
 * Geoserver 2.5.x
 
 ### What is a Time-Interpolated Query?
@@ -55,7 +55,7 @@ mvn clean install
 
 To see a list of arguments, run the jar file:
 {% highlight bash %}
-$ java -jar ~/.m2/repository/geomesa/example/ingest/twitter-ingest-accumulo1.5/1.0-SNAPSHOT/twitter-ingest-1.0-SNAPSHOT.jar
+$ java -jar ~/.m2/repository/geomesa/example/ingest/twitter-ingest/1.0-SNAPSHOT/twitter-ingest-1.0-SNAPSHOT.jar
 0 [main] INFO geomesa.example.ingest.twitter.Runner  - Error parsing arguments: The following options are required:     --featureName     --user     --instanceId     --zookeepers     --password     --tableName 
 Usage: <main class> [options] files
   Options:

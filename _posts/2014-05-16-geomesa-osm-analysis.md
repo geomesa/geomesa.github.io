@@ -16,7 +16,7 @@ redirect_from:
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
-    You will need access to a Kafka 0.8 installation, a Storm 0.8 installation as well as an Accumulo 1.5.x database.
+    You will need access to a Kafka 0.8 installation, a Storm 0.8 installation as well as an Accumulo 1.5+ database.
 </div>
 
 ### INGEST

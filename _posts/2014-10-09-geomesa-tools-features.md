@@ -24,41 +24,8 @@ setup of GeoMesa Tools and the feature management commands included with the mod
 
 To begin using the command line tools, first follow the [GeoMesa Deployment Tutorial](/geomesa-deployment/) to download and build the full GeoMesa project. 
 
-This will build the project and GeoMesa TAR-ball.  
-The TAR-ball can be found under `geomesa/geomesa-assemble/target`. Untar this file with:
-
-{% highlight bash %}
-tar xvfz geomesa-assemble/target/geomesa-{{ site.stableVersion }}-bin.tar.gz
-{% endhighlight %}
- 
-Next, cd into the newly created directory with:
-
-{% highlight bash %}
-cd geomesa-{{ site.stableVersion }}
-{% endhighlight %}
-
-GeoMesa Tools relies on a GEOMESA_HOME environment variable. Running:
-
-{% highlight bash %}
-source bin/geomesa configure
-{% endhighlight %}
-
-will set this for you, add $GEOMESA_HOME/bin to your PATH, and source your new 
-environment variables in your current shell session. Additionally, make sure that $ACCUMULO_HOME and 
-$HADOOP_CONF_DIR environment variables are set.
-
-The next steps are to install the Java Advanced Imaging (JAI) and JLine libraries to the `$GEOMESA_HOME/lib` folder.
-These libraries are necessary for full functionality in the GeoMesa command line tools. In particular, the raster support needs the vecmath and jai jars.
-Scripts are provided that attempt to `wget` the JAI and JLine
-jars and install them:
-
-{% highlight bash %}
-bin/install-jai
-bin/install-jline
-bin/install-vecmath
-{% endhighlight %}
-
-Now, you should be able to use GeoMesa from any directory on your computer. To test, `cd` to a 
+This tutorial runs through the beginning steps of testing the GeoMesa Command Line Tools, and some of those tests are repeated in this tutorial. After following
+the GeoMesa Deployment Tutorial, you should be able to use GeoMesa from any directory on your computer. To test, `cd` to a 
 different directory and run:
 
 {% highlight bash %}
@@ -87,7 +54,7 @@ geomesa
 once more. This should print out the following usage text: 
 
 {% highlight bash %}
-Using GEOMESA_HOME = /home/jkenneally/geomesa/geomesa-1.0.0-rc.6
+Using GEOMESA_HOME = /home/jkenneally/geomesa-{{ site.stableVersion }}
 Usage: geomesa [command] [command options]
   Commands:
     create           Create a feature definition in a GeoMesa catalog
@@ -106,7 +73,7 @@ Usage: geomesa [command] [command options]
 
 This usage text gives a brief overview of how to use each command. To learn more about each command 
 the the flags associated with them, take a look at the 
-[Github Tools README](https://github.com/locationtech/geomesa/tree/accumulo1.5.x/1.x/geomesa-tools#geomesa-tools).
+[GeoMesa Tools README](https://github.com/locationtech/geomesa/blob/master/geomesa-tools/README.md).
 
 Throughout this tutorial, be aware that all commands will require `-u` or `--user` flags, where 
 the username is your Accumulo username. The password for the Accumulo user can also be given on the 
