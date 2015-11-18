@@ -32,7 +32,7 @@ Although projections can also modify an attribute's value, in this tutorial we w
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
-    You will need access to a Hadoop 2.2 installation as well as an Accumulo 1.5+ database.
+    You will need access to a Hadoop 2.2 installation as well as an Accumulo {{ site.accumuloVersion }} database.
 </div>
 
 <div class="callout callout-warning">

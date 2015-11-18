@@ -18,7 +18,7 @@ redirect_from:
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
-    For Accumulo deployment, you will need access to a Hadoop 2.2 installation as well as an Accumulo 1.6.x database.
+    For Accumulo deployment, you will need access to a Hadoop 2.2 installation as well as an Accumulo {{ site.accumuloVersion }} database.
 </div>
 
 #### Other prerequisites

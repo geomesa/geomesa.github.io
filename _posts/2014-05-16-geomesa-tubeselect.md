@@ -15,8 +15,8 @@ redirect_from:
 
 #### Required Software
 * Hadoop 2.2.x
-* Accumulo 1.5+
-* GeoMesa 1.1.x
+* Accumulo {{ site.accumuloVersion }}
+* GeoMesa {{ site.stableVersion }}
 * Geoserver 2.5.x
 
 ### What is a Time-Interpolated Query?

@@ -53,7 +53,7 @@ authenticate with GeoServer and LDAP to store authorizations
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
-    You will need access to a Hadoop 2.2 installation as well as an Accumulo 1.5+ database.
+    You will need access to a Hadoop 2.2 installation as well as an Accumulo {{ site.accumuloVersion }} database.
 </div>
 
 #### Other prerequisites
