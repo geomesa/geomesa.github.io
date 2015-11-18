@@ -16,6 +16,7 @@ planner.  In this post, we present one challenge the query planner
 in GeoMesa has to overcome:  How to identify the Geohash prefixes that
 cover a query polygon.
 <!--more-->
+
 #### Indexing Geo-Time
 
 [Accumulo](http://accumulo.apache.org) -- GeoMesa's backing data store -- is a distributed,
