@@ -45,7 +45,7 @@ mvn clean install
 Use hadoop jar to launch the Map/Reduce ingest job
 
 {% highlight bash %}
-hadoop jar /path/to/geomesa-gdelt-accumulo1.5-1.0-SNAPSHOT.jar \
+hadoop jar /path/to/geomesa-gdelt-1.0-SNAPSHOT.jar \
    geomesa.gdelt.GDELTIngest                       \
    -instanceId <accumulo-instance-id>              \
    -zookeepers <zookeeper-hosts-string>            \
@@ -129,18 +129,18 @@ First, follow the [GeoMesa Deployment Tutorial](/geomesa-deployment/) to downloa
 
 Deploy the lib/*.jar files to Geoserver.
 Do not move the geomesa-distributed-runtime or geomesa-utils jars to Geoserver - they go to the tablet servers.
-Be sure to move the GeoMesa Geoserver plugin (geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar)
+Be sure to move the GeoMesa Geoserver plugin (geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar)
 
 If you are using tomcat:
 
 {% highlight bash %}
-cp geomesa-plugin/target/geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar
+cp geomesa-plugin/target/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar
 {% endhighlight %}
 
 If you are using GeoServer's built in Jetty web server:
 
 {% highlight bash %}
-cp geomesa-plugin/target/geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar ~/dev/geoserver-2.5/webapps/geoserver/WEB-INF/lib/
+cp geomesa-plugin/target/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar ~/dev/geoserver-2.5/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 Your local Accumulo and Zookeepers JARs also need to be available within your GeoServer's `lib` directory.

@@ -161,7 +161,7 @@ Follow the instructions [here](/geomesa-gdelt-analysis/), with the following cha
 The entire command will be as follows:
 
 {% highlight bash %}
-hadoop jar /path/to/geomesa-gdelt-accumulo1.5-1.0-SNAPSHOT.jar \
+hadoop jar /path/to/geomesa-gdelt-1.0-SNAPSHOT.jar \
    geomesa.gdelt.GDELTIngest                       \
    -instanceId <accumulo-instance-id>              \
    -zookeepers <zookeeper-hosts-string>            \
@@ -239,7 +239,7 @@ When this is complete, it will have built a JAR file that contains all of the co
 On the command-line, run:
 
 {% highlight bash %}
-java -cp ./target/geomesa-tutorial-authorizations-accumulo1.5-1.0-SNAPSHOT.jar \
+java -cp ./target/geomesa-tutorial-authorizations-1.0-SNAPSHOT.jar \
    geomesa.tutorial.AuthorizationsTutorial \
    -instanceId <instance> \
    -zookeepers <zoos> \
@@ -547,7 +547,7 @@ by building the project and running the test class:
 {% highlight bash %}
 mvn clean install
 
-java -cp ./target/geomesa-tutorial-authorizations-accumulo1.5-1.0-SNAPSHOT.jar \
+java -cp ./target/geomesa-tutorial-authorizations-1.0-SNAPSHOT.jar \
    geomesa.tutorial.LdapAuthorizationsProviderTest rod
 {% endhighlight %}
 
@@ -577,7 +577,7 @@ to be <code>geomesa.tutorial.LdapAuthorizationsProvider</code></li>
 
 {% highlight bash %}
 mvn clean install
-cp ./target/original-geomesa-tutorial-authorizations-accumulo1.5-1.0-SNAPSHOT.jar \
+cp ./target/original-geomesa-tutorial-authorizations-1.0-SNAPSHOT.jar \
    /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
@@ -623,7 +623,7 @@ our client.
 Go back to the tutorial folder, and execute the following command:
 
 {% highlight bash %}
-java -cp ./target/geomesa-tutorial-authorizations-accumulo1.5-1.0-SNAPSHOT.jar \
+java -cp ./target/geomesa-tutorial-authorizations-1.0-SNAPSHOT.jar \
    -Djavax.net.ssl.keyStore=/path/to/certs/rod.p12 \
    -Djavax.net.ssl.keyStorePassword=password \
    -Djavax.net.ssl.keyStoreType=PKCS12 \

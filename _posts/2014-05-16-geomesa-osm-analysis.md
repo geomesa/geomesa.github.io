@@ -47,7 +47,7 @@ mvn clean install
 Use storm jar to submit the topology to your Storm Nimbus.
 
 {% highlight bash %}
-storm jar geomesa-osm-accumulo1.5-1.0-SNAPSHOT.jar \
+storm jar geomesa-osm-1.0-SNAPSHOT.jar \
    geomesa.osm.OSMIngest                         \
    -instanceId <accumulo-instance-id>            \
    -zookeepers <zookeeper-hosts-string>          \   
@@ -88,7 +88,7 @@ kafka-create-topic.sh       \
 Create a Kafka producer to convert the ingest file into kafka messages.
 
 {% highlight bash %}
-java -cp geomesa-osm-accumulo1.5-1.0-SNAPSHOT.jar     \
+java -cp geomesa-osm-1.0-SNAPSHOT.jar     \
    geomesa.osm.OSMIngestProducer   \
    -ingestFile <ingestFile>        \
    -topic OSM                      \
@@ -174,18 +174,18 @@ First, follow the [GeoMesa Deployment Tutorial](/geomesa-deployment/) to downloa
 Deploy the lib/*.jar files to Geoserver: slf4j-api, accumulo-core, guava, hadoop-client
 
 Do not move the geomesa-distributed-runtime or geomesa-utils jars to Geoserver - they go to the tablet servers.
-Be sure to move the GeoMesa Geoserver plugin (geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar)
+Be sure to move the GeoMesa Geoserver plugin (geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar)
 
 If you are using tomcat:
 
 {% highlight bash %}
-cp geomesa-plugin/target/geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
+cp geomesa-plugin/target/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 If you are using GeoServer's built in Jetty web server:
 
 {% highlight bash %}
-cp geomesa-plugin/target/geomesa-plugin-accumulo1.5-{{ site.stableVersion }}-geoserver-plugin.jar ~/dev/geoserver-2.5/webapps/geoserver/WEB-INF/lib/
+cp geomesa-plugin/target/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar ~/dev/geoserver-2.5/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 Your local Accumulo and Zookeepers JARs also need to be available within your GeoServer's `lib` directory.
