@@ -50,8 +50,7 @@ bin  dist  docs  lib  LICENSE.txt  README.md
 GeoMesa comes with a set of command line tools for managing features. To complete the setup of the tools, cd into the bin directory and execute geomesa configure:
 
 {% highlight bash %}
-$ cd ~/tools/geomesa-{{ site.stableVersion }}
-$ ./geomesa configure
+$ cd ~/tools/geomesa-{{ site.stableVersion }}/bin
 $ ./geomesa configure
 Warning: GEOMESA_HOME is not set, using ~/tools/geomesa-{{ site.stableVersion }}
 Using GEOMESA_HOME as set: ~/tools/geomesa-{{ site.stableVersion }}
