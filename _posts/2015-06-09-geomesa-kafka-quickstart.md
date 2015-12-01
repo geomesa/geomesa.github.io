@@ -17,7 +17,7 @@ This quickstart tutorial is bundled as a Java program which will introduce how t
 
 ## Prerequisites
 
-* basic knowledge of [GeoTools](http://www.geotools.org), [GeoServer](http://geoser!!ver.org), and Kafka
+* basic knowledge of [GeoTools](http://www.geotools.org), [GeoServer](http://geoserver.org), and Kafka
 * access to a Kafka 0.8.2.x server with an appropriate Zookeeper instance(s)
 * access to GeoServer version 2.5.2
 * a local copy of the Java Development Kit 1.7.x
@@ -59,6 +59,7 @@ Select the `Kafka Data Store` vector data source and enter the following paramet
     * `data source name`:  pick a sensible name, such as, `geomesa_kafka_quickstart`
     * `description`:  this is strictly decorative; `GeoMesa Kafka quick start`
 * connection parameters:  these are the same parameter values that you supplied on the command-line when you ran the tutorial; they describe how to connect to the Kafka instance where your data resides
+    * `timeout`: how long the data will be available, in milliseconds
 
 Note: If you left out the zkPath command line argument when running the quickstart program, you can leave the zkPath connection parameter in GeoServer empty. 
 
@@ -124,6 +125,6 @@ fid:1 | name:James | age:59 | dtg:Sat Jan 24 06:26:44 EST 2015 | geom:POINT (132
 
 Since the source code for this quickstart is accessible, it is advised to follow along in the code to get a deeper understanding of what's really going on.
 
-Given a stream of geospatial data, GeoMesa's integration with Kafka enables users to maintain a real time state of SimpleFeatures or retrieve any arbitrary state preserved in history. One can additionally process and analyze streams of data by integrating a data processing system like [Storm](https://storm.apache.org/) or [Samza](http://samza.apache.org).
+Given a stream of geospatial data, GeoMesa's integration with Kafka enables users to maintain a real time state of SimpleFeatures or retrieve any arbitrary state preserved in history. One can additionally process and analyze streams of data by integrating a data processing system like [Storm](https://storm.apache.org/) or [Samza](http://samza.apache.org).  We have a [tutorial](http://www.geomesa.org/geomesa-osm-analysis/) on using Storm with GeoMesa.
 
 For additional information about the KafkaDataStore, see the [readme](https://github.com/locationtech/geomesa/blob/master/geomesa-kafka/geomesa-kafka-datastore/README.md) on github.
