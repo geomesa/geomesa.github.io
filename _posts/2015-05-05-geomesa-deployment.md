@@ -10,26 +10,28 @@ redirect_from:
 
 ### This tutorial will introduce how to:
 
-1. Install GeoMesa Command Line Tools
-2. Deploy the Distributed Runtime Jar to your Accumulo Cluster.
-3. Deploy the GeoServer Plugin.
+1. Install the GeoMesa command line tools.
+2. Deploy the distributed runtime JAR to your Accumulo cluster.
+3. Deploy the GeoServer plugin.
 4. Deploy necessary dependencies for GeoMesa's GeoServer plugin for Accumulo and/or Kafka.
 <!--more-->
+
+### PREREQUISITES
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
     For Accumulo deployment, you will need access to a Hadoop 2.2 installation as well as an Accumulo {{ site.accumuloVersion }} database.
 </div>
 
-#### Other prerequisites
+Before you begin, you should have these:
 
-Before you begin, you should also have these:
+* basic knowledge of [GeoTools](http://www.geotools.org), [GeoServer](http://geoserver.org), [Accumulo](http://accumulo.apache.org), and/or [Kafka](http://kafka.apache.org),
+* access to an Accumulo {{ site.accumuloVersion }} database (requires a Hadoop 2.2 installation),
+* access to a [GeoServer](http://geoserver.org/) 2.5.2 installation,
+* an Accumulo user that has both create-table and write permissions, and
+* [Java 7 JRE](http://www.oracle.com/technetwork/java/javase/downloads/index.html) installed.
 
-* basic knowledge of [GeoTools](http://www.geotools.org), [GeoServer](http://geoserver.org), [Accumulo](http://accumulo.apache.org), and/or [Kafka](http://kafka.apache.org)
-* an Accumulo user that has both create-table and write permissions
-* a Java 1.7 or higher runtime 
-
-### DOWNLOAD GEOMESA
+### DOWNLOAD THE GEOMESA BINARY DISTRIBUTION 
 
 GeoMesa artifacts are available for download or can be built from source. The easiest way to get started is to [download the most recent stable version ({{ site.stableVersion }})](http://repo.locationtech.org/content/repositories/geomesa-releases/org/locationtech/geomesa/geomesa-assemble/{{ site.stableVersion }}/geomesa-assemble-{{ site.stableVersion }}-bin.tar.gz) and untar it somewhere convenient:
 
@@ -45,7 +47,7 @@ $ ls
 bin  dist  docs  lib  LICENSE.txt  README.md
 {% endhighlight %}
 
-### INSTALL THE GEOMESA TOOLS
+### INSTALL THE COMMAND LINE TOOLS
 
 GeoMesa comes with a set of command line tools for managing features. To complete the setup of the tools, cd into the bin directory and execute geomesa configure:
 
@@ -66,7 +68,7 @@ export PATH=${GEOMESA_HOME}/bin:$PATH
 
 {% endhighlight %}
 
-Update and resource your bashrc to include the GEOMESA_HOME and PATH updates
+Update and re-source your ``~/.bashrc`` file to include the $GEOMESA_HOME and $PATH updates.
 
 Install GPL software:
 
@@ -134,10 +136,10 @@ cp $GEOMESA_HOME/dist/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.j
 If you are using GeoServer's built in Jetty web server:
 
 {% highlight bash %}
-cp $GEOMESA_HOME/dist/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar ~/dev/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
+cp $GEOMESA_HOME/dist/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar /path/to/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
-#### ADDITIONAL DEPENDENCIES
+#### Additional dependencies
 
 There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `WEB-INF/lib` directory.
 There is a script located at `$GEOMESA_HOME/bin/install-hadoop-accumulo.sh` which will install these dependencies to a target directory
@@ -190,25 +192,42 @@ Once all of the dependencies for the GeoServer plugin are in place you will need
 
 To verify that the deployment worked you can follow the [GeoMesa Quick Start tutorial](/geomesa-quickstart/) to ingest test data and view the data in GeoServer.  
 
-### KAFKA DEPLOYMENT
+### DEPLOY GEOMESA TO KAFKA
 
-To set up GeoMesa with Kafka, first build the geomesa-kafka submodule (see the [Kafka Quickstart tutorial](/geomesa-kafka-quickstart/) to see what GeoMesa can do with Kafka).
+<div class="callout callout-warning">
+    <span class="glyphicon glyphicon-exclamation-sign"></span>
+    Building the Kafka submodule requires that development tools be installed and configured. 
+</div>
+
+These development tools are required:
+
+* [Java JDK 7](http://www.oracle.com/technetwork/java/javase/downloads/index.html),
+* [Apache Maven](http://maven.apache.org/) 3.2.2 or better, and
+* [Git](https://git-scm.com/).
+
+To set up GeoMesa with Kafka, download the Geomesa source distribution that matches the binary distribution described above:
 
 {% highlight bash %}
-git clone --branch geomesa-{{ site.stableVersion }} https://github.com/locationtech/geomesa/ && mvn clean install -f geomesa/geomesa-kafka/pom.xml -DskipTests
+$ git clone https://github.com/locationtech/geomesa/
+$ git checkout tags/geomesa-{{ site.stableVersion }} -b geomesa-{{ site.stableVersion }} 
 {% endhighlight %}
 
-Copy the GeoMesa Kafka plugin jar files from the GeoMesa directory you built into your GeoServer's library directory.
+Then build the geomesa-kafka submodule (see the [Kafka Quickstart tutorial](/geomesa-kafka-quickstart/) to see what GeoMesa can do with Kafka).
+
+{% highlight bash %}
+$ mvn clean install -f geomesa/geomesa-kafka/pom.xml -DskipTests
+{% endhighlight %}
+
+Copy the GeoMesa Kafka plugin JAR files from the GeoMesa directory you built into your GeoServer's library directory. 
 
 Tomcat:
 {% highlight bash %}
-cp geomesa/geomesa-kafka/geomesa-kafka-geoserver-plugin/target/geomesa-kafka-geoserver-plugin-{{ site.developmentVersion }}-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
+cp geomesa/geomesa-kafka/geomesa-kafka-geoserver-plugin/target/geomesa-kafka-geoserver-plugin-{{ site.stableVersion }}-geoserver-plugin.jar /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 Jetty:
-
 {% highlight bash %}
-cp geomesa/geomesa-kafka/geomesa-kafka-geoserver-plugin/target/geomesa-kafka* ~/dev/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
+cp geomesa/geomesa-kafka/geomesa-kafka-geoserver-plugin/target/geomesa-kafka-geoserver-plugin-{{ site.stableVersion }}-geoserver-plugin.jar /path/to/jetty/geoserver-2.5.2/webapps/geoserver/WEB-INF/lib/
 {% endhighlight %}
 
 Then copy these dependencies to your `WEB-INF/lib` directory.
@@ -225,6 +244,7 @@ Note: when using the Kafka Data Store with GeoServer in Tomcat it will most like
 
 After placing the dependencies in the correct folder, be sure to restart GeoServer for changes to take place.
 
-### Configuring Geoserver
+### CONFIGURING GEOSERVER
+
 Depending on your hardware, it may be important to set the limits for your WMS plugin to be higher or disable them completely by clicking "WMS" under "Services" on the left side of the admin page of Geoserver. Check with your server administrator to determine the correct settings. For massive queries, the standard 60 second timeout may be too short.
 !["Disable limits"](/img/tutorials/2014-05-16-geomesa-tubeselect/wms_limits.png)
