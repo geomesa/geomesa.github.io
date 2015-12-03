@@ -143,7 +143,8 @@ cp $GEOMESA_HOME/dist/geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.j
 
 There are additional JARs that are specific to your installation that you will also need to copy to GeoServer's `WEB-INF/lib` directory.
 There is a script located at `$GEOMESA_HOME/bin/install-hadoop-accumulo.sh` which will install these dependencies to a target directory
-using wget which will require an internet connection.
+using `wget` which will require an internet connection. In the source distribution this script is found at `./geomesa-tools/bin/install-hadoop-accumulo.sh`.
+
 For example:
 {% highlight bash %}
 $> $GEOMESA_HOME/bin/install-hadoop-accumulo.sh /path/to/tomcat/webapps/geoserver/WEB-INF/lib/
