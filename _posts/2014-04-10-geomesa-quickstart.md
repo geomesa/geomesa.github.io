@@ -180,4 +180,4 @@ Here are just a few simple ways you can play with the visualization:
 #### Generating Heatmaps
 
 * To try out the DensityIterator, you can install the Heatmap SLD from the [GDELT tutorial](http://www.geomesa.org/geomesa-gdelt-analysis/#heatmaps).
-* After configuring the SLD, in the URL, change `styles=` to be `styles=heatmap&amp;density=true`.  Once you press &lt;Enter&gt;, the display will change to a density heat-map.  (NB:  For this to work, you will have to first install the WPS module for GeoServer.  See the official web site for a download.)
+* After configuring the SLD, in the URL, change `styles=` to be `styles=heatmap&density=true`.  Once you press &lt;Enter&gt;, the display will change to a density heat-map.  (NB:  For this to work, you will have to first install the WPS module for GeoServer.  See the official web site for a download.)
