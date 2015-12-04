@@ -7,28 +7,28 @@ redirect_from:
 ---
 
 {% include tutorial-header.html %}
+### This tutorial will show you how to:
 
-### Background
+Write custom Java code using GeoMesa to do the following:
 
-GeoMesa allows users to perform [relational projections](http://en.wikipedia.org/wiki/Projection_%28relational_algebra%29) on query results.  We call these 'transformations' to distinguish them from the overloaded term 'projection' which has a different meaning in a spatial context.  These transformations have the following uses and advantages
+1.  query previously-ingested data,
+2.  apply [relational projections](http://en.wikipedia.org/wiki/Projection_%28relational_algebra%29) to your query results, and
+3.  apply transformations to your query results.
+<!--more-->
+
+### BACKGROUND
+
+GeoMesa allows users to perform [relational projections](http://en.wikipedia.org/wiki/Projection_%28relational_algebra%29) on query results.  We call these "transformations" to distinguish them from the overloaded term "projection" which has a different meaning in a spatial context.  These transformations have the following uses and advantages:
 
 1. Subset to specified columns - reduces network overhead of returning results
 2. Rename specified columns - alters the schema of data on the fly
 3. Compute new attributes from one or more original attributes - adds derived fields to results
 
-The transformations are applied in parallel across the cluster thus making them very fast.  They are analogous to the map tasks in a map-reduce job.  Transformations are also extensible; developers can implement new functions and plug them into the system using standard mechanisms from Geotools.  
-<!--more-->
-### This tutorial will show you how to:
+The transformations are applied in parallel across the cluster thus making them very fast.  They are analogous to the map tasks in a map-reduce job.  Transformations are also extensible; developers can implement new functions and plug them into the system using standard mechanisms from [Geotools](http://www.geotools.org/).  
 
-Write custom Java code using GeoMesa to do the following:
+**Note:** when this tutorial refers to "projections", it means in the relational sense - see [Projection - Relational Algebra](http://en.wikipedia.org/wiki/Projection_(relational_algebra)). Projection also has [many other meanings](http://en.wikipedia.org/wiki/Projection_(disambiguation)) in spatial discussions - they are not used in this tutorial. Although projections can also modify an attribute's value, in this tutorial we will refer to such modifications as "transformations" to keep things clearer.
 
-1.  query previously-ingested data
-2.  apply relational projections to your query results
-3.  apply transformations to your query results
-
-**Note:** when this tutorial refers to ```projections```, it means in the relational sense - see [Projection - Relational Algebra](http://en.wikipedia.org/wiki/Projection_(relational_algebra)). Projection also has [many other meanings](http://en.wikipedia.org/wiki/Projection_(disambiguation)) in spatial discussions - they are not used in this tutorial.
-
-Although projections can also modify an attribute's value, in this tutorial we will refer to such modifications as ```transformations``` to keep things clearer.
+### PREREQUISITES
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
@@ -37,40 +37,50 @@ Although projections can also modify an attribute's value, in this tutorial we w
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
-    You will need to have ingested the GDELT data set using GeoMesa. Instructions are available <a href="/geomesa-gdelt-analysis/">here</a>.
+    You will need to have ingested GDELT data using GeoMesa. Instructions are available <a href="/geomesa-gdelt-analysis/">here</a>.
 </div>
 
-#### Other prerequisites
+You will also need:
 
-Before you begin, you should also have these:
+* an Accumulo user that has appropriate permissions to query your data,
+* Java JDK 7,
+* [Apache Maven](http://maven.apache.org/) 3.2.2 or better, and
+* a [git](http://git-scm.com/) client.
 
-* a local version of GeoMesa - see [GeoMesa Deployment](/geomesa-deployment/)
-* an Accumulo user that has appropriate permissions to query your data
-* a local copy of the Java Development Kit 1.7.x
-* Apache Maven installed
-* a GitHub client installed
+### DOWNLOAD AND BUILD TUTORIAL CODE
 
-### Download and Build the Tutorial Code
+Clone the geomesa project and build it, if you haven't already:
 
-Pick a reasonable directory on your machine, and run:
+{% highlight bash %}
+$ git clone https://github.com/locationtech/geomesa.git
+$ cd geomesa
+$ mvn clean install
+{% endhighlight %}
 
-```
-git clone https://github.com/geomesa/geomesa-tutorial-transformations.git
-```
+This is needed to install the GeoMesa JAR files in your local Maven repository. For more information see the [GeoMesa Accumulo Quick Start](/geomesa-quickstart/) tutorial. 
 
-The ```pom.xml``` file contains an explicit list of dependent libraries that will be bundled together into the final tutorial. You should confirm that the versions of Accumulo and Hadoop match what you are running; if it does not match, change the value in the POM. (NB: The only reason these libraries are bundled into the final JAR is that this is easier for most people to do this than it is to set the classpath when running the tutorial. If you would rather not bundle these dependencies, mark them as provided in the POM, and update your classpath as appropriate.)
+Clone the tutorial code as well:
+
+{% highlight bash %}
+$ git clone https://github.com/geomesa/geomesa-tutorial-transformations.git
+$ cd geomesa-tutorial-transformations
+{% endhighlight %}
+
+The Maven ```pom.xml``` file contains an explicit list of dependent libraries that will be bundled together into the final tutorial. You should confirm that the versions of Accumulo and Hadoop match what you are running; if it does not match, change the value in the POM. (NB: The only reason these libraries are bundled into the final JAR is that this is easier for most people to do this than it is to set the classpath when running the tutorial. If you would rather not bundle these dependencies, mark them as provided in the POM, and update your classpath as appropriate.)
 
 From within the root of the cloned tutorial, run:
 
-```
-mvn clean install
-```
+{% highlight bash %}
+$ mvn clean install
+{% endhighlight %}
 
-When this is complete, it will have built a JAR file that contains all of the code you need to run the tutorial.
+When this is complete, it will have built a JAR file that contains all of the code you need to run the tutorial in the ``target`` subdirectory.
 
-### Run the Tutorial
+### RUN THE TUTORIAL
+    
+You will need to have ingested some GDELT data using GeoMesa; instructions are available in the [GDELT Map-Reduce tutorial](/geomesa-gdelt-analysis/). Ideally data spanning 2013-2014 should be included, as this tutorial follows the previous tutorial in searching for events in the Ukraine during the recent civil unrest.
 
-On the command-line, run:
+On the command line, run:
 
 {% highlight bash %}
 java -cp ./target/geomesa-tutorial-transformations-1.0-SNAPSHOT.jar \
@@ -89,35 +99,30 @@ where you provide the following arguments:
 * ```<zoos>``` - comma-separated list of your Zookeeper nodes, e.g. zoo1:2181,zoo2:2181,zoo3:2181
 * ```<user>``` - the name of an Accumulo user that will execute the scans, e.g. root
 * ```<pwd>``` - the password for the previously-mentioned Accumulo user
-* ```<table>``` - the name of the Accumulo table that has the GeoMesa GDELT dataset, e.g. gdelt
-* ```<feature>``` - the feature name used to ingest the GeoMesa GDELT dataset, e.g. gdelt
+* ```<table>``` - the name of the Accumulo table that has the GeoMesa GDELT dataset, e.g. "gdelt" if you followed the GDELT tutorial
+* ```<feature>``` - the feature name used to ingest the GeoMesa GDELT dataset, e.g. "event" if you followed the GDELT tutorial 
 
 You should see several queries run and the results printed out to your console.
 
-### Insight Into How the Tutorial Works
+### INSIGHT INTO HOW THE TUTORIAL WORKS
 
-The code for querying and projections is available in the following class:
+The code for querying and projections is available in the class ```geomesa.tutorial.QueryTutorial```. The source code is meant to be accessible, but here is a high-level breakdown of the relevant methods:
 
-* ```geomesa.tutorial.QueryTutorial```
+* ``basicQuery`` - executes a base filter without any further options. All attributes are returned in the data set.
+* ``basicProjectionQuery`` - executes a base filter but specifies a subset of attributes to return.
+* ``basicTransformationQuery`` - executes a base filter and transforms one of the attributes that is returned.
+* ``renamedTransformationQuery`` - executes a base filter and transforms one of the attributes, returning it in a separate derived attribute.
+* ``mutliFieldTransformationQuery`` - executes a base filter and transforms two attributes into a single derived attributes.
+* ``geometricTransformationQuery`` - executes a base filter and transforms the geometry returned from a point into a polygon by buffering it. 
 
-The source code is meant to be accessible, but here is a high-level breakdown of the relevant methods:
-
-* basicQuery - executes a base filter without any further options. All attributes are returned in the data set.
-* basicProjectionQuery - executes a base filter but specifies a subset of attributes to return.
-* basicTransformationQuery - executes a base filter and transforms one of the attributes that is returned.
-* renamedTransformationQuery - executes a base filter and transforms one of the attributes, returning it in a separate derived attribute.
-* mutliFieldTransformationQuery - executes a base filter and transforms two attributes into a single derived attributes.
-* geometricTransformationQuery - executes a base filter and transforms the geometry returned from a point into a polygon by buffering it. 
-
-Additional transformation functions are listed [here](http://docs.geotools.org/latest/userguide/library/main/filter.html) (scroll to 'Function List').
-*Please note that currently not all functions are supported by GeoMesa.*
+Additional transformation functions are listed [here](http://docs.geotools.org/latest/userguide/library/main/filter.html). *Please note that currently not all functions are supported by GeoMesa.*
 
 Additionally, there are two helper classes included in the tutorial:
 
 * ```geomesa.tutorial.GdeltFeature``` - Contains the properties (attributes) available in the GDELT data set.
-* ```geomesa.tutorial.SetupUtil``` - Handles reading command-line arguments
+* ```geomesa.tutorial.SetupUtil``` - Handles reading command-line arguments.
 
-### Sample Code and Output
+### SAMPLE CODE AND OUTPUT
 
 The following code snippets show the basic aspects of creating queries for GeoMesa.
 
