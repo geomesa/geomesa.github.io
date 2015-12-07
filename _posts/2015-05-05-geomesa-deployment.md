@@ -88,25 +88,41 @@ Test the GeoMesa Tools:
 
 {% highlight bash %}
 $ geomesa
+Using GEOMESA_HOME = /path/to/geomesa-{{ site.stableVersion }}
 Usage: geomesa [command] [command options]
   Commands:
     create           Create a feature definition in a GeoMesa catalog
     deletecatalog    Delete a GeoMesa catalog completely (and all features in it)
-    deleteraster     Delete a raster table
+    deleteraster     Delete a GeoMesa Raster Table
     describe         Describe the attributes of a given feature in GeoMesa
     explain          Explain how a GeoMesa query will be executed
     export           Export a GeoMesa feature
+    getsft           Get the SimpleFeatureType of a feature
     help             Show help
     ingest           Ingest a file of various formats into GeoMesa
     ingestraster     Ingest a raster file or raster files in a directory into GeoMesa
     list             List GeoMesa features for a given catalog
-    metadata         Write out the metadata for a feature or catalog
     querystats       Export queries and statistics about the last X number of queries to a CSV file.
     removeschema     Remove a schema and associated features from a GeoMesa catalog
     tableconf        Perform table configuration operations
+    version          GeoMesa Version
 {% endhighlight %}
 
-For more information on the tools check out the  [GeoMesa Tools tutorial](/geomesa-tools-features/) after you're done with this tutorial
+For more information on the tools check out the  [GeoMesa Tools tutorial](/geomesa-tools-features/) after you're done with this tutorial.
+
+GeoMesa Tools comes with a bundled SLF4J implementation. However, if you receive an SLF4J error like this:
+
+{% highlight bash %}
+SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
+SLF4J: Defaulting to no-operation (NOP) logger implementation
+SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
+{% endhighlight %}
+    
+download the SLF4J TAR-ball [found here](http://www.slf4j.org/download.html). Extract 
+slf4j-log4j12-1.7.7.jar and place it in the geomesa-{{ site.stableVersion }}/lib directory. 
+
+If this conflicts with another SLF4J implementation, it may need to be removed from the lib directory.
+
 
 ### DEPLOY GEOMESA TO ACCUMULO
 
