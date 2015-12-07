@@ -81,7 +81,8 @@ Additionally, if you need visibilities or authorizations on your Accumulo tables
 
 #### create: creating a feature type
 
-To begin, let's start by creating a new feature type in GeoMesa with the `create` command. The `create`  command takes three required flags and one optional:  
+To begin, let's start by creating a new feature type in GeoMesa with the `create` command. The `create`  command 
+takes three required and one optional flag:  
 
 **Required**
  
@@ -189,7 +190,7 @@ State change: CONNECTED
 Removed feature
 {% endhighlight %}
 
-### Conclusion
+### CONCLUSION
 
 In this tutorial, you learned about the feature management commands `create`, `list`,
 `describe`, and `removeschema` in the GeoMesa Tools module. If you have ideas for additional functionality
