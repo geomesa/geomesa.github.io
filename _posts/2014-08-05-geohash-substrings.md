@@ -8,7 +8,7 @@ redirect_from:
 
 {% include tutorial-header.html %}
 
-### Overview
+### OVERVIEW
 
 Encoding a (geometry, date-time) pair is only useful when those
 encoded entries can be found quickly.  That is the job of the query
@@ -17,9 +17,9 @@ in GeoMesa has to overcome:  How to identify the Geohash prefixes that
 cover a query polygon.
 <!--more-->
 
-#### Indexing Geo-Time
+#### INDEXING GEO-TIME DATA
 
-[Accumulo](http://accumulo.apache.org) -- GeoMesa's backing data store -- is a distributed,
+[Accumulo](http://accumulo.apache.org) -- GeoMesa's primary backing data store -- is a distributed,
 sorted key-value store in which the only system-level index is the lexicographical ordering of the keys.  
 Indexing geo-time data is a matter of finding a sensible way to flatten three dimensions
 of data -- longitude, latitude, and time -- into a single dimension: the list of Accumulo keys.
@@ -132,8 +132,8 @@ its role in the overall query process has been simplified to streamline
 the explanation in this short note.  The full version as used within
 the query planner can be found nested inside the 
 [getUniqueGeohashSubstringsInPolygon](https://github.com/locationtech/geomesa/blob/master/geomesa-utils/src/main/scala/org/locationtech/geomesa/utils/geohash/GeohashUtils.scala#L914)
-routine, where it enables GeoMesa to enumerate the unique  
-sub-strings of larger Geohashes quickly and efficiently,
+method, where it enables GeoMesa to enumerate the unique  
+substrings of larger Geohashes quickly and efficiently,
 expediting the entire query-planning process.
 
 ### Addendum

@@ -13,7 +13,7 @@ redirect_from:
 code.xml { color:#93a1a1 }
 </style>
 
-### Background
+### BACKGROUND
 
 When you install the GeoMesa plugin for GeoServer, you get access to the GeoMesa User Interface.
 The GeoMesa UI provides status on your GeoMesa data stores and will eventually provide advanced
@@ -23,15 +23,15 @@ This post outlines some of the features currently available through the GeoMesa 
 <!--more-->
 
 Instructions for installing the GeoMesa plugin in GeoServer are available
-[here](/geomesa-gdelt-analysis/), under 'GeoServer Setup'.
+[here](/geomesa-deployment/), under 'Deploy GeoMesa Plugin to GeoServer'.
 
-## Access to the User Interface
+### ACCESS TO THE USER INTERFACE
 
-Once you have installed the GeoMesa plugin, there will be a GeoMesa menu on any GeoServer page:
+Once you have installed the GeoMesa plugin, there will be a GeoMesa menu on the sidebar of the GeoServer administration interface:
 
 !["GeoMesa Menu"](/img/tutorials/2014-08-06-geomesa-ui/geoserver-menu.png)
 
-## Data Store Summary
+### DATA STORE SUMMARY
 
 Any GeoMesa data stores that you have added to GeoServer can be examined on the Data Stores page.
 At the top of the page there is a table listing all of your GeoMesa data stores. Underneath that,
@@ -50,7 +50,7 @@ the attributes for the feature, and an indication if they are indexed for queryi
 
 !["Hadoop Status"](/img/tutorials/2014-08-06-geomesa-ui/geoserver-datastores.png)
 
-## Configuration
+### CONFIGURATION
 
 To enable some features in the UI, you will need to set various properties on the configuration page.
 Most of these properties correspond to Hadoop properties, and they can be copied from your hadoop
@@ -59,13 +59,9 @@ directly to the page. To do this, use the 'Load from XML' button.
 
 !["GeoMesa Configuration"](/img/tutorials/2014-08-06-geomesa-ui/geoserver-config.png)
 
-## Hadoop Status
+### HADOOP STATUS
 
 Once the configuration is done, you can monitor the Hadoop cluster status on the Hadoop Status page.
 Here you can see the load on your cluster and any currently running jobs. 
 
 !["Hadoop Status"](/img/tutorials/2014-08-06-geomesa-ui/geoserver-hadoop-status.png)
-
-## More to Come
-
-We'll be expanding the capabilities of the GeoMesa UI soon, so check back for more updates.

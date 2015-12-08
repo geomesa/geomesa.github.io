@@ -13,7 +13,7 @@ redirect_from:
 code.xml { color:#93a1a1 }
 </style>
 
-## Introduction
+### INTRODUCTION
 
 Feature visibility is a new and important feature recently supported by GeoMesa. Accumulo has support for cell-level visibility built-in, and in recent versions of GeoMesa,
 support was added to utilize these visibility markings and enhance data security.
@@ -186,6 +186,7 @@ If you're interested in learning more about this, feel free to email [geomesa-us
 To learn more about PKI or LDAP authorizations, see [the GeoMesa Authorizations tutorial here](http://www.geomesa.org/2014/06/04/geomesa-authorizations/#applying-authorizations-and-visibilities-to-geoserver-using-pkis-and-ldap).
 
 ### CONCLUSION
+
 In this tutorial, you learned about feature level visibility and security built into GeoMesa. You ingested a dataset of 1000 features to your GeoMesa instance -- 500 having the visibility `admin` and 500 having the visibility `user|admin`.
 You added two new users to Accumulo and granted them the correct authorization levels to query the data. Finally, you visualized the data and saw how, despite both ``DataStore`` connecting to the same
 features in GeoMesa, `user` could only have a subset of those features returned because of the lower security authorization.
