@@ -21,6 +21,17 @@ code.xml { color:#93a1a1 }
 
 ### INTRODUCTION
 
+<div class="callout callout-warning">
+    <span class="glyphicon glyphicon-exclamation-sign"></span>
+    The instructions in the tutorial apply to GeoMesa version 1.1.0-rc.6 and below. In later 
+    releases, including the current development branch, the <code>geomesa ingest</code>
+    command makes use of the <code>-conf</code> option to specify a <a href="https://github
+    .com/locationtech/geomesa/tree/master/geomesa-convert">geomesa-convert</a> configuration file
+    to pass arguments formerly specified by the <code>-cols</code>, <code>-dt</code>, <code>-dtf</code>,
+    <code>-h</code>, <code>-id</code>, <code>-lat</code>, <code>-long</code>, and <code>-ld</code> 
+    flags.
+</div>
+
 GeoMesa Tools is a set of command line tools to add feature management functions, query planning and
 explanation, ingest, and export abilities from the command line. In this tutorial, we'll cover how
 to ingest and export features using GeoMesa Tools.
@@ -142,7 +153,7 @@ geomesa ingest \
 ``<username>`` and ``<password>`` are the credentials associated with the Accumulo instance. ``<instance>`` and ``<zookeepers>`` are the connection parameters for Accumulo, if this is not specified in the configuration files in ``$ACCUMULO_HOME``.
 
 
-#### Customizing Ingest Fields
+### CUSTOMIZING INDEX FIELDS
 GeoMesa ingest supports customizing which fields are ingested from a CSV or TSV file. If we decide to drop the fields `ActionGeo_Long` and `ActionGeo_Lat` from our SFT spec in favor of just a geometry field we must do three things:
 
 1. Use the `-cols` attribute to indicate which positional fields from the csv file we want to ingest (0-6 and 9).
@@ -165,7 +176,7 @@ geomesa ingest \
  /path/to/ukraineNovToMar.csv
 {% endhighlight %}
 
-## Exporting Features
+### EXPORTING FEATURES
 
 Let's export your newly ingested features in a couple of file formats. Currently, the `export`
 command supports exports to CSV, TSV, Shapefile, GeoJSON, and GML. We'll do one of each format in
@@ -208,7 +219,7 @@ One last command in the GeoMesa Command Line Tools module is the `explain` comma
 in detail in the post [Understanding Queries by James Hughes](no-link-yet).
 -->
 
-## Conclusion
+### CONCLUSION
 In this tutorial, you learned about the how to run ingests and exports using the GeoMesa Command
 Line Tools. We covered `ingest` and `export`. If you have ideas for additional functionality to
 include in the Command Line Tools module, please don't hesitate to
