@@ -23,7 +23,7 @@ This post outlines some of the features currently available through the GeoMesa 
 <!--more-->
 
 Instructions for installing the GeoMesa plugin in GeoServer are available
-[here](/geomesa-deployment/), under 'Deploy GeoMesa Plugin to GeoServer'.
+[here](/geomesa-deployment/), under 'Deploy GeoMesa Accumulo Plugin to GeoServer'.
 
 ### ACCESS TO THE USER INTERFACE
 

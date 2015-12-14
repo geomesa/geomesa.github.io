@@ -78,7 +78,9 @@ $ bin/install-jline
 $ bin/install-vecmath
 {% endhighlight %}
 
-Finally, test your installation:
+Finally, edit the configuration variables at the top of the
+``bin/test-geomesa`` script as appropriate for your server configuration,
+and run it to test your installation:
 
 {% highlight bash %}
 $ bin/test-geomesa
@@ -133,13 +135,13 @@ The $GEOMESA_HOME/dist directory contains the distributed runtime jar that shoul
 scp $GEOMESA_HOME/dist/geomesa-distributed-runtime-{{ site.stableVersion }}.jar tserver1:$ACCUMULO_HOME/lib/ext/
 {% endhighlight %}
 
-### DEPLOY GEOMESA PLUGIN TO GEOSERVER
+### DEPLOY GEOMESA ACCUMULO PLUGIN TO GEOSERVER
 
 You should have an instance of GeoServer, version 2.5.2, running somewhere that has access to your Accumulo instance.
 
-#### Geoserver Setup
+#### GeoServer Setup
 
-In addition to our GeoServer plugin, you will also need to install the WPS plugin to your GeoServer instance. The [WPS Plugin](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html) must also match the version of GeoServer instance.
+First, you will need to install the WPS plugin to your GeoServer instance. The [WPS Plugin](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html) must also match the version of GeoServer instance.
 
 Copy the `geomesa-plugin-{{ site.stableVersion }}-geoserver-plugin.jar` jar file from the GeoMesa dist directory into your GeoServer's library directory.
 
@@ -209,7 +211,7 @@ Once all of the dependencies for the GeoServer plugin are in place you will need
 
 To verify that the deployment worked you can follow the [GeoMesa Quick Start tutorial](/geomesa-quickstart/) to ingest test data and view the data in GeoServer.  
 
-### DEPLOY GEOMESA TO KAFKA
+### DEPLOY GEOMESA TO KAFKA AND GEOSERVER
 
 <div class="callout callout-warning">
     <span class="glyphicon glyphicon-exclamation-sign"></span>
@@ -221,6 +223,8 @@ These development tools are required:
 * [Java JDK 7](http://www.oracle.com/technetwork/java/javase/downloads/index.html),
 * [Apache Maven](http://maven.apache.org/) 3.2.2 or better, and
 * [Git](https://git-scm.com/).
+
+#### Building Kafka support
 
 To set up GeoMesa with Kafka, download the Geomesa source distribution that matches the binary distribution described above:
 
@@ -234,6 +238,10 @@ Then build the geomesa-kafka submodule (see the [Kafka Quickstart tutorial](/geo
 {% highlight bash %}
 $ mvn clean install -f geomesa/geomesa-kafka/pom.xml -DskipTests
 {% endhighlight %}
+
+#### Installing GeoMesa Kafka plugin in GeoServer 
+
+First, you will need to install the WPS plugin to your GeoServer instance if you have not done so already. The [WPS Plugin](http://docs.geoserver.org/stable/en/user/extensions/wps/install.html) must also match the version of the GeoServer instance.
 
 Copy the GeoMesa Kafka plugin JAR files from the GeoMesa directory you built into your GeoServer's library directory. 
 
