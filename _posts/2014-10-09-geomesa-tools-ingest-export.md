@@ -25,8 +25,9 @@ code.xml { color:#93a1a1 }
     <span class="glyphicon glyphicon-exclamation-sign"></span>
     The instructions in the tutorial apply to GeoMesa version 1.1.0-rc.6 and below. In later 
     releases, including the current development branch, the <code>geomesa ingest</code>
-    command makes use of the <code>-conf</code> option to specify a <a href="https://github
-    .com/locationtech/geomesa/tree/master/geomesa-convert">geomesa-convert</a> configuration file
+    command makes use of 
+    <a href="https://github.com/locationtech/geomesa/tree/master/geomesa-convert">geomesa-convert</a>
+    configuration files
     to pass arguments formerly specified by the <code>-cols</code>, <code>-dt</code>, <code>-dtf</code>,
     <code>-h</code>, <code>-id</code>, <code>-lat</code>, <code>-long</code>, and <code>-ld</code> 
     flags.
