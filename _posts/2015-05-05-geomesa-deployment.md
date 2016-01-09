@@ -185,6 +185,7 @@ only for reference, and only apply if you are using Accumulo 1.6.2 and Hadoop 2.
     * accumulo-core-1.6.2.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-core/1.6.2/accumulo-core-1.6.2.jar)  
     * accumulo-fate-1.6.2.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-fate/1.6.2/accumulo-fate-1.6.2.jar) 
     * accumulo-trace-1.6.2.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-trace/1.6.2/accumulo-trace-1.6.2.jar)
+    * accumulo-server-base-1.6.2.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/accumulo/accumulo-server-base/1.6.2/accumulo-server-base-1.6.2.jar)
 * Zookeeper
     * zookeeper-3.4.5.jar [[download]](https://search.maven.org/remotecontent?filepath=org/apache/zookeeper/zookeeper/3.4.5/zookeeper-3.4.5.jar)
 * Hadoop core
