@@ -62,7 +62,7 @@ Jboss Installation
 ^^^^^^^^^^^^^^^^^^
 
 In Jboss, the easiest way to get the hadoop files on the classpath is to
-copy the contents of HADDOP\_HOME/conf into the exploded GeoServer war
+copy the contents of HADOOP\_HOME/conf into the exploded GeoServer war
 file under WEB-INF/classes.
 
 Alternatively, you can add hadoop as a module, as described here:

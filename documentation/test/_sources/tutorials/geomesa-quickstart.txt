@@ -22,8 +22,7 @@ code.
 Prerequisites
 -------------
 
-You should work through the `GeoMesa Deployment
-tutorial </geomesa-deployment/>`__ first, completing the tasks relevant
+You should work through the  :doc:`../user/installation_and_configuration` section of the GeoMesa User Manual first, completing the tasks relevant
 to Accumulo. Afterwards, it may be necessary to change the versions of
 Accumulo and Hadoop that the quickstart tutorial uses. After completing
 the deployment tutorial, you should have:

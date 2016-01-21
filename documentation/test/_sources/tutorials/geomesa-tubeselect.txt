@@ -14,7 +14,7 @@ Introduction
 A time-interpolated query finds features that intersect in both **space
 and time**. Normal spatial or temporal queries select features that
 fall within a specified geometry, time range, or both. A
-time-interpolated query has a changing geometry as you move foward in
+time-interpolated query has a changing geometry as you move forward in
 time.
 
 Imagine you are traveling from Washington, DC to New York City and are
@@ -31,11 +31,11 @@ known as **tube selects**.
 Prerequisites
 -------------
 
-You should work through the `GeoMesa Deployment
-tutorial </geomesa-deployment/>`__ first, completing the tasks relevant
-to Accumulo. Afterwards, it may be necessary to change the versions of
-Accumulo and Hadoop that the tutorial uses. After completing the
-deployment tutorial, you should have:
+Make sure that you've worked through the steps described in the
+:doc:`../user/installation_and_configuration` section of the GeoMesa User
+Manual, particularly the tasks relevant to Accumulo. Afterwards, it may be
+necessary to change the versions of Accumulo and Hadoop that the tutorial
+uses. After completing the deployment tutorial, you should have:
 
 -  an instance of Accumulo |accumulo_version| running on Hadoop
    2.2,
@@ -54,16 +54,11 @@ tools should also be installed and configured:
 Using the GeoServer Plugin
 --------------------------
 
-To complete this tutorial you will have needed to follow the
-instructions in the `GeoMesa
-Deployment <http://www.geomesa.org/geomesa-deployment/>`__ tutorial
-first to deploy GeoMesa and the GeoServer Plugin.
-
 Once everything is installed you should see "geomesa:TubeSelect" appear
 in the `WPS Request
 Builder <http://docs.geoserver.org/stable/en/user/extensions/wps/requestbuilder.html>`__,
 which is found under the *Demos* link in the menu bar on the left side
-of the GeoServer web adminstration interface.
+of the GeoServer web administration interface.
 
 .. figure:: _static/img/tutorials/2014-05-16-geomesa-tubeselect/wps_builder1.png
    :alt: "geomesa:TubeSelect WPS plugin"

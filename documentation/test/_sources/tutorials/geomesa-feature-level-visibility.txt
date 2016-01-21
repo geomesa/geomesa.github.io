@@ -35,10 +35,7 @@ You will also need:
 -  `Apache Maven <http://maven.apache.org/>`__ 3.2.2 or better, and
 -  a `git <http://git-scm.com/>`__ client.
 
-If you haven't already read through both the `GeoMesa Deployment
-Tutorial </geomesa-deployment/>`__ and the `Quick Start
-tutorial </geomesa-quickstart/>`__, you should do so now, and make sure
-you have gone through the initial setup of GeoMesa.
+If you haven't already read both the :doc:`../user/installation_and_configuration` section of the GeoMesa User Manual and the  :doc:`geomesa-quickstart`, you should do so now, and make sure you have gone through the initial setup of GeoMesa.
 
 Additionally, you should be familiar with `Accumulo's Security Label
 Expression
@@ -180,8 +177,7 @@ Let's move to GeoServer to visualize feature level visibility.
 GeoServer Visualization
 -----------------------
 
-Assuming you have already set up GeoServer (see the `Deployment
-Tutorial </geomesa-deployment/>`__), we're going to add a new
+Assuming you have already set up GeoServer  as described in the :doc:`../user/installation_and_configuration` section of the GeoMesa User Manual, we're going to add a new
 ``DataStore`` to GeoServer. First, login to GeoServer, and then click
 "Add stores" from the homepage.
 

@@ -20,7 +20,7 @@ then have an Accumulo visibility filter applied to SimpleFeatures. The
 visibility property in the simple feature ``user data`` will be compared
 to the current user's authorizations to determine if the user has access
 to the simple feature or not. Any simple feature with no visibility will
-be inaccessable to all users. This behavior differs from Accumulo where
+be inaccessible to all users. This behavior differs from Accumulo where
 entries without a visibility marking are accessible to all users.
 
 The ``DataStoreSecurityService`` provides read security. The data store
@@ -31,8 +31,8 @@ Set the "Catalog Mode" to "Hide". Next, click the default "*.*.w" rule
 and add the roles "ADMIN" and optionally "GROUP\_ADMIN". Without this
 all users will have write access by default. Finally, create a new rule
 for the workspace and layer that you want to control access to. Set the
-access mode to "Read" and add all roles (i.e. visibility lables) that
-exist in the datset. Don't forget to click "Save" on the main "Data
+access mode to "Read" and add all roles (i.e. visibility labels) that
+exist in the dataset. Don't forget to click "Save" on the main "Data
 Security" page when you're done.
 
 To add additional users and roles select "User, Groups, Roles" under

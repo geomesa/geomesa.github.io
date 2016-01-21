@@ -46,3 +46,4 @@ Indexing and Queries
     :maxdepth: 1
 
     geohash-substrings
+

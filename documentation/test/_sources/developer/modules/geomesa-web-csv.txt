@@ -90,7 +90,7 @@ How to use CSV upload from cURL:
         </wps:ResponseForm>
     </wps:Execute>
 
-7. Ingest to Geoserver
+7. Ingest to GeoServer
 
 ::
 

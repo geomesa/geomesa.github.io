@@ -147,7 +147,7 @@ In Scala-esque pseudo code, the algorithm is:
     getGeoHashPrefixes(GeoHash())
 
 Here is an animated GIF that shows how, given a query polygon that
-roughly approximates the continential USA, this algorithm steps through
+roughly approximates the continental USA, this algorithm steps through
 identifying Geohash prefixes whose precision is less than or equal to 10
 bits:
 
@@ -187,3 +187,4 @@ background:
 
 .. |"Animation of Covering Geohashes"| image:: _static/img/tutorials/2014-08-05-geohash-substrings/sel-XXYYTT-11.png
    :target: _static/img/tutorials/2014-08-05-geohash-substrings/progression.ogv
+

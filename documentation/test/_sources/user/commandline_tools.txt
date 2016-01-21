@@ -281,13 +281,13 @@ Export queries and statistics about the `n` most recent raster queries to a CSV 
     $ geomesa queryrasterstats -u username -p password -t somerastertable -n 10
 
 
-Performing system adminstration tasks
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Performing system administration tasks
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 deletecatalog
 ~~~~~~~~~~~~~
 
-Delete a GeoMesa catalog table completely, along with all featues in it.::
+Delete a GeoMesa catalog table completely, along with all features in it.::
 
     $ geomesa deletecatalog -u username -p password -i instance -z zoo1,zoo2,zoo3 -c test_catalog
  

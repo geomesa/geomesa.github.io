@@ -103,7 +103,7 @@ The instructions below assume that the ``geomesa-tools-$VERSION`` directory is k
 ``geomesa-$VERSION/dist/tools`` directory, but the tools distribution may be moved elsewhere
 as desired.
 
-In the ``geomesa-tools-$VERSION`` directory, run ``bin/geomesa confgire`` to set up the tools.
+In the ``geomesa-tools-$VERSION`` directory, run ``bin/geomesa configure`` to set up the tools.
 
 .. code-block:: bash
 
