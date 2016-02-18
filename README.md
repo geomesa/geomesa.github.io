@@ -6,25 +6,22 @@ This site is built with [ jekyll ](http://jekyllrb.com), a static site generator
 
 ### Installing jekyll 
 
-#### jekyll v2
-1. Make sure Ruby and rubygems are installed (preferrably ruby1.9.3)
-2. Install jekyll: `sudo gem install jekyll`(requires ruby > 1.9.2 on ubuntu)
-3. Install [ kramdown ](http://kramdown.gettalong.org/): `sudo gem install kramdown`
-4. Install [ Pygments ](http://pygments.org/): `sudo apt-get install pygments`(or python-pygments)
-5. Install nodejs which needed by newer versions of jekyll for a javascript/coffeescript runtime
+Jekyll v3 is now used on github.io.
 
 #### jekyll v3
 1. Make sure Ruby 2.0 and its development package are installed: `sudo apt-get install ruby2.0 ruby2.0-dev`
 2. Install jekyll: `sudo gem2.0 install jekyll` (requires ruby > 2.0 on Ubuntu)
 3. Install jekyll-redirect-from: `sudo gem2.0 install jekyll-redirect-from`
 3. Install [ kramdown ](http://kramdown.gettalong.org/): `sudo gem2.0 install kramdown`
-4. Install [ Pygments ](http://pygments.org/) and its Ruby gem: `sudo apt-get install python-pygments && sudo gem2.0 install pygments.rb`
+4. Install [ rouge ](http://rouge.jneen.net/): `sudo gem2.0 install rouge`
 5. Install nodejs: `sudo apt-get install nodejs` for the javascript/coffeescript runtime
 
 ### Generate and serve the site
 The command `jekyll serve --watch` will generate the site in the `_site` directory, watch source files for changes, and serve it locally on port 4000.
 
 ### Adding a tutorial
+
+**OBSOLETE: Many tutorials are now in the Sphinx-based documentation tree in the GeoMesa; consider putting your tutorial there instead.** 
 
 1. Add a markdown file with the following naming convention to the `_posts` directory: YYYY-MM-DD-[title-of-the-tutorial].md.
 2. In `_config.yml` make sure the author of the tutorial exists in the `authors` list.
@@ -58,10 +55,3 @@ You can add line numbers to the code snippet by including `linenos` after the la
 ### Notes
 
 - Changes made to `_config.yml` will not be caught in `watch` mode--need to restart jekyll.
-
-
-
-
-
-
-
