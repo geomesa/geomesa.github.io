@@ -425,6 +425,7 @@ Accumulo Visibilities
 GeoMesa support Accumulo visibilities for securing data. Visibilities can be set at data store level,
 feature level or individual attribute level.
 
+See :ref:`accumulo_authorizations` for details on querying data with visibilities.
 
 Data Store Level Visibilities
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -487,6 +488,80 @@ or
 
     feature.getUserData().put("geomesa.feature.visibility", "admin,user,admin,user");
 
+.. _accumulo_authorizations:
+
+Accumulo Authorizations
+-----------------------
+
+When performing a query, GeoMesa delegates the retrieval of authorizations to ``service providers`` that
+implement the following interface:
+
+.. code-block:: java
+
+    package org.locationtech.geomesa.security;
+
+    public interface AuthorizationsProvider {
+
+        public static final String AUTH_PROVIDER_SYS_PROPERTY = "geomesa.auth.provider.impl";
+
+        /**
+         * Gets the authorizations for the current context. This may change over time
+         * (e.g. in a multi-user environment), so the result should not be cached.
+         *
+         * @return
+         */
+        public Authorizations getAuthorizations();
+
+        /**
+         * Configures this instance with parameters passed into the DataStoreFinder
+         *
+         * @param params
+         */
+        public void configure(Map<String, Serializable> params);
+    }
+
+When a GeoMesa data store is instantiated, it will scan for available service providers.
+Third-party implementations can be enabled by placing them on the classpath and including
+a special service descriptor file. See the
+`Oracle Javadoc <http://docs.oracle.com/javase/7/docs/api/javax/imageio/spi/ServiceRegistry.html>`__
+for details on implementing a service provider.
+
+The GeoMesa data store will call ``configure()`` on the ``AuthorizationsProvider``
+implementation, passing in the parameter map from the call to ``DataStoreFinder.getDataStore(Map params)``.
+This allows the ``AuthorizationsProvider`` to configure itself based on the environment.
+
+To ensure that the correct ``AuthorizationsProvider`` is used, GeoMesa will throw an exception if multiple
+third-party service providers are found on the classpath. In this scenario, the particular service
+provider class to use can be specified by the following system property:
+
+.. code-block:: java
+
+    // equivalent to "geomesa.auth.provider.impl"
+    org.locationtech.geomesa.security.AuthorizationsProvider.AUTH_PROVIDER_SYS_PROPERTY
+
+For simple scenarios, the set of authorizations to apply to all queries can be specified when creating
+the GeoMesa data store by using the ``auths`` configuration parameter. This will use a
+default ``AuthorizationsProvider`` implementation provided by GeoMesa.
+
+.. code-block:: java
+
+    // create a map containing initialization data for the GeoMesa data store
+    Map<String, String> configuration = ...
+    configuration.put("auths", "user,admin");
+    DataStore dataStore = DataStoreFinder.getDataStore(configuration);
+
+If there are no ``AuthorizationsProvider`` implementations found on the classpath, and the ``auths`` parameter is
+not set, GeoMesa will default to using the authorizations associated with the underlying Accumulo
+connection (i.e. the ``user`` configuration value).
+
+.. warning::
+
+    This is not a recommended approach for a production system.
+
+In addition, please note that the authorizations used in any scenario cannot exceed
+the authorizations of the underlying Accumulo connection.
+
+For examples on implementing an ``AuthorizationsProvider`` see the :ref:`accumulo_tutorials_security` tutorials.
 
 Splitting the Record Index
 --------------------------
@@ -498,19 +573,19 @@ up ingestion and queries.
 
 GeoMesa supplies three different table splitter options:
 
-- ``org.locationtech.geomesa.accumulo.data.HexSplitter`` (used by default)
+- ``org.locationtech.geomesa.index.conf.HexSplitter`` (used by default)
 
   Assumes an even distribution of IDs starting with 0-9, a-f, A-F
 
-- ``org.locationtech.geomesa.accumulo.data.AlphaNumericSplitter``
+- ``org.locationtech.geomesa.index.conf.AlphaNumericSplitter``
 
   Assumes an even distribution of IDs starting with 0-9, a-z, A-Z
 
-- ``org.locationtech.geomesa.accumulo.data.DigitSplitter``
+- ``org.locationtech.geomesa.index.conf.DigitSplitter``
 
   Assumes an even distribution of IDs starting with numeric values, which are specified as options
 
-Custom splitters may also be used - any class that extends ``org.locationtech.geomesa.accumulo.data.TableSplitter``.
+Custom splitters may also be used - any class that extends ``org.locationtech.geomesa.index.conf.TableSplitter``.
 
 Specifying a Table Splitter
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -526,7 +601,7 @@ the hint to the end of the string, like so:
 
     // append the hints to the end of the string, separated by a semi-colon
     String spec = "name:String,dtg:Date,*geom:Point:srid=4326;" +
-        "table.splitter.class=org.locationtech.geomesa.accumulo.data.AlphaNumericSplitter";
+        "table.splitter.class=org.locationtech.geomesa.index.conf.AlphaNumericSplitter";
     SimpleFeatureType sft = SimpleFeatureTypes.createType("mySft", spec);
 
 If you have an existing simple feature type, or you are not using ``SimpleFeatureTypes.createType``,
@@ -537,7 +612,7 @@ you may set the hint directly in the feature type:
     // set the hint directly
     SimpleFeatureType sft = ...
     sft.getUserData().put("table.splitter.class",
-        "org.locationtech.geomesa.accumulo.data.DigitSplitter");
+        "org.locationtech.geomesa.index.conf.DigitSplitter");
     sft.getUserData().put("table.splitter.options", "fmt:%02d,min:0,max:99");
 
 If you are using TypeSafe configuration files to define your simple feature type, you may include
@@ -554,7 +629,7 @@ a 'user-data' key:
             { name = geom, type = Point, srid = 4326 }
           ]
           user-data = {
-            table.splitter.class = "org.locationtech.geomesa.accumulo.data.DigitSplitter"
+            table.splitter.class = "org.locationtech.geomesa.index.conf.DigitSplitter"
             table.splitter.options = "fmt:%01d,min:0,max:9"
           }
         }
