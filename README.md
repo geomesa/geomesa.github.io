@@ -9,11 +9,11 @@ This site is built with [ jekyll ](http://jekyllrb.com), a static site generator
 Jekyll v3 is now used on github.io.
 
 #### jekyll v3
-1. Make sure Ruby 2.0 and its development package are installed: `sudo apt-get install ruby2.0 ruby2.0-dev`
-2. Install jekyll: `sudo gem2.0 install jekyll` (requires ruby > 2.0 on Ubuntu)
-3. Install jekyll-redirect-from: `sudo gem2.0 install jekyll-redirect-from`
-3. Install [ kramdown ](http://kramdown.gettalong.org/): `sudo gem2.0 install kramdown`
-4. Install [ rouge ](http://rouge.jneen.net/): `sudo gem2.0 install rouge`
+1. Make sure Ruby and its development package are installed: `sudo apt-get install ruby ruby-dev`
+2. Install jekyll: `sudo gem install jekyll` (requires ruby >  on Ubuntu)
+3. Install jekyll-redirect-from: `sudo gem install jekyll-redirect-from`
+3. Install [ kramdown ](http://kramdown.gettalong.org/): `sudo gem install kramdown`
+4. Install [ rouge ](http://rouge.jneen.net/): `sudo gem install rouge`
 5. Install nodejs: `sudo apt-get install nodejs` for the javascript/coffeescript runtime
 
 ### Generate and serve the site
