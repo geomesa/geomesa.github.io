@@ -1,3 +1,5 @@
+.. _converter_validation:
+
 Parsing and Validation
 ----------------------
 
@@ -12,42 +14,94 @@ At their core, converters transform input streams into SimpleFeatures. Validator
 of those SimpleFeatures before they are written to GeoMesa. For example, you may want to validate that there is a
 geometry field and that the geometry is valid.
 
-There are currently three validators available for usage with GeoMesa converters:
+There are three validators provided for use with GeoMesa converters:
 
-* ``has-geo`` - Ensure that the SimpleFeature has a geometry and it is non-null
-* ``has-dtg`` - Ensure that the SimpleFeature has a date and it is non-null
-* ``z-index`` - Ensure the Geometry and Date are within the space/time bounds of GeoMesa Z-Index implementations
-(i.e. Z2, Z3, XZ2, XZ3)
+* ``has-geo`` - Ensure that the SimpleFeature has a non-null geometry
+* ``has-dtg`` - Ensure that the SimpleFeature has a non-null date
+* ``index`` - Ensure that the SimpleFeature has a geometry and date that are within the space/time bounds of
+  the relevant GeoMesa Z-Index implementations (i.e. Z2, Z3, XZ2, XZ3)
 
-By default the ``has-geo`` and ``has-dtg`` validators are enabled. To enable other validators add this to the options
-block of your typesafe converter config:
+Additional validators may be loaded through Java SPI by by implementing
+``org.locationtech.geomesa.convert.SimpleFeatureValidator$ValidatorFactory`` and including a special service
+descriptor file. See below for additional information.
 
-::
+By default the ``index`` validator is enabled. This is suitable for most use cases, as it will choose the appropriate
+validator based on the SimpleFeatureType. To enable other validators, specify them in the options block of your
+typesafe converter config::
 
     geomesa.converters.myconverter {
-        options {
-            validators = ["has-dtg", "has-geo", "z-index"]
-        }
+      options {
+        validators = [ "has-dtg", "has-geo" ]
+      }
     }
 
-Validation Mode
-~~~~~~~~~~~~~~~
+Validation can be disabled by setting it to an empty array.
 
-There are two types of validation modes:
+Custom Validators
+^^^^^^^^^^^^^^^^^
+
+Custom validators may be loaded through Java SPI by by implementing
+``org.locationtech.geomesa.convert.SimpleFeatureValidator$ValidatorFactory``, shown below. Note that validators
+must be registered through a special service descriptor file.
+
+.. code-block:: scala
+
+  trait ValidatorFactory {
+    def name: String
+    def validator(sft: SimpleFeatureType, config: Option[String]): Validator
+  }
+
+When specifying validators in a converter config, the ``name`` of the factory must match the ``validators`` string.
+Any additional arguments may be specified in parentheses, which will be passed to the ``validator`` method.
+For example::
+
+    geomesa.converters.myconverter {
+      options {
+        validators = [ "my-custom-validator(optionA,optionB)" ]
+      }
+    }
+
+.. code-block:: scala
+
+  class MyCustomValidator extends ValidatorFactory {
+
+    override val name: String = "my-custom-validator"
+
+    override def validator(sft: SimpleFeatureType, config: Option[String]): Validator = {
+      if (config.exists(_.contains("optionA"))) {
+        // handle option a
+      } else {
+        // handle other options
+      }
+    }
+  }
+
+See the GeoMesa
+`unit tests <https://github.com/locationtech/geomesa/blob/master/geomesa-convert/geomesa-convert-common/src/test/scala/org/locationtech/geomesa/convert/SimpleFeatureValidatorTest.scala>`__
+for a sample implementation.
+
+For more details on implementing a service provider, see the
+`Oracle Javadoc <http://docs.oracle.com/javase/7/docs/api/java/util/ServiceLoader.html>`__.
+
+Error Mode
+~~~~~~~~~~
+
+There are two types of modes for handling errors:
 
 * ``skip-bad-records``
 * ``raise-errors``
 
-``raise-errors`` mode will throw an IOException if bad data is detected based on parsing or validation.
-``skip-bad-records`` mode will still provide debug level logging but will not throw an exception. To configure the
-validation mode add the following option to your converter's typesafe config:
+``raise-errors`` mode will throw an IOException if bad data is detected based on parsing or validation. This can
+be especially useful when first developing and testing a converter definition. ``skip-bad-records`` mode will
+still provide debug level logging but will not throw an exception. To configure the
+error mode add the following option to your converter's typesafe config:
 
 ::
 
     geomesa.converters.myconverter {
-        options {
-            validation-mode = "raise-errors"
-        }
+      options {
+        error-mode = "raise-errors"
+      }
     }
 
 
@@ -73,47 +127,65 @@ To configure the parse mode use add an option to your converter's typesafe confi
 ::
 
     geomesa.converters.myconverter {
-        options {
-            parse-mode = "incremental"
-        }
+      options {
+        parse-mode = "incremental"
+      }
     }
 
 Logging
 ~~~~~~~
 
-To view validation logs you may want to enable debug level logging on the package ``org.locationtech.geomesa.convert``.
+To view validation logs you can enable debug level logging on the packages ``org.locationtech.geomesa.convert``
+and ``org.locationtech.geomesa.convert2``.
+
+By default, logging will just show the field that failed. To show the entire record, along with the stack trace,
+you can set ``options.verbose = true``.
 
 Transactional Considerations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Most of the datastores that GeoMesa works with (Accumulo, HBase, etc) do not provide transactions. Therefore, streaming
 data in and out of a converter and into an ingest pipeline is not transactional. To mimic transactions you can use
-a batch parse mode with ``raise-errors`` validation mode and likely with the ``z-index`` validator. Note that this may
+a batch parse mode with ``raise-errors`` error mode and with the ``index`` validator. Note that this may
 increase your memory requirements and hurt performance:
 
 ::
 
     geomesa.converters.myconverter {
-        options {
-            validators = ["z-index"]
-            parse-mode = "batch"
-            validation-mode = "raise-errors"
-        }
+      options {
+        validators = [ "index" ]
+        parse-mode = "batch"
+        error-mode = "raise-errors"
+      }
     }
 
-If you need notification of bad input data you may consider using a validation mode of ``raise-errors`` with an
+If you need notification of bad input data you may consider using an error mode of ``raise-errors`` with an
 incremental parse mode:
 
 ::
 
     geomesa.converters.myconverter {
-        options {
-            validators = ["z-index"]
-            parse-mode = "incremental"
-            validation-mode = "raise-errors"
-        }
+      options {
+        validators = [ "index" ]
+        parse-mode = "incremental"
+        error-mode = "raise-errors"
+      }
     }
 
 If you are using a framework such as the GeoMesa Nifi processor, then the file will still be routed to an error
 relationship but you may experience partially ingested data. See :doc:`/user/nifi` for more info.
 
+Managing Parsing and Validation Configuration with System Properties
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For inferred converters, one can manage the parsing, line, and validation modes via system property or
+``geomesa-site.xml``.  For each of the modes in the table below, the corresponding property name is given.
+
+============== ========================================
+Mode           System Property
+============== ========================================
+Error Mode     ``geomesa.converter.error.mode.default``
+Parse Mode     ``geomesa.converter.parse.mode.default``
+Line Mode      ``geomesa.converter.line.mode.default``
+Validator Mode ``geomesa.converter.validators``
+============== ========================================

@@ -14,5 +14,7 @@ source distribution.
     install
     usage
     geoserver
+    commandline
     heatmaps
+    index_config
     runtime_config

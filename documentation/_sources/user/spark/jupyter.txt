@@ -1,18 +1,23 @@
 Deploying GeoMesa Spark with Jupyter Notebook
 =============================================
 
-`Jupyter Notebook`_ is a web-based application for creating interactive documents containing runnable code, visualizations, and text. Via the `Apache Toree`_ kernel, Jupyter can be used for preparing spatio-temporal analyses in Scala and submitting them in `Spark`_. The guide below describes how to configure Jupyter with Spark 2.0, Scala 2.11, and GeoMesa.
+`Jupyter Notebook`_ is a web-based application for creating interactive documents containing runnable code,
+visualizations, and text. Via the `Apache Toree`_ kernel, Jupyter can be used for preparing spatio-temporal
+analyses in Scala and submitting them in `Spark`_. The guide below describes how to configure Jupyter with
+Spark |spark_version|, Scala 2.11, and GeoMesa.
 
 .. note::
 
-    GeoMesa support for PySpark provides access to GeoMesa Accumulo data stores through the Spark Python API using Jupyter's built in Python kernel. See :doc:`/user/spark/pyspark`.
+    GeoMesa support for PySpark provides access to GeoMesa Accumulo data stores through the Spark Python API
+    using Jupyter's built in Python kernel. See :doc:`/user/spark/pyspark`.
 
 .. _jupyter_prerequisites:
 
 Prerequisites
 -------------
 
-`Spark`_ 2.0 should be installed, and the environment variable ``SPARK_HOME`` should be set. Spark 2.0 and above requires Scala version 2.11.
+`Spark`_ |spark_version| should be installed, and the environment variable ``SPARK_HOME`` should be set.
+Spark 2.0 and above requires Scala version 2.11.
 
 `Python`_ 2.7 or 3.x should be installed, along with the Python development tools. For example, for Python 2.7 on Ubuntu:
 
@@ -27,7 +32,7 @@ For Python 2.7 on CentOS:
    $ sudo yum groupinstall 'Development Tools'
    $ sudo yum install python-devel
 
-Building the Toree kernel for Spark 2.0 requires Git, GNU Make, `Docker`_, and `SBT`_.
+Building the Toree kernel for Spark |spark_version| requires Git, GNU Make, `Docker`_, and `SBT`_.
 
 Installing Jupyter
 ------------------
@@ -47,7 +52,8 @@ or
 Installing the Toree Kernel
 ---------------------------
 
-Toree version 0.2.0-dev1 supports Spark 2.0 and above, and should be built from source as described via its `README file`_. Check out the project from GitHub:
+Toree version 0.2.0-dev1 supports Spark 2.0 and above, and should be built from source as described via
+its `README file`_. Check out the project from GitHub:
 
 .. _README file: https://github.com/apache/incubator-toree/blob/master/README.md
 
@@ -77,7 +83,9 @@ The built Toree distribution can then be installed via ``pip`` (or ``pip3``):
 Configure Toree and GeoMesa
 ---------------------------
 
-If you have the GeoMesa Accumulo distribution installed at ``GEOMESA_ACCUMULO_HOME`` as described in :ref:`setting_up_accumulo_commandline`, you can run the following example script to configure Toree with GeoMesa version ``VERSION``:
+If you have the GeoMesa Accumulo distribution installed at ``GEOMESA_ACCUMULO_HOME`` as described in
+:ref:`setting_up_accumulo_commandline`, you can run the following example script to configure Toree with
+GeoMesa version ``VERSION``:
 
 .. code-block:: bash
 
@@ -105,22 +113,140 @@ If you have the GeoMesa Accumulo distribution installed at ``GEOMESA_ACCUMULO_HO
 
 .. note::
 
-    The JARs specified will be in the respective ``target`` directory of each module of the source distribution if you built GeoMesa from source.
+    The JARs specified will be in the respective ``target`` directory of each module of the source distribution
+    if you built GeoMesa from source.
 
-You may also consider adding ``geomesa-tools-2.11-$VERSION-data.jar`` to include prepackaged converters for publically available data sources (as described in :ref:`prepackaged_converters`), ``geomesa-jupyter-leaflet-2.11-$VERSION.jar`` to include an interface for the `Leaflet`_ spatial visualization library, and/or ``geomesa-jupyter-vegas-2.11-$VERSION.jar`` to use the `Vegas`_ data plotting library (see :ref:`jupyter_vegas` below).
+You may also consider adding ``geomesa-tools-2.11-$VERSION-data.jar`` to include prepackaged converters for
+publicly available data sources (as described in :ref:`prepackaged_converters`),
+``geomesa-jupyter-leaflet-2.11-$VERSION.jar`` to include an interface for the `Leaflet`_ spatial visualization
+library (see :ref:`jupyter_leaflet`, next), and/or ``geomesa-jupyter-vegas-2.11-$VERSION.jar`` to use the `Vegas`_ data
+plotting library (see :ref:`jupyter_vegas`, below).
+
+.. _jupyter_leaflet:
+
+Leaflet for Visualization
+-------------------------
+
+The following sample notebook shows how you can use Leaflet for data visualization:
+
+
+.. code-block:: scala
+
+   classpath.addRepository("http://download.osgeo.org/webdav/geotools")
+   classpath.addRepository("http://central.maven.org/maven2")
+   classpath.addRepository("https://repo.locationtech.org/content/repositories/geomesa-releases")
+   classpath.addRepository("file:///home/username/.m2/repository")
+   classpath.add("com.vividsolutions" % "jts" % "1.13")
+   classpath.add("org.locationtech.geomesa" % "geomesa-accumulo-datastore" % "1.3.0")
+   classpath.add("org.apache.accumulo" % "accumulo-core" % "1.6.4")
+   classpath.add("org.locationtech.geomesa" % "geomesa-jupyter" % "1.3.0")
+
+   import org.locationtech.geomesa.jupyter.Jupyter._
+
+   implicit val displayer: String => Unit = display.html(_)
+
+   import scala.collection.JavaConversions._
+   import org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams._
+   import org.locationtech.geomesa.utils.geotools.Conversions._
+
+   val params = Map(
+           ZookeepersParam.key -> "ZOOKEEPERS",
+           InstanceIdParam.key -> "INSTANCE",
+           UserParam.key       -> "USER_NAME",
+           PasswordParam.key   -> "USER_PASS",
+           CatalogParam.key    -> "CATALOG")
+
+   val ds = org.geotools.data.DataStoreFinder.getDataStore(params)
+   val ff = org.geotools.factory.CommonFactoryFinder.getFilterFactory2
+   val fs = ds.getFeatureSource("twitter")
+
+   val filt = ff.and(
+       ff.between(ff.property("dtg"), ff.literal("2016-01-01"), ff.literal("2016-05-01")),
+       ff.bbox("geom", -80, 37, -75, 40, "EPSG:4326"))
+   val features = fs.getFeatures(filt).features.take(10).toList
+
+   displayer(L.render(Seq(WMSLayer(name="ne_10m_roads",namespace="NAMESPACE"),
+                          Circle(-78.0,38.0,1000,  StyleOptions(color="yellow",fillColor="#63A",fillOpacity=0.5)),
+                          Circle(-78.0,45.0,100000,StyleOptions(color="#0A5" ,fillColor="#63A",fillOpacity=0.5)),
+                          SimpleFeatureLayer(features)
+                         )))
+
+.. image:: /user/_static/img/jupyter-leaflet.png
+   :align: center
+
+Adding Layers to a Map and Displaying in the Notebook
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The following snippet is an example of rendering dataframes in Leaflet in a Jupyter notebook:
+
+.. code-block:: scala
+
+    implicit val displayer: String => Unit = { s => kernel.display.content("text/html", s) }
+
+    val function = """
+    function(feature) {
+      switch (feature.properties.plane_type) {
+        case "A388": return {color: "#1c2957"}
+        default: return {color: "#cdb87d"}
+      }
+    }
+    """
+
+    val sftLayer = time { L.DataFrameLayerNonPoint(flights_over_state, "__fid__", L.StyleOptionFunction(function)) }
+    val apLayer = time { L.DataFrameLayerPoint(flyovers, "origin", L.StyleOptions(color="#1c2957", fillColor="#cdb87d"), 2.5) }
+    val stLayer = time { L.DataFrameLayerNonPoint(queryOnStates, "ST", L.StyleOptions(color="#1c2957", fillColor="#cdb87d", fillOpacity= 0.45)) }
+    displayer(L.render(Seq[L.GeoRenderable](sftLayer,stLayer,apLayer),zoom = 1, path = "path/to/files"))
+
+
+.. image:: /user/_static/img/jupyter-leaflet-layer.png
+   :align: center
+
+StyleOptionFunction
+^^^^^^^^^^^^^^^^^^^
+
+This case class allows you to specify a Javascript function to perform styling. The anonymous function
+that you will pass takes a feature as an argument and returns a Javascript style object. An example of styling
+based on a specific property value is provided below:
+
+.. code-block:: javascript
+
+    function(feature) {
+      switch(feature.properties.someProp) {
+        case "someValue": return { color: "#ff0000" }
+        default         : return { color: "#0000ff" }
+      }
+    }
+
+The following table provides options that might be of interest:
+
+=========== ====== ======================
+Option      Type   Description
+=========== ====== ======================
+color       String Stroke color
+weight      Number Stroke width in pixels
+opacity     Number Stroke opacity
+fillColor   String Fill color
+fillOpacity Number Fill opacity
+=========== ====== ======================
+
+Note: Options are comma-separated (i.e. ``{ color: "#ff0000", fillColor: "#0000ff" }``)
 
 .. _jupyter_vegas:
 
-Vegas for Data Plotting
------------------------
+Vegas for Plotting
+------------------
 
-The `Vegas`_ library may be used with GeoMesa, Spark, and Toree in Jupyter to plot quantitative data. The ``geomesa-jupyter-vegas`` module builds a shaded JAR containing all of the dependencies needed to run Vegas in Jupyter+Toree. This module must be built from source, using the ``vegas`` profile:
+The `Vegas`_ library may be used with GeoMesa, Spark, and Toree in Jupyter to plot quantitative data. The
+``geomesa-jupyter-vegas`` module builds a shaded JAR containing all of the dependencies needed to run Vegas in
+Jupyter+Toree. This module must be built from source, using the ``vegas`` profile:
 
 .. code-block:: bash
 
     $ mvn clean install -Pvegas -pl geomesa-jupyter/geomesa-jupyter-vegas
 
-This will build ``geomesa-jupyter-vegas_2.11-$VERSION.jar`` in the ``target`` directory of the module, and should be added to the list of JARs in the ``jupyter toree install`` command described in :ref:`jupyter_configure_toree`:
+This will build ``geomesa-jupyter-vegas_2.11-$VERSION.jar`` in the ``target`` directory of the module, and
+should be added to the list of JARs in the ``jupyter toree install`` command described in
+:ref:`jupyter_configure_toree`:
 
 .. code-block:: bash
 
@@ -151,7 +277,8 @@ Then use the ``withDataFrame`` method to plot data in a ``DataFrame``:
 Running Jupyter
 ---------------
 
-For public notebooks, you should `configure Jupyter`_ to use a password and bind to a public IP address. To run Jupyter with the GeoMesa Spark kernel:
+For public notebooks, you should `configure Jupyter`_ to use a password and bind to a public IP address. To
+run Jupyter with the GeoMesa Spark kernel:
 
 .. _configure Jupyter: http://jupyter-notebook.readthedocs.io/en/latest/public_server.html#running-a-notebook-server
 
@@ -164,7 +291,8 @@ For public notebooks, you should `configure Jupyter`_ to use a password and bind
     Long-lived processes should probably be hosted in ``screen``, ``systemd``,
     or ``supervisord``.
 
-Your notebook server should launch and be accessible at http://localhost:8888/ (or the address and port you bound the server to).
+Your notebook server should launch and be accessible at http://localhost:8888/ (or the address and port you
+bound the server to).
 
 .. _Apache Toree: https://toree.apache.org/
 .. _Docker: https://www.docker.com/

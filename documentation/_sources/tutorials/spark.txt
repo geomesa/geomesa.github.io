@@ -39,7 +39,7 @@ Prerequisites
 
 You will also need:
 
--  a `Spark <http://spark.apache.org/>`__ 2.0.0 or later distribution
+-  a `Spark <http://spark.apache.org/>`__ |spark_version| distribution
 -  an Accumulo user that has appropriate permissions to query your data
 -  `Java JDK 8 <http://www.oracle.com/technetwork/java/javase/downloads/index.html>`__,
 -  `Apache Maven <http://maven.apache.org/>`__ |maven_version|, and
@@ -144,7 +144,7 @@ Next, initialize an ``RDD[SimpleFeature]`` using this provider:
 .. code-block:: scala
 
     // Get an RDD[SimpleFeature] from the spatial RDD provider
-    val rdd = spatialRDDProvider.rdd(new Configuration, sc, params, q)
+    val queryRDD = spatialRDDProvider.rdd(new Configuration, sc, params, q)
 
 Finally, we construct our computation which consists of extracting the
 ``SQLDATE`` from each ``SimpleFeature`` and truncating it to the day

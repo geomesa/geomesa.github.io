@@ -1,3 +1,5 @@
+.. _fsds_sparksql_example:
+
 GeoMesa FileSystem Data Store with Spark SQL
 ============================================
 
@@ -20,7 +22,7 @@ GDELT SimpleFeatureType and converter to ingest a year or so of data:
 
 .. code-block:: bash
 
-    tar xvf geomesa-fs-dist_2.11-$VERSION.tar.gz
+    tar xvf geomesa-fs_2.11-$VERSION.tar.gz
     . /etc/hadoop/conf/hadoop-env.sh
     . /etc/hadoop/conf/yarn-env.sh
     export HADOOP_CONF_DIR=/etc/hadoop/conf
@@ -70,7 +72,6 @@ have ingested GDELT data into S3 you can query it with SQL in the spark shell::
 
     val dataFrame = spark.read
       .format("geomesa")
-      .option("fs.encoding","parquet")
       .option("fs.path","s3a://mybucket/geomesa/datastore")
       .option("geomesa.feature", "gdelt")
       .load()
