@@ -17,6 +17,7 @@ Type Conversions
 -  ``stringToFloat``
 -  ``stringToDouble``
 -  ``stringToBoolean``
+-  ``intToBoolean``
 
 String Functions
 ~~~~~~~~~~~~~~~~
@@ -53,6 +54,7 @@ Date Functions
 -  ``dateHourMinuteSecondMillis``
 -  ``millisToDate``
 -  ``secsToDate``
+-  ``dateToString``
 
 Geometry Functions
 ~~~~~~~~~~~~~~~~~~
@@ -103,6 +105,7 @@ Control Functions
 
 -  ``try``
 -  ``withDefault``
+-  ``require``
 
 State Functions
 ~~~~~~~~~~~~~~~

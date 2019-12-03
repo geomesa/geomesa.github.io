@@ -125,6 +125,23 @@ also achievable with the following code:
     import spark.implicits. _
     chicagoDF.where(st_contains(st_makeBBOX(0.0, 0.0, 90.0, 90.0), $"geom"))
 
+GeoTools User-defined Functions
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Note that there are two GeoTools derived UDFs and those are:
+
+ * ``st_distanceSpheroid``
+ * ``st_lengthSpheroid``
+
+These are available in the geomesa-spark-sql jar, but also bundled by default in the spark-runtime.
+Example usage is as follows:
+
+.. code::
+
+    import org.locationtech.geomesa.spark.geotools._
+    chicagoDF.where(st_distanceSpheroid(st_point(0.0,0.0), col("geom")) > 10)
+
+
 A complete list of the implemented UDFs is given in the next section (:doc:`./sparksql_functions`).
 
 .. _classes representing geometry objects: http://docs.geotools.org/stable/userguide/library/jts/geometry.html
@@ -133,38 +150,12 @@ A complete list of the implemented UDFs is given in the next section (:doc:`./sp
 
 .. _OpenGIS Simple feature access SQL option: http://www.opengeospatial.org/standards/sfs
 
-GeoJSON Output
-^^^^^^^^^^^^^^
+.. code::
 
-The Spark JTS module also provides a means of exporting a ``DataFrame`` to a `GeoJSON <http://geojson.org/>`__ string.
-This allows for quick visualization of the data in many front-end mapping libraries that support GeoJSON input such as
-Leaflet or Open Layers.
+    import org.locationtech.geomesa.spark.jts._
+    import spark.implicits. _
+    chicagoDF.where(st_contains(st_makeBBOX(0.0, 0.0, 90.0, 90.0), $"geom"))
 
-To convert a DataFrame, import the implicit conversion and invoke the ``toGeoJSON`` method.
-
-.. code-block:: scala
-
-    import org.locationtech.geomesa.spark.jts.util.GeoJSONExtensions._
-    val df : DataFrame = // Some data frame
-    val geojsonDf = df.toGeoJSON
-
-Given only the schema, the converter can infer which of the fields holds the geometry, but in the event of multiple
-geometric fields, it defaults to the first such field. This behavior can be overridden by providing the index (starting
-from 0) of the desired geometry in the schema. For example, ``df.toGeoJSON(2)`` if the desired geometry is the third field
-of the schema.
-
-If the result can fit in memory, it can then be collected on the driver and written to a file. If not, each executor can
-write to a distributed file system like HDFS.
-
-.. code:: scala
-
-    val geoJsonString = geojsonDF.collect.mkString("[",",","]")
-
-.. note::
-
-    For this to work, the Data Frame should have a geometry field, meaning its schema should have a ``StructField`` that
-    is one of the JTS geometry types provided in this module. It is acceptable, however, if some of the rows have null
-    geometries. In such a case, ``null`` will be written as the value of the geometry in GeoJSON.
 
 Building
 ^^^^^^^^

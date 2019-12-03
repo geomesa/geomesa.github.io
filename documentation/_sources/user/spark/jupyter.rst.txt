@@ -4,7 +4,7 @@ Deploying GeoMesa Spark with Jupyter Notebook
 `Jupyter Notebook`_ is a web-based application for creating interactive documents containing runnable code,
 visualizations, and text. Via the `Apache Toree`_ kernel, Jupyter can be used for preparing spatio-temporal
 analyses in Scala and submitting them in `Spark`_. The guide below describes how to configure Jupyter with
-Spark |spark_version|, Scala 2.11, and GeoMesa.
+Spark |spark_required_version|, Scala 2.11, and GeoMesa.
 
 .. note::
 
@@ -16,23 +16,11 @@ Spark |spark_version|, Scala 2.11, and GeoMesa.
 Prerequisites
 -------------
 
-`Spark`_ |spark_version| should be installed, and the environment variable ``SPARK_HOME`` should be set.
+`Spark`_ |spark_required_version| should be installed, and the environment variable ``SPARK_HOME`` should be set.
 Spark 2.0 and above requires Scala version 2.11.
 
-`Python`_ 2.7 or 3.x should be installed, along with the Python development tools. For example, for Python 2.7 on Ubuntu:
-
-.. code-block:: bash
-
-    $ sudo apt-get install build-essential python-dev
-
-For Python 2.7 on CentOS:
-
-.. code-block:: bash
-
-   $ sudo yum groupinstall 'Development Tools'
-   $ sudo yum install python-devel
-
-Building the Toree kernel for Spark |spark_version| requires Git, GNU Make, `Docker`_, and `SBT`_.
+`Python`_ 2.7 or 3.x should be installed, and it is recommended that Jupyter and Toree are installed inside a Python
+``virtualenv`` or inside a ``conda`` environment.
 
 Installing Jupyter
 ------------------
@@ -52,31 +40,15 @@ or
 Installing the Toree Kernel
 ---------------------------
 
-Toree version 0.2.0-dev1 supports Spark 2.0 and above, and should be built from source as described via
-its `README file`_. Check out the project from GitHub:
+.. code-block:: bash
 
-.. _README file: https://github.com/apache/incubator-toree/blob/master/README.md
+    $ pip install --upgrade toree
+
+or
 
 .. code-block:: bash
 
-    $ git clone https://github.com/apache/incubator-toree.git
-    $ cd incubator-toree
-    $ git checkout v0.2.0-dev1
-
-Build the project using ``make``; as described in :ref:`jupyter_prerequisites`, `Docker`_ and `SBT`_ are required:
-
-.. code-block:: bash
-
-    $ make clean
-    $ make release
-
-The built Toree distribution can then be installed via ``pip`` (or ``pip3``):
-
-.. code-block:: bash
-
-    $ pip install --upgrade ./dist/toree-pip/toree-0.2.0.dev1.tar.gz
-    $ pip freeze | grep toree
-    toree==0.2.0.dev1
+    $ pip3 install --upgrade toree
 
 .. _jupyter_configure_toree:
 
@@ -95,9 +67,8 @@ GeoMesa version ``VERSION``:
     # (contains geomesa-accumulo-spark, geomesa-spark-core, geomesa-spark-sql, and dependencies)
     jars="file://$GEOMESA_ACCUMULO_HOME/dist/spark/geomesa-accumulo-spark-runtime_2.11-$VERSION.jar"
 
-    # uncomment to use the converter or GeoTools RDD providers
+    # uncomment to use the converter RDD provider
     #jars="$jars,file://$GEOMESA_ACCUMULO_HOME/lib/geomesa-spark-converter_2.11-$VERSION.jar"
-    #jars="$jars,file://$GEOMESA_ACCUMULO_HOME/lib/geomesa-spark-geotools_2.11-$VERSION.jar"
 
     # uncomment to work with shapefiles (requires $GEOMESA_ACCUMULO_HOME/bin/install-jai.sh)
     #jars="$jars,file://$GEOMESA_ACCUMULO_HOME/lib/jai_codec-1.1.3.jar"
@@ -116,11 +87,40 @@ GeoMesa version ``VERSION``:
     The JARs specified will be in the respective ``target`` directory of each module of the source distribution
     if you built GeoMesa from source.
 
+.. note::
+
+    You may wish to change ``--spark_opts`` to specify the number and configuration of your executors; otherwise the
+    values in ``$SPARK_HOME/conf/spark-defaults.conf`` or ``$SPARK_OPTS`` will be used.
+
 You may also consider adding ``geomesa-tools-2.11-$VERSION-data.jar`` to include prepackaged converters for
 publicly available data sources (as described in :ref:`prepackaged_converters`),
 ``geomesa-jupyter-leaflet-2.11-$VERSION.jar`` to include an interface for the `Leaflet`_ spatial visualization
-library (see :ref:`jupyter_leaflet`, next), and/or ``geomesa-jupyter-vegas-2.11-$VERSION.jar`` to use the `Vegas`_ data
+library (see :ref:`jupyter_leaflet`, below), and/or ``geomesa-jupyter-vegas-2.11-$VERSION.jar`` to use the `Vegas`_ data
 plotting library (see :ref:`jupyter_vegas`, below).
+
+Running Jupyter
+---------------
+
+For public notebooks, you should `configure Jupyter`_ to use a password and bind to a public IP address (by default,
+Jupyter will only accept connections from ``localhost``). To run Jupyter with the GeoMesa Spark kernel:
+
+.. _configure Jupyter: http://jupyter-notebook.readthedocs.io/en/latest/public_server.html#running-a-notebook-server
+
+.. code-block:: bash
+
+    $ jupyter notebook
+
+.. note::
+
+    Long-lived processes should probably be hosted in ``screen``, ``systemd``,
+    or ``supervisord``.
+
+Your notebook server should launch and be accessible at http://localhost:8888/ (or the address and port you
+bound the server to), potentially requiring an access token which will be shown in the server output.
+
+.. note::
+    All Spark code will be submitted as the user account running the Jupyter server. You may wish to look at
+    `JupyterLab`_ for a multi-user Jupyter server.
 
 .. _jupyter_leaflet:
 
@@ -274,28 +274,9 @@ Then use the ``withDataFrame`` method to plot data in a ``DataFrame``:
       mark(Bar).
       show(displayer)
 
-Running Jupyter
----------------
-
-For public notebooks, you should `configure Jupyter`_ to use a password and bind to a public IP address. To
-run Jupyter with the GeoMesa Spark kernel:
-
-.. _configure Jupyter: http://jupyter-notebook.readthedocs.io/en/latest/public_server.html#running-a-notebook-server
-
-.. code-block:: bash
-
-    $ jupyter notebook
-
-.. note::
-
-    Long-lived processes should probably be hosted in ``screen``, ``systemd``,
-    or ``supervisord``.
-
-Your notebook server should launch and be accessible at http://localhost:8888/ (or the address and port you
-bound the server to).
-
 .. _Apache Toree: https://toree.apache.org/
 .. _Docker: https://www.docker.com/
+.. _JupyterLab: https://jupyterlab.readthedocs.io/
 .. _Jupyter Notebook: http://jupyter.org/
 .. _Leaflet: http://leafletjs.com/
 .. _Python: https://www.python.org/
