@@ -90,7 +90,6 @@ GeoMesa Project Structure
 * **geomesa-archetypes**: Template modules for Maven builds
 * **geomesa-arrow**: Apache Arrow integration and ``DataStore`` implementation
 * **geomesa-bigtable**: ``DataStore`` implementation for Google Bigtable
-* **geomesa-blobstore**: Accumulo-backed store designed for large files which have associated spatio-temporal data
 * **geomesa-cassandra**: ``DataStore`` implementation for Apache Cassandra
 * **geomesa-convert**: Configurable and extensible library for converting arbitrary data into ``SimpleFeature``\ s
 * **geomesa-features**: Custom implementations and serialization of ``SimpleFeature``\ s
@@ -104,13 +103,10 @@ GeoMesa Project Structure
 * **geomesa-kafka**: ``DataStore`` implementation for Apache Kafka, for near-real-time streaming data
 * **geomesa-lambda**: ``DataStore`` implementation that seamlessly uses Kafka for frequent updates and Accumulo for long-term persistence
 * **geomesa-memory**: In-memory indexing code
-* **geomesa-metrics**: Extensions and configuration for DropWizard metrics integration
-* **geomesa-native-api**: Non-GeoTools API for persisting and querying data in Accumulo
 * **geomesa-process**: Analytic processes optimized for GeoMesa stores
 * **geomesa-security**: API for managing security and authorization levels in GeoMesa
 * **geomesa-spark**: Apache Spark integration
 * **geomesa-stream**: ``DataStore`` implementation that reads features from arbitrary URLs
-* **geomesa-test**: Integration testing scripts
 * **geomesa-tools**: Command-line tools for ingesting, querying and managing data in GeoMesa
 * **geomesa-utils**: Common utility code
 * **geomesa-web**: REST-ful web services for integrating with GeoMesa

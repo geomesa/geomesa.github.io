@@ -65,12 +65,12 @@ GeoMesa version ``VERSION``:
 
     # bundled GeoMesa Accumulo Spark and Spark SQL runtime JAR
     # (contains geomesa-accumulo-spark, geomesa-spark-core, geomesa-spark-sql, and dependencies)
-    jars="file://$GEOMESA_ACCUMULO_HOME/dist/spark/geomesa-accumulo-spark-runtime_2.11-$VERSION.jar"
+    jars="file://$GEOMESA_ACCUMULO_HOME/dist/spark/geomesa-accumulo-spark-runtime-accumulo2_2.11-$VERSION.jar"
 
     # uncomment to use the converter RDD provider
     #jars="$jars,file://$GEOMESA_ACCUMULO_HOME/lib/geomesa-spark-converter_2.11-$VERSION.jar"
 
-    # uncomment to work with shapefiles (requires $GEOMESA_ACCUMULO_HOME/bin/install-jai.sh)
+    # uncomment to work with shapefiles (requires $GEOMESA_ACCUMULO_HOME/bin/install-shapefile-dependencies.sh)
     #jars="$jars,file://$GEOMESA_ACCUMULO_HOME/lib/jai_codec-1.1.3.jar"
     #jars="$jars,file://$GEOMESA_ACCUMULO_HOME/lib/jai_core-1.1.3.jar"
     #jars="$jars,file;//$GEOMESA_ACCUMULO_HOME/lib/jai_imageio-1.1.jar"

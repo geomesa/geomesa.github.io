@@ -38,7 +38,6 @@ Parameter                              Type    Description
 ``lambda.accumulo.user *``             String  Accumulo username
 ``lambda.accumulo.password``           String  Accumulo password
 ``lambda.accumulo.keytab.path``        String  Path to a Kerberos keytab file containing an entry for the specified user
-``lambda.accumulo.mock``               Boolean Use a mock connection (for testing)
 ``lambda.kafka.brokers *``             String  A comma separated list of kafka brokers (e.g. ``broker1:9092,broker2:9092``)
 ``lambda.kafka.zookeepers *``          String  A comma separated list of zookeeper servers (e.g. ``zoo1,zoo2,zoo3`` or ``localhost:2181``)
 ``lambda.kafka.partitions``            Integer Number of partitions used to create new topics. You should generally set this to the number of
@@ -54,7 +53,6 @@ Parameter                              Type    Description
 ``geomesa.security.auths``             String  Comma-delimited superset of authorizations that will be used for queries via Accumulo
 ``geomesa.security.force-empty-auths`` Boolean Forces authorizations to be empty
 ``geomesa.security.auth-provider``     String  Class name for an ``AuthorizationsProvider`` implementation
-``geomesa.security.visibilities``      String  Visibilities to apply to all written data
 ``geomesa.query.audit``                Boolean Audit queries being run. Queries will be stored in a ``<catalog>_queries`` table
 ``geomesa.query.timeout``              String  The max time a query will be allowed to run before being killed. The
                                                timeout is specified as a duration, e.g. ``1 minute`` or ``60 seconds``

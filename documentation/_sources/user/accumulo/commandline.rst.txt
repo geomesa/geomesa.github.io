@@ -21,25 +21,22 @@ here are Accumulo-specific.
 General Arguments
 -----------------
 
-Most commands require you to specify the connection to Accumulo. This generally includes a username and
-password (or Kerberos keytab file). Specify the username and password with ``--user`` and ``--password``
-(or ``-u`` and ``-p``). In order to avoid plaintext passwords in the bash history and process list,
-the password argument may be omitted, in which case it will be prompted for instead.
+Most commands require you to specify the connection to Accumulo. This generally includes the instance name,
+zookeeper hosts, username, and password (or Kerberos keytab file). Specify the instance with ``--instance-name``
+and ``--zookeepers``, and the username and password with ``--user`` and ``--password``. The password argument may be
+omitted in order to avoid plaintext credentials in the bash history and process list - in this case it will be
+prompted case for later. To use Kerberos authentication instead of a password, use ``--keytab`` with a path to a
+Kerberos keytab file containing an entry for the specified user. Since a keytab file allows authentication
+without any further constraints, it should be protected appropriately.
 
-To use Kerberos authentication instead of a password, use ``--keytab`` with a path to a Kerberos keytab
-file containing an entry for the specified user. Since a keytab file allows authentication without any
-further constraints, it should be protected appropriately.
+Instead of specifying the cluster connection explicitly, an appropriate ``accumulo-client.properties`` (for Accumulo
+2) or ``client.conf`` (for Accumulo 1) may be added to the classpath. See the
+`Accumulo documentation <https://accumulo.apache.org/docs/2.x/getting-started/clients#creating-an-accumulo-client>`_
+for information on the necessary configuration keys. Any explicit command-line arguments will take precedence over
+the configuration file.
 
-If the necessary environment variables are set (generally as part of the install process), the tools should
-connect automatically to the Accumulo instance. To specify the connection instead, use ``--instance-name``
-and ``--zookeepers`` (or ``-i`` and ``-z``).
-
-The ``--auths`` and ``--visibilities`` arguments correspond to the ``AccumuloDataStore`` parameters
-``geomesa.security.auths`` and ``geomesa.security.visibilities``, respectively. See :ref:`authorizations`
-and :ref:`accumulo_visibilities` for more information.
-
-The ``--mock`` argument can be used to run against a mock Accumulo instance, for testing. In particular,
-this can be useful for verifying ingest converters.
+The ``--auths`` argument corresponds to the ``AccumuloDataStore`` parameter ``geomesa.security.auths``. See
+:ref:`authorizations` and :ref:`accumulo_visibilities` for more information.
 
 Commands
 --------
@@ -258,56 +255,4 @@ Argument                 Description
 ======================== =========================================================
 ``-c, --catalog *``      The catalog table containing schema metadata
 ``-f, --feature-name *`` The name of the schema
-======================== =========================================================
-
-.. _accumulo_tools_raster:
-
-``ingest-raster``
-^^^^^^^^^^^^^^^^^
-
-.. warning::
-
-  GeoMesa raster support is deprecated and will be removed in a future version.
-
-Ingest one or more raster image files into Geomesa. Input files, GeoTIFF or DTED, should be located
-on the local file system.
-
-.. warning::
-
-    In order to ingest rasters, ensure that you install JAI and JLine as described under
-    :ref:`setting_up_accumulo_commandline`.
-
-Input raster files are assumed to have CRS of ``EPSG:4326``. Non-``EPSG:4326`` files will need to be
-converted into ``EPSG:4326`` raster files before ingestion. An example of doing conversion with GDAL is::
-
-    gdalwarp -t_srs EPSG:4326 input_file out_file
-
-======================== =========================================================
-Argument                 Description
-======================== =========================================================
-``-t, --raster-table *`` Accumulo table for storing raster data
-``-f, --file *``         A single raster file or a directly containing raster files to ingest
-``-F, --format``         The format of raster files, which must match the file extension
-``-P, --parallel-level`` Maximum number of local threads for ingesting multiple raster files
-``-T, --timestamp``      Ingestion time (defaults to current time)
-``--write-memory``       Memory allocation for ingestion operation
-``--write-threads``      Numer of threads used for writing raster data
-``--query-threads``      Number of threads used for querying raster data
-======================== =========================================================
-
-.. warning::
-
-    When ingesting rasters from a directory, ensure that the ``--format`` argument matches the file extension of
-    the files. Otherwise, no files will be ingested.
-
-``delete-raster``
-^^^^^^^^^^^^^^^^^
-
-Delete ingested rasters.
-
-======================== =========================================================
-Argument                 Description
-======================== =========================================================
-``-t, --raster-table *`` Accumulo table for storing raster data
-``--force``              Delete without prompting for confirmation
 ======================== =========================================================
