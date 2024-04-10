@@ -1,0 +1,2066 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/gt/partition/postgis/dialect/procedures/RollWriteAheadLog.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2024 Commonwealth Computer Research, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * http://www.opensource.org/licenses/apache2.0.php.
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.gt.partition.postgis.dialect
+</span>10 <span style=''>package procedures
+</span>11 <span style=''>
+</span>12 <span style=''>import org.locationtech.geomesa.gt.partition.postgis.dialect.tables.{PartitionTablespacesTable, SequenceTable}
+</span>13 <span style=''>
+</span>14 <span style=''>/**
+</span>15 <span style=''> * Moves the current write ahead table to a sequential name, and creates a new write ahead table
+</span>16 <span style=''> * to accept writes going forward
+</span>17 <span style=''> */
+</span>18 <span style=''>object RollWriteAheadLog extends SqlProcedure with CronSchedule {
+</span>19 <span style=''>
+</span>20 <span style=''>  override def name(info: TypeInfo): FunctionName = </span><span style='background: #AEF1AE'>FunctionName(s&quot;${info.typeName}_roll_wa&quot;)</span><span style=''>
+</span>21 <span style=''>
+</span>22 <span style=''>  override def jobName(info: TypeInfo): SqlLiteral = </span><span style='background: #AEF1AE'>SqlLiteral(s&quot;${info.typeName}-roll-wa&quot;)</span><span style=''>
+</span>23 <span style=''>
+</span>24 <span style=''>  override protected def schedule(info: TypeInfo): SqlLiteral = </span><span style='background: #AEF1AE'>SqlLiteral(&quot;9,19,29,39,49,59 * * * *&quot;)</span><span style=''>
+</span>25 <span style=''>
+</span>26 <span style=''>  override protected def invocation(info: TypeInfo): SqlLiteral = </span><span style='background: #AEF1AE'>SqlLiteral(s&quot;CALL ${name(info).quoted}()&quot;)</span><span style=''>
+</span>27 <span style=''>
+</span>28 <span style=''>  override protected def createStatements(info: TypeInfo): Seq[String] =
+</span>29 <span style=''>    </span><span style='background: #AEF1AE'>Seq(proc(info)) ++ super.createStatements(info)</span><span style=''>
+</span>30 <span style=''>
+</span>31 <span style=''>  private def proc(info: TypeInfo): String = {
+</span>32 <span style=''>    val table = </span><span style='background: #AEF1AE'>info.tables.writeAhead</span><span style=''>
+</span>33 <span style=''>    val partitionsTable = </span><span style='background: #AEF1AE'>s&quot;${info.schema.quoted}.${PartitionTablespacesTable.Name.quoted}&quot;</span><span style=''>
+</span>34 <span style=''>
+</span>35 <span style=''>    </span><span style='background: #AEF1AE'>s&quot;&quot;&quot;CREATE OR REPLACE PROCEDURE ${name(info).quoted}() LANGUAGE plpgsql AS
+</span>36 <span style=''></span><span style='background: #AEF1AE'>       |  $$BODY$$
+</span>37 <span style=''></span><span style='background: #AEF1AE'>       |    DECLARE
+</span>38 <span style=''></span><span style='background: #AEF1AE'>       |      seq_val smallint;
+</span>39 <span style=''></span><span style='background: #AEF1AE'>       |      cur_partition text;        -- rename of the _writes table
+</span>40 <span style=''></span><span style='background: #AEF1AE'>       |      next_partition text;       -- next partition that will be created from the _writes table
+</span>41 <span style=''></span><span style='background: #AEF1AE'>       |      partition_tablespace text; -- table space command
+</span>42 <span style=''></span><span style='background: #AEF1AE'>       |      index_space text;          -- index table space command
+</span>43 <span style=''></span><span style='background: #AEF1AE'>       |      pexists boolean;           -- table exists check
+</span>44 <span style=''></span><span style='background: #AEF1AE'>       |    BEGIN
+</span>45 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>46 <span style=''></span><span style='background: #AEF1AE'>       |      SELECT value FROM ${info.schema.quoted}.${SequenceTable.Name.quoted}
+</span>47 <span style=''></span><span style='background: #AEF1AE'>       |        WHERE type_name = ${literal(info.typeName)} INTO seq_val;
+</span>48 <span style=''></span><span style='background: #AEF1AE'>       |      cur_partition := ${literal(table.name.raw + &quot;_&quot;)} || lpad(seq_val::text, 3, '0');
+</span>49 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>50 <span style=''></span><span style='background: #AEF1AE'>       |      -- get the required locks up front to avoid deadlocks with inserts
+</span>51 <span style=''></span><span style='background: #AEF1AE'>       |      LOCK TABLE ONLY ${table.name.qualified} IN SHARE UPDATE EXCLUSIVE MODE;
+</span>52 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>53 <span style=''></span><span style='background: #AEF1AE'>       |      -- don't re-create the table if there hasn't been any data inserted
+</span>54 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'SELECT EXISTS(SELECT 1 FROM ${info.schema.quoted}.' || quote_ident(cur_partition) || ')'
+</span>55 <span style=''></span><span style='background: #AEF1AE'>       |          INTO pexists;
+</span>56 <span style=''></span><span style='background: #AEF1AE'>       |      IF pexists THEN
+</span>57 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>58 <span style=''></span><span style='background: #AEF1AE'>       |        IF seq_val &lt; 999 THEN
+</span>59 <span style=''></span><span style='background: #AEF1AE'>       |          seq_val := seq_val + 1;
+</span>60 <span style=''></span><span style='background: #AEF1AE'>       |        ELSE
+</span>61 <span style=''></span><span style='background: #AEF1AE'>       |          seq_val := 0;
+</span>62 <span style=''></span><span style='background: #AEF1AE'>       |        END IF;
+</span>63 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>64 <span style=''></span><span style='background: #AEF1AE'>       |        UPDATE ${info.schema.quoted}.${SequenceTable.Name.quoted} SET value = seq_val
+</span>65 <span style=''></span><span style='background: #AEF1AE'>       |          WHERE type_name = ${literal(info.typeName)};
+</span>66 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>67 <span style=''></span><span style='background: #AEF1AE'>       |        -- format the table name to be 3 digits, with leading zeros as needed
+</span>68 <span style=''></span><span style='background: #AEF1AE'>       |        next_partition := ${literal(table.name.raw + &quot;_&quot;)} || lpad(seq_val::text, 3, '0');
+</span>69 <span style=''></span><span style='background: #AEF1AE'>       |        SELECT table_space INTO partition_tablespace FROM $partitionsTable
+</span>70 <span style=''></span><span style='background: #AEF1AE'>       |          WHERE type_name = ${literal(info.typeName)} AND table_type = ${WriteAheadTableSuffix.quoted};
+</span>71 <span style=''></span><span style='background: #AEF1AE'>       |        IF partition_tablespace IS NULL THEN
+</span>72 <span style=''></span><span style='background: #AEF1AE'>       |          partition_tablespace := '';
+</span>73 <span style=''></span><span style='background: #AEF1AE'>       |          index_space := '';
+</span>74 <span style=''></span><span style='background: #AEF1AE'>       |        ELSE
+</span>75 <span style=''></span><span style='background: #AEF1AE'>       |          partition_tablespace := ' TABLESPACE ' || quote_ident(partition_tablespace);
+</span>76 <span style=''></span><span style='background: #AEF1AE'>       |          index_space := ' USING INDEX' || partition_tablespace;
+</span>77 <span style=''></span><span style='background: #AEF1AE'>       |        END IF;
+</span>78 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>79 <span style=''></span><span style='background: #AEF1AE'>       |        -- requires SHARE UPDATE EXCLUSIVE
+</span>80 <span style=''></span><span style='background: #AEF1AE'>       |        EXECUTE 'CREATE TABLE IF NOT EXISTS ${info.schema.quoted}.' || quote_ident(next_partition) || '(' ||
+</span>81 <span style=''></span><span style='background: #AEF1AE'>       |          'CONSTRAINT ' || quote_ident(next_partition || '_pkey') ||
+</span>82 <span style=''></span><span style='background: #AEF1AE'>       |          ' PRIMARY KEY (fid, ${info.cols.dtg.quoted})' || index_space || ')' ||
+</span>83 <span style=''></span><span style='background: #AEF1AE'>       |          ' INHERITS (${table.name.qualified})${table.storage.opts}' || partition_tablespace;
+</span>84 <span style=''></span><span style='background: #AEF1AE'>       |        EXECUTE 'CREATE INDEX IF NOT EXISTS ' || quote_ident(next_partition || '_' || ${info.cols.dtg.asLiteral}) ||
+</span>85 <span style=''></span><span style='background: #AEF1AE'>       |          ' ON ${info.schema.quoted}.' || quote_ident(next_partition) || ' (${info.cols.dtg.quoted})' ||
+</span>86 <span style=''></span><span style='background: #AEF1AE'>       |          partition_tablespace;
+</span>87 <span style=''></span><span style='background: #AEF1AE'>       |${info.cols.geoms.map { col =&gt;
+</span>88 <span style=''></span><span style='background: #AEF1AE'>    s&quot;&quot;&quot;        EXECUTE 'CREATE INDEX IF NOT EXISTS ' || quote_ident(next_partition || '_spatial_' || ${col.asLiteral}) ||
+</span>89 <span style=''></span><span style='background: #AEF1AE'>       |          ' ON ${info.schema.quoted}.' || quote_ident(next_partition) || ' USING gist(${col.quoted})' ||
+</span>90 <span style=''></span><span style='background: #AEF1AE'>       |          partition_tablespace;&quot;&quot;&quot;.stripMargin}.mkString(&quot;\n&quot;)}
+</span>91 <span style=''></span><span style='background: #AEF1AE'>       |${info.cols.indexed.map { col =&gt;
+</span>92 <span style=''></span><span style='background: #AEF1AE'>    s&quot;&quot;&quot;        EXECUTE 'CREATE INDEX IF NOT EXISTS ' || quote_ident(next_partition || '_' || ${col.asLiteral}) ||
+</span>93 <span style=''></span><span style='background: #AEF1AE'>       |          ' ON ${info.schema.quoted}.' || quote_ident(next_partition) || '(${col.quoted})' ||
+</span>94 <span style=''></span><span style='background: #AEF1AE'>       |          partition_tablespace;&quot;&quot;&quot;.stripMargin}.mkString(&quot;\n&quot;)}
+</span>95 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>96 <span style=''></span><span style='background: #AEF1AE'>       |        COMMIT; -- releases our locks
+</span>97 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>98 <span style=''></span><span style='background: #AEF1AE'>       |        EXECUTE 'ANALYZE ' || quote_ident(cur_partition);
+</span>99 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>100 <span style=''></span><span style='background: #AEF1AE'>       |      END IF;
+</span>101 <span style=''></span><span style='background: #AEF1AE'>       |    END;
+</span>102 <span style=''></span><span style='background: #AEF1AE'>       |  $$BODY$$;&quot;&quot;&quot;.stripMargin</span><span style=''>
+</span>103 <span style=''>  }
+</span>104 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          20
+        </td>
+        <td>
+          86203
+        </td>
+        <td>
+          948
+          -
+          957
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;_roll_wa&quot;
+        </td>
+      </tr><tr>
+        <td>
+          20
+        </td>
+        <td>
+          86202
+        </td>
+        <td>
+          932
+          -
+          933
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          20
+        </td>
+        <td>
+          86205
+        </td>
+        <td>
+          930
+          -
+          957
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;_roll_wa&quot;).s(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          20
+        </td>
+        <td>
+          86204
+        </td>
+        <td>
+          934
+          -
+          947
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          20
+        </td>
+        <td>
+          86206
+        </td>
+        <td>
+          917
+          -
+          958
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dialect.this.`package`.FunctionName.apply(scala.StringContext.apply(&quot;&quot;, &quot;_roll_wa&quot;).s(info.typeName))
+        </td>
+      </tr><tr>
+        <td>
+          22
+        </td>
+        <td>
+          86207
+        </td>
+        <td>
+          1026
+          -
+          1027
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          22
+        </td>
+        <td>
+          86209
+        </td>
+        <td>
+          1028
+          -
+          1041
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          22
+        </td>
+        <td>
+          86208
+        </td>
+        <td>
+          1042
+          -
+          1051
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;-roll-wa&quot;
+        </td>
+      </tr><tr>
+        <td>
+          22
+        </td>
+        <td>
+          86211
+        </td>
+        <td>
+          1013
+          -
+          1052
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlLiteral.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dialect.this.`package`.SqlLiteral.apply(scala.StringContext.apply(&quot;&quot;, &quot;-roll-wa&quot;).s(info.typeName))
+        </td>
+      </tr><tr>
+        <td>
+          22
+        </td>
+        <td>
+          86210
+        </td>
+        <td>
+          1024
+          -
+          1051
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;-roll-wa&quot;).s(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          24
+        </td>
+        <td>
+          86212
+        </td>
+        <td>
+          1118
+          -
+          1156
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlLiteral.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dialect.this.`package`.SqlLiteral.apply(&quot;9,19,29,39,49,59 * * * *&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          86213
+        </td>
+        <td>
+          1237
+          -
+          1243
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;CALL &quot;
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          86215
+        </td>
+        <td>
+          1244
+          -
+          1261
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RollWriteAheadLog.this.name(info).quoted
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          86214
+        </td>
+        <td>
+          1262
+          -
+          1265
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;()&quot;
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          86217
+        </td>
+        <td>
+          1224
+          -
+          1266
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlLiteral.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dialect.this.`package`.SqlLiteral.apply(scala.StringContext.apply(&quot;CALL &quot;, &quot;()&quot;).s(RollWriteAheadLog.this.name(info).quoted))
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          86216
+        </td>
+        <td>
+          1235
+          -
+          1265
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;CALL &quot;, &quot;()&quot;).s(RollWriteAheadLog.this.name(info).quoted)
+        </td>
+      </tr><tr>
+        <td>
+          29
+        </td>
+        <td>
+          86219
+        </td>
+        <td>
+          1364
+          -
+          1392
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.CronSchedule.createStatements
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RollWriteAheadLog.super.createStatements(info)
+        </td>
+      </tr><tr>
+        <td>
+          29
+        </td>
+        <td>
+          86218
+        </td>
+        <td>
+          1349
+          -
+          1359
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.procedures.RollWriteAheadLog.proc
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RollWriteAheadLog.this.proc(info)
+        </td>
+      </tr><tr>
+        <td>
+          29
+        </td>
+        <td>
+          86221
+        </td>
+        <td>
+          1345
+          -
+          1392
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.++
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[String](RollWriteAheadLog.this.proc(info)).++[String, Seq[String]](RollWriteAheadLog.super.createStatements(info))(collection.this.Seq.canBuildFrom[String])
+        </td>
+      </tr><tr>
+        <td>
+          29
+        </td>
+        <td>
+          86220
+        </td>
+        <td>
+          1361
+          -
+          1361
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[String]
+        </td>
+      </tr><tr>
+        <td>
+          32
+        </td>
+        <td>
+          86222
+        </td>
+        <td>
+          1457
+          -
+          1479
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.Tables.writeAhead
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.tables.writeAhead
+        </td>
+      </tr><tr>
+        <td>
+          33
+        </td>
+        <td>
+          86223
+        </td>
+        <td>
+          1508
+          -
+          1509
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          33
+        </td>
+        <td>
+          86225
+        </td>
+        <td>
+          1570
+          -
+          1571
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          33
+        </td>
+        <td>
+          86224
+        </td>
+        <td>
+          1529
+          -
+          1531
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          33
+        </td>
+        <td>
+          86227
+        </td>
+        <td>
+          1532
+          -
+          1569
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.tables.PartitionTablespacesTable.Name.quoted
+        </td>
+      </tr><tr>
+        <td>
+          33
+        </td>
+        <td>
+          86226
+        </td>
+        <td>
+          1510
+          -
+          1528
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          33
+        </td>
+        <td>
+          86228
+        </td>
+        <td>
+          1506
+          -
+          1571
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;.&quot;, &quot;&quot;).s(info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.PartitionTablespacesTable.Name.quoted)
+        </td>
+      </tr><tr>
+        <td>
+          35
+        </td>
+        <td>
+          86229
+        </td>
+        <td>
+          1581
+          -
+          1610
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;CREATE OR REPLACE PROCEDURE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          35
+        </td>
+        <td>
+          86230
+        </td>
+        <td>
+          1629
+          -
+          2155
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;() LANGUAGE plpgsql AS\n       |  $BODY$\n       |    DECLARE\n       |      seq_val smallint;\n       |      cur_partition text;        -- rename of the _writes table\n       |      next_partition text;       -- next partition that will be created from the _writes table\n       |      partition_tablespace text; -- table space command\n       |      index_space text;          -- index table space command\n       |      pexists boolean;           -- table exists check\n       |    BEGIN\n       |\n       |      SELECT value FROM &quot;
+        </td>
+      </tr><tr>
+        <td>
+          35
+        </td>
+        <td>
+          86253
+        </td>
+        <td>
+          1611
+          -
+          1628
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RollWriteAheadLog.this.name(info).quoted
+        </td>
+      </tr><tr>
+        <td>
+          35
+        </td>
+        <td>
+          86280
+        </td>
+        <td>
+          1577
+          -
+          5486
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;CREATE OR REPLACE PROCEDURE &quot;, &quot;() LANGUAGE plpgsql AS\n       |  $BODY$\n       |    DECLARE\n       |      seq_val smallint;\n       |      cur_partition text;        -- rename of the _writes table\n       |      next_partition text;       -- next partition that will be created from the _writes table\n       |      partition_tablespace text; -- table space command\n       |      index_space text;          -- index table space command\n       |      pexists boolean;           -- table exists check\n       |    BEGIN\n       |\n       |      SELECT value FROM &quot;, &quot;.&quot;, &quot;\n       |        WHERE type_name = &quot;, &quot; INTO seq_val;\n       |      cur_partition := &quot;, &quot; || lpad(seq_val::text, 3, \'0\');\n       |\n       |      -- get the required locks up front to avoid deadlocks with inserts\n       |      LOCK TABLE ONLY &quot;, &quot; IN SHARE UPDATE EXCLUSIVE MODE;\n       |\n       |      -- don\'t re-create the table if there hasn\'t been any data inserted\n       |      EXECUTE \'SELECT EXISTS(SELECT 1 FROM &quot;, &quot;.\' || quote_ident(cur_partition) || \')\'\n       |          INTO pexists;\n       |      IF pexists THEN\n       |\n       |        IF seq_val &lt; 999 THEN\n       |          seq_val := seq_val + 1;\n       |        ELSE\n       |          seq_val := 0;\n       |        END IF;\n       |\n       |        UPDATE &quot;, &quot;.&quot;, &quot; SET value = seq_val\n       |          WHERE type_name = &quot;, &quot;;\n       |\n       |        -- format the table name to be 3 digits, with leading zeros as needed\n       |        next_partition := &quot;, &quot; || lpad(seq_val::text, 3, \'0\');\n       |        SELECT table_space INTO partition_tablespace FROM &quot;, &quot;\n       |          WHERE type_name = &quot;, &quot; AND table_type = &quot;, &quot;;\n       |        IF partition_tablespace IS NULL THEN\n       |          partition_tablespace := \'\';\n       |          index_space := \'\';\n       |        ELSE\n       |          partition_tablespace := \' TABLESPACE \' || quote_ident(partition_tablespace);\n       |          index_space := \' USING INDEX\' || partition_tablespace;\n       |        END IF;\n       |\n       |        -- requires SHARE UPDATE EXCLUSIVE\n       |        EXECUTE \'CREATE TABLE IF NOT EXISTS &quot;, &quot;.\' || quote_ident(next_partition) || \'(\' ||\n       |          \'CONSTRAINT \' || quote_ident(next_partition || \'_pkey\') ||\n       |          \' PRIMARY KEY (fid, &quot;, &quot;)\' || index_space || \')\' ||\n       |          \' INHERITS (&quot;, &quot;)&quot;, &quot;\' || partition_tablespace;\n       |        EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(next_partition || \'_\' || &quot;, &quot;) ||\n       |          \' ON &quot;, &quot;.\' || quote_ident(next_partition) || \' (&quot;, &quot;)\' ||\n       |          partition_tablespace;\n       |&quot;, &quot;\n       |&quot;, &quot;\n       |\n       |        COMMIT; -- releases our locks\n       |\n       |        EXECUTE \'ANALYZE \' || quote_ident(cur_partition);\n       |\n       |      END IF;\n       |    END;\n       |  $BODY$;&quot;).s(RollWriteAheadLog.this.name(info).quoted, info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.SequenceTable.Name.quoted, `package`.literal(info.typeName), `package`.literal(table.name.raw.+(&quot;_&quot;)), table.name.qualified, info.schema.quoted, info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.SequenceTable.Name.quoted, `package`.literal(info.typeName), `package`.literal(table.name.raw.+(&quot;_&quot;)), partitionsTable, `package`.literal(info.typeName), dialect.this.`package`.WriteAheadTableSuffix.quoted, info.schema.quoted, info.cols.dtg.quoted, table.name.qualified, table.storage.opts, info.cols.dtg.asLiteral, info.schema.quoted, info.cols.dtg.quoted, info.cols.geoms.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;        EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(next_partition || \'_spatial_\' || &quot;, &quot;) ||\n       |          \' ON &quot;, &quot;.\' || quote_ident(next_partition) || \' USING gist(&quot;, &quot;)\' ||\n       |          partition_tablespace;&quot;).s(col.asLiteral, info.schema.quoted, col.quoted)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;), info.cols.indexed.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;        EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(next_partition || \'_\' || &quot;, &quot;) ||\n       |          \' ON &quot;, &quot;.\' || quote_ident(next_partition) || \'(&quot;, &quot;)\' ||\n       |          partition_tablespace;&quot;).s(col.asLiteral, info.schema.quoted, col.quoted)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          86231
+        </td>
+        <td>
+          2175
+          -
+          2177
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          86232
+        </td>
+        <td>
+          2204
+          -
+          2240
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n       |        WHERE type_name = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          86255
+        </td>
+        <td>
+          2178
+          -
+          2203
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.tables.SequenceTable.Name.quoted
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          86254
+        </td>
+        <td>
+          2156
+          -
+          2174
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          86233
+        </td>
+        <td>
+          2264
+          -
+          2311
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; INTO seq_val;\n       |      cur_partition := &quot;
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          86257
+        </td>
+        <td>
+          2241
+          -
+          2263
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          86256
+        </td>
+        <td>
+          2249
+          -
+          2262
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          86234
+        </td>
+        <td>
+          2342
+          -
+          2496
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; || lpad(seq_val::text, 3, \'0\');\n       |\n       |      -- get the required locks up front to avoid deadlocks with inserts\n       |      LOCK TABLE ONLY &quot;
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          86259
+        </td>
+        <td>
+          2312
+          -
+          2341
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(table.name.raw.+(&quot;_&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          86258
+        </td>
+        <td>
+          2320
+          -
+          2340
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          table.name.raw.+(&quot;_&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          86235
+        </td>
+        <td>
+          2518
+          -
+          2694
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; IN SHARE UPDATE EXCLUSIVE MODE;\n       |\n       |      -- don\'t re-create the table if there hasn\'t been any data inserted\n       |      EXECUTE \'SELECT EXISTS(SELECT 1 FROM &quot;
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          86260
+        </td>
+        <td>
+          2497
+          -
+          2517
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableIdentifier.qualified
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          table.name.qualified
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          86236
+        </td>
+        <td>
+          2714
+          -
+          3015
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(cur_partition) || \')\'\n       |          INTO pexists;\n       |      IF pexists THEN\n       |\n       |        IF seq_val &lt; 999 THEN\n       |          seq_val := seq_val + 1;\n       |        ELSE\n       |          seq_val := 0;\n       |        END IF;\n       |\n       |        UPDATE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          86261
+        </td>
+        <td>
+          2695
+          -
+          2713
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          86237
+        </td>
+        <td>
+          3035
+          -
+          3037
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          86238
+        </td>
+        <td>
+          3064
+          -
+          3122
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; SET value = seq_val\n       |          WHERE type_name = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          86263
+        </td>
+        <td>
+          3038
+          -
+          3063
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.tables.SequenceTable.Name.quoted
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          86262
+        </td>
+        <td>
+          3016
+          -
+          3034
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          86239
+        </td>
+        <td>
+          3146
+          -
+          3278
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;;\n       |\n       |        -- format the table name to be 3 digits, with leading zeros as needed\n       |        next_partition := &quot;
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          86265
+        </td>
+        <td>
+          3123
+          -
+          3145
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          86264
+        </td>
+        <td>
+          3131
+          -
+          3144
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          86240
+        </td>
+        <td>
+          3309
+          -
+          3409
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; || lpad(seq_val::text, 3, \'0\');\n       |        SELECT table_space INTO partition_tablespace FROM &quot;
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          86267
+        </td>
+        <td>
+          3279
+          -
+          3308
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(table.name.raw.+(&quot;_&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          86266
+        </td>
+        <td>
+          3287
+          -
+          3307
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          table.name.raw.+(&quot;_&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          69
+        </td>
+        <td>
+          86241
+        </td>
+        <td>
+          3424
+          -
+          3462
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n       |          WHERE type_name = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          86243
+        </td>
+        <td>
+          3535
+          -
+          3999
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;;\n       |        IF partition_tablespace IS NULL THEN\n       |          partition_tablespace := \'\';\n       |          index_space := \'\';\n       |        ELSE\n       |          partition_tablespace := \' TABLESPACE \' || quote_ident(partition_tablespace);\n       |          index_space := \' USING INDEX\' || partition_tablespace;\n       |        END IF;\n       |\n       |        -- requires SHARE UPDATE EXCLUSIVE\n       |        EXECUTE \'CREATE TABLE IF NOT EXISTS &quot;
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          86242
+        </td>
+        <td>
+          3486
+          -
+          3505
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; AND table_type = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          86269
+        </td>
+        <td>
+          3463
+          -
+          3485
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          86268
+        </td>
+        <td>
+          3471
+          -
+          3484
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          86270
+        </td>
+        <td>
+          3506
+          -
+          3534
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlLiteral.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dialect.this.`package`.WriteAheadTableSuffix.quoted
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          86244
+        </td>
+        <td>
+          4019
+          -
+          4179
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(next_partition) || \'(\' ||\n       |          \'CONSTRAINT \' || quote_ident(next_partition || \'_pkey\') ||\n       |          \' PRIMARY KEY (fid, &quot;
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          86271
+        </td>
+        <td>
+          4000
+          -
+          4018
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          86245
+        </td>
+        <td>
+          4201
+          -
+          4260
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;)\' || index_space || \')\' ||\n       |          \' INHERITS (&quot;
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          86272
+        </td>
+        <td>
+          4180
+          -
+          4200
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.quoted
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          86247
+        </td>
+        <td>
+          4304
+          -
+          4426
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\' || partition_tablespace;\n       |        EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(next_partition || \'_\' || &quot;
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          86246
+        </td>
+        <td>
+          4282
+          -
+          4284
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;)&quot;
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          86273
+        </td>
+        <td>
+          4261
+          -
+          4281
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableIdentifier.qualified
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          table.name.qualified
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          86274
+        </td>
+        <td>
+          4285
+          -
+          4303
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.Storage.opts
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          table.storage.opts
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          86248
+        </td>
+        <td>
+          4451
+          -
+          4480
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;) ||\n       |          \' ON &quot;
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          86275
+        </td>
+        <td>
+          4427
+          -
+          4450
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlIdentifier.asLiteral
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.asLiteral
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          86249
+        </td>
+        <td>
+          4500
+          -
+          4541
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(next_partition) || \' (&quot;
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          86250
+        </td>
+        <td>
+          4563
+          -
+          4618
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;)\' ||\n       |          partition_tablespace;\n       |&quot;
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          86277
+        </td>
+        <td>
+          4542
+          -
+          4562
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.quoted
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          86276
+        </td>
+        <td>
+          4481
+          -
+          4499
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          86251
+        </td>
+        <td>
+          4955
+          -
+          4965
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n       |&quot;
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          86278
+        </td>
+        <td>
+          4619
+          -
+          4954
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.mkString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.geoms.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;        EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(next_partition || \'_spatial_\' || &quot;, &quot;) ||\n       |          \' ON &quot;, &quot;.\' || quote_ident(next_partition) || \' USING gist(&quot;, &quot;)\' ||\n       |          partition_tablespace;&quot;).s(col.asLiteral, info.schema.quoted, col.quoted)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          86252
+        </td>
+        <td>
+          5285
+          -
+          5486
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n       |\n       |        COMMIT; -- releases our locks\n       |\n       |        EXECUTE \'ANALYZE \' || quote_ident(cur_partition);\n       |\n       |      END IF;\n       |    END;\n       |  $BODY$;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          86279
+        </td>
+        <td>
+          4966
+          -
+          5284
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.mkString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.indexed.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;        EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(next_partition || \'_\' || &quot;, &quot;) ||\n       |          \' ON &quot;, &quot;.\' || quote_ident(next_partition) || \'(&quot;, &quot;)\' ||\n       |          partition_tablespace;&quot;).s(col.asLiteral, info.schema.quoted, col.quoted)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          86281
+        </td>
+        <td>
+          1577
+          -
+          5498
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.stripMargin
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.augmentString(scala.StringContext.apply(&quot;CREATE OR REPLACE PROCEDURE &quot;, &quot;() LANGUAGE plpgsql AS\n       |  $BODY$\n       |    DECLARE\n       |      seq_val smallint;\n       |      cur_partition text;        -- rename of the _writes table\n       |      next_partition text;       -- next partition that will be created from the _writes table\n       |      partition_tablespace text; -- table space command\n       |      index_space text;          -- index table space command\n       |      pexists boolean;           -- table exists check\n       |    BEGIN\n       |\n       |      SELECT value FROM &quot;, &quot;.&quot;, &quot;\n       |        WHERE type_name = &quot;, &quot; INTO seq_val;\n       |      cur_partition := &quot;, &quot; || lpad(seq_val::text, 3, \'0\');\n       |\n       |      -- get the required locks up front to avoid deadlocks with inserts\n       |      LOCK TABLE ONLY &quot;, &quot; IN SHARE UPDATE EXCLUSIVE MODE;\n       |\n       |      -- don\'t re-create the table if there hasn\'t been any data inserted\n       |      EXECUTE \'SELECT EXISTS(SELECT 1 FROM &quot;, &quot;.\' || quote_ident(cur_partition) || \')\'\n       |          INTO pexists;\n       |      IF pexists THEN\n       |\n       |        IF seq_val &lt; 999 THEN\n       |          seq_val := seq_val + 1;\n       |        ELSE\n       |          seq_val := 0;\n       |        END IF;\n       |\n       |        UPDATE &quot;, &quot;.&quot;, &quot; SET value = seq_val\n       |          WHERE type_name = &quot;, &quot;;\n       |\n       |        -- format the table name to be 3 digits, with leading zeros as needed\n       |        next_partition := &quot;, &quot; || lpad(seq_val::text, 3, \'0\');\n       |        SELECT table_space INTO partition_tablespace FROM &quot;, &quot;\n       |          WHERE type_name = &quot;, &quot; AND table_type = &quot;, &quot;;\n       |        IF partition_tablespace IS NULL THEN\n       |          partition_tablespace := \'\';\n       |          index_space := \'\';\n       |        ELSE\n       |          partition_tablespace := \' TABLESPACE \' || quote_ident(partition_tablespace);\n       |          index_space := \' USING INDEX\' || partition_tablespace;\n       |        END IF;\n       |\n       |        -- requires SHARE UPDATE EXCLUSIVE\n       |        EXECUTE \'CREATE TABLE IF NOT EXISTS &quot;, &quot;.\' || quote_ident(next_partition) || \'(\' ||\n       |          \'CONSTRAINT \' || quote_ident(next_partition || \'_pkey\') ||\n       |          \' PRIMARY KEY (fid, &quot;, &quot;)\' || index_space || \')\' ||\n       |          \' INHERITS (&quot;, &quot;)&quot;, &quot;\' || partition_tablespace;\n       |        EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(next_partition || \'_\' || &quot;, &quot;) ||\n       |          \' ON &quot;, &quot;.\' || quote_ident(next_partition) || \' (&quot;, &quot;)\' ||\n       |          partition_tablespace;\n       |&quot;, &quot;\n       |&quot;, &quot;\n       |\n       |        COMMIT; -- releases our locks\n       |\n       |        EXECUTE \'ANALYZE \' || quote_ident(cur_partition);\n       |\n       |      END IF;\n       |    END;\n       |  $BODY$;&quot;).s(RollWriteAheadLog.this.name(info).quoted, info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.SequenceTable.Name.quoted, `package`.literal(info.typeName), `package`.literal(table.name.raw.+(&quot;_&quot;)), table.name.qualified, info.schema.quoted, info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.SequenceTable.Name.quoted, `package`.literal(info.typeName), `package`.literal(table.name.raw.+(&quot;_&quot;)), partitionsTable, `package`.literal(info.typeName), dialect.this.`package`.WriteAheadTableSuffix.quoted, info.schema.quoted, info.cols.dtg.quoted, table.name.qualified, table.storage.opts, info.cols.dtg.asLiteral, info.schema.quoted, info.cols.dtg.quoted, info.cols.geoms.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;        EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(next_partition || \'_spatial_\' || &quot;, &quot;) ||\n       |          \' ON &quot;, &quot;.\' || quote_ident(next_partition) || \' USING gist(&quot;, &quot;)\' ||\n       |          partition_tablespace;&quot;).s(col.asLiteral, info.schema.quoted, col.quoted)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;), info.cols.indexed.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;        EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(next_partition || \'_\' || &quot;, &quot;) ||\n       |          \' ON &quot;, &quot;.\' || quote_ident(next_partition) || \'(&quot;, &quot;)\' ||\n       |          partition_tablespace;&quot;).s(col.asLiteral, info.schema.quoted, col.quoted)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;))).stripMargin
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>
