@@ -1,0 +1,5855 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/spark/sql/GeoMesaRelation.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2024 Commonwealth Computer Research, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * http://www.opensource.org/licenses/apache2.0.php.
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.spark.sql
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.LazyLogging
+</span>12 <span style=''>import org.apache.hadoop.conf.Configuration
+</span>13 <span style=''>import org.apache.spark.rdd.RDD
+</span>14 <span style=''>import org.apache.spark.sql.catalyst.expressions.Expression
+</span>15 <span style=''>import org.apache.spark.sql.sources._
+</span>16 <span style=''>import org.apache.spark.sql.types.StructType
+</span>17 <span style=''>import org.apache.spark.sql.{Row, SQLContext}
+</span>18 <span style=''>import org.apache.spark.storage.StorageLevel
+</span>19 <span style=''>import org.geotools.api.data.{DataStoreFinder, Query, Transaction}
+</span>20 <span style=''>import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+</span>21 <span style=''>import org.geotools.filter.text.ecql.ECQL
+</span>22 <span style=''>import org.locationtech.geomesa.filter.FilterHelper
+</span>23 <span style=''>import org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore
+</span>24 <span style=''>import org.locationtech.geomesa.spark.jts.util.WKTUtils
+</span>25 <span style=''>import org.locationtech.geomesa.spark.sql.GeoMesaRelation.{CachedRDD, IndexedRDD, PartitionedIndexedRDD, PartitionedRDD}
+</span>26 <span style=''>import org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE
+</span>27 <span style=''>import org.locationtech.geomesa.spark.{GeoMesaSpark, SpatialRDD}
+</span>28 <span style=''>import org.locationtech.geomesa.utils.collection.SelfClosingIterator
+</span>29 <span style=''>import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes
+</span>30 <span style=''>import org.locationtech.jts.geom.Envelope
+</span>31 <span style=''>
+</span>32 <span style=''>import java.util.{Collections, Locale}
+</span>33 <span style=''>import scala.util.control.NonFatal
+</span>34 <span style=''>
+</span>35 <span style=''>/**
+</span>36 <span style=''>  * The Spark Relation that builds the scan over the GeoMesa table
+</span>37 <span style=''>  *
+</span>38 <span style=''>  * @param sqlContext spark sql context
+</span>39 <span style=''>  * @param sft simple feature type associated with the rows in the relation
+</span>40 <span style=''>  * @param schema spark sql schema (must correspond to the sft)
+</span>41 <span style=''>  * @param params user parameters, generally for configured the underlying data store and/or caching/partitioning
+</span>42 <span style=''>  * @param filter a push-down geotools filter applied to the relation
+</span>43 <span style=''>  * @param cached an optional cached RDD, used to speed up queries when enabled
+</span>44 <span style=''>  * @param partitioned an optional spatially partitioned RDD, used to speed up spatial joins when enabled
+</span>45 <span style=''>  */
+</span>46 <span style=''>case class GeoMesaRelation(
+</span>47 <span style=''>    sqlContext: SQLContext,
+</span>48 <span style=''>    sft: SimpleFeatureType,
+</span>49 <span style=''>    schema: StructType,
+</span>50 <span style=''>    params: Map[String, String],
+</span>51 <span style=''>    filter: Option[org.geotools.api.filter.Filter],
+</span>52 <span style=''>    cached: Option[CachedRDD],
+</span>53 <span style=''>    partitioned: Option[PartitionedRDD]
+</span>54 <span style=''>  ) extends BaseRelation with PrunedFilteredScan with LazyLogging {
+</span>55 <span style=''>
+</span>56 <span style=''>  import scala.collection.JavaConverters._
+</span>57 <span style=''>
+</span>58 <span style=''>  /**
+</span>59 <span style=''>    * Attempts to do an optimized join between two relations.
+</span>60 <span style=''>    *
+</span>61 <span style=''>    * Currently this method uses grid partitioning on both relations so that the join comparisons
+</span>62 <span style=''>    * only need to be applied on each pair of partitions, instead of globally. This only works
+</span>63 <span style=''>    * if both relations have already been grid partitioned.
+</span>64 <span style=''>    *
+</span>65 <span style=''>    * @param other relation to join
+</span>66 <span style=''>    * @param condition join condition
+</span>67 <span style=''>    * @return an optimized join, if possible to do so
+</span>68 <span style=''>    */
+</span>69 <span style=''>  def join(other: GeoMesaRelation, condition: Expression): Option[GeoMesaJoinRelation] = {
+</span>70 <span style=''>    val opt = </span><span style='background: #AEF1AE'>for { p &lt;- partitioned; o &lt;- other.partitioned } yield {
+</span>71 <span style=''></span><span style='background: #AEF1AE'>      val toJoin = if (p.envelopes == o.envelopes) {
+</span>72 <span style=''></span><span style='background: #AEF1AE'>        Some(other)
+</span>73 <span style=''></span><span style='background: #AEF1AE'>      } else </span><span style='background: #F0ADAD'>if (p.cover) {
+</span>74 <span style=''></span><span style='background: #F0ADAD'>        val repartitioned: SpatialRDD = p.partitions match {
+</span>75 <span style=''></span><span style='background: #F0ADAD'>          case None =&gt; p.raw
+</span>76 <span style=''></span><span style='background: #F0ADAD'>          case Some(partitions) =&gt; SpatialRDD(p.raw.repartition(partitions), p.raw.schema)
+</span>77 <span style=''></span><span style='background: #F0ADAD'>        }
+</span>78 <span style=''></span><span style='background: #F0ADAD'>        val parallelism = p.partitions.getOrElse(sqlContext.sparkContext.defaultParallelism)
+</span>79 <span style=''></span><span style='background: #F0ADAD'>        val rdd = RelationUtils.grid(repartitioned, p.envelopes, parallelism)
+</span>80 <span style=''></span><span style='background: #F0ADAD'>        val partitioned = Some(PartitionedRDD(rdd, p.raw, p.envelopes, p.partitions, p.cover))
+</span>81 <span style=''></span><span style='background: #F0ADAD'>        Some(other.copy(partitioned = partitioned))
+</span>82 <span style=''></span><span style='background: #F0ADAD'>      } else {
+</span>83 <span style=''></span><span style='background: #F0ADAD'>        logger.warn(&quot;Joining across two relations that are not partitioned by the same scheme - unable to optimize&quot;)
+</span>84 <span style=''></span><span style='background: #F0ADAD'>        None
+</span>85 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style='background: #AEF1AE'>
+</span>86 <span style=''></span><span style='background: #AEF1AE'>      toJoin.map { rel =&gt;
+</span>87 <span style=''></span><span style='background: #AEF1AE'>        GeoMesaJoinRelation(sqlContext, this, rel, StructType(schema.fields ++ rel.schema.fields), condition)
+</span>88 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>89 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>90 <span style=''>    </span><span style='background: #AEF1AE'>opt.flatten</span><span style=''>
+</span>91 <span style=''>  }
+</span>92 <span style=''>
+</span>93 <span style=''>  override def buildScan(
+</span>94 <span style=''>      requiredColumns: Array[String],
+</span>95 <span style=''>      filters: Array[org.apache.spark.sql.sources.Filter]): RDD[Row] = {
+</span>96 <span style=''>    lazy val debug =
+</span>97 <span style=''>      s&quot;filt = $filter, filters = ${filters.mkString(&quot;,&quot;)}, requiredColumns = ${requiredColumns.mkString(&quot;,&quot;)}&quot;
+</span>98 <span style=''>
+</span>99 <span style=''>    val filt = {
+</span>100 <span style=''>      val sum = </span><span style='background: #AEF1AE'>Seq.newBuilder[org.geotools.api.filter.Filter]</span><span style=''>
+</span>101 <span style=''>      </span><span style='background: #AEF1AE'>filter.foreach(sum += _)</span><span style=''>
+</span>102 <span style=''>      </span><span style='background: #AEF1AE'>filters.foreach(f =&gt; SparkUtils.sparkFilterToCQLFilter(f).foreach(sum += _))</span><span style=''>
+</span>103 <span style=''>      </span><span style='background: #AEF1AE'>FilterHelper.filterListAsAnd(sum.result).getOrElse(</span><span style='background: #F0ADAD'>org.geotools.api.filter.Filter.INCLUDE</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>104 <span style=''>    }
+</span>105 <span style=''>    val requiredAttributes = </span><span style='background: #AEF1AE'>requiredColumns.filterNot(_ == &quot;__fid__&quot;)</span><span style=''>
+</span>106 <span style=''>
+</span>107 <span style=''>    // avoid closures on complex objects
+</span>108 <span style=''>    val schema = </span><span style='background: #AEF1AE'>this.schema</span><span style=''> // note: referencing case class members evidently serializes the whole class??
+</span>109 <span style=''>    val typeName = </span><span style='background: #AEF1AE'>sft.getTypeName</span><span style=''>
+</span>110 <span style=''>
+</span>111 <span style=''>    val result: RDD[SimpleFeature] = </span><span style='background: #AEF1AE'>cached</span><span style=''> match {
+</span>112 <span style=''>      case None </span><span style='background: #AEF1AE'>=&gt;
+</span>113 <span style=''></span><span style='background: #AEF1AE'>        logger.debug(s&quot;Building scan, $debug&quot;)
+</span>114 <span style=''></span><span style='background: #AEF1AE'>        val conf = new Configuration(sqlContext.sparkContext.hadoopConfiguration)
+</span>115 <span style=''></span><span style='background: #AEF1AE'>        val query = new Query(typeName, filt, requiredAttributes: _*)
+</span>116 <span style=''></span><span style='background: #AEF1AE'>        GeoMesaSpark(params.asJava).rdd(conf, sqlContext.sparkContext, params, query)</span><span style=''>
+</span>117 <span style=''>
+</span>118 <span style=''>      case Some(IndexedRDD(rdd)) </span><span style='background: #AEF1AE'>=&gt;
+</span>119 <span style=''></span><span style='background: #AEF1AE'>        logger.debug(s&quot;Building in-memory scan, $debug&quot;)
+</span>120 <span style=''></span><span style='background: #AEF1AE'>        val cql = ECQL.toCQL(filt)
+</span>121 <span style=''></span><span style='background: #AEF1AE'>        rdd.flatMap { engine =&gt;
+</span>122 <span style=''></span><span style='background: #AEF1AE'>          val query = new Query(typeName, ECQL.toFilter(cql), requiredAttributes: _*)
+</span>123 <span style=''></span><span style='background: #AEF1AE'>          SelfClosingIterator(engine.getFeatureReader(query, Transaction.AUTO_COMMIT))
+</span>124 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>125 <span style=''>
+</span>126 <span style=''>      case Some(PartitionedIndexedRDD(rdd, _)) </span><span style='background: #AEF1AE'>=&gt;
+</span>127 <span style=''></span><span style='background: #AEF1AE'>        logger.debug(s&quot;Building partitioned in-memory scan, $debug&quot;)
+</span>128 <span style=''></span><span style='background: #AEF1AE'>        val cql = ECQL.toCQL(filt)
+</span>129 <span style=''></span><span style='background: #AEF1AE'>        rdd.flatMap { case (_, engine) =&gt;
+</span>130 <span style=''></span><span style='background: #AEF1AE'>          val query = new Query(typeName, ECQL.toFilter(cql), requiredAttributes: _*)
+</span>131 <span style=''></span><span style='background: #AEF1AE'>          SelfClosingIterator(engine.getFeatureReader(query, Transaction.AUTO_COMMIT))
+</span>132 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>133 <span style=''>    }
+</span>134 <span style=''>
+</span>135 <span style=''>    val extractors = </span><span style='background: #AEF1AE'>SparkUtils.getExtractors(requiredColumns, schema)</span><span style=''>
+</span>136 <span style=''>
+</span>137 <span style=''>    </span><span style='background: #AEF1AE'>result.map(SparkUtils.sf2row(schema, _, extractors))</span><span style=''>
+</span>138 <span style=''>  }
+</span>139 <span style=''>
+</span>140 <span style=''>  override def unhandledFilters(filters: Array[Filter]): Array[Filter] = {
+</span>141 <span style=''>    </span><span style='background: #AEF1AE'>filters.filter {
+</span>142 <span style=''></span><span style='background: #AEF1AE'>      case _ @ (_:IsNotNull | _:IsNull) =&gt; </span><span style='background: #F0ADAD'>true</span><span style='background: #AEF1AE'>
+</span>143 <span style=''></span><span style='background: #AEF1AE'>      case _ =&gt; false
+</span>144 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>145 <span style=''>  }
+</span>146 <span style=''>}
+</span>147 <span style=''>
+</span>148 <span style=''>object GeoMesaRelation extends LazyLogging {
+</span>149 <span style=''>
+</span>150 <span style=''>  import scala.collection.JavaConverters._
+</span>151 <span style=''>
+</span>152 <span style=''>  /**
+</span>153 <span style=''>    * Create a new relation based on the input parameters
+</span>154 <span style=''>    *
+</span>155 <span style=''>    * @param sqlContext sql context
+</span>156 <span style=''>    * @param params parameters
+</span>157 <span style=''>    * @return
+</span>158 <span style=''>    */
+</span>159 <span style=''>  def apply(sqlContext: SQLContext, params: Map[String, String]): GeoMesaRelation = {
+</span>160 <span style=''>    val name = </span><span style='background: #AEF1AE'>params.getOrElse(GEOMESA_SQL_FEATURE,
+</span>161 <span style=''></span><span style='background: #AEF1AE'>      </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Feature type must be specified with '$GEOMESA_SQL_FEATURE'&quot;)</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>162 <span style=''>    val sft = </span><span style='background: #AEF1AE'>GeoMesaSpark(params.asJava).sft(params, name).getOrElse {
+</span>163 <span style=''></span><span style='background: #AEF1AE'>      </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Could not load feature type with name '$name'&quot;)</span><span style='background: #AEF1AE'>
+</span>164 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>165 <span style=''>    </span><span style='background: #AEF1AE'>apply(sqlContext, params, SparkUtils.createStructType(sft), sft)</span><span style=''>
+</span>166 <span style=''>  }
+</span>167 <span style=''>
+</span>168 <span style=''>  /**
+</span>169 <span style=''>    * Create a new relation based on the input parameters, with the given schema
+</span>170 <span style=''>    *
+</span>171 <span style=''>    * @param sqlContext sql context
+</span>172 <span style=''>    * @param params parameters
+</span>173 <span style=''>    * @param schema schema
+</span>174 <span style=''>    * @return
+</span>175 <span style=''>    */
+</span>176 <span style=''>  def apply(sqlContext: SQLContext, params: Map[String, String], schema: StructType): GeoMesaRelation = {
+</span>177 <span style=''>    val name = </span><span style='background: #F0ADAD'>params.getOrElse(GEOMESA_SQL_FEATURE,
+</span>178 <span style=''></span><span style='background: #F0ADAD'>      throw new IllegalArgumentException(s&quot;Feature type must be specified with '$GEOMESA_SQL_FEATURE'&quot;))</span><span style=''>
+</span>179 <span style=''>    val sft = </span><span style='background: #F0ADAD'>GeoMesaSpark(params.asJava).sft(params, name).getOrElse {
+</span>180 <span style=''></span><span style='background: #F0ADAD'>      throw new IllegalArgumentException(s&quot;Could not load feature type with name '$name'&quot;)
+</span>181 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>182 <span style=''>    </span><span style='background: #F0ADAD'>apply(sqlContext, params, schema, sft)</span><span style=''>
+</span>183 <span style=''>  }
+</span>184 <span style=''>
+</span>185 <span style=''>  /**
+</span>186 <span style=''>    * Create a new relation based on the input parameters, with the given schema and underlying feature type
+</span>187 <span style=''>    *
+</span>188 <span style=''>    * @param sqlContext sql context
+</span>189 <span style=''>    * @param params parameters
+</span>190 <span style=''>    * @param schema schema
+</span>191 <span style=''>    * @param sft simple feature type
+</span>192 <span style=''>    * @return
+</span>193 <span style=''>    */
+</span>194 <span style=''>  def apply(
+</span>195 <span style=''>      sqlContext: SQLContext,
+</span>196 <span style=''>      params: Map[String, String],
+</span>197 <span style=''>      schema: StructType,
+</span>198 <span style=''>      sft: SimpleFeatureType): GeoMesaRelation = {
+</span>199 <span style=''>
+</span>200 <span style=''>    logger.trace(s&quot;Creating GeoMesaRelation with sft: $sft&quot;)
+</span>201 <span style=''>
+</span>202 <span style=''>    def get[T](key: String, transform: String =&gt; T, default: =&gt; T): T = {
+</span>203 <span style=''>      </span><span style='background: #AEF1AE'>params.get(key)</span><span style=''> match {
+</span>204 <span style=''>        case None =&gt; </span><span style='background: #AEF1AE'>default</span><span style=''>
+</span>205 <span style=''>        case Some(v) =&gt;
+</span>206 <span style=''>          </span><span style='background: #AEF1AE'>try { transform(v) } catch {
+</span>207 <span style=''></span><span style='background: #AEF1AE'>            case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt; logger.error(s&quot;Error evaluating param '$key' with value '$v':&quot;, e); default</span><span style='background: #AEF1AE'>
+</span>208 <span style=''></span><span style='background: #AEF1AE'>          }</span><span style=''>
+</span>209 <span style=''>      }
+</span>210 <span style=''>    }
+</span>211 <span style=''>
+</span>212 <span style=''>    def rawRDD: SpatialRDD = {
+</span>213 <span style=''>      val query = </span><span style='background: #AEF1AE'>new Query(sft.getTypeName, ECQL.toFilter(params.getOrElse(&quot;query&quot;, &quot;INCLUDE&quot;)))</span><span style=''>
+</span>214 <span style=''>      </span><span style='background: #AEF1AE'>GeoMesaSpark(params.asJava).rdd(new Configuration(), sqlContext.sparkContext, params, query)</span><span style=''>
+</span>215 <span style=''>    }
+</span>216 <span style=''>
+</span>217 <span style=''>    val partitioned = if (</span><span style='background: #AEF1AE'>!get[Boolean](&quot;spatial&quot;, _.toBoolean, false)</span><span style=''>) { </span><span style='background: #AEF1AE'>None</span><span style=''> } else </span><span style='background: #AEF1AE'>{
+</span>218 <span style=''></span><span style='background: #AEF1AE'>      val raw = rawRDD
+</span>219 <span style=''></span><span style='background: #AEF1AE'>      val bounds: Envelope = params.get(&quot;bounds&quot;) match {
+</span>220 <span style=''></span><span style='background: #AEF1AE'>        case None =&gt; RelationUtils.getBound(raw)
+</span>221 <span style=''></span><span style='background: #AEF1AE'>        case Some(b) =&gt;
+</span>222 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>try { WKTUtils.read(b).getEnvelopeInternal } catch {
+</span>223 <span style=''></span><span style='background: #F0ADAD'>            case NonFatal(e) =&gt; throw new IllegalArgumentException(s&quot;Error reading provided bounds '$b':&quot;, e)
+</span>224 <span style=''></span><span style='background: #F0ADAD'>          }</span><span style='background: #AEF1AE'>
+</span>225 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>226 <span style=''></span><span style='background: #AEF1AE'>
+</span>227 <span style=''></span><span style='background: #AEF1AE'>      val partitions = Option(get[Int](&quot;partitions&quot;, _.toInt, -1)).filter(_ &gt; 0)
+</span>228 <span style=''></span><span style='background: #AEF1AE'>      val parallelism = partitions.getOrElse(sqlContext.sparkContext.defaultParallelism)
+</span>229 <span style=''></span><span style='background: #AEF1AE'>      // control partitioning strategies that require a sample of the data
+</span>230 <span style=''></span><span style='background: #AEF1AE'>      lazy val sampleSize = get[Int](&quot;sampleSize&quot;, _.toInt, 100)
+</span>231 <span style=''></span><span style='background: #AEF1AE'>      lazy val threshold = get[Double](&quot;threshold&quot;, _.toDouble, 0.3)
+</span>232 <span style=''></span><span style='background: #AEF1AE'>
+</span>233 <span style=''></span><span style='background: #AEF1AE'>      val envelopes = params.getOrElse(&quot;strategy&quot;, &quot;equal&quot;).toLowerCase(Locale.US) match {
+</span>234 <span style=''></span><span style='background: #AEF1AE'>        case &quot;equal&quot;    =&gt; RelationUtils.equalPartitioning(bounds, parallelism)
+</span>235 <span style=''></span><span style='background: #AEF1AE'>        case &quot;earth&quot;    =&gt; RelationUtils.wholeEarthPartitioning(parallelism)
+</span>236 <span style=''></span><span style='background: #AEF1AE'>        case &quot;weighted&quot; =&gt; </span><span style='background: #F0ADAD'>RelationUtils.weightedPartitioning(raw, bounds, parallelism, sampleSize)</span><span style='background: #AEF1AE'>
+</span>237 <span style=''></span><span style='background: #AEF1AE'>        case &quot;rtree&quot;    =&gt; RelationUtils.rtreePartitioning(raw, parallelism, sampleSize, threshold)
+</span>238 <span style=''></span><span style='background: #AEF1AE'>        case s =&gt; </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Invalid partitioning strategy: $s&quot;)</span><span style='background: #AEF1AE'>
+</span>239 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>240 <span style=''></span><span style='background: #AEF1AE'>
+</span>241 <span style=''></span><span style='background: #AEF1AE'>      val rdd = RelationUtils.grid(raw, envelopes, parallelism)
+</span>242 <span style=''></span><span style='background: #AEF1AE'>      rdd.persist(StorageLevel.MEMORY_ONLY)
+</span>243 <span style=''></span><span style='background: #AEF1AE'>      Some(PartitionedRDD(rdd, raw, envelopes, partitions, get[Boolean](&quot;cover&quot;, </span><span style='background: #F0ADAD'>_.toBoolean</span><span style='background: #AEF1AE'>, false)))
+</span>244 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>245 <span style=''>
+</span>246 <span style=''>    val cached = if (</span><span style='background: #AEF1AE'>!get[Boolean](&quot;cache&quot;, _.toBoolean, false)</span><span style=''>) { </span><span style='background: #AEF1AE'>None</span><span style=''> } else </span><span style='background: #AEF1AE'>{
+</span>247 <span style=''></span><span style='background: #AEF1AE'>      val check = Collections.singletonMap[String, java.io.Serializable](&quot;cqengine&quot;, &quot;true&quot;)
+</span>248 <span style=''></span><span style='background: #AEF1AE'>      if (!DataStoreFinder.getAvailableDataStores.asScala.exists(_.canProcess(check))) {
+</span>249 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(&quot;Caching requires the GeoCQEngineDataStore to be available on the classpath&quot;)</span><span style='background: #AEF1AE'>
+</span>250 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>251 <span style=''></span><span style='background: #AEF1AE'>
+</span>252 <span style=''></span><span style='background: #AEF1AE'>      // avoid closure on full sft
+</span>253 <span style=''></span><span style='background: #AEF1AE'>      val typeName = sft.getTypeName
+</span>254 <span style=''></span><span style='background: #AEF1AE'>      val encodedSft = SimpleFeatureTypes.encodeType(sft, includeUserData = true)
+</span>255 <span style=''></span><span style='background: #AEF1AE'>
+</span>256 <span style=''></span><span style='background: #AEF1AE'>      val indexGeom = get[Boolean](&quot;indexGeom&quot;, </span><span style='background: #F0ADAD'>_.toBoolean</span><span style='background: #AEF1AE'>, false)
+</span>257 <span style=''></span><span style='background: #AEF1AE'>
+</span>258 <span style=''></span><span style='background: #AEF1AE'>      partitioned match {
+</span>259 <span style=''></span><span style='background: #AEF1AE'>        case Some(p) =&gt;
+</span>260 <span style=''></span><span style='background: #AEF1AE'>          val rdd = p.rdd.mapValues { iter =&gt;
+</span>261 <span style=''></span><span style='background: #AEF1AE'>            val engine = new GeoCQEngineDataStore(indexGeom)
+</span>262 <span style=''></span><span style='background: #AEF1AE'>            engine.createSchema(SimpleFeatureTypes.createType(typeName, encodedSft))
+</span>263 <span style=''></span><span style='background: #AEF1AE'>            engine.namesToEngine.get(typeName).insert(iter)
+</span>264 <span style=''></span><span style='background: #AEF1AE'>            engine
+</span>265 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>266 <span style=''></span><span style='background: #AEF1AE'>          p.rdd.unpersist() // make this call blocking?
+</span>267 <span style=''></span><span style='background: #AEF1AE'>          rdd.persist(StorageLevel.MEMORY_ONLY)
+</span>268 <span style=''></span><span style='background: #AEF1AE'>          Some(PartitionedIndexedRDD(rdd, p.envelopes))
+</span>269 <span style=''></span><span style='background: #AEF1AE'>
+</span>270 <span style=''></span><span style='background: #AEF1AE'>        case None =&gt;
+</span>271 <span style=''></span><span style='background: #AEF1AE'>          val rdd = rawRDD.mapPartitions { iter =&gt;
+</span>272 <span style=''></span><span style='background: #AEF1AE'>            val engine = new GeoCQEngineDataStore(indexGeom)
+</span>273 <span style=''></span><span style='background: #AEF1AE'>            engine.createSchema(SimpleFeatureTypes.createType(typeName, encodedSft))
+</span>274 <span style=''></span><span style='background: #AEF1AE'>            engine.namesToEngine.get(typeName).insert(iter.toList)
+</span>275 <span style=''></span><span style='background: #AEF1AE'>            Iterator.single(engine)
+</span>276 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>277 <span style=''></span><span style='background: #AEF1AE'>          rdd.persist(StorageLevel.MEMORY_ONLY)
+</span>278 <span style=''></span><span style='background: #AEF1AE'>          Some(IndexedRDD(rdd))
+</span>279 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>280 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>281 <span style=''>   
+</span>282 <span style=''>   val filter = </span><span style='background: #AEF1AE'>Option(ECQL.toFilter(params.getOrElse(&quot;query&quot;, &quot;INCLUDE&quot;)))</span><span style=''>
+</span>283 <span style=''>
+</span>284 <span style=''>    </span><span style='background: #AEF1AE'>GeoMesaRelation(sqlContext, sft, schema, params, filter, cached, partitioned)</span><span style=''>
+</span>285 <span style=''>  }
+</span>286 <span style=''>
+</span>287 <span style=''>  /**
+</span>288 <span style=''>    * Holder for a partitioning scheme
+</span>289 <span style=''>    *
+</span>290 <span style=''>    * @param rdd partitioned rdd
+</span>291 <span style=''>    * @param raw underlying unpartitioned rdd
+</span>292 <span style=''>    * @param envelopes envelopes used in partitioning
+</span>293 <span style=''>    * @param partitions hint for number of partitions
+</span>294 <span style=''>    * @param cover cover partitions or not when joining
+</span>295 <span style=''>    */
+</span>296 <span style=''>  case class PartitionedRDD(
+</span>297 <span style=''>      rdd: RDD[(Int, Iterable[SimpleFeature])],
+</span>298 <span style=''>      raw: SpatialRDD,
+</span>299 <span style=''>      envelopes: List[Envelope],
+</span>300 <span style=''>      partitions: Option[Int],
+</span>301 <span style=''>      cover: Boolean
+</span>302 <span style=''>    )
+</span>303 <span style=''>
+</span>304 <span style=''>  /**
+</span>305 <span style=''>    * Trait for cached RDDs used to accelerate scans
+</span>306 <span style=''>    */
+</span>307 <span style=''>  sealed trait CachedRDD
+</span>308 <span style=''>
+</span>309 <span style=''>  /**
+</span>310 <span style=''>    * An RDD where each element is a spatial index containing multiple features
+</span>311 <span style=''>    *
+</span>312 <span style=''>    * @param rdd indexed features
+</span>313 <span style=''>    */
+</span>314 <span style=''>  case class IndexedRDD(rdd: RDD[GeoCQEngineDataStore]) extends CachedRDD
+</span>315 <span style=''>
+</span>316 <span style=''>  /**
+</span>317 <span style=''>    * An RDD where each element is a spatial index containing multiple features, partitioned by
+</span>318 <span style=''>    * a spatial grid
+</span>319 <span style=''>    *
+</span>320 <span style=''>    * @param rdd grid cell -&gt; indexed features
+</span>321 <span style=''>    * @param envelopes envelopes corresponding the each grid cell
+</span>322 <span style=''>    */
+</span>323 <span style=''>  case class PartitionedIndexedRDD(rdd: RDD[(Int, GeoCQEngineDataStore)], envelopes: List[Envelope])
+</span>324 <span style=''>      extends CachedRDD
+</span>325 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          70239
+        </td>
+        <td>
+          3331
+          -
+          4300
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.partitioned.flatMap[Option[org.locationtech.geomesa.spark.sql.GeoMesaJoinRelation]](((p: org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD) =&gt; other.partitioned.map[Option[org.locationtech.geomesa.spark.sql.GeoMesaJoinRelation]](((o: org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD) =&gt; {
+  val toJoin: Option[org.locationtech.geomesa.spark.sql.GeoMesaRelation] = if (p.envelopes.==(o.envelopes))
+    scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation](other)
+  else
+    if (p.cover)
+      {
+        val repartitioned: org.locationtech.geomesa.spark.SpatialRDD = p.partitions match {
+          case scala.None =&gt; p.raw
+          case (value: Int)Some[Int]((partitions @ _)) =&gt; org.locationtech.geomesa.spark.SpatialRDD.apply({
+            &lt;artifact&gt; val x$1: Int = partitions;
+            &lt;artifact&gt; val x$2: Ordering[org.geotools.api.feature.simple.SimpleFeature] @scala.reflect.internal.annotations.uncheckedBounds = p.raw.repartition$default$2(x$1);
+            p.raw.repartition(x$1)(x$2)
+          }, p.raw.schema)
+        };
+        val parallelism: Int = p.partitions.getOrElse[Int](GeoMesaRelation.this.sqlContext.sparkContext.defaultParallelism);
+        val rdd: org.apache.spark.rdd.RDD[(Int, Iterable[org.geotools.api.feature.simple.SimpleFeature])] = RelationUtils.grid(repartitioned, p.envelopes, parallelism);
+        val partitioned: Some[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD] = scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD](org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.apply(rdd, p.raw, p.envelopes, p.partitions, p.cover));
+        scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation]({
+          &lt;artifact&gt; val x$3: Some[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD] @scala.reflect.internal.annotations.uncheckedBounds = partitioned;
+          &lt;artifact&gt; val x$4: org.apache.spark.sql.SQLContext = other.copy$default$1;
+          &lt;artifact&gt; val x$5: org.geotools.api.feature.simple.SimpleFeatureType = other.copy$default$2;
+          &lt;artifact&gt; val x$6: org.apache.spark.sql.types.StructType = other.copy$default$3;
+          &lt;artifact&gt; val x$7: Map[String,String] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$4;
+          &lt;artifact&gt; val x$8: Option[org.geotools.api.filter.Filter] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$5;
+          &lt;artifact&gt; val x$9: Option[org.locationtech.geomesa.spark.sql.GeoMesaRelation.CachedRDD] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$6;
+          other.copy(x$4, x$5, x$6, x$7, x$8, x$9, x$3)
+        })
+      }
+    else
+      {
+        (if (GeoMesaRelation.this.logger.underlying.isWarnEnabled())
+          GeoMesaRelation.this.logger.underlying.warn(&quot;Joining across two relations that are not partitioned by the same scheme - unable to optimize&quot;)
+        else
+          (): Unit);
+        scala.None
+      };
+  toJoin.map[org.locationtech.geomesa.spark.sql.GeoMesaJoinRelation](((rel: org.locationtech.geomesa.spark.sql.GeoMesaRelation) =&gt; GeoMesaJoinRelation.apply(GeoMesaRelation.this.sqlContext, this, rel, org.apache.spark.sql.types.StructType.apply(scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](GeoMesaRelation.this.schema.fields).++[org.apache.spark.sql.types.StructField, Array[org.apache.spark.sql.types.StructField]](scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](rel.schema.fields))(scala.this.Array.canBuildFrom[org.apache.spark.sql.types.StructField]((ClassTag.apply[org.apache.spark.sql.types.StructField](classOf[org.apache.spark.sql.types.StructField]): scala.reflect.ClassTag[org.apache.spark.sql.types.StructField])))), condition, GeoMesaJoinRelation.apply$default$6, GeoMesaJoinRelation.apply$default$7)))
+}))))
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          70238
+        </td>
+        <td>
+          3355
+          -
+          4300
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          other.partitioned.map[Option[org.locationtech.geomesa.spark.sql.GeoMesaJoinRelation]](((o: org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD) =&gt; {
+  val toJoin: Option[org.locationtech.geomesa.spark.sql.GeoMesaRelation] = if (p.envelopes.==(o.envelopes))
+    scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation](other)
+  else
+    if (p.cover)
+      {
+        val repartitioned: org.locationtech.geomesa.spark.SpatialRDD = p.partitions match {
+          case scala.None =&gt; p.raw
+          case (value: Int)Some[Int]((partitions @ _)) =&gt; org.locationtech.geomesa.spark.SpatialRDD.apply({
+            &lt;artifact&gt; val x$1: Int = partitions;
+            &lt;artifact&gt; val x$2: Ordering[org.geotools.api.feature.simple.SimpleFeature] @scala.reflect.internal.annotations.uncheckedBounds = p.raw.repartition$default$2(x$1);
+            p.raw.repartition(x$1)(x$2)
+          }, p.raw.schema)
+        };
+        val parallelism: Int = p.partitions.getOrElse[Int](GeoMesaRelation.this.sqlContext.sparkContext.defaultParallelism);
+        val rdd: org.apache.spark.rdd.RDD[(Int, Iterable[org.geotools.api.feature.simple.SimpleFeature])] = RelationUtils.grid(repartitioned, p.envelopes, parallelism);
+        val partitioned: Some[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD] = scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD](org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.apply(rdd, p.raw, p.envelopes, p.partitions, p.cover));
+        scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation]({
+          &lt;artifact&gt; val x$3: Some[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD] @scala.reflect.internal.annotations.uncheckedBounds = partitioned;
+          &lt;artifact&gt; val x$4: org.apache.spark.sql.SQLContext = other.copy$default$1;
+          &lt;artifact&gt; val x$5: org.geotools.api.feature.simple.SimpleFeatureType = other.copy$default$2;
+          &lt;artifact&gt; val x$6: org.apache.spark.sql.types.StructType = other.copy$default$3;
+          &lt;artifact&gt; val x$7: Map[String,String] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$4;
+          &lt;artifact&gt; val x$8: Option[org.geotools.api.filter.Filter] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$5;
+          &lt;artifact&gt; val x$9: Option[org.locationtech.geomesa.spark.sql.GeoMesaRelation.CachedRDD] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$6;
+          other.copy(x$4, x$5, x$6, x$7, x$8, x$9, x$3)
+        })
+      }
+    else
+      {
+        (if (GeoMesaRelation.this.logger.underlying.isWarnEnabled())
+          GeoMesaRelation.this.logger.underlying.warn(&quot;Joining across two relations that are not partitioned by the same scheme - unable to optimize&quot;)
+        else
+          (): Unit);
+        scala.None
+      };
+  toJoin.map[org.locationtech.geomesa.spark.sql.GeoMesaJoinRelation](((rel: org.locationtech.geomesa.spark.sql.GeoMesaRelation) =&gt; GeoMesaJoinRelation.apply(GeoMesaRelation.this.sqlContext, this, rel, org.apache.spark.sql.types.StructType.apply(scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](GeoMesaRelation.this.schema.fields).++[org.apache.spark.sql.types.StructField, Array[org.apache.spark.sql.types.StructField]](scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](rel.schema.fields))(scala.this.Array.canBuildFrom[org.apache.spark.sql.types.StructField]((ClassTag.apply[org.apache.spark.sql.types.StructField](classOf[org.apache.spark.sql.types.StructField]): scala.reflect.ClassTag[org.apache.spark.sql.types.StructField])))), condition, GeoMesaJoinRelation.apply$default$6, GeoMesaJoinRelation.apply$default$7)))
+}))
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          70201
+        </td>
+        <td>
+          3426
+          -
+          3437
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.envelopes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          o.envelopes
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          70202
+        </td>
+        <td>
+          3411
+          -
+          3437
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          p.envelopes.==(o.envelopes)
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          70203
+        </td>
+        <td>
+          3449
+          -
+          3460
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation](other)
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          70204
+        </td>
+        <td>
+          3449
+          -
+          3460
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation](other)
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          70205
+        </td>
+        <td>
+          3478
+          -
+          3485
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.cover
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.cover
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          70225
+        </td>
+        <td>
+          3487
+          -
+          4005
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  val repartitioned: org.locationtech.geomesa.spark.SpatialRDD = p.partitions match {
+    case scala.None =&gt; p.raw
+    case (value: Int)Some[Int]((partitions @ _)) =&gt; org.locationtech.geomesa.spark.SpatialRDD.apply({
+      &lt;artifact&gt; val x$1: Int = partitions;
+      &lt;artifact&gt; val x$2: Ordering[org.geotools.api.feature.simple.SimpleFeature] @scala.reflect.internal.annotations.uncheckedBounds = p.raw.repartition$default$2(x$1);
+      p.raw.repartition(x$1)(x$2)
+    }, p.raw.schema)
+  };
+  val parallelism: Int = p.partitions.getOrElse[Int](GeoMesaRelation.this.sqlContext.sparkContext.defaultParallelism);
+  val rdd: org.apache.spark.rdd.RDD[(Int, Iterable[org.geotools.api.feature.simple.SimpleFeature])] = RelationUtils.grid(repartitioned, p.envelopes, parallelism);
+  val partitioned: Some[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD] = scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD](org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.apply(rdd, p.raw, p.envelopes, p.partitions, p.cover));
+  scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation]({
+    &lt;artifact&gt; val x$3: Some[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD] @scala.reflect.internal.annotations.uncheckedBounds = partitioned;
+    &lt;artifact&gt; val x$4: org.apache.spark.sql.SQLContext = other.copy$default$1;
+    &lt;artifact&gt; val x$5: org.geotools.api.feature.simple.SimpleFeatureType = other.copy$default$2;
+    &lt;artifact&gt; val x$6: org.apache.spark.sql.types.StructType = other.copy$default$3;
+    &lt;artifact&gt; val x$7: Map[String,String] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$4;
+    &lt;artifact&gt; val x$8: Option[org.geotools.api.filter.Filter] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$5;
+    &lt;artifact&gt; val x$9: Option[org.locationtech.geomesa.spark.sql.GeoMesaRelation.CachedRDD] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$6;
+    other.copy(x$4, x$5, x$6, x$7, x$8, x$9, x$3)
+  })
+}
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          70228
+        </td>
+        <td>
+          3474
+          -
+          4150
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          if (p.cover)
+  {
+    val repartitioned: org.locationtech.geomesa.spark.SpatialRDD = p.partitions match {
+      case scala.None =&gt; p.raw
+      case (value: Int)Some[Int]((partitions @ _)) =&gt; org.locationtech.geomesa.spark.SpatialRDD.apply({
+        &lt;artifact&gt; val x$1: Int = partitions;
+        &lt;artifact&gt; val x$2: Ordering[org.geotools.api.feature.simple.SimpleFeature] @scala.reflect.internal.annotations.uncheckedBounds = p.raw.repartition$default$2(x$1);
+        p.raw.repartition(x$1)(x$2)
+      }, p.raw.schema)
+    };
+    val parallelism: Int = p.partitions.getOrElse[Int](GeoMesaRelation.this.sqlContext.sparkContext.defaultParallelism);
+    val rdd: org.apache.spark.rdd.RDD[(Int, Iterable[org.geotools.api.feature.simple.SimpleFeature])] = RelationUtils.grid(repartitioned, p.envelopes, parallelism);
+    val partitioned: Some[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD] = scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD](org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.apply(rdd, p.raw, p.envelopes, p.partitions, p.cover));
+    scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation]({
+      &lt;artifact&gt; val x$3: Some[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD] @scala.reflect.internal.annotations.uncheckedBounds = partitioned;
+      &lt;artifact&gt; val x$4: org.apache.spark.sql.SQLContext = other.copy$default$1;
+      &lt;artifact&gt; val x$5: org.geotools.api.feature.simple.SimpleFeatureType = other.copy$default$2;
+      &lt;artifact&gt; val x$6: org.apache.spark.sql.types.StructType = other.copy$default$3;
+      &lt;artifact&gt; val x$7: Map[String,String] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$4;
+      &lt;artifact&gt; val x$8: Option[org.geotools.api.filter.Filter] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$5;
+      &lt;artifact&gt; val x$9: Option[org.locationtech.geomesa.spark.sql.GeoMesaRelation.CachedRDD] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$6;
+      other.copy(x$4, x$5, x$6, x$7, x$8, x$9, x$3)
+    })
+  }
+else
+  {
+    (if (GeoMesaRelation.this.logger.underlying.isWarnEnabled())
+      GeoMesaRelation.this.logger.underlying.warn(&quot;Joining across two relations that are not partitioned by the same scheme - unable to optimize&quot;)
+    else
+      (): Unit);
+    scala.None
+  }
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          70206
+        </td>
+        <td>
+          3529
+          -
+          3541
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.partitions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.partitions
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          70207
+        </td>
+        <td>
+          3573
+          -
+          3578
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.raw
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.raw
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          70208
+        </td>
+        <td>
+          3573
+          -
+          3578
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.raw
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.raw
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          70209
+        </td>
+        <td>
+          3642
+          -
+          3642
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.repartition$default$2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.raw.repartition$default$2(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          70211
+        </td>
+        <td>
+          3614
+          -
+          3669
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.SpatialRDD.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.spark.SpatialRDD.apply({
+  &lt;artifact&gt; val x$1: Int = partitions;
+  &lt;artifact&gt; val x$2: Ordering[org.geotools.api.feature.simple.SimpleFeature] @scala.reflect.internal.annotations.uncheckedBounds = p.raw.repartition$default$2(x$1);
+  p.raw.repartition(x$1)(x$2)
+}, p.raw.schema)
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          70210
+        </td>
+        <td>
+          3625
+          -
+          3654
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.repartition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.raw.repartition(x$1)(x$2)
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          70212
+        </td>
+        <td>
+          3614
+          -
+          3669
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.SpatialRDD.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.spark.SpatialRDD.apply({
+  &lt;artifact&gt; val x$1: Int = partitions;
+  &lt;artifact&gt; val x$2: Ordering[org.geotools.api.feature.simple.SimpleFeature] @scala.reflect.internal.annotations.uncheckedBounds = p.raw.repartition$default$2(x$1);
+  p.raw.repartition(x$1)(x$2)
+}, p.raw.schema)
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          70213
+        </td>
+        <td>
+          3729
+          -
+          3771
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.apache.spark.SparkContext.defaultParallelism
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaRelation.this.sqlContext.sparkContext.defaultParallelism
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          70214
+        </td>
+        <td>
+          3706
+          -
+          3772
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.partitions.getOrElse[Int](GeoMesaRelation.this.sqlContext.sparkContext.defaultParallelism)
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          70215
+        </td>
+        <td>
+          3825
+          -
+          3836
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.envelopes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.envelopes
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          70216
+        </td>
+        <td>
+          3791
+          -
+          3850
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.grid
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RelationUtils.grid(repartitioned, p.envelopes, parallelism)
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          70217
+        </td>
+        <td>
+          3902
+          -
+          3907
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.raw
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.raw
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          70219
+        </td>
+        <td>
+          3922
+          -
+          3934
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.partitions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.partitions
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          70218
+        </td>
+        <td>
+          3909
+          -
+          3920
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.envelopes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.envelopes
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          70221
+        </td>
+        <td>
+          3882
+          -
+          3944
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.apply(rdd, p.raw, p.envelopes, p.partitions, p.cover)
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          70220
+        </td>
+        <td>
+          3936
+          -
+          3943
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.cover
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.cover
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          70222
+        </td>
+        <td>
+          3877
+          -
+          3945
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD](org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.apply(rdd, p.raw, p.envelopes, p.partitions, p.cover))
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          70223
+        </td>
+        <td>
+          3959
+          -
+          3996
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.copy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          other.copy(x$4, x$5, x$6, x$7, x$8, x$9, x$3)
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          70224
+        </td>
+        <td>
+          3954
+          -
+          3997
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation]({
+  &lt;artifact&gt; val x$3: Some[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD] @scala.reflect.internal.annotations.uncheckedBounds = partitioned;
+  &lt;artifact&gt; val x$4: org.apache.spark.sql.SQLContext = other.copy$default$1;
+  &lt;artifact&gt; val x$5: org.geotools.api.feature.simple.SimpleFeatureType = other.copy$default$2;
+  &lt;artifact&gt; val x$6: org.apache.spark.sql.types.StructType = other.copy$default$3;
+  &lt;artifact&gt; val x$7: Map[String,String] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$4;
+  &lt;artifact&gt; val x$8: Option[org.geotools.api.filter.Filter] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$5;
+  &lt;artifact&gt; val x$9: Option[org.locationtech.geomesa.spark.sql.GeoMesaRelation.CachedRDD] @scala.reflect.internal.annotations.uncheckedBounds = other.copy$default$6;
+  other.copy(x$4, x$5, x$6, x$7, x$8, x$9, x$3)
+})
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          70227
+        </td>
+        <td>
+          4011
+          -
+          4150
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (GeoMesaRelation.this.logger.underlying.isWarnEnabled())
+    GeoMesaRelation.this.logger.underlying.warn(&quot;Joining across two relations that are not partitioned by the same scheme - unable to optimize&quot;)
+  else
+    (): Unit);
+  scala.None
+}
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          70226
+        </td>
+        <td>
+          4138
+          -
+          4142
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          70237
+        </td>
+        <td>
+          4157
+          -
+          4294
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          toJoin.map[org.locationtech.geomesa.spark.sql.GeoMesaJoinRelation](((rel: org.locationtech.geomesa.spark.sql.GeoMesaRelation) =&gt; GeoMesaJoinRelation.apply(GeoMesaRelation.this.sqlContext, this, rel, org.apache.spark.sql.types.StructType.apply(scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](GeoMesaRelation.this.schema.fields).++[org.apache.spark.sql.types.StructField, Array[org.apache.spark.sql.types.StructField]](scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](rel.schema.fields))(scala.this.Array.canBuildFrom[org.apache.spark.sql.types.StructField]((ClassTag.apply[org.apache.spark.sql.types.StructField](classOf[org.apache.spark.sql.types.StructField]): scala.reflect.ClassTag[org.apache.spark.sql.types.StructField])))), condition, GeoMesaJoinRelation.apply$default$6, GeoMesaJoinRelation.apply$default$7)))
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          70229
+        </td>
+        <td>
+          4205
+          -
+          4215
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.sqlContext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.sqlContext
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          70231
+        </td>
+        <td>
+          4256
+          -
+          4273
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.apache.spark.sql.types.StructType.fields
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rel.schema.fields
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          70230
+        </td>
+        <td>
+          4239
+          -
+          4252
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.apache.spark.sql.types.StructType.fields
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.schema.fields
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          70233
+        </td>
+        <td>
+          4253
+          -
+          4253
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Array.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Array.canBuildFrom[org.apache.spark.sql.types.StructField]((ClassTag.apply[org.apache.spark.sql.types.StructField](classOf[org.apache.spark.sql.types.StructField]): scala.reflect.ClassTag[org.apache.spark.sql.types.StructField]))
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          70232
+        </td>
+        <td>
+          4256
+          -
+          4273
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Predef.refArrayOps
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](rel.schema.fields)
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          70235
+        </td>
+        <td>
+          4228
+          -
+          4274
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.spark.sql.types.StructType.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.apache.spark.sql.types.StructType.apply(scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](GeoMesaRelation.this.schema.fields).++[org.apache.spark.sql.types.StructField, Array[org.apache.spark.sql.types.StructField]](scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](rel.schema.fields))(scala.this.Array.canBuildFrom[org.apache.spark.sql.types.StructField]((ClassTag.apply[org.apache.spark.sql.types.StructField](classOf[org.apache.spark.sql.types.StructField]): scala.reflect.ClassTag[org.apache.spark.sql.types.StructField]))))
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          70234
+        </td>
+        <td>
+          4239
+          -
+          4273
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.++
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](GeoMesaRelation.this.schema.fields).++[org.apache.spark.sql.types.StructField, Array[org.apache.spark.sql.types.StructField]](scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](rel.schema.fields))(scala.this.Array.canBuildFrom[org.apache.spark.sql.types.StructField]((ClassTag.apply[org.apache.spark.sql.types.StructField](classOf[org.apache.spark.sql.types.StructField]): scala.reflect.ClassTag[org.apache.spark.sql.types.StructField])))
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          70236
+        </td>
+        <td>
+          4185
+          -
+          4286
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaJoinRelation.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaJoinRelation.apply(GeoMesaRelation.this.sqlContext, this, rel, org.apache.spark.sql.types.StructType.apply(scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](GeoMesaRelation.this.schema.fields).++[org.apache.spark.sql.types.StructField, Array[org.apache.spark.sql.types.StructField]](scala.Predef.refArrayOps[org.apache.spark.sql.types.StructField](rel.schema.fields))(scala.this.Array.canBuildFrom[org.apache.spark.sql.types.StructField]((ClassTag.apply[org.apache.spark.sql.types.StructField](classOf[org.apache.spark.sql.types.StructField]): scala.reflect.ClassTag[org.apache.spark.sql.types.StructField])))), condition, GeoMesaJoinRelation.apply$default$6, GeoMesaJoinRelation.apply$default$7)
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          70241
+        </td>
+        <td>
+          4305
+          -
+          4316
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Option.flatten
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          opt.flatten[org.locationtech.geomesa.spark.sql.GeoMesaJoinRelation](scala.Predef.$conforms[Option[org.locationtech.geomesa.spark.sql.GeoMesaJoinRelation]])
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          70240
+        </td>
+        <td>
+          4309
+          -
+          4309
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Predef.$conforms
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.$conforms[Option[org.locationtech.geomesa.spark.sql.GeoMesaJoinRelation]]
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          70242
+        </td>
+        <td>
+          4626
+          -
+          4672
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.newBuilder
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.newBuilder[org.geotools.api.filter.Filter]
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          70243
+        </td>
+        <td>
+          4694
+          -
+          4702
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.Builder.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sum.+=(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          70244
+        </td>
+        <td>
+          4679
+          -
+          4703
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.filter.foreach[scala.collection.mutable.Builder[org.geotools.api.filter.Filter,Seq[org.geotools.api.filter.Filter]]](((x$1: org.geotools.api.filter.Filter) =&gt; sum.+=(x$1)))
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          70245
+        </td>
+        <td>
+          4776
+          -
+          4784
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.Builder.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sum.+=(x$2)
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          70247
+        </td>
+        <td>
+          4710
+          -
+          4786
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IndexedSeqOptimized.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.refArrayOps[org.apache.spark.sql.sources.Filter](filters).foreach[Unit](((f: org.apache.spark.sql.sources.Filter) =&gt; SparkUtils.sparkFilterToCQLFilter(f).foreach[scala.collection.mutable.Builder[org.geotools.api.filter.Filter,Seq[org.geotools.api.filter.Filter]]](((x$2: org.geotools.api.filter.Filter) =&gt; sum.+=(x$2)))))
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          70246
+        </td>
+        <td>
+          4731
+          -
+          4785
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SparkUtils.sparkFilterToCQLFilter(f).foreach[scala.collection.mutable.Builder[org.geotools.api.filter.Filter,Seq[org.geotools.api.filter.Filter]]](((x$2: org.geotools.api.filter.Filter) =&gt; sum.+=(x$2)))
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          70249
+        </td>
+        <td>
+          4844
+          -
+          4882
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.filter.Filter.INCLUDE
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.geotools.api.filter.Filter.INCLUDE
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          70248
+        </td>
+        <td>
+          4822
+          -
+          4832
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.Builder.result
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sum.result()
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          70250
+        </td>
+        <td>
+          4793
+          -
+          4883
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.filterListAsAnd(sum.result()).getOrElse[org.geotools.api.filter.Filter](org.geotools.api.filter.Filter.INCLUDE)
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          70251
+        </td>
+        <td>
+          4945
+          -
+          4959
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$3.==(&quot;__fid__&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          70252
+        </td>
+        <td>
+          4919
+          -
+          4960
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.TraversableLike.filterNot
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.refArrayOps[String](requiredColumns).filterNot(((x$3: String) =&gt; x$3.==(&quot;__fid__&quot;)))
+        </td>
+      </tr><tr>
+        <td>
+          108
+        </td>
+        <td>
+          70253
+        </td>
+        <td>
+          5020
+          -
+          5031
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.schema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          this.schema
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          70254
+        </td>
+        <td>
+          5130
+          -
+          5145
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          70255
+        </td>
+        <td>
+          5184
+          -
+          5190
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.cached
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.cached
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          70264
+        </td>
+        <td>
+          5215
+          -
+          5502
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  (if (GeoMesaRelation.this.logger.underlying.isDebugEnabled())
+    GeoMesaRelation.this.logger.underlying.debug(&quot;Building scan, {}&quot;, (debug: AnyRef))
+  else
+    (): Unit);
+  val conf: org.apache.hadoop.conf.Configuration = new org.apache.hadoop.conf.Configuration(GeoMesaRelation.this.sqlContext.sparkContext.hadoopConfiguration);
+  val query: org.geotools.api.data.Query = new org.geotools.api.data.Query(typeName, filt, (requiredAttributes: _*));
+  org.locationtech.geomesa.spark.GeoMesaSpark.apply(scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](GeoMesaRelation.this.params).asJava).rdd(conf, GeoMesaRelation.this.sqlContext.sparkContext, GeoMesaRelation.this.params, query)
+}
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          70257
+        </td>
+        <td>
+          5284
+          -
+          5346
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.conf.Configuration.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.hadoop.conf.Configuration(GeoMesaRelation.this.sqlContext.sparkContext.hadoopConfiguration)
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          70256
+        </td>
+        <td>
+          5302
+          -
+          5345
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.apache.spark.SparkContext.hadoopConfiguration
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.sqlContext.sparkContext.hadoopConfiguration
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          70258
+        </td>
+        <td>
+          5367
+          -
+          5416
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.Query.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.geotools.api.data.Query(typeName, filt, (requiredAttributes: _*))
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          70259
+        </td>
+        <td>
+          5438
+          -
+          5444
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.params
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.params
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          70261
+        </td>
+        <td>
+          5463
+          -
+          5486
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.apache.spark.sql.SQLContext.sparkContext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.sqlContext.sparkContext
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          70260
+        </td>
+        <td>
+          5438
+          -
+          5451
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](GeoMesaRelation.this.params).asJava
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          70263
+        </td>
+        <td>
+          5425
+          -
+          5502
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.SpatialRDDProvider.rdd
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.spark.GeoMesaSpark.apply(scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](GeoMesaRelation.this.params).asJava).rdd(conf, GeoMesaRelation.this.sqlContext.sparkContext, GeoMesaRelation.this.params, query)
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          70262
+        </td>
+        <td>
+          5488
+          -
+          5494
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.params
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.params
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          70272
+        </td>
+        <td>
+          5537
+          -
+          5846
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  (if (GeoMesaRelation.this.logger.underlying.isDebugEnabled())
+    GeoMesaRelation.this.logger.underlying.debug(&quot;Building in-memory scan, {}&quot;, (debug: AnyRef))
+  else
+    (): Unit);
+  val cql: String = org.geotools.filter.text.ecql.ECQL.toCQL(filt);
+  rdd.flatMap[org.geotools.api.feature.simple.SimpleFeature](((engine: org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore) =&gt; {
+    val query: org.geotools.api.data.Query = new org.geotools.api.data.Query(typeName, org.geotools.filter.text.ecql.ECQL.toFilter(cql), (requiredAttributes: _*));
+    org.locationtech.geomesa.utils.collection.SelfClosingIterator.apply[org.geotools.api.feature.simple.SimpleFeature, org.geotools.api.feature.simple.SimpleFeatureType](engine.getFeatureReader(query, org.geotools.api.data.Transaction.AUTO_COMMIT))
+  }))((ClassTag.apply[org.geotools.api.feature.simple.SimpleFeature](classOf[org.geotools.api.feature.simple.SimpleFeature]): scala.reflect.ClassTag[org.geotools.api.feature.simple.SimpleFeature]))
+}
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          70265
+        </td>
+        <td>
+          5615
+          -
+          5631
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.filter.text.ecql.ECQL.toCQL
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.filter.text.ecql.ECQL.toCQL(filt)
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          70271
+        </td>
+        <td>
+          5640
+          -
+          5846
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rdd.flatMap[org.geotools.api.feature.simple.SimpleFeature](((engine: org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore) =&gt; {
+  val query: org.geotools.api.data.Query = new org.geotools.api.data.Query(typeName, org.geotools.filter.text.ecql.ECQL.toFilter(cql), (requiredAttributes: _*));
+  org.locationtech.geomesa.utils.collection.SelfClosingIterator.apply[org.geotools.api.feature.simple.SimpleFeature, org.geotools.api.feature.simple.SimpleFeatureType](engine.getFeatureReader(query, org.geotools.api.data.Transaction.AUTO_COMMIT))
+}))((ClassTag.apply[org.geotools.api.feature.simple.SimpleFeature](classOf[org.geotools.api.feature.simple.SimpleFeature]): scala.reflect.ClassTag[org.geotools.api.feature.simple.SimpleFeature]))
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          70267
+        </td>
+        <td>
+          5686
+          -
+          5749
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.Query.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.geotools.api.data.Query(typeName, org.geotools.filter.text.ecql.ECQL.toFilter(cql), (requiredAttributes: _*))
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          70266
+        </td>
+        <td>
+          5706
+          -
+          5724
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.filter.text.ecql.ECQL.toFilter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.filter.text.ecql.ECQL.toFilter(cql)
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          70269
+        </td>
+        <td>
+          5780
+          -
+          5835
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.data.store.ContentDataStore.getFeatureReader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          engine.getFeatureReader(query, org.geotools.api.data.Transaction.AUTO_COMMIT)
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          70268
+        </td>
+        <td>
+          5811
+          -
+          5834
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          70270
+        </td>
+        <td>
+          5760
+          -
+          5836
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.collection.SelfClosingIterator.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.collection.SelfClosingIterator.apply[org.geotools.api.feature.simple.SimpleFeature, org.geotools.api.feature.simple.SimpleFeatureType](engine.getFeatureReader(query, org.geotools.api.data.Transaction.AUTO_COMMIT))
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          70281
+        </td>
+        <td>
+          5895
+          -
+          6226
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  (if (GeoMesaRelation.this.logger.underlying.isDebugEnabled())
+    GeoMesaRelation.this.logger.underlying.debug(&quot;Building partitioned in-memory scan, {}&quot;, (debug: AnyRef))
+  else
+    (): Unit);
+  val cql: String = org.geotools.filter.text.ecql.ECQL.toCQL(filt);
+  rdd.flatMap[org.geotools.api.feature.simple.SimpleFeature](((x0$1: (Int, org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore)) =&gt; x0$1 match {
+    case (_1: Int, _2: org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore)(Int, org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore)(_, (engine @ _)) =&gt; {
+      val query: org.geotools.api.data.Query = new org.geotools.api.data.Query(typeName, org.geotools.filter.text.ecql.ECQL.toFilter(cql), (requiredAttributes: _*));
+      org.locationtech.geomesa.utils.collection.SelfClosingIterator.apply[org.geotools.api.feature.simple.SimpleFeature, org.geotools.api.feature.simple.SimpleFeatureType](engine.getFeatureReader(query, org.geotools.api.data.Transaction.AUTO_COMMIT))
+    }
+  }))((ClassTag.apply[org.geotools.api.feature.simple.SimpleFeature](classOf[org.geotools.api.feature.simple.SimpleFeature]): scala.reflect.ClassTag[org.geotools.api.feature.simple.SimpleFeature]))
+}
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          70273
+        </td>
+        <td>
+          5985
+          -
+          6001
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.filter.text.ecql.ECQL.toCQL
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.filter.text.ecql.ECQL.toCQL(filt)
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          70279
+        </td>
+        <td>
+          6041
+          -
+          6216
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val query: org.geotools.api.data.Query = new org.geotools.api.data.Query(typeName, org.geotools.filter.text.ecql.ECQL.toFilter(cql), (requiredAttributes: _*));
+  org.locationtech.geomesa.utils.collection.SelfClosingIterator.apply[org.geotools.api.feature.simple.SimpleFeature, org.geotools.api.feature.simple.SimpleFeatureType](engine.getFeatureReader(query, org.geotools.api.data.Transaction.AUTO_COMMIT))
+}
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          70280
+        </td>
+        <td>
+          6010
+          -
+          6226
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rdd.flatMap[org.geotools.api.feature.simple.SimpleFeature](((x0$1: (Int, org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore)) =&gt; x0$1 match {
+  case (_1: Int, _2: org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore)(Int, org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore)(_, (engine @ _)) =&gt; {
+    val query: org.geotools.api.data.Query = new org.geotools.api.data.Query(typeName, org.geotools.filter.text.ecql.ECQL.toFilter(cql), (requiredAttributes: _*));
+    org.locationtech.geomesa.utils.collection.SelfClosingIterator.apply[org.geotools.api.feature.simple.SimpleFeature, org.geotools.api.feature.simple.SimpleFeatureType](engine.getFeatureReader(query, org.geotools.api.data.Transaction.AUTO_COMMIT))
+  }
+}))((ClassTag.apply[org.geotools.api.feature.simple.SimpleFeature](classOf[org.geotools.api.feature.simple.SimpleFeature]): scala.reflect.ClassTag[org.geotools.api.feature.simple.SimpleFeature]))
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          70275
+        </td>
+        <td>
+          6066
+          -
+          6129
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.Query.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.geotools.api.data.Query(typeName, org.geotools.filter.text.ecql.ECQL.toFilter(cql), (requiredAttributes: _*))
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          70274
+        </td>
+        <td>
+          6086
+          -
+          6104
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.filter.text.ecql.ECQL.toFilter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.filter.text.ecql.ECQL.toFilter(cql)
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          70277
+        </td>
+        <td>
+          6160
+          -
+          6215
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.data.store.ContentDataStore.getFeatureReader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          engine.getFeatureReader(query, org.geotools.api.data.Transaction.AUTO_COMMIT)
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          70276
+        </td>
+        <td>
+          6191
+          -
+          6214
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          70278
+        </td>
+        <td>
+          6140
+          -
+          6216
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.collection.SelfClosingIterator.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.collection.SelfClosingIterator.apply[org.geotools.api.feature.simple.SimpleFeature, org.geotools.api.feature.simple.SimpleFeatureType](engine.getFeatureReader(query, org.geotools.api.data.Transaction.AUTO_COMMIT))
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          70282
+        </td>
+        <td>
+          6255
+          -
+          6304
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.SparkUtils.getExtractors
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SparkUtils.getExtractors(requiredColumns, schema)
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          70283
+        </td>
+        <td>
+          6321
+          -
+          6361
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.SparkUtils.sf2row
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SparkUtils.sf2row(schema, x$4, extractors)
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          70284
+        </td>
+        <td>
+          6310
+          -
+          6362
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          result.map[org.apache.spark.sql.Row](((x$4: org.geotools.api.feature.simple.SimpleFeature) =&gt; SparkUtils.sf2row(schema, x$4, extractors)))((ClassTag.apply[org.apache.spark.sql.Row](classOf[org.apache.spark.sql.Row]): scala.reflect.ClassTag[org.apache.spark.sql.Row]))
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          70289
+        </td>
+        <td>
+          6447
+          -
+          6539
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.TraversableLike.filter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.refArrayOps[org.apache.spark.sql.sources.Filter](filters).filter(((x0$1: org.apache.spark.sql.sources.Filter) =&gt; x0$1 match {
+  case ((_: org.apache.spark.sql.sources.IsNotNull)| (_: org.apache.spark.sql.sources.IsNull)) =&gt; true
+  case _ =&gt; false
+}))
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          70285
+        </td>
+        <td>
+          6507
+          -
+          6511
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          70286
+        </td>
+        <td>
+          6507
+          -
+          6511
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          143
+        </td>
+        <td>
+          70287
+        </td>
+        <td>
+          6528
+          -
+          6533
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          143
+        </td>
+        <td>
+          70288
+        </td>
+        <td>
+          6528
+          -
+          6533
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          160
+        </td>
+        <td>
+          70290
+        </td>
+        <td>
+          6913
+          -
+          6932
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE
+        </td>
+      </tr><tr>
+        <td>
+          160
+        </td>
+        <td>
+          70292
+        </td>
+        <td>
+          6896
+          -
+          7038
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.MapLike.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          params.getOrElse[String](org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE, throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Feature type must be specified with \'&quot;, &quot;\'&quot;).s(org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE)))
+        </td>
+      </tr><tr>
+        <td>
+          161
+        </td>
+        <td>
+          70291
+        </td>
+        <td>
+          6940
+          -
+          7037
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Feature type must be specified with \'&quot;, &quot;\'&quot;).s(org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE))
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          70293
+        </td>
+        <td>
+          7066
+          -
+          7079
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](params).asJava
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          70295
+        </td>
+        <td>
+          7053
+          -
+          7207
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.spark.GeoMesaSpark.apply(scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](params).asJava).sft(params, name).getOrElse[org.geotools.api.feature.simple.SimpleFeatureType](throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Could not load feature type with name \'&quot;, &quot;\'&quot;).s(name)))
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          70294
+        </td>
+        <td>
+          7117
+          -
+          7201
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Could not load feature type with name \'&quot;, &quot;\'&quot;).s(name))
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          70297
+        </td>
+        <td>
+          7212
+          -
+          7276
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.apply(sqlContext, params, SparkUtils.createStructType(sft), sft)
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          70296
+        </td>
+        <td>
+          7238
+          -
+          7270
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.SparkUtils.createStructType
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SparkUtils.createStructType(sft)
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          70298
+        </td>
+        <td>
+          7628
+          -
+          7647
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          70300
+        </td>
+        <td>
+          7611
+          -
+          7753
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.MapLike.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          params.getOrElse[String](org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE, throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Feature type must be specified with \'&quot;, &quot;\'&quot;).s(org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE)))
+        </td>
+      </tr><tr>
+        <td>
+          178
+        </td>
+        <td>
+          70299
+        </td>
+        <td>
+          7655
+          -
+          7752
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Feature type must be specified with \'&quot;, &quot;\'&quot;).s(org.locationtech.geomesa.spark.sql.GeoMesaSparkSQL.GEOMESA_SQL_FEATURE))
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          70301
+        </td>
+        <td>
+          7781
+          -
+          7794
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](params).asJava
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          70303
+        </td>
+        <td>
+          7768
+          -
+          7922
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.spark.GeoMesaSpark.apply(scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](params).asJava).sft(params, name).getOrElse[org.geotools.api.feature.simple.SimpleFeatureType](throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Could not load feature type with name \'&quot;, &quot;\'&quot;).s(name)))
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          70302
+        </td>
+        <td>
+          7832
+          -
+          7916
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Could not load feature type with name \'&quot;, &quot;\'&quot;).s(name))
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          70304
+        </td>
+        <td>
+          7927
+          -
+          7965
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaRelation.this.apply(sqlContext, params, schema, sft)
+        </td>
+      </tr><tr>
+        <td>
+          203
+        </td>
+        <td>
+          70305
+        </td>
+        <td>
+          8542
+          -
+          8557
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.MapLike.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          params.get(key)
+        </td>
+      </tr><tr>
+        <td>
+          204
+        </td>
+        <td>
+          70306
+        </td>
+        <td>
+          8587
+          -
+          8594
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.default
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          default
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          70307
+        </td>
+        <td>
+          8635
+          -
+          8647
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Function1.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          transform.apply(v)
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          70308
+        </td>
+        <td>
+          8635
+          -
+          8647
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Function1.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          transform.apply(v)
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          70310
+        </td>
+        <td>
+          8629
+          -
+          8777
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  transform.apply(v)
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; {
+    (if (GeoMesaRelation.this.logger.underlying.isErrorEnabled())
+      GeoMesaRelation.this.logger.underlying.error(scala.StringContext.apply(&quot;Error evaluating param \'&quot;, &quot;\' with value \'&quot;, &quot;\':&quot;).s(key, v), e)
+    else
+      (): Unit);
+    default
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          207
+        </td>
+        <td>
+          70309
+        </td>
+        <td>
+          8687
+          -
+          8765
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (GeoMesaRelation.this.logger.underlying.isErrorEnabled())
+    GeoMesaRelation.this.logger.underlying.error(scala.StringContext.apply(&quot;Error evaluating param \'&quot;, &quot;\' with value \'&quot;, &quot;\':&quot;).s(key, v), e)
+  else
+    (): Unit);
+  default
+}
+        </td>
+      </tr><tr>
+        <td>
+          213
+        </td>
+        <td>
+          70311
+        </td>
+        <td>
+          8852
+          -
+          8867
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          213
+        </td>
+        <td>
+          70313
+        </td>
+        <td>
+          8869
+          -
+          8920
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.filter.text.ecql.ECQL.toFilter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.filter.text.ecql.ECQL.toFilter(params.getOrElse[String](&quot;query&quot;, &quot;INCLUDE&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          213
+        </td>
+        <td>
+          70312
+        </td>
+        <td>
+          8883
+          -
+          8919
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.MapLike.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          params.getOrElse[String](&quot;query&quot;, &quot;INCLUDE&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          213
+        </td>
+        <td>
+          70314
+        </td>
+        <td>
+          8842
+          -
+          8921
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.Query.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.geotools.api.data.Query(sft.getTypeName(), org.geotools.filter.text.ecql.ECQL.toFilter(params.getOrElse[String](&quot;query&quot;, &quot;INCLUDE&quot;)))
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          70315
+        </td>
+        <td>
+          8941
+          -
+          8954
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](params).asJava
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          70317
+        </td>
+        <td>
+          8981
+          -
+          9004
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.apache.spark.sql.SQLContext.sparkContext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sqlContext.sparkContext
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          70316
+        </td>
+        <td>
+          8960
+          -
+          8979
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.conf.Configuration.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.hadoop.conf.Configuration()
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          70318
+        </td>
+        <td>
+          8928
+          -
+          9020
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.SpatialRDDProvider.rdd
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.spark.GeoMesaSpark.apply(scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](params).asJava).rdd(new org.apache.hadoop.conf.Configuration(), sqlContext.sparkContext, params, query)
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          70319
+        </td>
+        <td>
+          9068
+          -
+          9077
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;spatial&quot;
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          70321
+        </td>
+        <td>
+          9092
+          -
+          9097
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          70320
+        </td>
+        <td>
+          9079
+          -
+          9090
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.toBoolean
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.augmentString(x$5).toBoolean
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          70323
+        </td>
+        <td>
+          9102
+          -
+          9106
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          70322
+        </td>
+        <td>
+          9054
+          -
+          9098
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          get[Boolean](&quot;spatial&quot;, ((x$5: String) =&gt; scala.Predef.augmentString(x$5).toBoolean), false).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          70324
+        </td>
+        <td>
+          9102
+          -
+          9106
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          70364
+        </td>
+        <td>
+          9114
+          -
+          10608
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val raw: org.locationtech.geomesa.spark.SpatialRDD = rawRDD;
+  val bounds: org.locationtech.jts.geom.Envelope = params.get(&quot;bounds&quot;) match {
+    case scala.None =&gt; RelationUtils.getBound(raw)
+    case (value: String)Some[String]((b @ _)) =&gt; try {
+      org.locationtech.geomesa.spark.jts.util.WKTUtils.read(b).getEnvelopeInternal()
+    } catch {
+      case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Error reading provided bounds \'&quot;, &quot;\':&quot;).s(b), e)
+    }
+  };
+  val partitions: Option[Int] = scala.Option.apply[Int](get[Int](&quot;partitions&quot;, ((x$6: String) =&gt; scala.Predef.augmentString(x$6).toInt), -1)).filter(((x$7: Int) =&gt; x$7.&gt;(0)));
+  val parallelism: Int = partitions.getOrElse[Int](sqlContext.sparkContext.defaultParallelism);
+  &lt;stable&gt; &lt;accessor&gt; lazy val sampleSize: Int = get[Int](&quot;sampleSize&quot;, ((x$8: String) =&gt; scala.Predef.augmentString(x$8).toInt), 100);
+  &lt;stable&gt; &lt;accessor&gt; lazy val threshold: Double = get[Double](&quot;threshold&quot;, ((x$9: String) =&gt; scala.Predef.augmentString(x$9).toDouble), 0.3);
+  val envelopes: List[org.locationtech.jts.geom.Envelope] = params.getOrElse[String](&quot;strategy&quot;, &quot;equal&quot;).toLowerCase(java.util.Locale.US) match {
+    case &quot;equal&quot; =&gt; RelationUtils.equalPartitioning(bounds, parallelism)
+    case &quot;earth&quot; =&gt; RelationUtils.wholeEarthPartitioning(parallelism)
+    case &quot;weighted&quot; =&gt; RelationUtils.weightedPartitioning(raw, bounds, parallelism, sampleSize)
+    case &quot;rtree&quot; =&gt; RelationUtils.rtreePartitioning(raw, parallelism, sampleSize, threshold)
+    case (s @ _) =&gt; throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Invalid partitioning strategy: &quot;, &quot;&quot;).s(s))
+  };
+  val rdd: org.apache.spark.rdd.RDD[(Int, Iterable[org.geotools.api.feature.simple.SimpleFeature])] = RelationUtils.grid(raw, envelopes, parallelism);
+  rdd.persist(org.apache.spark.storage.StorageLevel.MEMORY_ONLY);
+  scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD](GeoMesaRelation.this.PartitionedRDD.apply(rdd, raw, envelopes, partitions, get[Boolean](&quot;cover&quot;, ((x$10: String) =&gt; scala.Predef.augmentString(x$10).toBoolean), false)))
+}
+        </td>
+      </tr><tr>
+        <td>
+          219
+        </td>
+        <td>
+          70325
+        </td>
+        <td>
+          9168
+          -
+          9188
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.MapLike.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          params.get(&quot;bounds&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          220
+        </td>
+        <td>
+          70327
+        </td>
+        <td>
+          9218
+          -
+          9245
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.getBound
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RelationUtils.getBound(raw)
+        </td>
+      </tr><tr>
+        <td>
+          220
+        </td>
+        <td>
+          70326
+        </td>
+        <td>
+          9218
+          -
+          9245
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.getBound
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RelationUtils.getBound(raw)
+        </td>
+      </tr><tr>
+        <td>
+          222
+        </td>
+        <td>
+          70329
+        </td>
+        <td>
+          9286
+          -
+          9322
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.jts.geom.Geometry.getEnvelopeInternal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.spark.jts.util.WKTUtils.read(b).getEnvelopeInternal()
+        </td>
+      </tr><tr>
+        <td>
+          222
+        </td>
+        <td>
+          70328
+        </td>
+        <td>
+          9286
+          -
+          9322
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Geometry.getEnvelopeInternal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.spark.jts.util.WKTUtils.read(b).getEnvelopeInternal()
+        </td>
+      </tr><tr>
+        <td>
+          222
+        </td>
+        <td>
+          70332
+        </td>
+        <td>
+          9280
+          -
+          9454
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          try {
+  org.locationtech.geomesa.spark.jts.util.WKTUtils.read(b).getEnvelopeInternal()
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Error reading provided bounds \'&quot;, &quot;\':&quot;).s(b), e)
+}
+        </td>
+      </tr><tr>
+        <td>
+          223
+        </td>
+        <td>
+          70331
+        </td>
+        <td>
+          9365
+          -
+          9442
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Error reading provided bounds \'&quot;, &quot;\':&quot;).s(b), e)
+        </td>
+      </tr><tr>
+        <td>
+          223
+        </td>
+        <td>
+          70330
+        </td>
+        <td>
+          9365
+          -
+          9442
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Error reading provided bounds \'&quot;, &quot;\':&quot;).s(b), e)
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          70333
+        </td>
+        <td>
+          9503
+          -
+          9515
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;partitions&quot;
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          70335
+        </td>
+        <td>
+          9526
+          -
+          9528
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          -1
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          70334
+        </td>
+        <td>
+          9517
+          -
+          9524
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.toInt
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.augmentString(x$6).toInt
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          70337
+        </td>
+        <td>
+          9538
+          -
+          9543
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$7.&gt;(0)
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          70336
+        </td>
+        <td>
+          9494
+          -
+          9529
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          get[Int](&quot;partitions&quot;, ((x$6: String) =&gt; scala.Predef.augmentString(x$6).toInt), -1)
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          70338
+        </td>
+        <td>
+          9487
+          -
+          9544
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.filter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Option.apply[Int](get[Int](&quot;partitions&quot;, ((x$6: String) =&gt; scala.Predef.augmentString(x$6).toInt), -1)).filter(((x$7: Int) =&gt; x$7.&gt;(0)))
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          70339
+        </td>
+        <td>
+          9590
+          -
+          9632
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.apache.spark.SparkContext.defaultParallelism
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sqlContext.sparkContext.defaultParallelism
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          70340
+        </td>
+        <td>
+          9569
+          -
+          9633
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          partitions.getOrElse[Int](sqlContext.sparkContext.defaultParallelism)
+        </td>
+      </tr><tr>
+        <td>
+          233
+        </td>
+        <td>
+          70341
+        </td>
+        <td>
+          9883
+          -
+          9893
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;strategy&quot;
+        </td>
+      </tr><tr>
+        <td>
+          233
+        </td>
+        <td>
+          70343
+        </td>
+        <td>
+          9916
+          -
+          9925
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.util.Locale.US
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Locale.US
+        </td>
+      </tr><tr>
+        <td>
+          233
+        </td>
+        <td>
+          70342
+        </td>
+        <td>
+          9895
+          -
+          9902
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;equal&quot;
+        </td>
+      </tr><tr>
+        <td>
+          233
+        </td>
+        <td>
+          70344
+        </td>
+        <td>
+          9866
+          -
+          9926
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.toLowerCase
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          params.getOrElse[String](&quot;strategy&quot;, &quot;equal&quot;).toLowerCase(java.util.Locale.US)
+        </td>
+      </tr><tr>
+        <td>
+          234
+        </td>
+        <td>
+          70345
+        </td>
+        <td>
+          9962
+          -
+          10014
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.equalPartitioning
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RelationUtils.equalPartitioning(bounds, parallelism)
+        </td>
+      </tr><tr>
+        <td>
+          234
+        </td>
+        <td>
+          70346
+        </td>
+        <td>
+          9962
+          -
+          10014
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.equalPartitioning
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RelationUtils.equalPartitioning(bounds, parallelism)
+        </td>
+      </tr><tr>
+        <td>
+          235
+        </td>
+        <td>
+          70347
+        </td>
+        <td>
+          10042
+          -
+          10091
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.wholeEarthPartitioning
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RelationUtils.wholeEarthPartitioning(parallelism)
+        </td>
+      </tr><tr>
+        <td>
+          235
+        </td>
+        <td>
+          70348
+        </td>
+        <td>
+          10042
+          -
+          10091
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.wholeEarthPartitioning
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RelationUtils.wholeEarthPartitioning(parallelism)
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          70349
+        </td>
+        <td>
+          10119
+          -
+          10191
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.weightedPartitioning
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RelationUtils.weightedPartitioning(raw, bounds, parallelism, sampleSize)
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          70350
+        </td>
+        <td>
+          10119
+          -
+          10191
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.weightedPartitioning
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RelationUtils.weightedPartitioning(raw, bounds, parallelism, sampleSize)
+        </td>
+      </tr><tr>
+        <td>
+          237
+        </td>
+        <td>
+          70351
+        </td>
+        <td>
+          10219
+          -
+          10291
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.rtreePartitioning
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RelationUtils.rtreePartitioning(raw, parallelism, sampleSize, threshold)
+        </td>
+      </tr><tr>
+        <td>
+          237
+        </td>
+        <td>
+          70352
+        </td>
+        <td>
+          10219
+          -
+          10291
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.rtreePartitioning
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RelationUtils.rtreePartitioning(raw, parallelism, sampleSize, threshold)
+        </td>
+      </tr><tr>
+        <td>
+          238
+        </td>
+        <td>
+          70353
+        </td>
+        <td>
+          10310
+          -
+          10382
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Invalid partitioning strategy: &quot;, &quot;&quot;).s(s))
+        </td>
+      </tr><tr>
+        <td>
+          238
+        </td>
+        <td>
+          70354
+        </td>
+        <td>
+          10310
+          -
+          10382
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Invalid partitioning strategy: &quot;, &quot;&quot;).s(s))
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          70355
+        </td>
+        <td>
+          10408
+          -
+          10455
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.RelationUtils.grid
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RelationUtils.grid(raw, envelopes, parallelism)
+        </td>
+      </tr><tr>
+        <td>
+          242
+        </td>
+        <td>
+          70357
+        </td>
+        <td>
+          10462
+          -
+          10499
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.persist
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rdd.persist(org.apache.spark.storage.StorageLevel.MEMORY_ONLY)
+        </td>
+      </tr><tr>
+        <td>
+          242
+        </td>
+        <td>
+          70356
+        </td>
+        <td>
+          10474
+          -
+          10498
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.apache.spark.storage.StorageLevel.MEMORY_ONLY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.apache.spark.storage.StorageLevel.MEMORY_ONLY
+        </td>
+      </tr><tr>
+        <td>
+          243
+        </td>
+        <td>
+          70359
+        </td>
+        <td>
+          10581
+          -
+          10592
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.toBoolean
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.augmentString(x$10).toBoolean
+        </td>
+      </tr><tr>
+        <td>
+          243
+        </td>
+        <td>
+          70358
+        </td>
+        <td>
+          10572
+          -
+          10579
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;cover&quot;
+        </td>
+      </tr><tr>
+        <td>
+          243
+        </td>
+        <td>
+          70361
+        </td>
+        <td>
+          10559
+          -
+          10600
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          get[Boolean](&quot;cover&quot;, ((x$10: String) =&gt; scala.Predef.augmentString(x$10).toBoolean), false)
+        </td>
+      </tr><tr>
+        <td>
+          243
+        </td>
+        <td>
+          70360
+        </td>
+        <td>
+          10594
+          -
+          10599
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          243
+        </td>
+        <td>
+          70363
+        </td>
+        <td>
+          10506
+          -
+          10602
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD](GeoMesaRelation.this.PartitionedRDD.apply(rdd, raw, envelopes, partitions, get[Boolean](&quot;cover&quot;, ((x$10: String) =&gt; scala.Predef.augmentString(x$10).toBoolean), false)))
+        </td>
+      </tr><tr>
+        <td>
+          243
+        </td>
+        <td>
+          70362
+        </td>
+        <td>
+          10511
+          -
+          10601
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.PartitionedRDD.apply(rdd, raw, envelopes, partitions, get[Boolean](&quot;cover&quot;, ((x$10: String) =&gt; scala.Predef.augmentString(x$10).toBoolean), false))
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          70365
+        </td>
+        <td>
+          10645
+          -
+          10652
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;cache&quot;
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          70367
+        </td>
+        <td>
+          10667
+          -
+          10672
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          70366
+        </td>
+        <td>
+          10654
+          -
+          10665
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.toBoolean
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.augmentString(x$11).toBoolean
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          70369
+        </td>
+        <td>
+          10677
+          -
+          10681
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          70368
+        </td>
+        <td>
+          10631
+          -
+          10673
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          get[Boolean](&quot;cache&quot;, ((x$11: String) =&gt; scala.Predef.augmentString(x$11).toBoolean), false).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          70370
+        </td>
+        <td>
+          10677
+          -
+          10681
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          70412
+        </td>
+        <td>
+          10689
+          -
+          12147
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val check: java.util.Map[String,java.io.Serializable] = java.util.Collections.singletonMap[String, java.io.Serializable](&quot;cqengine&quot;, &quot;true&quot;);
+  if (scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.data.DataStoreFactorySpi](org.geotools.api.data.DataStoreFinder.getAvailableDataStores()).asScala.exists(((x$12: org.geotools.api.data.DataStoreFactorySpi) =&gt; x$12.canProcess(check))).unary_!)
+    throw new scala.`package`.IllegalArgumentException(&quot;Caching requires the GeoCQEngineDataStore to be available on the classpath&quot;)
+  else
+    ();
+  val typeName: String = sft.getTypeName();
+  val encodedSft: String = org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.encodeType(sft, true);
+  val indexGeom: Boolean = get[Boolean](&quot;indexGeom&quot;, ((x$13: String) =&gt; scala.Predef.augmentString(x$13).toBoolean), false);
+  partitioned match {
+    case (value: org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD)Some[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD]((p @ _)) =&gt; {
+      val rdd: org.apache.spark.rdd.RDD[(Int, org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore)] = rdd.this.RDD.rddToPairRDDFunctions[Int, Iterable[org.geotools.api.feature.simple.SimpleFeature]](p.rdd)((ClassTag.Int: scala.reflect.ClassTag[Int]), (ClassTag.apply[Iterable[org.geotools.api.feature.simple.SimpleFeature]](classOf[scala.collection.Iterable]): scala.reflect.ClassTag[Iterable[org.geotools.api.feature.simple.SimpleFeature]]), math.this.Ordering.Int).mapValues[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](((iter: Iterable[org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
+        val engine: org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore = new org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore(indexGeom);
+        engine.createSchema(org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType(typeName, encodedSft));
+        engine.namesToEngine.get(typeName).insert(iter);
+        engine
+      }));
+      p.rdd.unpersist(p.rdd.unpersist$default$1);
+      rdd.persist(org.apache.spark.storage.StorageLevel.MEMORY_ONLY);
+      scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedIndexedRDD](GeoMesaRelation.this.PartitionedIndexedRDD.apply(rdd, p.envelopes))
+    }
+    case scala.None =&gt; {
+      val rdd: org.apache.spark.rdd.RDD[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore] = {
+        &lt;artifact&gt; val qual$1: org.locationtech.geomesa.spark.SpatialRDD = rawRDD;
+        &lt;artifact&gt; val x$1: Iterator[org.geotools.api.feature.simple.SimpleFeature] =&gt; Iterator[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore] @scala.reflect.internal.annotations.uncheckedBounds = ((iter: Iterator[org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
+          val engine: org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore = new org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore(indexGeom);
+          engine.createSchema(org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType(typeName, encodedSft));
+          engine.namesToEngine.get(typeName).insert(iter.toList);
+          scala.`package`.Iterator.single[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](engine)
+        });
+        &lt;artifact&gt; val x$2: Boolean = qual$1.mapPartitions$default$2[Nothing];
+        qual$1.mapPartitions[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](x$1, x$2)((ClassTag.apply[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](classOf[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore]): scala.reflect.ClassTag[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore]))
+      };
+      rdd.persist(org.apache.spark.storage.StorageLevel.MEMORY_ONLY);
+      scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.IndexedRDD](GeoMesaRelation.this.IndexedRDD.apply(rdd))
+    }
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          247
+        </td>
+        <td>
+          70371
+        </td>
+        <td>
+          10709
+          -
+          10783
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collections.singletonMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Collections.singletonMap[String, java.io.Serializable](&quot;cqengine&quot;, &quot;true&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          248
+        </td>
+        <td>
+          70373
+        </td>
+        <td>
+          10849
+          -
+          10868
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.DataAccessFactory.canProcess
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$12.canProcess(check)
+        </td>
+      </tr><tr>
+        <td>
+          248
+        </td>
+        <td>
+          70372
+        </td>
+        <td>
+          10795
+          -
+          10833
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.DataStoreFinder.getAvailableDataStores
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.data.DataStoreFinder.getAvailableDataStores()
+        </td>
+      </tr><tr>
+        <td>
+          248
+        </td>
+        <td>
+          70374
+        </td>
+        <td>
+          10794
+          -
+          10869
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.data.DataStoreFactorySpi](org.geotools.api.data.DataStoreFinder.getAvailableDataStores()).asScala.exists(((x$12: org.geotools.api.data.DataStoreFactorySpi) =&gt; x$12.canProcess(check))).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          248
+        </td>
+        <td>
+          70377
+        </td>
+        <td>
+          10790
+          -
+          10790
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          248
+        </td>
+        <td>
+          70378
+        </td>
+        <td>
+          10790
+          -
+          10790
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          249
+        </td>
+        <td>
+          70375
+        </td>
+        <td>
+          10881
+          -
+          10993
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(&quot;Caching requires the GeoCQEngineDataStore to be available on the classpath&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          249
+        </td>
+        <td>
+          70376
+        </td>
+        <td>
+          10881
+          -
+          10993
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(&quot;Caching requires the GeoCQEngineDataStore to be available on the classpath&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          253
+        </td>
+        <td>
+          70379
+        </td>
+        <td>
+          11059
+          -
+          11074
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          254
+        </td>
+        <td>
+          70380
+        </td>
+        <td>
+          11098
+          -
+          11156
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.encodeType
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.encodeType(sft, true)
+        </td>
+      </tr><tr>
+        <td>
+          256
+        </td>
+        <td>
+          70381
+        </td>
+        <td>
+          11193
+          -
+          11204
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;indexGeom&quot;
+        </td>
+      </tr><tr>
+        <td>
+          256
+        </td>
+        <td>
+          70383
+        </td>
+        <td>
+          11219
+          -
+          11224
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          256
+        </td>
+        <td>
+          70382
+        </td>
+        <td>
+          11206
+          -
+          11217
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.toBoolean
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.augmentString(x$13).toBoolean
+        </td>
+      </tr><tr>
+        <td>
+          256
+        </td>
+        <td>
+          70384
+        </td>
+        <td>
+          11180
+          -
+          11225
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          get[Boolean](&quot;indexGeom&quot;, ((x$13: String) =&gt; scala.Predef.augmentString(x$13).toBoolean), false)
+        </td>
+      </tr><tr>
+        <td>
+          259
+        </td>
+        <td>
+          70398
+        </td>
+        <td>
+          11274
+          -
+          11719
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val rdd: org.apache.spark.rdd.RDD[(Int, org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore)] = rdd.this.RDD.rddToPairRDDFunctions[Int, Iterable[org.geotools.api.feature.simple.SimpleFeature]](p.rdd)((ClassTag.Int: scala.reflect.ClassTag[Int]), (ClassTag.apply[Iterable[org.geotools.api.feature.simple.SimpleFeature]](classOf[scala.collection.Iterable]): scala.reflect.ClassTag[Iterable[org.geotools.api.feature.simple.SimpleFeature]]), math.this.Ordering.Int).mapValues[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](((iter: Iterable[org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
+    val engine: org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore = new org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore(indexGeom);
+    engine.createSchema(org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType(typeName, encodedSft));
+    engine.namesToEngine.get(typeName).insert(iter);
+    engine
+  }));
+  p.rdd.unpersist(p.rdd.unpersist$default$1);
+  rdd.persist(org.apache.spark.storage.StorageLevel.MEMORY_ONLY);
+  scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedIndexedRDD](GeoMesaRelation.this.PartitionedIndexedRDD.apply(rdd, p.envelopes))
+}
+        </td>
+      </tr><tr>
+        <td>
+          260
+        </td>
+        <td>
+          70385
+        </td>
+        <td>
+          11297
+          -
+          11302
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.rdd
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          p.rdd
+        </td>
+      </tr><tr>
+        <td>
+          260
+        </td>
+        <td>
+          70386
+        </td>
+        <td>
+          11299
+          -
+          11299
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.math.Ordering.Int
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          math.this.Ordering.Int
+        </td>
+      </tr><tr>
+        <td>
+          260
+        </td>
+        <td>
+          70391
+        </td>
+        <td>
+          11297
+          -
+          11559
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.spark.rdd.PairRDDFunctions.mapValues
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rdd.this.RDD.rddToPairRDDFunctions[Int, Iterable[org.geotools.api.feature.simple.SimpleFeature]](p.rdd)((ClassTag.Int: scala.reflect.ClassTag[Int]), (ClassTag.apply[Iterable[org.geotools.api.feature.simple.SimpleFeature]](classOf[scala.collection.Iterable]): scala.reflect.ClassTag[Iterable[org.geotools.api.feature.simple.SimpleFeature]]), math.this.Ordering.Int).mapValues[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](((iter: Iterable[org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
+  val engine: org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore = new org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore(indexGeom);
+  engine.createSchema(org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType(typeName, encodedSft));
+  engine.namesToEngine.get(typeName).insert(iter);
+  engine
+}))
+        </td>
+      </tr><tr>
+        <td>
+          261
+        </td>
+        <td>
+          70387
+        </td>
+        <td>
+          11348
+          -
+          11383
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore(indexGeom)
+        </td>
+      </tr><tr>
+        <td>
+          262
+        </td>
+        <td>
+          70389
+        </td>
+        <td>
+          11396
+          -
+          11468
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore.createSchema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          engine.createSchema(org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType(typeName, encodedSft))
+        </td>
+      </tr><tr>
+        <td>
+          262
+        </td>
+        <td>
+          70388
+        </td>
+        <td>
+          11416
+          -
+          11467
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType(typeName, encodedSft)
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          70390
+        </td>
+        <td>
+          11481
+          -
+          11528
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.cqengine.GeoCQEngine.insert
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          engine.namesToEngine.get(typeName).insert(iter)
+        </td>
+      </tr><tr>
+        <td>
+          266
+        </td>
+        <td>
+          70392
+        </td>
+        <td>
+          11570
+          -
+          11587
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.unpersist
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          p.rdd.unpersist(p.rdd.unpersist$default$1)
+        </td>
+      </tr><tr>
+        <td>
+          267
+        </td>
+        <td>
+          70393
+        </td>
+        <td>
+          11638
+          -
+          11662
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.apache.spark.storage.StorageLevel.MEMORY_ONLY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.apache.spark.storage.StorageLevel.MEMORY_ONLY
+        </td>
+      </tr><tr>
+        <td>
+          267
+        </td>
+        <td>
+          70394
+        </td>
+        <td>
+          11626
+          -
+          11663
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.persist
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rdd.persist(org.apache.spark.storage.StorageLevel.MEMORY_ONLY)
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          70395
+        </td>
+        <td>
+          11706
+          -
+          11717
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedRDD.envelopes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          p.envelopes
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          70397
+        </td>
+        <td>
+          11674
+          -
+          11719
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedIndexedRDD](GeoMesaRelation.this.PartitionedIndexedRDD.apply(rdd, p.envelopes))
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          70396
+        </td>
+        <td>
+          11679
+          -
+          11718
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.PartitionedIndexedRDD.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.PartitionedIndexedRDD.apply(rdd, p.envelopes)
+        </td>
+      </tr><tr>
+        <td>
+          270
+        </td>
+        <td>
+          70411
+        </td>
+        <td>
+          11739
+          -
+          12133
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val rdd: org.apache.spark.rdd.RDD[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore] = {
+    &lt;artifact&gt; val qual$1: org.locationtech.geomesa.spark.SpatialRDD = rawRDD;
+    &lt;artifact&gt; val x$1: Iterator[org.geotools.api.feature.simple.SimpleFeature] =&gt; Iterator[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore] @scala.reflect.internal.annotations.uncheckedBounds = ((iter: Iterator[org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
+      val engine: org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore = new org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore(indexGeom);
+      engine.createSchema(org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType(typeName, encodedSft));
+      engine.namesToEngine.get(typeName).insert(iter.toList);
+      scala.`package`.Iterator.single[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](engine)
+    });
+    &lt;artifact&gt; val x$2: Boolean = qual$1.mapPartitions$default$2[Nothing];
+    qual$1.mapPartitions[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](x$1, x$2)((ClassTag.apply[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](classOf[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore]): scala.reflect.ClassTag[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore]))
+  };
+  rdd.persist(org.apache.spark.storage.StorageLevel.MEMORY_ONLY);
+  scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.IndexedRDD](GeoMesaRelation.this.IndexedRDD.apply(rdd))
+}
+        </td>
+      </tr><tr>
+        <td>
+          271
+        </td>
+        <td>
+          70405
+        </td>
+        <td>
+          11769
+          -
+          11769
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.mapPartitions$default$2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          qual$1.mapPartitions$default$2[Nothing]
+        </td>
+      </tr><tr>
+        <td>
+          271
+        </td>
+        <td>
+          70406
+        </td>
+        <td>
+          11762
+          -
+          12053
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.mapPartitions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          qual$1.mapPartitions[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](x$1, x$2)((ClassTag.apply[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](classOf[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore]): scala.reflect.ClassTag[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore]))
+        </td>
+      </tr><tr>
+        <td>
+          272
+        </td>
+        <td>
+          70399
+        </td>
+        <td>
+          11818
+          -
+          11853
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore(indexGeom)
+        </td>
+      </tr><tr>
+        <td>
+          273
+        </td>
+        <td>
+          70401
+        </td>
+        <td>
+          11866
+          -
+          11938
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore.createSchema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          engine.createSchema(org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType(typeName, encodedSft))
+        </td>
+      </tr><tr>
+        <td>
+          273
+        </td>
+        <td>
+          70400
+        </td>
+        <td>
+          11886
+          -
+          11937
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.createType(typeName, encodedSft)
+        </td>
+      </tr><tr>
+        <td>
+          274
+        </td>
+        <td>
+          70403
+        </td>
+        <td>
+          11951
+          -
+          12005
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.cqengine.GeoCQEngine.insert
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          engine.namesToEngine.get(typeName).insert(iter.toList)
+        </td>
+      </tr><tr>
+        <td>
+          274
+        </td>
+        <td>
+          70402
+        </td>
+        <td>
+          11993
+          -
+          12004
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toList
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          iter.toList
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          70404
+        </td>
+        <td>
+          12018
+          -
+          12041
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.single
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.`package`.Iterator.single[org.locationtech.geomesa.memory.cqengine.datastore.GeoCQEngineDataStore](engine)
+        </td>
+      </tr><tr>
+        <td>
+          277
+        </td>
+        <td>
+          70407
+        </td>
+        <td>
+          12076
+          -
+          12100
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.apache.spark.storage.StorageLevel.MEMORY_ONLY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.apache.spark.storage.StorageLevel.MEMORY_ONLY
+        </td>
+      </tr><tr>
+        <td>
+          277
+        </td>
+        <td>
+          70408
+        </td>
+        <td>
+          12064
+          -
+          12101
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.spark.rdd.RDD.persist
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rdd.persist(org.apache.spark.storage.StorageLevel.MEMORY_ONLY)
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          70409
+        </td>
+        <td>
+          12117
+          -
+          12132
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.IndexedRDD.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.this.IndexedRDD.apply(rdd)
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          70410
+        </td>
+        <td>
+          12112
+          -
+          12133
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.locationtech.geomesa.spark.sql.GeoMesaRelation.IndexedRDD](GeoMesaRelation.this.IndexedRDD.apply(rdd))
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          70413
+        </td>
+        <td>
+          12189
+          -
+          12225
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.MapLike.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          params.getOrElse[String](&quot;query&quot;, &quot;INCLUDE&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          70415
+        </td>
+        <td>
+          12168
+          -
+          12227
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Option.apply[org.geotools.api.filter.Filter](org.geotools.filter.text.ecql.ECQL.toFilter(params.getOrElse[String](&quot;query&quot;, &quot;INCLUDE&quot;)))
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          70414
+        </td>
+        <td>
+          12175
+          -
+          12226
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.filter.text.ecql.ECQL.toFilter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.filter.text.ecql.ECQL.toFilter(params.getOrElse[String](&quot;query&quot;, &quot;INCLUDE&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          284
+        </td>
+        <td>
+          70416
+        </td>
+        <td>
+          12233
+          -
+          12310
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.spark.sql.GeoMesaRelation.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaRelation.apply(sqlContext, sft, schema, params, filter, cached, partitioned)
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>

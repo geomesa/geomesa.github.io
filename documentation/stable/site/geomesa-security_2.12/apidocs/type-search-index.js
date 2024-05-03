@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes","url":"allclasses-index.html"},{"p":"org.locationtech.geomesa.security","l":"AuthorizationsProvider"},{"p":"org.locationtech.geomesa.security","l":"SecurityUtils"}]

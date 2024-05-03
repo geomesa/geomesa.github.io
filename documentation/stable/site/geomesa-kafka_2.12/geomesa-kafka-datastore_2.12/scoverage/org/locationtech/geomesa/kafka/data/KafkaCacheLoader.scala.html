@@ -1,0 +1,4074 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/kafka/data/KafkaCacheLoader.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2024 Commonwealth Computer Research, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * http://www.opensource.org/licenses/apache2.0.php.
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.kafka.data
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.LazyLogging
+</span>12 <span style=''>import org.apache.kafka.clients.consumer.{Consumer, ConsumerRecord}
+</span>13 <span style=''>import org.geotools.api.feature.simple.SimpleFeatureType
+</span>14 <span style=''>import org.geotools.api.filter.Filter
+</span>15 <span style=''>import org.locationtech.geomesa.kafka.consumer.ThreadedConsumer
+</span>16 <span style=''>import org.locationtech.geomesa.kafka.data.KafkaDataStore.ExpiryTimeConfig
+</span>17 <span style=''>import org.locationtech.geomesa.kafka.index.KafkaFeatureCache
+</span>18 <span style=''>import org.locationtech.geomesa.kafka.utils.GeoMessage.{Change, Clear, Delete}
+</span>19 <span style=''>import org.locationtech.geomesa.kafka.utils.GeoMessageSerializer
+</span>20 <span style=''>import org.locationtech.geomesa.kafka.versions.{KafkaConsumerVersions, RecordVersions}
+</span>21 <span style=''>import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+</span>22 <span style=''>import org.locationtech.geomesa.utils.io.CloseWithLogging
+</span>23 <span style=''>
+</span>24 <span style=''>import java.io.Closeable
+</span>25 <span style=''>import java.time.Duration
+</span>26 <span style=''>import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+</span>27 <span style=''>import java.util.concurrent.{ConcurrentHashMap, CountDownLatch}
+</span>28 <span style=''>
+</span>29 <span style=''>/**
+</span>30 <span style=''>  * Reads from Kafka and populates a `KafkaFeatureCache`.
+</span>31 <span style=''>  * Manages geotools feature listeners
+</span>32 <span style=''>  */
+</span>33 <span style=''>trait KafkaCacheLoader extends Closeable with LazyLogging {
+</span>34 <span style=''>  def cache: KafkaFeatureCache
+</span>35 <span style=''>}
+</span>36 <span style=''>
+</span>37 <span style=''>object KafkaCacheLoader extends LazyLogging {
+</span>38 <span style=''>
+</span>39 <span style=''>  object LoaderStatus {
+</span>40 <span style=''>    private val count = </span><span style='background: #AEF1AE'>new AtomicInteger(0)</span><span style=''>
+</span>41 <span style=''>    private val firstLoadStartTime = </span><span style='background: #AEF1AE'>new AtomicLong(0L)</span><span style=''>
+</span>42 <span style=''>
+</span>43 <span style=''>    def startLoad(): Boolean = </span><span style='background: #AEF1AE'>synchronized {
+</span>44 <span style=''></span><span style='background: #AEF1AE'>      count.incrementAndGet()
+</span>45 <span style=''></span><span style='background: #AEF1AE'>      firstLoadStartTime.compareAndSet(0L, System.currentTimeMillis())
+</span>46 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>47 <span style=''>    def completedLoad(): Unit = </span><span style='background: #AEF1AE'>synchronized {
+</span>48 <span style=''></span><span style='background: #AEF1AE'>      if (count.decrementAndGet() == 0) {
+</span>49 <span style=''></span><span style='background: #AEF1AE'>        logger.info(s&quot;Last active initial load completed.  &quot; +
+</span>50 <span style=''></span><span style='background: #AEF1AE'>          s&quot;Initial loads took ${System.currentTimeMillis()-firstLoadStartTime.get} milliseconds.&quot;)
+</span>51 <span style=''></span><span style='background: #AEF1AE'>        firstLoadStartTime.set(0L)
+</span>52 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>53 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>54 <span style=''>
+</span>55 <span style=''>    def allLoaded(): Boolean = </span><span style='background: #F0ADAD'>count.get() == 0</span><span style=''>
+</span>56 <span style=''>  }
+</span>57 <span style=''>
+</span>58 <span style=''>  object NoOpLoader extends KafkaCacheLoader {
+</span>59 <span style=''>    override val cache: KafkaFeatureCache = </span><span style='background: #AEF1AE'>KafkaFeatureCache.empty()</span><span style=''>
+</span>60 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
+</span>61 <span style=''>  }
+</span>62 <span style=''>
+</span>63 <span style=''>  class KafkaCacheLoaderImpl(
+</span>64 <span style=''>      sft: SimpleFeatureType,
+</span>65 <span style=''>      override val cache: KafkaFeatureCache,
+</span>66 <span style=''>      consumers: Seq[Consumer[Array[Byte], Array[Byte]]],
+</span>67 <span style=''>      topic: String,
+</span>68 <span style=''>      frequency: Long,
+</span>69 <span style=''>      serializer: GeoMessageSerializer,
+</span>70 <span style=''>      doInitialLoad: Boolean,
+</span>71 <span style=''>      initialLoadConfig: ExpiryTimeConfig
+</span>72 <span style=''>    ) extends ThreadedConsumer(consumers, Duration.ofMillis(frequency)) with KafkaCacheLoader {
+</span>73 <span style=''>
+</span>74 <span style=''>    try { </span><span style='background: #AEF1AE'>classOf[ConsumerRecord[Any, Any]].getMethod(&quot;timestamp&quot;)</span><span style=''> } catch {
+</span>75 <span style=''>      case _: NoSuchMethodException =&gt; </span><span style='background: #F0ADAD'>logger.warn(&quot;This version of Kafka doesn't support timestamps, using system time&quot;)</span><span style=''>
+</span>76 <span style=''>    }
+</span>77 <span style=''>
+</span>78 <span style=''>    private val initialLoader = if (</span><span style='background: #AEF1AE'>doInitialLoad</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>79 <span style=''></span><span style='background: #AEF1AE'>      // for the initial load, don't bother spatially indexing until we have the final state
+</span>80 <span style=''></span><span style='background: #AEF1AE'>      val loader = new InitialLoader(sft, consumers, topic, frequency, serializer, initialLoadConfig, this)
+</span>81 <span style=''></span><span style='background: #AEF1AE'>      CachedThreadPool.execute(loader)
+</span>82 <span style=''></span><span style='background: #AEF1AE'>      Some(loader)
+</span>83 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''> else </span><span style='background: #F0ADAD'>{
+</span>84 <span style=''></span><span style='background: #F0ADAD'>      startConsumers()
+</span>85 <span style=''></span><span style='background: #F0ADAD'>      None
+</span>86 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>87 <span style=''>
+</span>88 <span style=''>    override def close(): Unit = {
+</span>89 <span style=''>      try {
+</span>90 <span style=''>        </span><span style='background: #AEF1AE'>super.close()</span><span style=''>
+</span>91 <span style=''>      } finally </span><span style='background: #AEF1AE'>{
+</span>92 <span style=''></span><span style='background: #AEF1AE'>        CloseWithLogging(initialLoader)
+</span>93 <span style=''></span><span style='background: #AEF1AE'>        cache.close()
+</span>94 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>95 <span style=''>    }
+</span>96 <span style=''>
+</span>97 <span style=''>    override protected [KafkaCacheLoader] def consume(record: ConsumerRecord[Array[Byte], Array[Byte]]): Unit = {
+</span>98 <span style=''>      val headers = </span><span style='background: #AEF1AE'>RecordVersions.getHeaders(record)</span><span style=''>
+</span>99 <span style=''>      val timestamp = </span><span style='background: #AEF1AE'>RecordVersions.getTimestamp(record)</span><span style=''>
+</span>100 <span style=''>      val message = </span><span style='background: #AEF1AE'>serializer.deserialize(record.key(), record.value(), headers, timestamp)</span><span style=''>
+</span>101 <span style=''>      logger.trace(s&quot;Consumed message [$topic:${record.partition}:${record.offset}] $message&quot;)
+</span>102 <span style=''>      message match {
+</span>103 <span style=''>        case m: Change </span><span style='background: #AEF1AE'>=&gt; cache.fireChange(timestamp, m.feature); cache.put(m.feature)</span><span style=''>
+</span>104 <span style=''>        case m: Delete </span><span style='background: #AEF1AE'>=&gt; cache.fireDelete(timestamp, m.id, cache.query(m.id).orNull); cache.remove(m.id)</span><span style=''>
+</span>105 <span style=''>        case _: Clear  </span><span style='background: #AEF1AE'>=&gt; cache.fireClear(timestamp); cache.clear()</span><span style=''>
+</span>106 <span style=''>        case m =&gt; </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Unknown message: $m&quot;)</span><span style=''>
+</span>107 <span style=''>      }
+</span>108 <span style=''>    }
+</span>109 <span style=''>  }
+</span>110 <span style=''>
+</span>111 <span style=''>  /**
+</span>112 <span style=''>    * Handles initial loaded 'from-beginning' without indexing features in the spatial index. Will still
+</span>113 <span style=''>    * trigger message events.
+</span>114 <span style=''>    *
+</span>115 <span style=''>    * @param consumers consumers, won't be closed even on call to 'close()'
+</span>116 <span style=''>    * @param topic kafka topic
+</span>117 <span style=''>    * @param frequency polling frequency in milliseconds
+</span>118 <span style=''>    * @param serializer message serializer
+</span>119 <span style=''>    * @param toLoad main cache loader, used for callback when bulk loading is done
+</span>120 <span style=''>    */
+</span>121 <span style=''>  private class InitialLoader(
+</span>122 <span style=''>      sft: SimpleFeatureType,
+</span>123 <span style=''>      consumers: Seq[Consumer[Array[Byte], Array[Byte]]],
+</span>124 <span style=''>      topic: String,
+</span>125 <span style=''>      frequency: Long,
+</span>126 <span style=''>      serializer: GeoMessageSerializer,
+</span>127 <span style=''>      ordering: ExpiryTimeConfig,
+</span>128 <span style=''>      toLoad: KafkaCacheLoaderImpl
+</span>129 <span style=''>    ) extends ThreadedConsumer(consumers, Duration.ofMillis(frequency), false) with Runnable {
+</span>130 <span style=''>
+</span>131 <span style=''>    private val cache = </span><span style='background: #AEF1AE'>KafkaFeatureCache.nonIndexing(sft, ordering)</span><span style=''>
+</span>132 <span style=''>
+</span>133 <span style=''>    // track the offsets that we want to read to
+</span>134 <span style=''>    private val offsets = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[Int, Long]()</span><span style=''>
+</span>135 <span style=''>    private var latch: CountDownLatch = _
+</span>136 <span style=''>    private val done = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
+</span>137 <span style=''>
+</span>138 <span style=''>    override protected def consume(record: ConsumerRecord[Array[Byte], Array[Byte]]): Unit = {
+</span>139 <span style=''>      if (</span><span style='background: #AEF1AE'>done.get</span><span style=''>) { </span><span style='background: #F0ADAD'>toLoad.consume(record)</span><span style=''> } else </span><span style='background: #AEF1AE'>{
+</span>140 <span style=''></span><span style='background: #AEF1AE'>        val headers = RecordVersions.getHeaders(record)
+</span>141 <span style=''></span><span style='background: #AEF1AE'>        val timestamp = RecordVersions.getTimestamp(record)
+</span>142 <span style=''></span><span style='background: #AEF1AE'>        val message = serializer.deserialize(record.key, record.value, headers, timestamp)
+</span>143 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(s&quot;Consumed message [$topic:${record.partition}:${record.offset}] $message&quot;)
+</span>144 <span style=''></span><span style='background: #AEF1AE'>        message match {
+</span>145 <span style=''></span><span style='background: #AEF1AE'>          case m: Change =&gt; toLoad.cache.fireChange(timestamp, m.feature); cache.put(m.feature)
+</span>146 <span style=''></span><span style='background: #AEF1AE'>          case m: Delete </span><span style='background: #F0ADAD'>=&gt; toLoad.cache.fireDelete(timestamp, m.id, cache.query(m.id).orNull); cache.remove(m.id)</span><span style='background: #AEF1AE'>
+</span>147 <span style=''></span><span style='background: #AEF1AE'>          case _: Clear  </span><span style='background: #F0ADAD'>=&gt; toLoad.cache.fireClear(timestamp); cache.clear()</span><span style='background: #AEF1AE'>
+</span>148 <span style=''></span><span style='background: #AEF1AE'>          case m =&gt; </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Unknown message: $m&quot;)</span><span style='background: #AEF1AE'>
+</span>149 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>150 <span style=''></span><span style='background: #AEF1AE'>        // once we've hit the max offset for the partition, remove from the offset map to indicate we're done
+</span>151 <span style=''></span><span style='background: #AEF1AE'>        val maxOffset = offsets.getOrDefault(record.partition, Long.MaxValue)
+</span>152 <span style=''></span><span style='background: #AEF1AE'>        if (maxOffset &lt;= record.offset) {
+</span>153 <span style=''></span><span style='background: #AEF1AE'>          offsets.remove(record.partition)
+</span>154 <span style=''></span><span style='background: #AEF1AE'>          latch.countDown()
+</span>155 <span style=''></span><span style='background: #AEF1AE'>          logger.info(s&quot;Initial load: consumed [$topic:${record.partition}:${record.offset}] of $maxOffset, &quot; +
+</span>156 <span style=''></span><span style='background: #AEF1AE'>              s&quot;${latch.getCount} partitions remaining&quot;)
+</span>157 <span style=''></span><span style='background: #AEF1AE'>        } else if (record.offset &gt; 0 &amp;&amp; record.offset % 1048576 == 0) { // magic number 2^20
+</span>158 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>logger.info(s&quot;Initial load: consumed [$topic:${record.partition}:${record.offset}] of $maxOffset&quot;)</span><span style='background: #AEF1AE'>
+</span>159 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>160 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>161 <span style=''>    }
+</span>162 <span style=''>
+</span>163 <span style=''>    override def run(): Unit = {
+</span>164 <span style=''>      </span><span style='background: #AEF1AE'>LoaderStatus.startLoad()</span><span style=''>
+</span>165 <span style=''>
+</span>166 <span style=''>      import scala.collection.JavaConverters._
+</span>167 <span style=''>
+</span>168 <span style=''>      val partitions = </span><span style='background: #AEF1AE'>consumers.head.partitionsFor(topic).asScala.map(_.partition)</span><span style=''>
+</span>169 <span style=''>      try {
+</span>170 <span style=''>        // note: these methods are not available in kafka 0.9, which will cause it to fall back to normal loading
+</span>171 <span style=''>        </span><span style='background: #AEF1AE'>val beginningOffsets = KafkaConsumerVersions.beginningOffsets(consumers.head, topic, partitions.toSeq)
+</span>172 <span style=''></span><span style='background: #AEF1AE'>        val endOffsets = KafkaConsumerVersions.endOffsets(consumers.head, topic, partitions.toSeq)
+</span>173 <span style=''></span><span style='background: #AEF1AE'>        partitions.foreach { p =&gt;
+</span>174 <span style=''></span><span style='background: #AEF1AE'>          // end offsets are the *next* offset that will be returned, so subtract one to track the last offset
+</span>175 <span style=''></span><span style='background: #AEF1AE'>          // we will actually consume
+</span>176 <span style=''></span><span style='background: #AEF1AE'>          val endOffset = endOffsets.getOrElse(p, 0L) - 1L
+</span>177 <span style=''></span><span style='background: #AEF1AE'>          // note: not sure if start offsets are also off by one, but at the worst we would skip bulk loading
+</span>178 <span style=''></span><span style='background: #AEF1AE'>          // for the last message per topic
+</span>179 <span style=''></span><span style='background: #AEF1AE'>          val beginningOffset = beginningOffsets.getOrElse(p, 0L)
+</span>180 <span style=''></span><span style='background: #AEF1AE'>          if (beginningOffset &lt; endOffset) {
+</span>181 <span style=''></span><span style='background: #AEF1AE'>            offsets.put(p, endOffset)
+</span>182 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>183 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>184 <span style=''>      } catch {
+</span>185 <span style=''>        case e: NoSuchMethodException =&gt; </span><span style='background: #F0ADAD'>logger.warn(s&quot;Can't support initial bulk loading for current Kafka version: $e&quot;)</span><span style=''>
+</span>186 <span style=''>      }
+</span>187 <span style=''>      // don't bother spinning up the consumer threads if we don't need to actually bulk load anything
+</span>188 <span style=''>      if (</span><span style='background: #AEF1AE'>!offsets.isEmpty</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>189 <span style=''></span><span style='background: #AEF1AE'>        logger.info(s&quot;Starting initial load for [$topic] with ${offsets.size} partitions&quot;)
+</span>190 <span style=''></span><span style='background: #AEF1AE'>        latch = new CountDownLatch(offsets.size)
+</span>191 <span style=''></span><span style='background: #AEF1AE'>        startConsumers() // kick off the asynchronous consumer threads
+</span>192 <span style=''></span><span style='background: #AEF1AE'>        try { latch.await() } finally {
+</span>193 <span style=''></span><span style='background: #AEF1AE'>          // stop the consumer threads, but won't close the consumers due to `closeConsumers`
+</span>194 <span style=''></span><span style='background: #AEF1AE'>          close()
+</span>195 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>196 <span style=''></span><span style='background: #AEF1AE'>        // set a flag just in case the consumer threads haven't finished spinning down, so that we will
+</span>197 <span style=''></span><span style='background: #AEF1AE'>        // pass any additional messages back to the main loader
+</span>198 <span style=''></span><span style='background: #AEF1AE'>        done.set(true)
+</span>199 <span style=''></span><span style='background: #AEF1AE'>        logger.info(s&quot;Finished initial load, transferring to indexed cache for [$topic]&quot;)
+</span>200 <span style=''></span><span style='background: #AEF1AE'>        cache.query(Filter.INCLUDE).foreach(toLoad.cache.put)
+</span>201 <span style=''></span><span style='background: #AEF1AE'>        logger.info(s&quot;Finished transfer for [$topic]&quot;)
+</span>202 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>203 <span style=''>      logger.info(s&quot;Starting normal load for [$topic]&quot;)
+</span>204 <span style=''>      // start the normal loading
+</span>205 <span style=''>      </span><span style='background: #AEF1AE'>toLoad.startConsumers()</span><span style=''>
+</span>206 <span style=''>      </span><span style='background: #AEF1AE'>LoaderStatus.completedLoad()</span><span style=''>
+</span>207 <span style=''>    }
+</span>208 <span style=''>  }
+</span>209 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          40
+        </td>
+        <td>
+          1
+        </td>
+        <td>
+          1764
+          -
+          1784
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicInteger.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicInteger(0)
+        </td>
+      </tr><tr>
+        <td>
+          41
+        </td>
+        <td>
+          2
+        </td>
+        <td>
+          1822
+          -
+          1840
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicLong(0L)
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          7
+        </td>
+        <td>
+          1873
+          -
+          1994
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.synchronized
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LoaderStatus.this.synchronized[Boolean]({
+  LoaderStatus.this.count.incrementAndGet();
+  LoaderStatus.this.firstLoadStartTime.compareAndSet(0L, java.lang.System.currentTimeMillis())
+})
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          3
+        </td>
+        <td>
+          1894
+          -
+          1917
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicInteger.incrementAndGet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LoaderStatus.this.count.incrementAndGet()
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          4
+        </td>
+        <td>
+          1957
+          -
+          1959
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0L
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          5
+        </td>
+        <td>
+          1961
+          -
+          1987
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.System.currentTimeMillis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.currentTimeMillis()
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          6
+        </td>
+        <td>
+          1924
+          -
+          1988
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.compareAndSet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LoaderStatus.this.firstLoadStartTime.compareAndSet(0L, java.lang.System.currentTimeMillis())
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          13
+        </td>
+        <td>
+          2027
+          -
+          2295
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.synchronized
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LoaderStatus.this.synchronized[Unit](if (LoaderStatus.this.count.decrementAndGet().==(0))
+  {
+    (if (KafkaCacheLoader.this.logger.underlying.isInfoEnabled())
+      KafkaCacheLoader.this.logger.underlying.info(scala.StringContext.apply(&quot;Last active initial load completed.  &quot;).s().+(scala.StringContext.apply(&quot;Initial loads took &quot;, &quot; milliseconds.&quot;).s(java.lang.System.currentTimeMillis().-(LoaderStatus.this.firstLoadStartTime.get()))))
+    else
+      (): Unit);
+    LoaderStatus.this.firstLoadStartTime.set(0L)
+  }
+else
+  ())
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          8
+        </td>
+        <td>
+          2052
+          -
+          2080
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LoaderStatus.this.count.decrementAndGet().==(0)
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          10
+        </td>
+        <td>
+          2082
+          -
+          2289
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  (if (KafkaCacheLoader.this.logger.underlying.isInfoEnabled())
+    KafkaCacheLoader.this.logger.underlying.info(scala.StringContext.apply(&quot;Last active initial load completed.  &quot;).s().+(scala.StringContext.apply(&quot;Initial loads took &quot;, &quot; milliseconds.&quot;).s(java.lang.System.currentTimeMillis().-(LoaderStatus.this.firstLoadStartTime.get()))))
+  else
+    (): Unit);
+  LoaderStatus.this.firstLoadStartTime.set(0L)
+}
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          11
+        </td>
+        <td>
+          2048
+          -
+          2048
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          12
+        </td>
+        <td>
+          2048
+          -
+          2048
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          9
+        </td>
+        <td>
+          2255
+          -
+          2281
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.set
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LoaderStatus.this.firstLoadStartTime.set(0L)
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          14
+        </td>
+        <td>
+          2328
+          -
+          2344
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          LoaderStatus.this.count.get().==(0)
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          15
+        </td>
+        <td>
+          2441
+          -
+          2466
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.empty(org.locationtech.geomesa.kafka.index.KafkaFeatureCache.empty$default$1)
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          16
+        </td>
+        <td>
+          2500
+          -
+          2502
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          17
+        </td>
+        <td>
+          2934
+          -
+          2990
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Class.getMethod
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          classOf[org.apache.kafka.clients.consumer.ConsumerRecord].getMethod(&quot;timestamp&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          18
+        </td>
+        <td>
+          2934
+          -
+          2990
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.lang.Class.getMethod
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          classOf[org.apache.kafka.clients.consumer.ConsumerRecord].getMethod(&quot;timestamp&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          19
+        </td>
+        <td>
+          3040
+          -
+          3122
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (KafkaCacheLoaderImpl.this.logger.underlying.isWarnEnabled())
+  KafkaCacheLoaderImpl.this.logger.underlying.warn(&quot;This version of Kafka doesn\'t support timestamps, using system time&quot;)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          20
+        </td>
+        <td>
+          3166
+          -
+          3179
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.KafkaCacheLoaderImpl.doInitialLoad
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.doInitialLoad
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          30
+        </td>
+        <td>
+          3181
+          -
+          3447
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val loader: org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader = new KafkaCacheLoader.this.InitialLoader(KafkaCacheLoaderImpl.this.sft, KafkaCacheLoaderImpl.this.consumers, KafkaCacheLoaderImpl.this.topic, KafkaCacheLoaderImpl.this.frequency, KafkaCacheLoaderImpl.this.serializer, KafkaCacheLoaderImpl.this.initialLoadConfig, this);
+  org.locationtech.geomesa.utils.concurrent.CachedThreadPool.execute(loader);
+  scala.Some.apply[org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader](loader)
+}
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          21
+        </td>
+        <td>
+          3313
+          -
+          3316
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.KafkaCacheLoaderImpl.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          22
+        </td>
+        <td>
+          3318
+          -
+          3327
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.KafkaCacheLoaderImpl.consumers
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.consumers
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          23
+        </td>
+        <td>
+          3329
+          -
+          3334
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.KafkaCacheLoaderImpl.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          24
+        </td>
+        <td>
+          3336
+          -
+          3345
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.KafkaCacheLoaderImpl.frequency
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.frequency
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          25
+        </td>
+        <td>
+          3347
+          -
+          3357
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.KafkaCacheLoaderImpl.serializer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.serializer
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          26
+        </td>
+        <td>
+          3359
+          -
+          3376
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.KafkaCacheLoaderImpl.initialLoadConfig
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.initialLoadConfig
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          27
+        </td>
+        <td>
+          3295
+          -
+          3383
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new KafkaCacheLoader.this.InitialLoader(KafkaCacheLoaderImpl.this.sft, KafkaCacheLoaderImpl.this.consumers, KafkaCacheLoaderImpl.this.topic, KafkaCacheLoaderImpl.this.frequency, KafkaCacheLoaderImpl.this.serializer, KafkaCacheLoaderImpl.this.initialLoadConfig, this)
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          28
+        </td>
+        <td>
+          3390
+          -
+          3422
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.execute
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.execute(loader)
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          29
+        </td>
+        <td>
+          3429
+          -
+          3441
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader](loader)
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          33
+        </td>
+        <td>
+          3453
+          -
+          3494
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  KafkaCacheLoaderImpl.this.startConsumers(KafkaCacheLoaderImpl.this.startConsumers$default$1);
+  scala.None
+}
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          31
+        </td>
+        <td>
+          3461
+          -
+          3477
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BaseThreadedConsumer.startConsumers
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaCacheLoaderImpl.this.startConsumers(KafkaCacheLoaderImpl.this.startConsumers$default$1)
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          32
+        </td>
+        <td>
+          3484
+          -
+          3488
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          34
+        </td>
+        <td>
+          3551
+          -
+          3564
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BaseThreadedConsumer.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.super.close()
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          35
+        </td>
+        <td>
+          3551
+          -
+          3564
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BaseThreadedConsumer.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.super.close()
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          40
+        </td>
+        <td>
+          3581
+          -
+          3652
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[Option[org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader]](KafkaCacheLoaderImpl.this.initialLoader)(io.this.IsCloseable.optionIsCloseable);
+  KafkaCacheLoaderImpl.this.cache.close()
+}
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          36
+        </td>
+        <td>
+          3608
+          -
+          3621
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.KafkaCacheLoaderImpl.initialLoader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.initialLoader
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          37
+        </td>
+        <td>
+          3607
+          -
+          3607
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.optionIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.optionIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          38
+        </td>
+        <td>
+          3591
+          -
+          3622
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[Option[org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader]](KafkaCacheLoaderImpl.this.initialLoader)(io.this.IsCloseable.optionIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          39
+        </td>
+        <td>
+          3631
+          -
+          3644
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.Closeable.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.cache.close()
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          41
+        </td>
+        <td>
+          3794
+          -
+          3827
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.RecordVersions.getHeaders
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.RecordVersions.getHeaders(record)
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          42
+        </td>
+        <td>
+          3850
+          -
+          3885
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.RecordVersions.getTimestamp
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.RecordVersions.getTimestamp(record)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          43
+        </td>
+        <td>
+          3929
+          -
+          3941
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecord.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          record.key()
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          44
+        </td>
+        <td>
+          3943
+          -
+          3957
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecord.value
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          record.value()
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          45
+        </td>
+        <td>
+          3906
+          -
+          3978
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.serializer.deserialize(record.key(), record.value(), headers, timestamp)
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          46
+        </td>
+        <td>
+          4150
+          -
+          4159
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          m.feature
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          47
+        </td>
+        <td>
+          4122
+          -
+          4160
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaListeners.fireChange
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.cache.fireChange(timestamp, m.feature)
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          48
+        </td>
+        <td>
+          4172
+          -
+          4181
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          m.feature
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          49
+        </td>
+        <td>
+          4162
+          -
+          4182
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.cache.put(m.feature)
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          50
+        </td>
+        <td>
+          4119
+          -
+          4182
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  KafkaCacheLoaderImpl.this.cache.fireChange(timestamp, m.feature);
+  KafkaCacheLoaderImpl.this.cache.put(m.feature)
+}
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          51
+        </td>
+        <td>
+          4237
+          -
+          4241
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          m.id
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          52
+        </td>
+        <td>
+          4255
+          -
+          4259
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          m.id
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          53
+        </td>
+        <td>
+          4261
+          -
+          4261
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Predef.$conforms
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.$conforms[Null]
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          54
+        </td>
+        <td>
+          4243
+          -
+          4267
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Option.orNull
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.cache.query(m.id).orNull[org.geotools.api.feature.simple.SimpleFeature](scala.Predef.$conforms[Null])
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          55
+        </td>
+        <td>
+          4209
+          -
+          4268
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaListeners.fireDelete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.cache.fireDelete(timestamp, m.id, KafkaCacheLoaderImpl.this.cache.query(m.id).orNull[org.geotools.api.feature.simple.SimpleFeature](scala.Predef.$conforms[Null]))
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          56
+        </td>
+        <td>
+          4283
+          -
+          4287
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          m.id
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          57
+        </td>
+        <td>
+          4270
+          -
+          4288
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.cache.remove(m.id)
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          58
+        </td>
+        <td>
+          4206
+          -
+          4288
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  KafkaCacheLoaderImpl.this.cache.fireDelete(timestamp, m.id, KafkaCacheLoaderImpl.this.cache.query(m.id).orNull[org.geotools.api.feature.simple.SimpleFeature](scala.Predef.$conforms[Null]));
+  KafkaCacheLoaderImpl.this.cache.remove(m.id)
+}
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          59
+        </td>
+        <td>
+          4315
+          -
+          4341
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaListeners.fireClear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.cache.fireClear(timestamp)
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          60
+        </td>
+        <td>
+          4343
+          -
+          4356
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoaderImpl.this.cache.clear()
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          61
+        </td>
+        <td>
+          4312
+          -
+          4356
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  KafkaCacheLoaderImpl.this.cache.fireClear(timestamp);
+  KafkaCacheLoaderImpl.this.cache.clear()
+}
+        </td>
+      </tr><tr>
+        <td>
+          106
+        </td>
+        <td>
+          62
+        </td>
+        <td>
+          4375
+          -
+          4433
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unknown message: &quot;, &quot;&quot;).s(m))
+        </td>
+      </tr><tr>
+        <td>
+          106
+        </td>
+        <td>
+          63
+        </td>
+        <td>
+          4375
+          -
+          4433
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unknown message: &quot;, &quot;&quot;).s(m))
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          64
+        </td>
+        <td>
+          5319
+          -
+          5322
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          65
+        </td>
+        <td>
+          5324
+          -
+          5332
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.ordering
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.ordering
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          66
+        </td>
+        <td>
+          5289
+          -
+          5333
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.nonIndexing
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.nonIndexing(InitialLoader.this.sft, InitialLoader.this.ordering)
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          67
+        </td>
+        <td>
+          5410
+          -
+          5444
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.ConcurrentHashMap[Int,Long]()
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          68
+        </td>
+        <td>
+          5510
+          -
+          5534
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicBoolean(false)
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          69
+        </td>
+        <td>
+          5641
+          -
+          5649
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.done.get()
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          70
+        </td>
+        <td>
+          5653
+          -
+          5675
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.KafkaCacheLoaderImpl.consume
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          InitialLoader.this.toLoad.consume(record)
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          71
+        </td>
+        <td>
+          5653
+          -
+          5675
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.KafkaCacheLoaderImpl.consume
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          InitialLoader.this.toLoad.consume(record)
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          111
+        </td>
+        <td>
+          5683
+          -
+          7079
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val headers: Map[String,Array[Byte]] = org.locationtech.geomesa.kafka.versions.RecordVersions.getHeaders(record);
+  val timestamp: Long = org.locationtech.geomesa.kafka.versions.RecordVersions.getTimestamp(record);
+  val message: org.locationtech.geomesa.kafka.utils.GeoMessage = InitialLoader.this.serializer.deserialize(record.key(), record.value(), headers, timestamp);
+  (if (InitialLoader.this.logger.underlying.isTraceEnabled())
+    InitialLoader.this.logger.underlying.trace(&quot;Consumed message [{}:{}:{}] {}&quot;, (InitialLoader.this.topic: AnyRef), record.partition().asInstanceOf[AnyRef], record.offset().asInstanceOf[AnyRef], (message: AnyRef))
+  else
+    (): Unit);
+  message match {
+    case (m @ (_: org.locationtech.geomesa.kafka.utils.GeoMessage.Change)) =&gt; {
+      InitialLoader.this.toLoad.cache.fireChange(timestamp, m.feature);
+      InitialLoader.this.cache.put(m.feature)
+    }
+    case (m @ (_: org.locationtech.geomesa.kafka.utils.GeoMessage.Delete)) =&gt; {
+      InitialLoader.this.toLoad.cache.fireDelete(timestamp, m.id, InitialLoader.this.cache.query(m.id).orNull[org.geotools.api.feature.simple.SimpleFeature](scala.Predef.$conforms[Null]));
+      InitialLoader.this.cache.remove(m.id)
+    }
+    case (_: org.locationtech.geomesa.kafka.utils.GeoMessage.Clear) =&gt; {
+      InitialLoader.this.toLoad.cache.fireClear(timestamp);
+      InitialLoader.this.cache.clear()
+    }
+    case (m @ _) =&gt; throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unknown message: &quot;, &quot;&quot;).s(m))
+  };
+  val maxOffset: Long = InitialLoader.this.offsets.getOrDefault(record.partition(), 9223372036854775807L);
+  if (maxOffset.&lt;=(record.offset()))
+    {
+      InitialLoader.this.offsets.remove(record.partition());
+      InitialLoader.this.latch.countDown();
+      (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+        InitialLoader.this.logger.underlying.info(scala.StringContext.apply(&quot;Initial load: consumed [&quot;, &quot;:&quot;, &quot;:&quot;, &quot;] of &quot;, &quot;, &quot;).s(InitialLoader.this.topic, record.partition(), record.offset(), maxOffset).+(scala.StringContext.apply(&quot;&quot;, &quot; partitions remaining&quot;).s(InitialLoader.this.latch.getCount())))
+      else
+        (): Unit)
+    }
+  else
+    if (record.offset().&gt;(0).&amp;&amp;(record.offset().%(1048576).==(0)))
+      (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+        InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}] of {}&quot;, (InitialLoader.this.topic: AnyRef), record.partition().asInstanceOf[AnyRef], record.offset().asInstanceOf[AnyRef], maxOffset.asInstanceOf[AnyRef])
+      else
+        (): Unit)
+    else
+      ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          140
+        </td>
+        <td>
+          72
+        </td>
+        <td>
+          5707
+          -
+          5740
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.RecordVersions.getHeaders
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.RecordVersions.getHeaders(record)
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          73
+        </td>
+        <td>
+          5765
+          -
+          5800
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.RecordVersions.getTimestamp
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.RecordVersions.getTimestamp(record)
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          74
+        </td>
+        <td>
+          5846
+          -
+          5856
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecord.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          record.key()
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          75
+        </td>
+        <td>
+          5858
+          -
+          5870
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecord.value
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          record.value()
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          76
+        </td>
+        <td>
+          5823
+          -
+          5891
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.serializer.deserialize(record.key(), record.value(), headers, timestamp)
+        </td>
+      </tr><tr>
+        <td>
+          145
+        </td>
+        <td>
+          77
+        </td>
+        <td>
+          6076
+          -
+          6085
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          m.feature
+        </td>
+      </tr><tr>
+        <td>
+          145
+        </td>
+        <td>
+          78
+        </td>
+        <td>
+          6041
+          -
+          6086
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaListeners.fireChange
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.toLoad.cache.fireChange(timestamp, m.feature)
+        </td>
+      </tr><tr>
+        <td>
+          145
+        </td>
+        <td>
+          79
+        </td>
+        <td>
+          6098
+          -
+          6107
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          m.feature
+        </td>
+      </tr><tr>
+        <td>
+          145
+        </td>
+        <td>
+          80
+        </td>
+        <td>
+          6088
+          -
+          6108
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.cache.put(m.feature)
+        </td>
+      </tr><tr>
+        <td>
+          145
+        </td>
+        <td>
+          81
+        </td>
+        <td>
+          6038
+          -
+          6108
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  InitialLoader.this.toLoad.cache.fireChange(timestamp, m.feature);
+  InitialLoader.this.cache.put(m.feature)
+}
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          82
+        </td>
+        <td>
+          6172
+          -
+          6176
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          m.id
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          83
+        </td>
+        <td>
+          6190
+          -
+          6194
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          m.id
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          84
+        </td>
+        <td>
+          6196
+          -
+          6196
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Predef.$conforms
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.$conforms[Null]
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          85
+        </td>
+        <td>
+          6178
+          -
+          6202
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Option.orNull
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          InitialLoader.this.cache.query(m.id).orNull[org.geotools.api.feature.simple.SimpleFeature](scala.Predef.$conforms[Null])
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          86
+        </td>
+        <td>
+          6137
+          -
+          6203
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaListeners.fireDelete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          InitialLoader.this.toLoad.cache.fireDelete(timestamp, m.id, InitialLoader.this.cache.query(m.id).orNull[org.geotools.api.feature.simple.SimpleFeature](scala.Predef.$conforms[Null]))
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          87
+        </td>
+        <td>
+          6218
+          -
+          6222
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          m.id
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          88
+        </td>
+        <td>
+          6205
+          -
+          6223
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          InitialLoader.this.cache.remove(m.id)
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          89
+        </td>
+        <td>
+          6134
+          -
+          6223
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  InitialLoader.this.toLoad.cache.fireDelete(timestamp, m.id, InitialLoader.this.cache.query(m.id).orNull[org.geotools.api.feature.simple.SimpleFeature](scala.Predef.$conforms[Null]));
+  InitialLoader.this.cache.remove(m.id)
+}
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          90
+        </td>
+        <td>
+          6252
+          -
+          6285
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaListeners.fireClear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          InitialLoader.this.toLoad.cache.fireClear(timestamp)
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          91
+        </td>
+        <td>
+          6287
+          -
+          6300
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          InitialLoader.this.cache.clear()
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          92
+        </td>
+        <td>
+          6249
+          -
+          6300
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  InitialLoader.this.toLoad.cache.fireClear(timestamp);
+  InitialLoader.this.cache.clear()
+}
+        </td>
+      </tr><tr>
+        <td>
+          148
+        </td>
+        <td>
+          93
+        </td>
+        <td>
+          6321
+          -
+          6379
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unknown message: &quot;, &quot;&quot;).s(m))
+        </td>
+      </tr><tr>
+        <td>
+          148
+        </td>
+        <td>
+          94
+        </td>
+        <td>
+          6321
+          -
+          6379
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unknown message: &quot;, &quot;&quot;).s(m))
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          95
+        </td>
+        <td>
+          6545
+          -
+          6561
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecord.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          record.partition()
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          96
+        </td>
+        <td>
+          6563
+          -
+          6576
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          9223372036854775807L
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          97
+        </td>
+        <td>
+          6524
+          -
+          6577
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.getOrDefault
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.offsets.getOrDefault(record.partition(), 9223372036854775807L)
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          98
+        </td>
+        <td>
+          6603
+          -
+          6616
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecord.offset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          record.offset()
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          99
+        </td>
+        <td>
+          6590
+          -
+          6616
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          maxOffset.&lt;=(record.offset())
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          103
+        </td>
+        <td>
+          6618
+          -
+          6869
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  InitialLoader.this.offsets.remove(record.partition());
+  InitialLoader.this.latch.countDown();
+  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+    InitialLoader.this.logger.underlying.info(scala.StringContext.apply(&quot;Initial load: consumed [&quot;, &quot;:&quot;, &quot;:&quot;, &quot;] of &quot;, &quot;, &quot;).s(InitialLoader.this.topic, record.partition(), record.offset(), maxOffset).+(scala.StringContext.apply(&quot;&quot;, &quot; partitions remaining&quot;).s(InitialLoader.this.latch.getCount())))
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          153
+        </td>
+        <td>
+          100
+        </td>
+        <td>
+          6645
+          -
+          6661
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecord.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          record.partition()
+        </td>
+      </tr><tr>
+        <td>
+          153
+        </td>
+        <td>
+          101
+        </td>
+        <td>
+          6630
+          -
+          6662
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.offsets.remove(record.partition())
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          102
+        </td>
+        <td>
+          6673
+          -
+          6690
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.CountDownLatch.countDown
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.latch.countDown()
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          104
+        </td>
+        <td>
+          6895
+          -
+          6896
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          105
+        </td>
+        <td>
+          6900
+          -
+          6928
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          record.offset().%(1048576).==(0)
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          106
+        </td>
+        <td>
+          6879
+          -
+          6928
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          record.offset().&gt;(0).&amp;&amp;(record.offset().%(1048576).==(0))
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          108
+        </td>
+        <td>
+          6875
+          -
+          6875
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          109
+        </td>
+        <td>
+          6875
+          -
+          6875
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          110
+        </td>
+        <td>
+          6875
+          -
+          7071
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (record.offset().&gt;(0).&amp;&amp;(record.offset().%(1048576).==(0)))
+  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+    InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}] of {}&quot;, (InitialLoader.this.topic: AnyRef), record.partition().asInstanceOf[AnyRef], record.offset().asInstanceOf[AnyRef], maxOffset.asInstanceOf[AnyRef])
+  else
+    (): Unit)
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          107
+        </td>
+        <td>
+          6963
+          -
+          7061
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+  InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}] of {}&quot;, (InitialLoader.this.topic: AnyRef), record.partition().asInstanceOf[AnyRef], record.offset().asInstanceOf[AnyRef], maxOffset.asInstanceOf[AnyRef])
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          112
+        </td>
+        <td>
+          7126
+          -
+          7150
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.LoaderStatus.startLoad
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoader.this.LoaderStatus.startLoad()
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          113
+        </td>
+        <td>
+          7252
+          -
+          7257
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          114
+        </td>
+        <td>
+          7223
+          -
+          7258
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.partitionsFor
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.consumers.head.partitionsFor(InitialLoader.this.topic)
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          115
+        </td>
+        <td>
+          7271
+          -
+          7282
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.common.PartitionInfo.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1.partition()
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          116
+        </td>
+        <td>
+          7270
+          -
+          7270
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.mutable.Buffer.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutable.this.Buffer.canBuildFrom[Int]
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          117
+        </td>
+        <td>
+          7223
+          -
+          7283
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaBufferConverter[org.apache.kafka.common.PartitionInfo](InitialLoader.this.consumers.head.partitionsFor(InitialLoader.this.topic)).asScala.map[Int, scala.collection.mutable.Buffer[Int]](((x$1: org.apache.kafka.common.PartitionInfo) =&gt; x$1.partition()))(mutable.this.Buffer.canBuildFrom[Int])
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          134
+        </td>
+        <td>
+          7418
+          -
+          8186
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val beginningOffsets: Map[Int,Long] = org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.beginningOffsets(InitialLoader.this.consumers.head, InitialLoader.this.topic, partitions.toSeq);
+  val endOffsets: Map[Int,Long] = org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.endOffsets(InitialLoader.this.consumers.head, InitialLoader.this.topic, partitions.toSeq);
+  partitions.foreach[AnyVal](((p: Int) =&gt; {
+    val endOffset: Long = endOffsets.getOrElse[Long](p, 0L).-(1L);
+    val beginningOffset: Long = beginningOffsets.getOrElse[Long](p, 0L);
+    if (beginningOffset.&lt;(endOffset))
+      InitialLoader.this.offsets.put(p, endOffset)
+    else
+      ()
+  }))
+}
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          118
+        </td>
+        <td>
+          7480
+          -
+          7494
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.IterableLike.head
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.consumers.head
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          119
+        </td>
+        <td>
+          7496
+          -
+          7501
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          120
+        </td>
+        <td>
+          7503
+          -
+          7519
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SeqLike.toSeq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          partitions.toSeq
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          121
+        </td>
+        <td>
+          7441
+          -
+          7520
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.beginningOffsets
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.beginningOffsets(InitialLoader.this.consumers.head, InitialLoader.this.topic, partitions.toSeq)
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          122
+        </td>
+        <td>
+          7579
+          -
+          7593
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.IterableLike.head
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.consumers.head
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          123
+        </td>
+        <td>
+          7595
+          -
+          7600
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          124
+        </td>
+        <td>
+          7602
+          -
+          7618
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SeqLike.toSeq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          partitions.toSeq
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          125
+        </td>
+        <td>
+          7546
+          -
+          7619
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.endOffsets
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.endOffsets(InitialLoader.this.consumers.head, InitialLoader.this.topic, partitions.toSeq)
+        </td>
+      </tr><tr>
+        <td>
+          173
+        </td>
+        <td>
+          133
+        </td>
+        <td>
+          7628
+          -
+          8186
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          partitions.foreach[AnyVal](((p: Int) =&gt; {
+  val endOffset: Long = endOffsets.getOrElse[Long](p, 0L).-(1L);
+  val beginningOffset: Long = beginningOffsets.getOrElse[Long](p, 0L);
+  if (beginningOffset.&lt;(endOffset))
+    InitialLoader.this.offsets.put(p, endOffset)
+  else
+    ()
+}))
+        </td>
+      </tr><tr>
+        <td>
+          176
+        </td>
+        <td>
+          126
+        </td>
+        <td>
+          7829
+          -
+          7861
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          endOffsets.getOrElse[Long](p, 0L).-(1L)
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          127
+        </td>
+        <td>
+          8048
+          -
+          8081
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.MapLike.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          beginningOffsets.getOrElse[Long](p, 0L)
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          128
+        </td>
+        <td>
+          8096
+          -
+          8123
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          beginningOffset.&lt;(endOffset)
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          131
+        </td>
+        <td>
+          8092
+          -
+          8092
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          132
+        </td>
+        <td>
+          8092
+          -
+          8092
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          129
+        </td>
+        <td>
+          8139
+          -
+          8164
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.offsets.put(p, endOffset)
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          130
+        </td>
+        <td>
+          8139
+          -
+          8164
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.offsets.put(p, endOffset)
+        </td>
+      </tr><tr>
+        <td>
+          185
+        </td>
+        <td>
+          135
+        </td>
+        <td>
+          8244
+          -
+          8324
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (InitialLoader.this.logger.underlying.isWarnEnabled())
+  InitialLoader.this.logger.underlying.warn(&quot;Can\'t support initial bulk loading for current Kafka version: {}&quot;, (e: AnyRef))
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          136
+        </td>
+        <td>
+          8446
+          -
+          8462
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.offsets.isEmpty().unary_!
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          149
+        </td>
+        <td>
+          8464
+          -
+          9244
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+    InitialLoader.this.logger.underlying.info(&quot;Starting initial load for [{}] with {} partitions&quot;, (scala.Array.apply[AnyRef]((InitialLoader.this.topic: AnyRef), InitialLoader.this.offsets.size().asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  InitialLoader.this.latch_=(new java.util.concurrent.CountDownLatch(InitialLoader.this.offsets.size()));
+  InitialLoader.this.startConsumers(InitialLoader.this.startConsumers$default$1);
+  try {
+    InitialLoader.this.latch.await()
+  } finally InitialLoader.this.close();
+  InitialLoader.this.done.set(true);
+  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+    InitialLoader.this.logger.underlying.info(&quot;Finished initial load, transferring to indexed cache for [{}]&quot;, (InitialLoader.this.topic: AnyRef))
+  else
+    (): Unit);
+  InitialLoader.this.cache.query(org.geotools.api.filter.Filter.INCLUDE).foreach[Unit]({
+    ((feature: org.geotools.api.feature.simple.SimpleFeature) =&gt; InitialLoader.this.toLoad.cache.put(feature))
+  });
+  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+    InitialLoader.this.logger.underlying.info(&quot;Finished transfer for [{}]&quot;, (InitialLoader.this.topic: AnyRef))
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          150
+        </td>
+        <td>
+          8442
+          -
+          8442
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          151
+        </td>
+        <td>
+          8442
+          -
+          8442
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          190
+        </td>
+        <td>
+          137
+        </td>
+        <td>
+          8592
+          -
+          8604
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.offsets.size()
+        </td>
+      </tr><tr>
+        <td>
+          190
+        </td>
+        <td>
+          138
+        </td>
+        <td>
+          8573
+          -
+          8605
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.CountDownLatch.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.CountDownLatch(InitialLoader.this.offsets.size())
+        </td>
+      </tr><tr>
+        <td>
+          190
+        </td>
+        <td>
+          139
+        </td>
+        <td>
+          8565
+          -
+          8605
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.latch_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.latch_=(new java.util.concurrent.CountDownLatch(InitialLoader.this.offsets.size()))
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          140
+        </td>
+        <td>
+          8614
+          -
+          8630
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BaseThreadedConsumer.startConsumers
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.startConsumers(InitialLoader.this.startConsumers$default$1)
+        </td>
+      </tr><tr>
+        <td>
+          192
+        </td>
+        <td>
+          141
+        </td>
+        <td>
+          8691
+          -
+          8704
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.CountDownLatch.await
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.latch.await()
+        </td>
+      </tr><tr>
+        <td>
+          192
+        </td>
+        <td>
+          142
+        </td>
+        <td>
+          8691
+          -
+          8704
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.concurrent.CountDownLatch.await
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.latch.await()
+        </td>
+      </tr><tr>
+        <td>
+          194
+        </td>
+        <td>
+          143
+        </td>
+        <td>
+          8821
+          -
+          8828
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BaseThreadedConsumer.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.close()
+        </td>
+      </tr><tr>
+        <td>
+          194
+        </td>
+        <td>
+          144
+        </td>
+        <td>
+          8821
+          -
+          8828
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BaseThreadedConsumer.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.close()
+        </td>
+      </tr><tr>
+        <td>
+          198
+        </td>
+        <td>
+          145
+        </td>
+        <td>
+          9015
+          -
+          9029
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.set
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.done.set(true)
+        </td>
+      </tr><tr>
+        <td>
+          200
+        </td>
+        <td>
+          146
+        </td>
+        <td>
+          9140
+          -
+          9154
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.filter.Filter.INCLUDE
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.filter.Filter.INCLUDE
+        </td>
+      </tr><tr>
+        <td>
+          200
+        </td>
+        <td>
+          147
+        </td>
+        <td>
+          9164
+          -
+          9180
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.index.KafkaFeatureCache.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.toLoad.cache.put(feature)
+        </td>
+      </tr><tr>
+        <td>
+          200
+        </td>
+        <td>
+          148
+        </td>
+        <td>
+          9128
+          -
+          9181
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.cache.query(org.geotools.api.filter.Filter.INCLUDE).foreach[Unit]({
+  ((feature: org.geotools.api.feature.simple.SimpleFeature) =&gt; InitialLoader.this.toLoad.cache.put(feature))
+})
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          152
+        </td>
+        <td>
+          9341
+          -
+          9364
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BaseThreadedConsumer.startConsumers
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.toLoad.startConsumers(InitialLoader.this.toLoad.startConsumers$default$1)
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          153
+        </td>
+        <td>
+          9371
+          -
+          9399
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.LoaderStatus.completedLoad
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaCacheLoader.this.LoaderStatus.completedLoad()
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>
