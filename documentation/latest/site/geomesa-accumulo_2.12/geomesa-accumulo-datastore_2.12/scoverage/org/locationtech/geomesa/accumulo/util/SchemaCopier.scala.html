@@ -1,0 +1,6413 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/accumulo/util/SchemaCopier.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2024 Commonwealth Computer Research, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * http://www.opensource.org/licenses/apache2.0.php.
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.accumulo.util
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.StrictLogging
+</span>12 <span style=''>import org.apache.accumulo.core.client.admin.TableOperations
+</span>13 <span style=''>import org.apache.commons.io.IOUtils
+</span>14 <span style=''>import org.apache.hadoop.conf.Configuration
+</span>15 <span style=''>import org.apache.hadoop.fs.{FileSystem, FileUtil, Path}
+</span>16 <span style=''>import org.apache.hadoop.tools.DistCp
+</span>17 <span style=''>import org.geotools.api.data.DataStoreFinder
+</span>18 <span style=''>import org.geotools.api.feature.simple.SimpleFeatureType
+</span>19 <span style=''>import org.locationtech.geomesa.accumulo.data.{AccumuloDataStore, AccumuloDataStoreParams}
+</span>20 <span style=''>import org.locationtech.geomesa.accumulo.util.SchemaCopier.{Cluster, ClusterConfig, CopyOptions, PartitionId, PartitionName, PartitionValue}
+</span>21 <span style=''>import org.locationtech.geomesa.features.ScalaSimpleFeature
+</span>22 <span style=''>import org.locationtech.geomesa.index.api.GeoMesaFeatureIndex
+</span>23 <span style=''>import org.locationtech.geomesa.index.conf.partition.TablePartition
+</span>24 <span style=''>import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+</span>25 <span style=''>import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes
+</span>26 <span style=''>import org.locationtech.geomesa.utils.hadoop.DistributedCopyOptions
+</span>27 <span style=''>import org.locationtech.geomesa.utils.io.{CloseWithLogging, WithClose}
+</span>28 <span style=''>
+</span>29 <span style=''>import java.io.{Closeable, File, IOException}
+</span>30 <span style=''>import java.nio.charset.StandardCharsets
+</span>31 <span style=''>import java.util.Collections
+</span>32 <span style=''>import java.util.concurrent.atomic.AtomicBoolean
+</span>33 <span style=''>import scala.collection.mutable.ListBuffer
+</span>34 <span style=''>import scala.util.Try
+</span>35 <span style=''>import scala.util.control.NonFatal
+</span>36 <span style=''>
+</span>37 <span style=''>/**
+</span>38 <span style=''> * Copies a schema from one cluster (or catalog) to another, using bulk file operations
+</span>39 <span style=''> *
+</span>40 <span style=''> * @param fromCluster source cluster
+</span>41 <span style=''> * @param toCluster destination cluster
+</span>42 <span style=''> * @param typeName name of the feature type to copy
+</span>43 <span style=''> * @param exportDir hdfs or s3a path to use for source table export - the scheme and authority (e.g. bucket name) must match
+</span>44 <span style=''> *                   the destination table filesystem
+</span>45 <span style=''> * @param indices specific indices to copy, or empty to copy all indices
+</span>46 <span style=''> * @param partitions if schema is partitioned - specific partitions to copy, or empty to copy all partitions
+</span>47 <span style=''> * @param options other copy options
+</span>48 <span style=''> */
+</span>49 <span style=''>class SchemaCopier(
+</span>50 <span style=''>    fromCluster: ClusterConfig,
+</span>51 <span style=''>    toCluster: ClusterConfig,
+</span>52 <span style=''>    typeName: String,
+</span>53 <span style=''>    exportDir: String,
+</span>54 <span style=''>    indices: Seq[String],
+</span>55 <span style=''>    partitions: Seq[PartitionId],
+</span>56 <span style=''>    options: CopyOptions,
+</span>57 <span style=''>  ) extends Runnable with Closeable with StrictLogging {
+</span>58 <span style=''>
+</span>59 <span style=''>  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+</span>60 <span style=''>
+</span>61 <span style=''>  import scala.collection.JavaConverters._
+</span>62 <span style=''>
+</span>63 <span style=''>  private val tryFrom = </span><span style='background: #F0ADAD'>Try(Cluster(fromCluster))</span><span style=''>
+</span>64 <span style=''>  private val tryTo = </span><span style='background: #F0ADAD'>Try(Cluster(toCluster))</span><span style=''>
+</span>65 <span style=''>
+</span>66 <span style=''>  // note: all other class variables are lazy, so that we can instantiate an instance and then clean up connections on close()
+</span>67 <span style=''>
+</span>68 <span style=''>  // the cluster we are exporting from
+</span>69 <span style=''>  lazy private val from: Cluster = tryFrom.get
+</span>70 <span style=''>  // the cluster we are exporting to
+</span>71 <span style=''>  lazy private val to: Cluster = tryTo.get
+</span>72 <span style=''>
+</span>73 <span style=''>  lazy private val exportPath: Path = {
+</span>74 <span style=''>    val defaultFs = FileSystem.get(to.conf)
+</span>75 <span style=''>    // makeQualified is a no-op if the path was already qualified (has a defined scheme and is not a relative path)
+</span>76 <span style=''>    val path = new Path(exportDir).makeQualified(defaultFs.getUri, defaultFs.getWorkingDirectory)
+</span>77 <span style=''>    if (path.toUri.getScheme == &quot;file&quot;) {
+</span>78 <span style=''>      throw new RuntimeException(&quot;Could not read defaultFS - this may be caused by a missing Hadoop core-site.xml file&quot;)
+</span>79 <span style=''>    }
+</span>80 <span style=''>    path
+</span>81 <span style=''>  }
+</span>82 <span style=''>
+</span>83 <span style=''>  lazy private val exportFs: FileSystem = exportPath.getFileSystem(to.conf)
+</span>84 <span style=''>
+</span>85 <span style=''>  // sft should be shareable/the same from both datastores
+</span>86 <span style=''>  lazy private val sft: SimpleFeatureType = {
+</span>87 <span style=''>    val sft = from.ds.getSchema(typeName)
+</span>88 <span style=''>    if (sft == null) {
+</span>89 <span style=''>      throw new IllegalArgumentException(s&quot;Schema '$typeName' does not exist in the source store&quot;)
+</span>90 <span style=''>    } else {
+</span>91 <span style=''>      val toSft = to.ds.getSchema(typeName)
+</span>92 <span style=''>      if (toSft == null) {
+</span>93 <span style=''>        throw new IllegalArgumentException(s&quot;Schema '$typeName' does not exist in the destination store&quot;)
+</span>94 <span style=''>      } else if (SimpleFeatureTypes.compare(sft, toSft) != 0) {
+</span>95 <span style=''>        throw new IllegalArgumentException(s&quot;Schema '$typeName' is not the same in the source and destination store&quot;)
+</span>96 <span style=''>      } else if (SimpleFeatureTypes.compareIndexConfigs(sft, toSft) != 0) {
+</span>97 <span style=''>        throw new IllegalArgumentException(s&quot;Schema '$typeName' does not have compatible indices in the source and destination store&quot;)
+</span>98 <span style=''>      }
+</span>99 <span style=''>    }
+</span>100 <span style=''>    sft
+</span>101 <span style=''>  }
+</span>102 <span style=''>
+</span>103 <span style=''>  lazy private val fromIndices = {
+</span>104 <span style=''>    val all = from.ds.manager.indices(sft)
+</span>105 <span style=''>    if (indices.isEmpty) { all } else {
+</span>106 <span style=''>      val builder = Seq.newBuilder[GeoMesaFeatureIndex[_, _]]
+</span>107 <span style=''>      indices.foreach { ident =&gt;
+</span>108 <span style=''>        val filtered = all.filter(_.identifier.contains(ident))
+</span>109 <span style=''>        if (filtered.isEmpty) {
+</span>110 <span style=''>          throw new IllegalArgumentException(
+</span>111 <span style=''>            s&quot;Index '$ident' does not exist in the schema. Available indices: ${all.map(_.identifier).mkString(&quot;, &quot;)}&quot;)
+</span>112 <span style=''>        }
+</span>113 <span style=''>        logger.debug(s&quot;Mapped identifier $ident to ${filtered.map(_.identifier).mkString(&quot;, &quot;)}&quot;)
+</span>114 <span style=''>        builder ++= filtered
+</span>115 <span style=''>      }
+</span>116 <span style=''>      builder.result.distinct
+</span>117 <span style=''>    }
+</span>118 <span style=''>  }
+</span>119 <span style=''>
+</span>120 <span style=''>  // these get passed into our index method calls - for partitioned schemas, it must be a Seq[Some[_]],
+</span>121 <span style=''>  // while for non-partitioned schemas it must always be Seq(None)
+</span>122 <span style=''>  lazy private val fromPartitions: Seq[Option[String]] = {
+</span>123 <span style=''>    if (sft.isPartitioned) {
+</span>124 <span style=''>      val builder = ListBuffer.empty[String]
+</span>125 <span style=''>      lazy val partitioning = TablePartition(from.ds, sft).get
+</span>126 <span style=''>      lazy val sf = new ScalaSimpleFeature(sft, &quot;&quot;)
+</span>127 <span style=''>      builder ++= partitions.map {
+</span>128 <span style=''>        case PartitionName(name) =&gt; name
+</span>129 <span style=''>        case PartitionValue(value) =&gt;
+</span>130 <span style=''>          sf.setAttribute(sft.getDtgIndex.get, value)
+</span>131 <span style=''>          val partition = partitioning.partition(sf)
+</span>132 <span style=''>          logger.debug(s&quot;Generated partition $partition from value $value&quot;)
+</span>133 <span style=''>          partition
+</span>134 <span style=''>      }
+</span>135 <span style=''>      if (builder.isEmpty) {
+</span>136 <span style=''>        logger.debug(&quot;No partitions specified - loading all partitions from store&quot;)
+</span>137 <span style=''>        builder ++= fromIndices.flatMap(_.getPartitions)
+</span>138 <span style=''>      }
+</span>139 <span style=''>      builder.result.distinct.sorted.map(Option.apply)
+</span>140 <span style=''>    } else {
+</span>141 <span style=''>      if (partitions.nonEmpty) {
+</span>142 <span style=''>        throw new IllegalArgumentException(&quot;partitions are not applicable for a non-partitioned schema&quot;)
+</span>143 <span style=''>      }
+</span>144 <span style=''>      Seq(None)
+</span>145 <span style=''>    }
+</span>146 <span style=''>  }
+</span>147 <span style=''>
+</span>148 <span style=''>  /**
+</span>149 <span style=''>   * Execute the copy
+</span>150 <span style=''>   */
+</span>151 <span style=''>  override def run(): Unit = </span><span style='background: #F0ADAD'>run(false)</span><span style=''>
+</span>152 <span style=''>
+</span>153 <span style=''>  /**
+</span>154 <span style=''>   * Execute the copy
+</span>155 <span style=''>   *
+</span>156 <span style=''>   * @param resume resume from a previously interrupted run, vs overwrite any existing output
+</span>157 <span style=''>   */
+</span>158 <span style=''>  def run(resume: Boolean): Unit = {
+</span>159 <span style=''>    </span><span style='background: #F0ADAD'>CachedThreadPool.executor(options.tableConcurrency) { executor =&gt;
+</span>160 <span style=''></span><span style='background: #F0ADAD'>      fromPartitions.foreach { partition =&gt;
+</span>161 <span style=''></span><span style='background: #F0ADAD'>        fromIndices.foreach { fromIndex =&gt;
+</span>162 <span style=''></span><span style='background: #F0ADAD'>          val toIndex = to.ds.manager.index(sft, fromIndex.identifier)
+</span>163 <span style=''></span><span style='background: #F0ADAD'>          val partitionLogId = s&quot;${partition.fold(s&quot;index&quot;)(p =&gt; s&quot;partition $p&quot;)} ${fromIndex.identifier}&quot;
+</span>164 <span style=''></span><span style='background: #F0ADAD'>          val runnable: Runnable = () =&gt; {
+</span>165 <span style=''></span><span style='background: #F0ADAD'>            try {
+</span>166 <span style=''></span><span style='background: #F0ADAD'>              logger.info(s&quot;Copying $partitionLogId&quot;)
+</span>167 <span style=''></span><span style='background: #F0ADAD'>              copy(fromIndex, toIndex, partition, resume, partitionLogId)
+</span>168 <span style=''></span><span style='background: #F0ADAD'>              logger.info(s&quot;Bulk copy complete for $partitionLogId&quot;)
+</span>169 <span style=''></span><span style='background: #F0ADAD'>            } catch {
+</span>170 <span style=''></span><span style='background: #F0ADAD'>              // catch Throwable so NoClassDefFound still gets logged
+</span>171 <span style=''></span><span style='background: #F0ADAD'>              case e: Throwable =&gt;
+</span>172 <span style=''></span><span style='background: #F0ADAD'>                logger.error(s&quot;Error copying $partitionLogId: ${e.getMessage}&quot;)
+</span>173 <span style=''></span><span style='background: #F0ADAD'>                logger.debug(s&quot;Error copying $partitionLogId&quot;, e)
+</span>174 <span style=''></span><span style='background: #F0ADAD'>            }
+</span>175 <span style=''></span><span style='background: #F0ADAD'>          }
+</span>176 <span style=''></span><span style='background: #F0ADAD'>          executor.submit(runnable)
+</span>177 <span style=''></span><span style='background: #F0ADAD'>        }
+</span>178 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>179 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>180 <span style=''>  }
+</span>181 <span style=''>
+</span>182 <span style=''>  /**
+</span>183 <span style=''>   * Copy a single index + partition
+</span>184 <span style=''>   *
+</span>185 <span style=''>   * @param fromIndex from index
+</span>186 <span style=''>   * @param toIndex to index
+</span>187 <span style=''>   * @param partition partition name - must be Some if schema is partitioned
+</span>188 <span style=''>   * @param resume use any partial results from a previous run, if present
+</span>189 <span style=''>   * @param partitionLogId identifier for log messages
+</span>190 <span style=''>   */
+</span>191 <span style=''>  private def copy(
+</span>192 <span style=''>      fromIndex: GeoMesaFeatureIndex[_, _],
+</span>193 <span style=''>      toIndex: GeoMesaFeatureIndex[_, _],
+</span>194 <span style=''>      partition: Option[String],
+</span>195 <span style=''>      resume: Boolean,
+</span>196 <span style=''>      partitionLogId: String): Unit = {
+</span>197 <span style=''>
+</span>198 <span style=''>    </span><span style='background: #F0ADAD'>require(sft.isPartitioned == partition.isDefined)</span><span style=''> // sanity check - this should always be true due to our setup
+</span>199 <span style=''>
+</span>200 <span style=''>    val fromTable = try { </span><span style='background: #F0ADAD'>fromIndex.getTableName(partition)</span><span style=''> } catch {
+</span>201 <span style=''>      case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>throw new RuntimeException(&quot;Could not get source table&quot;, e)</span><span style=''>
+</span>202 <span style=''>    }
+</span>203 <span style=''>
+</span>204 <span style=''>    val completeMarker = </span><span style='background: #F0ADAD'>new Path(exportPath, s&quot;$fromTable.complete&quot;)</span><span style=''>
+</span>205 <span style=''>    if (</span><span style='background: #F0ADAD'>exportFs.exists(completeMarker)</span><span style=''>) {
+</span>206 <span style=''>      </span><span style='background: #F0ADAD'>if (resume) {
+</span>207 <span style=''></span><span style='background: #F0ADAD'>        logger.debug(&quot;Skipping already completed copy&quot;)
+</span>208 <span style=''></span><span style='background: #F0ADAD'>        return
+</span>209 <span style=''></span><span style='background: #F0ADAD'>      } else {
+</span>210 <span style=''></span><span style='background: #F0ADAD'>        exportFs.delete(completeMarker, false)
+</span>211 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
+</span>212 <span style=''>    }
+</span>213 <span style=''>
+</span>214 <span style=''>    val tableExportPath = </span><span style='background: #F0ADAD'>new Path(exportPath, fromTable)</span><span style=''>
+</span>215 <span style=''>    val distcpPath = </span><span style='background: #F0ADAD'>new Path(tableExportPath, &quot;distcp.txt&quot;)</span><span style=''>
+</span>216 <span style=''>    val copyToDir = </span><span style='background: #F0ADAD'>new Path(tableExportPath, &quot;files&quot;)</span><span style=''>
+</span>217 <span style=''>    val cloneTable = </span><span style='background: #F0ADAD'>s&quot;${fromTable}_bc_tmp&quot;</span><span style=''>
+</span>218 <span style=''>
+</span>219 <span style=''>    logger.debug(s&quot;Source table $fromTable (${from.tableOps.tableIdMap().get(fromTable)})&quot;)
+</span>220 <span style=''>    logger.debug(s&quot;Export path $tableExportPath&quot;)
+</span>221 <span style=''>
+</span>222 <span style=''>    if (</span><span style='background: #F0ADAD'>resume &amp;&amp; from.tableOps.exists(cloneTable)</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>223 <span style=''></span><span style='background: #F0ADAD'>      logger.debug(s&quot;Using existing cloned table $cloneTable - ensuring table is offline&quot;)
+</span>224 <span style=''></span><span style='background: #F0ADAD'>      from.tableOps.offline(cloneTable, true)
+</span>225 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''> else </span><span style='background: #F0ADAD'>{
+</span>226 <span style=''></span><span style='background: #F0ADAD'>      // clone the table as we have to take it offline in order to export it
+</span>227 <span style=''></span><span style='background: #F0ADAD'>      // note that cloning is just a metadata op as it shares the underlying data files (until they change)
+</span>228 <span style=''></span><span style='background: #F0ADAD'>      logger.debug(s&quot;Checking for existence and deleting any existing cloned table $cloneTable&quot;)
+</span>229 <span style=''></span><span style='background: #F0ADAD'>      from.ds.adapter.deleteTable(cloneTable) // no-op if table doesn't exist
+</span>230 <span style=''></span><span style='background: #F0ADAD'>      logger.debug(s&quot;Cloning $fromTable to $cloneTable&quot;)
+</span>231 <span style=''></span><span style='background: #F0ADAD'>      from.tableOps.clone(fromTable, cloneTable, false, Collections.emptyMap(), Collections.emptySet()) // use 2.0 method for compatibility
+</span>232 <span style=''></span><span style='background: #F0ADAD'>      logger.debug(s&quot;Taking $cloneTable offline&quot;)
+</span>233 <span style=''></span><span style='background: #F0ADAD'>      from.tableOps.offline(cloneTable, true)
+</span>234 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>235 <span style=''>
+</span>236 <span style=''>    if (</span><span style='background: #F0ADAD'>resume &amp;&amp; exportFs.exists(distcpPath) &amp;&amp; exportFs.getFileStatus(distcpPath).getLen &gt; 0</span><span style=''>) {
+</span>237 <span style=''>      </span><span style='background: #F0ADAD'>logger.debug(s&quot;Using existing export results $distcpPath&quot;)</span><span style=''>
+</span>238 <span style=''>    } else </span><span style='background: #F0ADAD'>{
+</span>239 <span style=''></span><span style='background: #F0ADAD'>      if (exportFs.exists(tableExportPath)) {
+</span>240 <span style=''></span><span style='background: #F0ADAD'>        logger.debug(s&quot;Deleting existing export directory $tableExportPath&quot;)
+</span>241 <span style=''></span><span style='background: #F0ADAD'>        exportFs.delete(tableExportPath, true)
+</span>242 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>243 <span style=''></span><span style='background: #F0ADAD'>      logger.debug(s&quot;Exporting table to $tableExportPath&quot;)
+</span>244 <span style=''></span><span style='background: #F0ADAD'>      from.tableOps.exportTable(cloneTable, tableExportPath.toString)
+</span>245 <span style=''></span><span style='background: #F0ADAD'>
+</span>246 <span style=''></span><span style='background: #F0ADAD'>      if (!exportFs.exists(distcpPath) || exportFs.getFileStatus(distcpPath).getLen == 0) {
+</span>247 <span style=''></span><span style='background: #F0ADAD'>        throw new RuntimeException(s&quot;Could not read table export results at $distcpPath&quot;)
+</span>248 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>249 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>250 <span style=''>
+</span>251 <span style=''>    // ensures the destination table exists
+</span>252 <span style=''>    logger.debug(s&quot;Checking destination for table $fromTable&quot;)
+</span>253 <span style=''>    </span><span style='background: #F0ADAD'>to.ds.adapter.createTable(toIndex, partition, Seq.empty)</span><span style=''>
+</span>254 <span style=''>    val toTable = try { </span><span style='background: #F0ADAD'>toIndex.getTableName(partition)</span><span style=''> } catch {
+</span>255 <span style=''>      case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>throw new RuntimeException(&quot;Could not get destination table&quot;, e)</span><span style=''>
+</span>256 <span style=''>    }
+</span>257 <span style=''>    logger.debug(s&quot;Destination table $toTable (${to.tableOps.tableIdMap().get(toTable)})&quot;)
+</span>258 <span style=''>
+</span>259 <span style=''>    // create splits, do this separately in case the table already exists
+</span>260 <span style=''>    val splits = </span><span style='background: #F0ADAD'>new java.util.TreeSet(from.tableOps.listSplits(cloneTable))</span><span style=''>
+</span>261 <span style=''>    val existingSplits = </span><span style='background: #F0ADAD'>to.tableOps.listSplits(toTable)</span><span style=''>
+</span>262 <span style=''>    </span><span style='background: #F0ADAD'>splits.removeAll(existingSplits)</span><span style=''>
+</span>263 <span style=''>    if (</span><span style='background: #F0ADAD'>!splits.isEmpty</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>264 <span style=''></span><span style='background: #F0ADAD'>      if (!existingSplits.isEmpty) {
+</span>265 <span style=''></span><span style='background: #F0ADAD'>        logger.warn(s&quot;Detected split mismatch between source ($fromTable) and destination ($toTable) for $partitionLogId&quot;)
+</span>266 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>267 <span style=''></span><span style='background: #F0ADAD'>      logger.debug(s&quot;Adding splits to destination table $toTable&quot;)
+</span>268 <span style=''></span><span style='background: #F0ADAD'>      to.tableOps.addSplits(toTable, splits)
+</span>269 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>270 <span style=''>
+</span>271 <span style=''>    val hadCopyError = </span><span style='background: #F0ADAD'>new AtomicBoolean(false)</span><span style=''>
+</span>272 <span style=''>    // read the distcp.txt file produced by the table export
+</span>273 <span style=''>    // consumer: (src, dest) =&gt; Unit
+</span>274 <span style=''>    def distCpConsumer(threads: Int)(consumer: (Path, Path) =&gt; Unit): Unit = {
+</span>275 <span style=''>      logger.debug(s&quot;Reading $distcpPath&quot;)
+</span>276 <span style=''>      </span><span style='background: #F0ADAD'>WithClose(IOUtils.lineIterator(exportFs.open(distcpPath), StandardCharsets.UTF_8)) { files =&gt;
+</span>277 <span style=''></span><span style='background: #F0ADAD'>        CachedThreadPool.executor(threads) { executor =&gt;
+</span>278 <span style=''></span><span style='background: #F0ADAD'>          files.asScala.foreach { file =&gt;
+</span>279 <span style=''></span><span style='background: #F0ADAD'>            val runnable: Runnable = () =&gt; {
+</span>280 <span style=''></span><span style='background: #F0ADAD'>              val path = new Path(file)
+</span>281 <span style=''></span><span style='background: #F0ADAD'>              val copy = new Path(copyToDir, path.getName)
+</span>282 <span style=''></span><span style='background: #F0ADAD'>              try {
+</span>283 <span style=''></span><span style='background: #F0ADAD'>                if (resume &amp;&amp; exportFs.exists(copy) &amp;&amp;
+</span>284 <span style=''></span><span style='background: #F0ADAD'>                  path.getFileSystem(from.conf).getFileStatus(path).getLen == exportFs.getFileStatus(copy).getLen) {
+</span>285 <span style=''></span><span style='background: #F0ADAD'>                  logger.debug(s&quot;Using existing copy of $path at $copy&quot;)
+</span>286 <span style=''></span><span style='background: #F0ADAD'>                } else {
+</span>287 <span style=''></span><span style='background: #F0ADAD'>                  consumer(path, copy)
+</span>288 <span style=''></span><span style='background: #F0ADAD'>                }
+</span>289 <span style=''></span><span style='background: #F0ADAD'>              } catch {
+</span>290 <span style=''></span><span style='background: #F0ADAD'>                // catch Throwable so NoClassDefFound still gets logged
+</span>291 <span style=''></span><span style='background: #F0ADAD'>                case e: Throwable =&gt;
+</span>292 <span style=''></span><span style='background: #F0ADAD'>                  hadCopyError.set(true)
+</span>293 <span style=''></span><span style='background: #F0ADAD'>                  logger.error(s&quot;Failed to copy $path to $copy: ${e.getMessage}&quot;)
+</span>294 <span style=''></span><span style='background: #F0ADAD'>                  logger.debug(s&quot;Failed to copy $path to $copy&quot;, e)
+</span>295 <span style=''></span><span style='background: #F0ADAD'>              }
+</span>296 <span style=''></span><span style='background: #F0ADAD'>            }
+</span>297 <span style=''></span><span style='background: #F0ADAD'>            executor.submit(runnable)
+</span>298 <span style=''></span><span style='background: #F0ADAD'>          }
+</span>299 <span style=''></span><span style='background: #F0ADAD'>        }
+</span>300 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
+</span>301 <span style=''>    }
+</span>302 <span style=''>
+</span>303 <span style=''>    if (</span><span style='background: #F0ADAD'>options.distCp</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>304 <span style=''></span><span style='background: #F0ADAD'>      var inputPath = distcpPath
+</span>305 <span style=''></span><span style='background: #F0ADAD'>      if (resume) {
+</span>306 <span style=''></span><span style='background: #F0ADAD'>        logger.debug(s&quot;Checking copy status of files in $distcpPath&quot;)
+</span>307 <span style=''></span><span style='background: #F0ADAD'>        inputPath = new Path(tableExportPath, &quot;distcp-remaining.txt&quot;)
+</span>308 <span style=''></span><span style='background: #F0ADAD'>        WithClose(exportFs.create(inputPath, true)) { out =&gt;
+</span>309 <span style=''></span><span style='background: #F0ADAD'>          distCpConsumer(1) { (path, _) =&gt;
+</span>310 <span style=''></span><span style='background: #F0ADAD'>            logger.debug(s&quot;Adding $path to distcp&quot;)
+</span>311 <span style=''></span><span style='background: #F0ADAD'>            out.writeUTF(s&quot;$path\n&quot;)
+</span>312 <span style=''></span><span style='background: #F0ADAD'>          }
+</span>313 <span style=''></span><span style='background: #F0ADAD'>        }
+</span>314 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>315 <span style=''></span><span style='background: #F0ADAD'>      val job = new DistCp(from.conf, DistributedCopyOptions(inputPath, copyToDir)).execute()
+</span>316 <span style=''></span><span style='background: #F0ADAD'>      logger.info(s&quot;Tracking available at ${job.getStatus.getTrackingUrl}&quot;)
+</span>317 <span style=''></span><span style='background: #F0ADAD'>      while (!job.isComplete) {
+</span>318 <span style=''></span><span style='background: #F0ADAD'>        Thread.sleep(500)
+</span>319 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>320 <span style=''></span><span style='background: #F0ADAD'>      if (job.isSuccessful) {
+</span>321 <span style=''></span><span style='background: #F0ADAD'>        logger.info(s&quot;Successfully copied data to $copyToDir&quot;)
+</span>322 <span style=''></span><span style='background: #F0ADAD'>      } else {
+</span>323 <span style=''></span><span style='background: #F0ADAD'>        hadCopyError.set(true)
+</span>324 <span style=''></span><span style='background: #F0ADAD'>        logger.error(s&quot;Job failed with state ${job.getStatus.getState} due to: ${job.getStatus.getFailureInfo}&quot;)
+</span>325 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>326 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''> else {
+</span>327 <span style=''>      </span><span style='background: #F0ADAD'>distCpConsumer(options.fileConcurrency) { (path, copy) =&gt;
+</span>328 <span style=''></span><span style='background: #F0ADAD'>        logger.debug(s&quot;Copying $path to $copy&quot;)
+</span>329 <span style=''></span><span style='background: #F0ADAD'>        val fs = path.getFileSystem(from.conf)
+</span>330 <span style=''></span><span style='background: #F0ADAD'>        if (!FileUtil.copy(fs, path, exportFs, copy, false, true, to.conf)) {
+</span>331 <span style=''></span><span style='background: #F0ADAD'>          // consolidate error handling in the catch block
+</span>332 <span style=''></span><span style='background: #F0ADAD'>          throw new IOException(s&quot;Failed to copy $path to $copy, copy returned false&quot;)
+</span>333 <span style=''></span><span style='background: #F0ADAD'>        }
+</span>334 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
+</span>335 <span style=''>    }
+</span>336 <span style=''>    if (</span><span style='background: #F0ADAD'>hadCopyError.get</span><span style=''>) {
+</span>337 <span style=''>      </span><span style='background: #F0ADAD'>throw new RuntimeException(&quot;Error copying data files&quot;)</span><span style=''>
+</span>338 <span style=''>    }
+</span>339 <span style=''>
+</span>340 <span style=''>    logger.debug(s&quot;Loading rfiles from $copyToDir to $toTable&quot;)
+</span>341 <span style=''>    val importDir = </span><span style='background: #F0ADAD'>to.tableOps.importDirectory(copyToDir.toString).to(toTable)</span><span style=''>
+</span>342 <span style=''>    try { </span><span style='background: #F0ADAD'>importDir.ignoreEmptyDir(true)</span><span style=''> } catch {
+</span>343 <span style=''>      case _: NoSuchMethodError </span><span style='background: #F0ADAD'>=&gt;</span><span style=''> // accumulo 2.0, ignore
+</span>344 <span style=''>    }
+</span>345 <span style=''>    try { </span><span style='background: #F0ADAD'>importDir.load()</span><span style=''> } catch {
+</span>346 <span style=''>      case e: IllegalArgumentException =&gt; </span><span style='background: #F0ADAD'>logger.trace(&quot;Error importing directory:&quot;, e)</span><span style=''> // should mean empty dir
+</span>347 <span style=''>    }
+</span>348 <span style=''>
+</span>349 <span style=''>    // create marker indicating this copy was successful
+</span>350 <span style=''>    logger.debug(s&quot;Creating completion marker $completeMarker&quot;)
+</span>351 <span style=''>    </span><span style='background: #F0ADAD'>exportFs.create(completeMarker).close()</span><span style=''>
+</span>352 <span style=''>
+</span>353 <span style=''>    // cleanup
+</span>354 <span style=''>    logger.debug(s&quot;Deleting export path $tableExportPath&quot;)
+</span>355 <span style=''>    </span><span style='background: #F0ADAD'>exportFs.delete(tableExportPath, true)</span><span style=''>
+</span>356 <span style=''>    logger.debug(s&quot;Deleting clone table $cloneTable&quot;)
+</span>357 <span style=''>    </span><span style='background: #F0ADAD'>from.tableOps.delete(cloneTable)</span><span style=''>
+</span>358 <span style=''>  }
+</span>359 <span style=''>
+</span>360 <span style=''>  override def close(): Unit = {
+</span>361 <span style=''>    </span><span style='background: #F0ADAD'>CloseWithLogging(tryFrom.toOption)</span><span style=''>
+</span>362 <span style=''>    </span><span style='background: #F0ADAD'>CloseWithLogging(tryTo.toOption)</span><span style=''>
+</span>363 <span style=''>  }
+</span>364 <span style=''>}
+</span>365 <span style=''>
+</span>366 <span style=''>object SchemaCopier {
+</span>367 <span style=''>
+</span>368 <span style=''>  sealed trait ClusterCredentials
+</span>369 <span style=''>  case class ClusterPassword(password: String) extends ClusterCredentials
+</span>370 <span style=''>  case class ClusterKeytab(keytabPath: String) extends ClusterCredentials
+</span>371 <span style=''>
+</span>372 <span style=''>  sealed trait PartitionId
+</span>373 <span style=''>  case class PartitionName(name: String) extends PartitionId
+</span>374 <span style=''>  case class PartitionValue(value: AnyRef) extends PartitionId
+</span>375 <span style=''>
+</span>376 <span style=''>  /**
+</span>377 <span style=''>   * Connection info for an Accumulo cluster
+</span>378 <span style=''>   *
+</span>379 <span style=''>   * @param instanceName instance name
+</span>380 <span style=''>   * @param zookeepers zookeepers
+</span>381 <span style=''>   * @param user user
+</span>382 <span style=''>   * @param credentials credentials
+</span>383 <span style=''>   * @param catalog catalog table containing the feature type
+</span>384 <span style=''>   * @param configFiles additional hadoop *-site.xml files for configuring hdfs operations
+</span>385 <span style=''>   */
+</span>386 <span style=''>  case class ClusterConfig(
+</span>387 <span style=''>    instanceName: String, zookeepers: String, user: String, credentials: ClusterCredentials, catalog: String, configFiles: Seq[File])
+</span>388 <span style=''>
+</span>389 <span style=''>  /**
+</span>390 <span style=''>   * Options
+</span>391 <span style=''>   *
+</span>392 <span style=''>   * @param tableConcurrency number of tables to copy in parallel
+</span>393 <span style=''>   * @param fileConcurrency number of files to copy in parallel, per table (when not using distcp)
+</span>394 <span style=''>   * @param distCp use hadoop distcp to copy files, instead of the hadoop client
+</span>395 <span style=''>   */
+</span>396 <span style=''>  case class CopyOptions(tableConcurrency: Int = 1, fileConcurrency: Int = 4, distCp: Boolean = false)
+</span>397 <span style=''>
+</span>398 <span style=''>  /**
+</span>399 <span style=''>   * Holds state for a given Accumulo cluster
+</span>400 <span style=''>   *
+</span>401 <span style=''>   * @param instance instance name
+</span>402 <span style=''>   * @param zk instance zookeepers
+</span>403 <span style=''>   * @param user username
+</span>404 <span style=''>   * @param credentials credentials - either Right(password) or Left(keytab)
+</span>405 <span style=''>   * @param catalog catalog table
+</span>406 <span style=''>   * @param configs additional hadoop configuration files
+</span>407 <span style=''>   */
+</span>408 <span style=''>  private class Cluster(
+</span>409 <span style=''>      instance: String,
+</span>410 <span style=''>      zk: String,
+</span>411 <span style=''>      user: String,
+</span>412 <span style=''>      credentials: ClusterCredentials,
+</span>413 <span style=''>      catalog: String,
+</span>414 <span style=''>      configs: Seq[File]
+</span>415 <span style=''>    ) extends Closeable {
+</span>416 <span style=''>
+</span>417 <span style=''>    import scala.collection.JavaConverters._
+</span>418 <span style=''>
+</span>419 <span style=''>    private val auth = </span><span style='background: #F0ADAD'>credentials</span><span style=''> match {
+</span>420 <span style=''>      case ClusterPassword(password) =&gt; </span><span style='background: #F0ADAD'>AccumuloDataStoreParams.PasswordParam.key -&gt; password</span><span style=''>
+</span>421 <span style=''>      case ClusterKeytab(keytabPath) =&gt; </span><span style='background: #F0ADAD'>AccumuloDataStoreParams.KeytabPathParam.key -&gt; keytabPath</span><span style=''>
+</span>422 <span style=''>    }
+</span>423 <span style=''>
+</span>424 <span style=''>    private val params = </span><span style='background: #F0ADAD'>Map(
+</span>425 <span style=''></span><span style='background: #F0ADAD'>      AccumuloDataStoreParams.InstanceNameParam.key -&gt; instance,
+</span>426 <span style=''></span><span style='background: #F0ADAD'>      AccumuloDataStoreParams.ZookeepersParam.key -&gt; zk,
+</span>427 <span style=''></span><span style='background: #F0ADAD'>      AccumuloDataStoreParams.UserParam.key -&gt; user,
+</span>428 <span style=''></span><span style='background: #F0ADAD'>      AccumuloDataStoreParams.CatalogParam.key -&gt; catalog,
+</span>429 <span style=''></span><span style='background: #F0ADAD'>      auth
+</span>430 <span style=''></span><span style='background: #F0ADAD'>    )</span><span style=''>
+</span>431 <span style=''>
+</span>432 <span style=''>    val conf = </span><span style='background: #F0ADAD'>new Configuration()</span><span style=''>
+</span>433 <span style=''>    </span><span style='background: #F0ADAD'>configs.foreach(f =&gt; conf.addResource(f.toURI.toURL))</span><span style=''>
+</span>434 <span style=''>
+</span>435 <span style=''>    val ds: AccumuloDataStore =
+</span>436 <span style=''>      try { </span><span style='background: #F0ADAD'>DataStoreFinder.getDataStore(params.asJava).asInstanceOf[AccumuloDataStore]</span><span style=''> } catch {
+</span>437 <span style=''>        case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>throw new IOException(&quot;Unable to load datastore:&quot;, e)</span><span style=''>
+</span>438 <span style=''>      }
+</span>439 <span style=''>
+</span>440 <span style=''>    if (</span><span style='background: #F0ADAD'>ds == null</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>441 <span style=''></span><span style='background: #F0ADAD'>      val maskedParams = params.map {
+</span>442 <span style=''></span><span style='background: #F0ADAD'>        case (AccumuloDataStoreParams.PasswordParam.key , _) =&gt; s&quot;${AccumuloDataStoreParams.PasswordParam.key }=******&quot;
+</span>443 <span style=''></span><span style='background: #F0ADAD'>        case (k, v) =&gt; s&quot;$k=$v&quot;
+</span>444 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>445 <span style=''></span><span style='background: #F0ADAD'>      throw new IOException(s&quot;Unable to load datastore using provided values: ${maskedParams.mkString(&quot;, &quot;)}&quot;)
+</span>446 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>447 <span style=''>
+</span>448 <span style=''>    val tableOps: TableOperations = </span><span style='background: #F0ADAD'>ds.connector.tableOperations()</span><span style=''>
+</span>449 <span style=''>
+</span>450 <span style=''>    override def close(): Unit = </span><span style='background: #F0ADAD'>ds.dispose()</span><span style=''>
+</span>451 <span style=''>  }
+</span>452 <span style=''>
+</span>453 <span style=''>  private object Cluster {
+</span>454 <span style=''>    def apply(config: ClusterConfig): Cluster =
+</span>455 <span style=''>      </span><span style='background: #F0ADAD'>new Cluster(config.instanceName, config.zookeepers, config.user, config.credentials, config.catalog, config.configFiles)</span><span style=''>
+</span>456 <span style=''>  }
+</span>457 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          63
+        </td>
+        <td>
+          3156
+        </td>
+        <td>
+          2930
+          -
+          2941
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.fromCluster
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.fromCluster
+        </td>
+      </tr><tr>
+        <td>
+          63
+        </td>
+        <td>
+          3157
+        </td>
+        <td>
+          2922
+          -
+          2942
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.apply(SchemaCopier.this.fromCluster)
+        </td>
+      </tr><tr>
+        <td>
+          63
+        </td>
+        <td>
+          3158
+        </td>
+        <td>
+          2918
+          -
+          2943
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.util.Try.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.util.Try.apply[org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster](org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.apply(SchemaCopier.this.fromCluster))
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          3159
+        </td>
+        <td>
+          2978
+          -
+          2987
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.toCluster
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.toCluster
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          3160
+        </td>
+        <td>
+          2970
+          -
+          2988
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.apply(SchemaCopier.this.toCluster)
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          3161
+        </td>
+        <td>
+          2966
+          -
+          2989
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.util.Try.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.util.Try.apply[org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster](org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.apply(SchemaCopier.this.toCluster))
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          3162
+        </td>
+        <td>
+          6610
+          -
+          6620
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.run
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.run(false)
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          3163
+        </td>
+        <td>
+          6822
+          -
+          6846
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.CopyOptions.tableConcurrency
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.options.tableConcurrency
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          3181
+        </td>
+        <td>
+          6796
+          -
+          7744
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.executor
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.executor(SchemaCopier.this.options.tableConcurrency)(((executor: java.util.concurrent.ExecutorService) =&gt; SchemaCopier.this.fromPartitions.foreach[Unit](((partition: Option[String]) =&gt; SchemaCopier.this.fromIndices.foreach[java.util.concurrent.Future[_]](((fromIndex: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[_, _]) =&gt; {
+  val toIndex: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[Nothing,Nothing] = SchemaCopier.this.to.ds.manager.index[Nothing, Nothing](SchemaCopier.this.sft, fromIndex.identifier, SchemaCopier.this.to.ds.manager.index$default$3[Nothing, Nothing]);
+  val partitionLogId: String = scala.StringContext.apply(&quot;&quot;, &quot; &quot;, &quot;&quot;).s(partition.fold[String](scala.StringContext.apply(&quot;index&quot;).s())(((p: String) =&gt; scala.StringContext.apply(&quot;partition &quot;, &quot;&quot;).s(p))), fromIndex.identifier);
+  val runnable: Runnable = (() =&gt; try {
+    (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+      SchemaCopier.this.logger.underlying.info(&quot;Copying {}&quot;, (partitionLogId: AnyRef))
+    else
+      (): Unit);
+    SchemaCopier.this.copy(fromIndex, toIndex, partition, resume, partitionLogId);
+    (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+      SchemaCopier.this.logger.underlying.info(&quot;Bulk copy complete for {}&quot;, (partitionLogId: AnyRef))
+    else
+      (): Unit)
+  } catch {
+    case (e @ (_: Throwable)) =&gt; {
+      (if (SchemaCopier.this.logger.underlying.isErrorEnabled())
+        SchemaCopier.this.logger.underlying.error(&quot;Error copying {}: {}&quot;, (scala.Array.apply[AnyRef]((partitionLogId: AnyRef), (e.getMessage(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+      else
+        (): Unit);
+      (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+        SchemaCopier.this.logger.underlying.debug(scala.StringContext.apply(&quot;Error copying &quot;, &quot;&quot;).s(partitionLogId), e)
+      else
+        (): Unit)
+    }
+  });
+  executor.submit(runnable)
+}))))))
+        </td>
+      </tr><tr>
+        <td>
+          160
+        </td>
+        <td>
+          3180
+        </td>
+        <td>
+          6868
+          -
+          7738
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.fromPartitions.foreach[Unit](((partition: Option[String]) =&gt; SchemaCopier.this.fromIndices.foreach[java.util.concurrent.Future[_]](((fromIndex: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[_, _]) =&gt; {
+  val toIndex: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[Nothing,Nothing] = SchemaCopier.this.to.ds.manager.index[Nothing, Nothing](SchemaCopier.this.sft, fromIndex.identifier, SchemaCopier.this.to.ds.manager.index$default$3[Nothing, Nothing]);
+  val partitionLogId: String = scala.StringContext.apply(&quot;&quot;, &quot; &quot;, &quot;&quot;).s(partition.fold[String](scala.StringContext.apply(&quot;index&quot;).s())(((p: String) =&gt; scala.StringContext.apply(&quot;partition &quot;, &quot;&quot;).s(p))), fromIndex.identifier);
+  val runnable: Runnable = (() =&gt; try {
+    (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+      SchemaCopier.this.logger.underlying.info(&quot;Copying {}&quot;, (partitionLogId: AnyRef))
+    else
+      (): Unit);
+    SchemaCopier.this.copy(fromIndex, toIndex, partition, resume, partitionLogId);
+    (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+      SchemaCopier.this.logger.underlying.info(&quot;Bulk copy complete for {}&quot;, (partitionLogId: AnyRef))
+    else
+      (): Unit)
+  } catch {
+    case (e @ (_: Throwable)) =&gt; {
+      (if (SchemaCopier.this.logger.underlying.isErrorEnabled())
+        SchemaCopier.this.logger.underlying.error(&quot;Error copying {}: {}&quot;, (scala.Array.apply[AnyRef]((partitionLogId: AnyRef), (e.getMessage(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+      else
+        (): Unit);
+      (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+        SchemaCopier.this.logger.underlying.debug(scala.StringContext.apply(&quot;Error copying &quot;, &quot;&quot;).s(partitionLogId), e)
+      else
+        (): Unit)
+    }
+  });
+  executor.submit(runnable)
+}))))
+        </td>
+      </tr><tr>
+        <td>
+          161
+        </td>
+        <td>
+          3179
+        </td>
+        <td>
+          6914
+          -
+          7730
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.fromIndices.foreach[java.util.concurrent.Future[_]](((fromIndex: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[_, _]) =&gt; {
+  val toIndex: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[Nothing,Nothing] = SchemaCopier.this.to.ds.manager.index[Nothing, Nothing](SchemaCopier.this.sft, fromIndex.identifier, SchemaCopier.this.to.ds.manager.index$default$3[Nothing, Nothing]);
+  val partitionLogId: String = scala.StringContext.apply(&quot;&quot;, &quot; &quot;, &quot;&quot;).s(partition.fold[String](scala.StringContext.apply(&quot;index&quot;).s())(((p: String) =&gt; scala.StringContext.apply(&quot;partition &quot;, &quot;&quot;).s(p))), fromIndex.identifier);
+  val runnable: Runnable = (() =&gt; try {
+    (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+      SchemaCopier.this.logger.underlying.info(&quot;Copying {}&quot;, (partitionLogId: AnyRef))
+    else
+      (): Unit);
+    SchemaCopier.this.copy(fromIndex, toIndex, partition, resume, partitionLogId);
+    (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+      SchemaCopier.this.logger.underlying.info(&quot;Bulk copy complete for {}&quot;, (partitionLogId: AnyRef))
+    else
+      (): Unit)
+  } catch {
+    case (e @ (_: Throwable)) =&gt; {
+      (if (SchemaCopier.this.logger.underlying.isErrorEnabled())
+        SchemaCopier.this.logger.underlying.error(&quot;Error copying {}: {}&quot;, (scala.Array.apply[AnyRef]((partitionLogId: AnyRef), (e.getMessage(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+      else
+        (): Unit);
+      (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+        SchemaCopier.this.logger.underlying.debug(scala.StringContext.apply(&quot;Error copying &quot;, &quot;&quot;).s(partitionLogId), e)
+      else
+        (): Unit)
+    }
+  });
+  executor.submit(runnable)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          3164
+        </td>
+        <td>
+          6998
+          -
+          7018
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.identifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          fromIndex.identifier
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          3165
+        </td>
+        <td>
+          6987
+          -
+          6987
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexManager.index$default$3
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.to.ds.manager.index$default$3[Nothing, Nothing]
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          3166
+        </td>
+        <td>
+          6973
+          -
+          7019
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexManager.index
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.to.ds.manager.index[Nothing, Nothing](SchemaCopier.this.sft, fromIndex.identifier, SchemaCopier.this.to.ds.manager.index$default$3[Nothing, Nothing])
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          3167
+        </td>
+        <td>
+          7053
+          -
+          7054
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          3168
+        </td>
+        <td>
+          7102
+          -
+          7104
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot; &quot;
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          3169
+        </td>
+        <td>
+          7126
+          -
+          7127
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          3170
+        </td>
+        <td>
+          7070
+          -
+          7078
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;index&quot;).s()
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          3171
+        </td>
+        <td>
+          7085
+          -
+          7100
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;partition &quot;, &quot;&quot;).s(p)
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          3172
+        </td>
+        <td>
+          7055
+          -
+          7101
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.fold
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          partition.fold[String](scala.StringContext.apply(&quot;index&quot;).s())(((p: String) =&gt; scala.StringContext.apply(&quot;partition &quot;, &quot;&quot;).s(p)))
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          3173
+        </td>
+        <td>
+          7105
+          -
+          7125
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.identifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          fromIndex.identifier
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          3174
+        </td>
+        <td>
+          7051
+          -
+          7127
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;&quot;, &quot; &quot;, &quot;&quot;).s(partition.fold[String](scala.StringContext.apply(&quot;index&quot;).s())(((p: String) =&gt; scala.StringContext.apply(&quot;partition &quot;, &quot;&quot;).s(p))), fromIndex.identifier)
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          3176
+        </td>
+        <td>
+          7203
+          -
+          7385
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+    SchemaCopier.this.logger.underlying.info(&quot;Copying {}&quot;, (partitionLogId: AnyRef))
+  else
+    (): Unit);
+  SchemaCopier.this.copy(fromIndex, toIndex, partition, resume, partitionLogId);
+  (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+    SchemaCopier.this.logger.underlying.info(&quot;Bulk copy complete for {}&quot;, (partitionLogId: AnyRef))
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          3175
+        </td>
+        <td>
+          7257
+          -
+          7316
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.copy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.copy(fromIndex, toIndex, partition, resume, partitionLogId)
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          3177
+        </td>
+        <td>
+          7510
+          -
+          7658
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (SchemaCopier.this.logger.underlying.isErrorEnabled())
+    SchemaCopier.this.logger.underlying.error(&quot;Error copying {}: {}&quot;, (scala.Array.apply[AnyRef]((partitionLogId: AnyRef), (e.getMessage(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(scala.StringContext.apply(&quot;Error copying &quot;, &quot;&quot;).s(partitionLogId), e)
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          176
+        </td>
+        <td>
+          3178
+        </td>
+        <td>
+          7695
+          -
+          7720
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ExecutorService.submit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          executor.submit(runnable)
+        </td>
+      </tr><tr>
+        <td>
+          198
+        </td>
+        <td>
+          3182
+        </td>
+        <td>
+          8309
+          -
+          8328
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Option.isDefined
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          partition.isDefined
+        </td>
+      </tr><tr>
+        <td>
+          198
+        </td>
+        <td>
+          3183
+        </td>
+        <td>
+          8288
+          -
+          8328
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(SchemaCopier.this.sft).isPartitioned.==(partition.isDefined)
+        </td>
+      </tr><tr>
+        <td>
+          198
+        </td>
+        <td>
+          3184
+        </td>
+        <td>
+          8280
+          -
+          8329
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.require(org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(SchemaCopier.this.sft).isPartitioned.==(partition.isDefined))
+        </td>
+      </tr><tr>
+        <td>
+          200
+        </td>
+        <td>
+          3185
+        </td>
+        <td>
+          8419
+          -
+          8452
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.getTableName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          fromIndex.getTableName(partition)
+        </td>
+      </tr><tr>
+        <td>
+          200
+        </td>
+        <td>
+          3186
+        </td>
+        <td>
+          8419
+          -
+          8452
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.getTableName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          fromIndex.getTableName(partition)
+        </td>
+      </tr><tr>
+        <td>
+          201
+        </td>
+        <td>
+          3187
+        </td>
+        <td>
+          8489
+          -
+          8548
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.RuntimeException(&quot;Could not get source table&quot;, e)
+        </td>
+      </tr><tr>
+        <td>
+          201
+        </td>
+        <td>
+          3188
+        </td>
+        <td>
+          8489
+          -
+          8548
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.RuntimeException(&quot;Could not get source table&quot;, e)
+        </td>
+      </tr><tr>
+        <td>
+          204
+        </td>
+        <td>
+          3189
+        </td>
+        <td>
+          8602
+          -
+          8624
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;&quot;, &quot;.complete&quot;).s(fromTable)
+        </td>
+      </tr><tr>
+        <td>
+          204
+        </td>
+        <td>
+          3190
+        </td>
+        <td>
+          8581
+          -
+          8625
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.hadoop.fs.Path(SchemaCopier.this.exportPath, scala.StringContext.apply(&quot;&quot;, &quot;.complete&quot;).s(fromTable))
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          3191
+        </td>
+        <td>
+          8634
+          -
+          8665
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileSystem.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.exists(completeMarker)
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          3197
+        </td>
+        <td>
+          8630
+          -
+          8630
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          3198
+        </td>
+        <td>
+          8630
+          -
+          8630
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          3193
+        </td>
+        <td>
+          8687
+          -
+          8767
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Skipping already completed copy&quot;)
+  else
+    (): Unit);
+  return ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          3196
+        </td>
+        <td>
+          8675
+          -
+          8829
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          if (resume)
+  {
+    (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+      SchemaCopier.this.logger.underlying.debug(&quot;Skipping already completed copy&quot;)
+    else
+      (): Unit);
+    return ()
+  }
+else
+  SchemaCopier.this.exportFs.delete(completeMarker, false)
+        </td>
+      </tr><tr>
+        <td>
+          208
+        </td>
+        <td>
+          3192
+        </td>
+        <td>
+          8753
+          -
+          8759
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          210
+        </td>
+        <td>
+          3194
+        </td>
+        <td>
+          8783
+          -
+          8821
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileSystem.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.delete(completeMarker, false)
+        </td>
+      </tr><tr>
+        <td>
+          210
+        </td>
+        <td>
+          3195
+        </td>
+        <td>
+          8783
+          -
+          8821
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileSystem.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.delete(completeMarker, false)
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          3199
+        </td>
+        <td>
+          8863
+          -
+          8894
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.hadoop.fs.Path(SchemaCopier.this.exportPath, fromTable)
+        </td>
+      </tr><tr>
+        <td>
+          215
+        </td>
+        <td>
+          3200
+        </td>
+        <td>
+          8916
+          -
+          8955
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.hadoop.fs.Path(tableExportPath, &quot;distcp.txt&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          216
+        </td>
+        <td>
+          3201
+        </td>
+        <td>
+          8976
+          -
+          9010
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.hadoop.fs.Path(tableExportPath, &quot;files&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          3202
+        </td>
+        <td>
+          9032
+          -
+          9054
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;&quot;, &quot;_bc_tmp&quot;).s(fromTable)
+        </td>
+      </tr><tr>
+        <td>
+          222
+        </td>
+        <td>
+          3203
+        </td>
+        <td>
+          9217
+          -
+          9249
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.from.tableOps.exists(cloneTable)
+        </td>
+      </tr><tr>
+        <td>
+          222
+        </td>
+        <td>
+          3204
+        </td>
+        <td>
+          9207
+          -
+          9249
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          resume.&amp;&amp;(SchemaCopier.this.from.tableOps.exists(cloneTable))
+        </td>
+      </tr><tr>
+        <td>
+          222
+        </td>
+        <td>
+          3206
+        </td>
+        <td>
+          9251
+          -
+          9395
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Using existing cloned table {} - ensuring table is offline&quot;, (cloneTable: AnyRef))
+  else
+    (): Unit);
+  SchemaCopier.this.from.tableOps.offline(cloneTable, true)
+}
+        </td>
+      </tr><tr>
+        <td>
+          224
+        </td>
+        <td>
+          3205
+        </td>
+        <td>
+          9350
+          -
+          9389
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.offline
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.from.tableOps.offline(cloneTable, true)
+        </td>
+      </tr><tr>
+        <td>
+          225
+        </td>
+        <td>
+          3213
+        </td>
+        <td>
+          9401
+          -
+          10061
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Checking for existence and deleting any existing cloned table {}&quot;, (cloneTable: AnyRef))
+  else
+    (): Unit);
+  SchemaCopier.this.from.ds.adapter.deleteTable(cloneTable);
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Cloning {} to {}&quot;, (scala.Array.apply[AnyRef]((fromTable: AnyRef), (cloneTable: AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  SchemaCopier.this.from.tableOps.clone(fromTable, cloneTable, false, java.util.Collections.emptyMap[String, String](), java.util.Collections.emptySet[String]());
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Taking {} offline&quot;, (cloneTable: AnyRef))
+  else
+    (): Unit);
+  SchemaCopier.this.from.tableOps.offline(cloneTable, true)
+}
+        </td>
+      </tr><tr>
+        <td>
+          229
+        </td>
+        <td>
+          3207
+        </td>
+        <td>
+          9691
+          -
+          9730
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.TableManager.deleteTable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.from.ds.adapter.deleteTable(cloneTable)
+        </td>
+      </tr><tr>
+        <td>
+          231
+        </td>
+        <td>
+          3208
+        </td>
+        <td>
+          9869
+          -
+          9874
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          231
+        </td>
+        <td>
+          3209
+        </td>
+        <td>
+          9876
+          -
+          9898
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collections.emptyMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          java.util.Collections.emptyMap[String, String]()
+        </td>
+      </tr><tr>
+        <td>
+          231
+        </td>
+        <td>
+          3210
+        </td>
+        <td>
+          9900
+          -
+          9922
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collections.emptySet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          java.util.Collections.emptySet[String]()
+        </td>
+      </tr><tr>
+        <td>
+          231
+        </td>
+        <td>
+          3211
+        </td>
+        <td>
+          9826
+          -
+          9923
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.clone
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.from.tableOps.clone(fromTable, cloneTable, false, java.util.Collections.emptyMap[String, String](), java.util.Collections.emptySet[String]())
+        </td>
+      </tr><tr>
+        <td>
+          233
+        </td>
+        <td>
+          3212
+        </td>
+        <td>
+          10016
+          -
+          10055
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.offline
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.from.tableOps.offline(cloneTable, true)
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          3214
+        </td>
+        <td>
+          10081
+          -
+          10108
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileSystem.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.exists(distcpPath)
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          3215
+        </td>
+        <td>
+          10112
+          -
+          10157
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.getFileStatus(distcpPath).getLen().&gt;(0)
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          3216
+        </td>
+        <td>
+          10071
+          -
+          10157
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          resume.&amp;&amp;(SchemaCopier.this.exportFs.exists(distcpPath)).&amp;&amp;(SchemaCopier.this.exportFs.getFileStatus(distcpPath).getLen().&gt;(0))
+        </td>
+      </tr><tr>
+        <td>
+          237
+        </td>
+        <td>
+          3217
+        </td>
+        <td>
+          10167
+          -
+          10225
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+  SchemaCopier.this.logger.underlying.debug(&quot;Using existing export results {}&quot;, (distcpPath: AnyRef))
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          238
+        </td>
+        <td>
+          3231
+        </td>
+        <td>
+          10237
+          -
+          10742
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  if (SchemaCopier.this.exportFs.exists(tableExportPath))
+    {
+      (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+        SchemaCopier.this.logger.underlying.debug(&quot;Deleting existing export directory {}&quot;, (tableExportPath: AnyRef))
+      else
+        (): Unit);
+      SchemaCopier.this.exportFs.delete(tableExportPath, true)
+    }
+  else
+    ();
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Exporting table to {}&quot;, (tableExportPath: AnyRef))
+  else
+    (): Unit);
+  SchemaCopier.this.from.tableOps.exportTable(cloneTable, tableExportPath.toString());
+  if (SchemaCopier.this.exportFs.exists(distcpPath).unary_!.||(SchemaCopier.this.exportFs.getFileStatus(distcpPath).getLen().==(0)))
+    throw new scala.`package`.RuntimeException(scala.StringContext.apply(&quot;Could not read table export results at &quot;, &quot;&quot;).s(distcpPath))
+  else
+    ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          239
+        </td>
+        <td>
+          3218
+        </td>
+        <td>
+          10249
+          -
+          10281
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileSystem.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.exists(tableExportPath)
+        </td>
+      </tr><tr>
+        <td>
+          239
+        </td>
+        <td>
+          3220
+        </td>
+        <td>
+          10283
+          -
+          10416
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Deleting existing export directory {}&quot;, (tableExportPath: AnyRef))
+  else
+    (): Unit);
+  SchemaCopier.this.exportFs.delete(tableExportPath, true)
+}
+        </td>
+      </tr><tr>
+        <td>
+          239
+        </td>
+        <td>
+          3221
+        </td>
+        <td>
+          10245
+          -
+          10245
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          239
+        </td>
+        <td>
+          3222
+        </td>
+        <td>
+          10245
+          -
+          10245
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          3219
+        </td>
+        <td>
+          10370
+          -
+          10408
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileSystem.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.delete(tableExportPath, true)
+        </td>
+      </tr><tr>
+        <td>
+          244
+        </td>
+        <td>
+          3223
+        </td>
+        <td>
+          10520
+          -
+          10544
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.toString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          tableExportPath.toString()
+        </td>
+      </tr><tr>
+        <td>
+          244
+        </td>
+        <td>
+          3224
+        </td>
+        <td>
+          10482
+          -
+          10545
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.exportTable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.from.tableOps.exportTable(cloneTable, tableExportPath.toString())
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          3225
+        </td>
+        <td>
+          10589
+          -
+          10635
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.getFileStatus(distcpPath).getLen().==(0)
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          3226
+        </td>
+        <td>
+          10557
+          -
+          10635
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.exists(distcpPath).unary_!.||(SchemaCopier.this.exportFs.getFileStatus(distcpPath).getLen().==(0))
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          3229
+        </td>
+        <td>
+          10553
+          -
+          10553
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          3230
+        </td>
+        <td>
+          10553
+          -
+          10553
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          247
+        </td>
+        <td>
+          3227
+        </td>
+        <td>
+          10647
+          -
+          10728
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.RuntimeException(scala.StringContext.apply(&quot;Could not read table export results at &quot;, &quot;&quot;).s(distcpPath))
+        </td>
+      </tr><tr>
+        <td>
+          247
+        </td>
+        <td>
+          3228
+        </td>
+        <td>
+          10647
+          -
+          10728
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.RuntimeException(scala.StringContext.apply(&quot;Could not read table export results at &quot;, &quot;&quot;).s(distcpPath))
+        </td>
+      </tr><tr>
+        <td>
+          253
+        </td>
+        <td>
+          3232
+        </td>
+        <td>
+          10901
+          -
+          10910
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.collection.Seq.empty[Nothing]
+        </td>
+      </tr><tr>
+        <td>
+          253
+        </td>
+        <td>
+          3233
+        </td>
+        <td>
+          10855
+          -
+          10911
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.AccumuloIndexAdapter.createTable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.to.ds.adapter.createTable(toIndex, partition, scala.collection.Seq.empty[Nothing])
+        </td>
+      </tr><tr>
+        <td>
+          254
+        </td>
+        <td>
+          3234
+        </td>
+        <td>
+          10936
+          -
+          10967
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.getTableName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          toIndex.getTableName(partition)
+        </td>
+      </tr><tr>
+        <td>
+          254
+        </td>
+        <td>
+          3235
+        </td>
+        <td>
+          10936
+          -
+          10967
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.getTableName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          toIndex.getTableName(partition)
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          3236
+        </td>
+        <td>
+          11004
+          -
+          11068
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.RuntimeException(&quot;Could not get destination table&quot;, e)
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          3237
+        </td>
+        <td>
+          11004
+          -
+          11068
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.RuntimeException(&quot;Could not get destination table&quot;, e)
+        </td>
+      </tr><tr>
+        <td>
+          260
+        </td>
+        <td>
+          3238
+        </td>
+        <td>
+          11280
+          -
+          11316
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.listSplits
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.from.tableOps.listSplits(cloneTable)
+        </td>
+      </tr><tr>
+        <td>
+          260
+        </td>
+        <td>
+          3239
+        </td>
+        <td>
+          11258
+          -
+          11317
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeSet.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new java.util.TreeSet[org.apache.hadoop.io.Text](SchemaCopier.this.from.tableOps.listSplits(cloneTable))
+        </td>
+      </tr><tr>
+        <td>
+          261
+        </td>
+        <td>
+          3240
+        </td>
+        <td>
+          11343
+          -
+          11374
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.listSplits
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.to.tableOps.listSplits(toTable)
+        </td>
+      </tr><tr>
+        <td>
+          262
+        </td>
+        <td>
+          3241
+        </td>
+        <td>
+          11379
+          -
+          11411
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.AbstractSet.removeAll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          splits.removeAll(existingSplits)
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          3242
+        </td>
+        <td>
+          11420
+          -
+          11435
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          splits.isEmpty().unary_!
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          3248
+        </td>
+        <td>
+          11437
+          -
+          11724
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  if (existingSplits.isEmpty().unary_!)
+    (if (SchemaCopier.this.logger.underlying.isWarnEnabled())
+      SchemaCopier.this.logger.underlying.warn(&quot;Detected split mismatch between source ({}) and destination ({}) for {}&quot;, (fromTable: AnyRef), (toTable: AnyRef), (partitionLogId: AnyRef))
+    else
+      (): Unit)
+  else
+    ();
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Adding splits to destination table {}&quot;, (toTable: AnyRef))
+  else
+    (): Unit);
+  SchemaCopier.this.to.tableOps.addSplits(toTable, splits)
+}
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          3249
+        </td>
+        <td>
+          11416
+          -
+          11416
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          3250
+        </td>
+        <td>
+          11416
+          -
+          11416
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          3243
+        </td>
+        <td>
+          11449
+          -
+          11472
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          existingSplits.isEmpty().unary_!
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          3245
+        </td>
+        <td>
+          11445
+          -
+          11445
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          3246
+        </td>
+        <td>
+          11445
+          -
+          11445
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          265
+        </td>
+        <td>
+          3244
+        </td>
+        <td>
+          11484
+          -
+          11598
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (SchemaCopier.this.logger.underlying.isWarnEnabled())
+  SchemaCopier.this.logger.underlying.warn(&quot;Detected split mismatch between source ({}) and destination ({}) for {}&quot;, (fromTable: AnyRef), (toTable: AnyRef), (partitionLogId: AnyRef))
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          3247
+        </td>
+        <td>
+          11680
+          -
+          11718
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.addSplits
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.to.tableOps.addSplits(toTable, splits)
+        </td>
+      </tr><tr>
+        <td>
+          271
+        </td>
+        <td>
+          3251
+        </td>
+        <td>
+          11749
+          -
+          11773
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new java.util.concurrent.atomic.AtomicBoolean(false)
+        </td>
+      </tr><tr>
+        <td>
+          276
+        </td>
+        <td>
+          3252
+        </td>
+        <td>
+          12031
+          -
+          12056
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileSystem.open
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.open(distcpPath)
+        </td>
+      </tr><tr>
+        <td>
+          276
+        </td>
+        <td>
+          3253
+        </td>
+        <td>
+          12058
+          -
+          12080
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+      </tr><tr>
+        <td>
+          276
+        </td>
+        <td>
+          3254
+        </td>
+        <td>
+          12010
+          -
+          12081
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.commons.io.IOUtils.lineIterator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.apache.commons.io.IOUtils.lineIterator(SchemaCopier.this.exportFs.open(distcpPath), java.nio.charset.StandardCharsets.UTF_8)
+        </td>
+      </tr><tr>
+        <td>
+          276
+        </td>
+        <td>
+          3272
+        </td>
+        <td>
+          12083
+          -
+          12083
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          276
+        </td>
+        <td>
+          3273
+        </td>
+        <td>
+          12000
+          -
+          13105
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.apache.commons.io.LineIterator, Unit](org.apache.commons.io.IOUtils.lineIterator(SchemaCopier.this.exportFs.open(distcpPath), java.nio.charset.StandardCharsets.UTF_8))(((files: org.apache.commons.io.LineIterator) =&gt; org.locationtech.geomesa.utils.concurrent.CachedThreadPool.executor(threads)(((executor: java.util.concurrent.ExecutorService) =&gt; scala.collection.JavaConverters.asScalaIteratorConverter[String](files).asScala.foreach[java.util.concurrent.Future[_]](((file: String) =&gt; {
+  val runnable: Runnable = (() =&gt; {
+    val path: org.apache.hadoop.fs.Path = new org.apache.hadoop.fs.Path(file);
+    val copy: org.apache.hadoop.fs.Path = new org.apache.hadoop.fs.Path(copyToDir, path.getName());
+    try {
+      if (resume.&amp;&amp;(SchemaCopier.this.exportFs.exists(copy)).&amp;&amp;(path.getFileSystem(SchemaCopier.this.from.conf).getFileStatus(path).getLen().==(SchemaCopier.this.exportFs.getFileStatus(copy).getLen())))
+        (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+          SchemaCopier.this.logger.underlying.debug(&quot;Using existing copy of {} at {}&quot;, (scala.Array.apply[AnyRef]((path: AnyRef), (copy: AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+        else
+          (): Unit)
+      else
+        consumer.apply(path, copy)
+    } catch {
+      case (e @ (_: Throwable)) =&gt; {
+        hadCopyError.set(true);
+        (if (SchemaCopier.this.logger.underlying.isErrorEnabled())
+          SchemaCopier.this.logger.underlying.error(&quot;Failed to copy {} to {}: {}&quot;, (path: AnyRef), (copy: AnyRef), (e.getMessage(): AnyRef))
+        else
+          (): Unit);
+        (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+          SchemaCopier.this.logger.underlying.debug(scala.StringContext.apply(&quot;Failed to copy &quot;, &quot; to &quot;, &quot;&quot;).s(path, copy), e)
+        else
+          (): Unit)
+      }
+    }
+  });
+  executor.submit(runnable)
+}))))))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          277
+        </td>
+        <td>
+          3271
+        </td>
+        <td>
+          12102
+          -
+          13097
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.executor
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.executor(threads)(((executor: java.util.concurrent.ExecutorService) =&gt; scala.collection.JavaConverters.asScalaIteratorConverter[String](files).asScala.foreach[java.util.concurrent.Future[_]](((file: String) =&gt; {
+  val runnable: Runnable = (() =&gt; {
+    val path: org.apache.hadoop.fs.Path = new org.apache.hadoop.fs.Path(file);
+    val copy: org.apache.hadoop.fs.Path = new org.apache.hadoop.fs.Path(copyToDir, path.getName());
+    try {
+      if (resume.&amp;&amp;(SchemaCopier.this.exportFs.exists(copy)).&amp;&amp;(path.getFileSystem(SchemaCopier.this.from.conf).getFileStatus(path).getLen().==(SchemaCopier.this.exportFs.getFileStatus(copy).getLen())))
+        (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+          SchemaCopier.this.logger.underlying.debug(&quot;Using existing copy of {} at {}&quot;, (scala.Array.apply[AnyRef]((path: AnyRef), (copy: AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+        else
+          (): Unit)
+      else
+        consumer.apply(path, copy)
+    } catch {
+      case (e @ (_: Throwable)) =&gt; {
+        hadCopyError.set(true);
+        (if (SchemaCopier.this.logger.underlying.isErrorEnabled())
+          SchemaCopier.this.logger.underlying.error(&quot;Failed to copy {} to {}: {}&quot;, (path: AnyRef), (copy: AnyRef), (e.getMessage(): AnyRef))
+        else
+          (): Unit);
+        (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+          SchemaCopier.this.logger.underlying.debug(scala.StringContext.apply(&quot;Failed to copy &quot;, &quot; to &quot;, &quot;&quot;).s(path, copy), e)
+        else
+          (): Unit)
+      }
+    }
+  });
+  executor.submit(runnable)
+}))))
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          3270
+        </td>
+        <td>
+          12161
+          -
+          13087
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.collection.JavaConverters.asScalaIteratorConverter[String](files).asScala.foreach[java.util.concurrent.Future[_]](((file: String) =&gt; {
+  val runnable: Runnable = (() =&gt; {
+    val path: org.apache.hadoop.fs.Path = new org.apache.hadoop.fs.Path(file);
+    val copy: org.apache.hadoop.fs.Path = new org.apache.hadoop.fs.Path(copyToDir, path.getName());
+    try {
+      if (resume.&amp;&amp;(SchemaCopier.this.exportFs.exists(copy)).&amp;&amp;(path.getFileSystem(SchemaCopier.this.from.conf).getFileStatus(path).getLen().==(SchemaCopier.this.exportFs.getFileStatus(copy).getLen())))
+        (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+          SchemaCopier.this.logger.underlying.debug(&quot;Using existing copy of {} at {}&quot;, (scala.Array.apply[AnyRef]((path: AnyRef), (copy: AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+        else
+          (): Unit)
+      else
+        consumer.apply(path, copy)
+    } catch {
+      case (e @ (_: Throwable)) =&gt; {
+        hadCopyError.set(true);
+        (if (SchemaCopier.this.logger.underlying.isErrorEnabled())
+          SchemaCopier.this.logger.underlying.error(&quot;Failed to copy {} to {}: {}&quot;, (path: AnyRef), (copy: AnyRef), (e.getMessage(): AnyRef))
+        else
+          (): Unit);
+        (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+          SchemaCopier.this.logger.underlying.debug(scala.StringContext.apply(&quot;Failed to copy &quot;, &quot; to &quot;, &quot;&quot;).s(path, copy), e)
+        else
+          (): Unit)
+      }
+    }
+  });
+  executor.submit(runnable)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          280
+        </td>
+        <td>
+          3255
+        </td>
+        <td>
+          12263
+          -
+          12277
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.hadoop.fs.Path(file)
+        </td>
+      </tr><tr>
+        <td>
+          281
+        </td>
+        <td>
+          3256
+        </td>
+        <td>
+          12323
+          -
+          12335
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.getName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          path.getName()
+        </td>
+      </tr><tr>
+        <td>
+          281
+        </td>
+        <td>
+          3257
+        </td>
+        <td>
+          12303
+          -
+          12336
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.hadoop.fs.Path(copyToDir, path.getName())
+        </td>
+      </tr><tr>
+        <td>
+          283
+        </td>
+        <td>
+          3258
+        </td>
+        <td>
+          12387
+          -
+          12408
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileSystem.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.exists(copy)
+        </td>
+      </tr><tr>
+        <td>
+          283
+        </td>
+        <td>
+          3262
+        </td>
+        <td>
+          12377
+          -
+          12525
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          resume.&amp;&amp;(SchemaCopier.this.exportFs.exists(copy)).&amp;&amp;(path.getFileSystem(SchemaCopier.this.from.conf).getFileStatus(path).getLen().==(SchemaCopier.this.exportFs.getFileStatus(copy).getLen()))
+        </td>
+      </tr><tr>
+        <td>
+          283
+        </td>
+        <td>
+          3266
+        </td>
+        <td>
+          12373
+          -
+          12683
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          if (resume.&amp;&amp;(SchemaCopier.this.exportFs.exists(copy)).&amp;&amp;(path.getFileSystem(SchemaCopier.this.from.conf).getFileStatus(path).getLen().==(SchemaCopier.this.exportFs.getFileStatus(copy).getLen())))
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Using existing copy of {} at {}&quot;, (scala.Array.apply[AnyRef]((path: AnyRef), (copy: AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit)
+else
+  consumer.apply(path, copy)
+        </td>
+      </tr><tr>
+        <td>
+          284
+        </td>
+        <td>
+          3259
+        </td>
+        <td>
+          12449
+          -
+          12458
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.conf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.from.conf
+        </td>
+      </tr><tr>
+        <td>
+          284
+        </td>
+        <td>
+          3260
+        </td>
+        <td>
+          12490
+          -
+          12525
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileStatus.getLen
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.getFileStatus(copy).getLen()
+        </td>
+      </tr><tr>
+        <td>
+          284
+        </td>
+        <td>
+          3261
+        </td>
+        <td>
+          12430
+          -
+          12525
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          path.getFileSystem(SchemaCopier.this.from.conf).getFileStatus(path).getLen().==(SchemaCopier.this.exportFs.getFileStatus(copy).getLen())
+        </td>
+      </tr><tr>
+        <td>
+          285
+        </td>
+        <td>
+          3263
+        </td>
+        <td>
+          12547
+          -
+          12601
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+  SchemaCopier.this.logger.underlying.debug(&quot;Using existing copy of {} at {}&quot;, (scala.Array.apply[AnyRef]((path: AnyRef), (copy: AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          287
+        </td>
+        <td>
+          3264
+        </td>
+        <td>
+          12645
+          -
+          12665
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Function2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          consumer.apply(path, copy)
+        </td>
+      </tr><tr>
+        <td>
+          287
+        </td>
+        <td>
+          3265
+        </td>
+        <td>
+          12645
+          -
+          12665
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Function2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          consumer.apply(path, copy)
+        </td>
+      </tr><tr>
+        <td>
+          291
+        </td>
+        <td>
+          3268
+        </td>
+        <td>
+          12814
+          -
+          13007
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  hadCopyError.set(true);
+  (if (SchemaCopier.this.logger.underlying.isErrorEnabled())
+    SchemaCopier.this.logger.underlying.error(&quot;Failed to copy {} to {}: {}&quot;, (path: AnyRef), (copy: AnyRef), (e.getMessage(): AnyRef))
+  else
+    (): Unit);
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(scala.StringContext.apply(&quot;Failed to copy &quot;, &quot; to &quot;, &quot;&quot;).s(path, copy), e)
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          292
+        </td>
+        <td>
+          3267
+        </td>
+        <td>
+          12835
+          -
+          12857
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.set
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          hadCopyError.set(true)
+        </td>
+      </tr><tr>
+        <td>
+          297
+        </td>
+        <td>
+          3269
+        </td>
+        <td>
+          13050
+          -
+          13075
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ExecutorService.submit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          executor.submit(runnable)
+        </td>
+      </tr><tr>
+        <td>
+          303
+        </td>
+        <td>
+          3274
+        </td>
+        <td>
+          13121
+          -
+          13135
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.CopyOptions.distCp
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.options.distCp
+        </td>
+      </tr><tr>
+        <td>
+          303
+        </td>
+        <td>
+          3297
+        </td>
+        <td>
+          13137
+          -
+          14056
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  var inputPath: org.apache.hadoop.fs.Path = distcpPath;
+  if (resume)
+    {
+      (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+        SchemaCopier.this.logger.underlying.debug(&quot;Checking copy status of files in {}&quot;, (distcpPath: AnyRef))
+      else
+        (): Unit);
+      inputPath = new org.apache.hadoop.fs.Path(tableExportPath, &quot;distcp-remaining.txt&quot;);
+      org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.apache.hadoop.fs.FSDataOutputStream, Unit](SchemaCopier.this.exportFs.create(inputPath, true))(((out: org.apache.hadoop.fs.FSDataOutputStream) =&gt; distCpConsumer(1)(((path: org.apache.hadoop.fs.Path, x$5: org.apache.hadoop.fs.Path) =&gt; {
+        (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+          SchemaCopier.this.logger.underlying.debug(&quot;Adding {} to distcp&quot;, (path: AnyRef))
+        else
+          (): Unit);
+        out.writeUTF(scala.StringContext.apply(&quot;&quot;, &quot;\\n&quot;).s(path))
+      }))))(io.this.IsCloseable.closeableIsCloseable)
+    }
+  else
+    ();
+  val job: org.apache.hadoop.mapreduce.Job = new org.apache.hadoop.tools.DistCp(SchemaCopier.this.from.conf, org.locationtech.geomesa.utils.hadoop.DistributedCopyOptions.apply(inputPath, copyToDir)).execute();
+  (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+    SchemaCopier.this.logger.underlying.info(&quot;Tracking available at {}&quot;, (job.getStatus().getTrackingUrl(): AnyRef))
+  else
+    (): Unit);
+  while$1(){
+    if (job.isComplete().unary_!)
+      {
+        java.lang.Thread.sleep(500L);
+        while$1()
+      }
+    else
+      ()
+  };
+  if (job.isSuccessful())
+    (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+      SchemaCopier.this.logger.underlying.info(&quot;Successfully copied data to {}&quot;, (copyToDir: AnyRef))
+    else
+      (): Unit)
+  else
+    {
+      hadCopyError.set(true);
+      (if (SchemaCopier.this.logger.underlying.isErrorEnabled())
+        SchemaCopier.this.logger.underlying.error(&quot;Job failed with state {} due to: {}&quot;, (scala.Array.apply[AnyRef]((job.getStatus().getState(): AnyRef), (job.getStatus().getFailureInfo(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+      else
+        (): Unit)
+    }
+}
+        </td>
+      </tr><tr>
+        <td>
+          305
+        </td>
+        <td>
+          3283
+        </td>
+        <td>
+          13190
+          -
+          13554
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Checking copy status of files in {}&quot;, (distcpPath: AnyRef))
+  else
+    (): Unit);
+  inputPath = new org.apache.hadoop.fs.Path(tableExportPath, &quot;distcp-remaining.txt&quot;);
+  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.apache.hadoop.fs.FSDataOutputStream, Unit](SchemaCopier.this.exportFs.create(inputPath, true))(((out: org.apache.hadoop.fs.FSDataOutputStream) =&gt; distCpConsumer(1)(((path: org.apache.hadoop.fs.Path, x$5: org.apache.hadoop.fs.Path) =&gt; {
+    (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+      SchemaCopier.this.logger.underlying.debug(&quot;Adding {} to distcp&quot;, (path: AnyRef))
+    else
+      (): Unit);
+    out.writeUTF(scala.StringContext.apply(&quot;&quot;, &quot;\\n&quot;).s(path))
+  }))))(io.this.IsCloseable.closeableIsCloseable)
+}
+        </td>
+      </tr><tr>
+        <td>
+          305
+        </td>
+        <td>
+          3284
+        </td>
+        <td>
+          13178
+          -
+          13178
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          305
+        </td>
+        <td>
+          3285
+        </td>
+        <td>
+          13178
+          -
+          13178
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          307
+        </td>
+        <td>
+          3275
+        </td>
+        <td>
+          13282
+          -
+          13331
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.hadoop.fs.Path(tableExportPath, &quot;distcp-remaining.txt&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          308
+        </td>
+        <td>
+          3276
+        </td>
+        <td>
+          13350
+          -
+          13382
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileSystem.create
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.create(inputPath, true)
+        </td>
+      </tr><tr>
+        <td>
+          308
+        </td>
+        <td>
+          3281
+        </td>
+        <td>
+          13384
+          -
+          13384
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          308
+        </td>
+        <td>
+          3282
+        </td>
+        <td>
+          13340
+          -
+          13546
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.apache.hadoop.fs.FSDataOutputStream, Unit](SchemaCopier.this.exportFs.create(inputPath, true))(((out: org.apache.hadoop.fs.FSDataOutputStream) =&gt; distCpConsumer(1)(((path: org.apache.hadoop.fs.Path, x$5: org.apache.hadoop.fs.Path) =&gt; {
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Adding {} to distcp&quot;, (path: AnyRef))
+  else
+    (): Unit);
+  out.writeUTF(scala.StringContext.apply(&quot;&quot;, &quot;\\n&quot;).s(path))
+}))))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          309
+        </td>
+        <td>
+          3277
+        </td>
+        <td>
+          13418
+          -
+          13419
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          1
+        </td>
+      </tr><tr>
+        <td>
+          309
+        </td>
+        <td>
+          3280
+        </td>
+        <td>
+          13403
+          -
+          13536
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.distCpConsumer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          distCpConsumer(1)(((path: org.apache.hadoop.fs.Path, x$5: org.apache.hadoop.fs.Path) =&gt; {
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Adding {} to distcp&quot;, (path: AnyRef))
+  else
+    (): Unit);
+  out.writeUTF(scala.StringContext.apply(&quot;&quot;, &quot;\\n&quot;).s(path))
+}))
+        </td>
+      </tr><tr>
+        <td>
+          311
+        </td>
+        <td>
+          3278
+        </td>
+        <td>
+          13513
+          -
+          13523
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;&quot;, &quot;\\n&quot;).s(path)
+        </td>
+      </tr><tr>
+        <td>
+          311
+        </td>
+        <td>
+          3279
+        </td>
+        <td>
+          13500
+          -
+          13524
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.DataOutputStream.writeUTF
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          out.writeUTF(scala.StringContext.apply(&quot;&quot;, &quot;\\n&quot;).s(path))
+        </td>
+      </tr><tr>
+        <td>
+          315
+        </td>
+        <td>
+          3286
+        </td>
+        <td>
+          13571
+          -
+          13648
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.tools.DistCp.execute
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.hadoop.tools.DistCp(SchemaCopier.this.from.conf, org.locationtech.geomesa.utils.hadoop.DistributedCopyOptions.apply(inputPath, copyToDir)).execute()
+        </td>
+      </tr><tr>
+        <td>
+          317
+        </td>
+        <td>
+          3287
+        </td>
+        <td>
+          13738
+          -
+          13753
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          job.isComplete().unary_!
+        </td>
+      </tr><tr>
+        <td>
+          317
+        </td>
+        <td>
+          3290
+        </td>
+        <td>
+          13765
+          -
+          13782
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  java.lang.Thread.sleep(500L);
+  while$1()
+}
+        </td>
+      </tr><tr>
+        <td>
+          317
+        </td>
+        <td>
+          3291
+        </td>
+        <td>
+          13731
+          -
+          13731
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          317
+        </td>
+        <td>
+          3292
+        </td>
+        <td>
+          13731
+          -
+          13731
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          318
+        </td>
+        <td>
+          3288
+        </td>
+        <td>
+          13765
+          -
+          13782
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Thread.sleep
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          java.lang.Thread.sleep(500L)
+        </td>
+      </tr><tr>
+        <td>
+          318
+        </td>
+        <td>
+          3289
+        </td>
+        <td>
+          13777
+          -
+          13777
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.while$1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          while$1()
+        </td>
+      </tr><tr>
+        <td>
+          320
+        </td>
+        <td>
+          3293
+        </td>
+        <td>
+          13801
+          -
+          13817
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.Job.isSuccessful
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          job.isSuccessful()
+        </td>
+      </tr><tr>
+        <td>
+          321
+        </td>
+        <td>
+          3294
+        </td>
+        <td>
+          13829
+          -
+          13883
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (SchemaCopier.this.logger.underlying.isInfoEnabled())
+  SchemaCopier.this.logger.underlying.info(&quot;Successfully copied data to {}&quot;, (copyToDir: AnyRef))
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          322
+        </td>
+        <td>
+          3296
+        </td>
+        <td>
+          13897
+          -
+          14050
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  hadCopyError.set(true);
+  (if (SchemaCopier.this.logger.underlying.isErrorEnabled())
+    SchemaCopier.this.logger.underlying.error(&quot;Job failed with state {} due to: {}&quot;, (scala.Array.apply[AnyRef]((job.getStatus().getState(): AnyRef), (job.getStatus().getFailureInfo(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          323
+        </td>
+        <td>
+          3295
+        </td>
+        <td>
+          13907
+          -
+          13929
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.set
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          hadCopyError.set(true)
+        </td>
+      </tr><tr>
+        <td>
+          327
+        </td>
+        <td>
+          3298
+        </td>
+        <td>
+          14085
+          -
+          14108
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.CopyOptions.fileConcurrency
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.options.fileConcurrency
+        </td>
+      </tr><tr>
+        <td>
+          327
+        </td>
+        <td>
+          3309
+        </td>
+        <td>
+          14070
+          -
+          14464
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.distCpConsumer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          distCpConsumer(SchemaCopier.this.options.fileConcurrency)(((path: org.apache.hadoop.fs.Path, copy: org.apache.hadoop.fs.Path) =&gt; {
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Copying {} to {}&quot;, (scala.Array.apply[AnyRef]((path: AnyRef), (copy: AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  val fs: org.apache.hadoop.fs.FileSystem = path.getFileSystem(SchemaCopier.this.from.conf);
+  if (org.apache.hadoop.fs.FileUtil.copy(fs, path, SchemaCopier.this.exportFs, copy, false, true, SchemaCopier.this.to.conf).unary_!)
+    throw new java.io.IOException(scala.StringContext.apply(&quot;Failed to copy &quot;, &quot; to &quot;, &quot;, copy returned false&quot;).s(path, copy))
+  else
+    ()
+}))
+        </td>
+      </tr><tr>
+        <td>
+          327
+        </td>
+        <td>
+          3310
+        </td>
+        <td>
+          14070
+          -
+          14464
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.distCpConsumer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          distCpConsumer(SchemaCopier.this.options.fileConcurrency)(((path: org.apache.hadoop.fs.Path, copy: org.apache.hadoop.fs.Path) =&gt; {
+  (if (SchemaCopier.this.logger.underlying.isDebugEnabled())
+    SchemaCopier.this.logger.underlying.debug(&quot;Copying {} to {}&quot;, (scala.Array.apply[AnyRef]((path: AnyRef), (copy: AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  val fs: org.apache.hadoop.fs.FileSystem = path.getFileSystem(SchemaCopier.this.from.conf);
+  if (org.apache.hadoop.fs.FileUtil.copy(fs, path, SchemaCopier.this.exportFs, copy, false, true, SchemaCopier.this.to.conf).unary_!)
+    throw new java.io.IOException(scala.StringContext.apply(&quot;Failed to copy &quot;, &quot; to &quot;, &quot;, copy returned false&quot;).s(path, copy))
+  else
+    ()
+}))
+        </td>
+      </tr><tr>
+        <td>
+          329
+        </td>
+        <td>
+          3299
+        </td>
+        <td>
+          14212
+          -
+          14221
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.conf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.from.conf
+        </td>
+      </tr><tr>
+        <td>
+          329
+        </td>
+        <td>
+          3300
+        </td>
+        <td>
+          14193
+          -
+          14222
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.getFileSystem
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          path.getFileSystem(SchemaCopier.this.from.conf)
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          3301
+        </td>
+        <td>
+          14276
+          -
+          14281
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          3302
+        </td>
+        <td>
+          14283
+          -
+          14287
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          3303
+        </td>
+        <td>
+          14289
+          -
+          14296
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.conf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.to.conf
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          3304
+        </td>
+        <td>
+          14235
+          -
+          14297
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.apache.hadoop.fs.FileUtil.copy(fs, path, SchemaCopier.this.exportFs, copy, false, true, SchemaCopier.this.to.conf).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          3307
+        </td>
+        <td>
+          14231
+          -
+          14231
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          3308
+        </td>
+        <td>
+          14231
+          -
+          14231
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          332
+        </td>
+        <td>
+          3305
+        </td>
+        <td>
+          14370
+          -
+          14446
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.io.IOException(scala.StringContext.apply(&quot;Failed to copy &quot;, &quot; to &quot;, &quot;, copy returned false&quot;).s(path, copy))
+        </td>
+      </tr><tr>
+        <td>
+          332
+        </td>
+        <td>
+          3306
+        </td>
+        <td>
+          14370
+          -
+          14446
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.io.IOException(scala.StringContext.apply(&quot;Failed to copy &quot;, &quot; to &quot;, &quot;, copy returned false&quot;).s(path, copy))
+        </td>
+      </tr><tr>
+        <td>
+          336
+        </td>
+        <td>
+          3311
+        </td>
+        <td>
+          14479
+          -
+          14495
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          hadCopyError.get()
+        </td>
+      </tr><tr>
+        <td>
+          336
+        </td>
+        <td>
+          3314
+        </td>
+        <td>
+          14475
+          -
+          14475
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          336
+        </td>
+        <td>
+          3315
+        </td>
+        <td>
+          14475
+          -
+          14475
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          337
+        </td>
+        <td>
+          3312
+        </td>
+        <td>
+          14505
+          -
+          14559
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.RuntimeException(&quot;Error copying data files&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          337
+        </td>
+        <td>
+          3313
+        </td>
+        <td>
+          14505
+          -
+          14559
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.RuntimeException(&quot;Error copying data files&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          341
+        </td>
+        <td>
+          3316
+        </td>
+        <td>
+          14651
+          -
+          14710
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.ImportDestinationArguments.to
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.to.tableOps.importDirectory(copyToDir.toString()).to(toTable)
+        </td>
+      </tr><tr>
+        <td>
+          342
+        </td>
+        <td>
+          3317
+        </td>
+        <td>
+          14721
+          -
+          14751
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.ImportOptions.ignoreEmptyDir
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          importDir.ignoreEmptyDir(true)
+        </td>
+      </tr><tr>
+        <td>
+          342
+        </td>
+        <td>
+          3318
+        </td>
+        <td>
+          14721
+          -
+          14751
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.ImportOptions.ignoreEmptyDir
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          importDir.ignoreEmptyDir(true)
+        </td>
+      </tr><tr>
+        <td>
+          343
+        </td>
+        <td>
+          3319
+        </td>
+        <td>
+          14794
+          -
+          14796
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          343
+        </td>
+        <td>
+          3320
+        </td>
+        <td>
+          14794
+          -
+          14796
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          345
+        </td>
+        <td>
+          3321
+        </td>
+        <td>
+          14837
+          -
+          14853
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.ImportOptions.load
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          importDir.load()
+        </td>
+      </tr><tr>
+        <td>
+          345
+        </td>
+        <td>
+          3322
+        </td>
+        <td>
+          14837
+          -
+          14853
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.ImportOptions.load
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          importDir.load()
+        </td>
+      </tr><tr>
+        <td>
+          346
+        </td>
+        <td>
+          3323
+        </td>
+        <td>
+          14906
+          -
+          14951
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (SchemaCopier.this.logger.underlying.isTraceEnabled())
+  SchemaCopier.this.logger.underlying.trace(&quot;Error importing directory:&quot;, e)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          351
+        </td>
+        <td>
+          3324
+        </td>
+        <td>
+          15109
+          -
+          15148
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FSDataOutputStream.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.create(completeMarker).close()
+        </td>
+      </tr><tr>
+        <td>
+          355
+        </td>
+        <td>
+          3325
+        </td>
+        <td>
+          15228
+          -
+          15266
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileSystem.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.exportFs.delete(tableExportPath, true)
+        </td>
+      </tr><tr>
+        <td>
+          357
+        </td>
+        <td>
+          3326
+        </td>
+        <td>
+          15325
+          -
+          15357
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.from.tableOps.delete(cloneTable)
+        </td>
+      </tr><tr>
+        <td>
+          361
+        </td>
+        <td>
+          3327
+        </td>
+        <td>
+          15417
+          -
+          15433
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.util.Try.toOption
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.tryFrom.toOption
+        </td>
+      </tr><tr>
+        <td>
+          361
+        </td>
+        <td>
+          3328
+        </td>
+        <td>
+          15416
+          -
+          15416
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.optionIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          io.this.IsCloseable.optionIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          361
+        </td>
+        <td>
+          3329
+        </td>
+        <td>
+          15400
+          -
+          15434
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[Option[org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster]](SchemaCopier.this.tryFrom.toOption)(io.this.IsCloseable.optionIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          362
+        </td>
+        <td>
+          3330
+        </td>
+        <td>
+          15456
+          -
+          15470
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.util.Try.toOption
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SchemaCopier.this.tryTo.toOption
+        </td>
+      </tr><tr>
+        <td>
+          362
+        </td>
+        <td>
+          3331
+        </td>
+        <td>
+          15455
+          -
+          15455
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.optionIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          io.this.IsCloseable.optionIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          362
+        </td>
+        <td>
+          3332
+        </td>
+        <td>
+          15439
+          -
+          15471
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[Option[org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster]](SchemaCopier.this.tryTo.toOption)(io.this.IsCloseable.optionIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          362
+        </td>
+        <td>
+          3333
+        </td>
+        <td>
+          15455
+          -
+          15455
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          419
+        </td>
+        <td>
+          3334
+        </td>
+        <td>
+          17324
+          -
+          17335
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.credentials
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.credentials
+        </td>
+      </tr><tr>
+        <td>
+          420
+        </td>
+        <td>
+          3335
+        </td>
+        <td>
+          17384
+          -
+          17437
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.PasswordParam.key).-&gt;[String](password)
+        </td>
+      </tr><tr>
+        <td>
+          420
+        </td>
+        <td>
+          3336
+        </td>
+        <td>
+          17384
+          -
+          17437
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.PasswordParam.key).-&gt;[String](password)
+        </td>
+      </tr><tr>
+        <td>
+          421
+        </td>
+        <td>
+          3337
+        </td>
+        <td>
+          17478
+          -
+          17535
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.KeytabPathParam.key).-&gt;[String](keytabPath)
+        </td>
+      </tr><tr>
+        <td>
+          421
+        </td>
+        <td>
+          3338
+        </td>
+        <td>
+          17478
+          -
+          17535
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.KeytabPathParam.key).-&gt;[String](keytabPath)
+        </td>
+      </tr><tr>
+        <td>
+          424
+        </td>
+        <td>
+          3352
+        </td>
+        <td>
+          17568
+          -
+          17823
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenMapFactory.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.Map.apply[String, String](scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.InstanceNameParam.key).-&gt;[String](Cluster.this.instance), scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.ZookeepersParam.key).-&gt;[String](Cluster.this.zk), scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.UserParam.key).-&gt;[String](Cluster.this.user), scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.CatalogParam.key).-&gt;[String](Cluster.this.catalog), Cluster.this.auth)
+        </td>
+      </tr><tr>
+        <td>
+          425
+        </td>
+        <td>
+          3339
+        </td>
+        <td>
+          17579
+          -
+          17624
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Parameter.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.InstanceNameParam.key
+        </td>
+      </tr><tr>
+        <td>
+          425
+        </td>
+        <td>
+          3340
+        </td>
+        <td>
+          17628
+          -
+          17636
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.instance
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.instance
+        </td>
+      </tr><tr>
+        <td>
+          425
+        </td>
+        <td>
+          3341
+        </td>
+        <td>
+          17579
+          -
+          17636
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.InstanceNameParam.key).-&gt;[String](Cluster.this.instance)
+        </td>
+      </tr><tr>
+        <td>
+          426
+        </td>
+        <td>
+          3342
+        </td>
+        <td>
+          17644
+          -
+          17687
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Parameter.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.ZookeepersParam.key
+        </td>
+      </tr><tr>
+        <td>
+          426
+        </td>
+        <td>
+          3343
+        </td>
+        <td>
+          17691
+          -
+          17693
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.zk
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.zk
+        </td>
+      </tr><tr>
+        <td>
+          426
+        </td>
+        <td>
+          3344
+        </td>
+        <td>
+          17644
+          -
+          17693
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.ZookeepersParam.key).-&gt;[String](Cluster.this.zk)
+        </td>
+      </tr><tr>
+        <td>
+          427
+        </td>
+        <td>
+          3345
+        </td>
+        <td>
+          17701
+          -
+          17738
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Parameter.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.UserParam.key
+        </td>
+      </tr><tr>
+        <td>
+          427
+        </td>
+        <td>
+          3346
+        </td>
+        <td>
+          17742
+          -
+          17746
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.user
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.user
+        </td>
+      </tr><tr>
+        <td>
+          427
+        </td>
+        <td>
+          3347
+        </td>
+        <td>
+          17701
+          -
+          17746
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.UserParam.key).-&gt;[String](Cluster.this.user)
+        </td>
+      </tr><tr>
+        <td>
+          428
+        </td>
+        <td>
+          3348
+        </td>
+        <td>
+          17754
+          -
+          17794
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Parameter.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.CatalogParam.key
+        </td>
+      </tr><tr>
+        <td>
+          428
+        </td>
+        <td>
+          3349
+        </td>
+        <td>
+          17798
+          -
+          17805
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.catalog
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.catalog
+        </td>
+      </tr><tr>
+        <td>
+          428
+        </td>
+        <td>
+          3350
+        </td>
+        <td>
+          17754
+          -
+          17805
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.CatalogParam.key).-&gt;[String](Cluster.this.catalog)
+        </td>
+      </tr><tr>
+        <td>
+          429
+        </td>
+        <td>
+          3351
+        </td>
+        <td>
+          17813
+          -
+          17817
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.auth
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.auth
+        </td>
+      </tr><tr>
+        <td>
+          432
+        </td>
+        <td>
+          3353
+        </td>
+        <td>
+          17840
+          -
+          17859
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.conf.Configuration.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.hadoop.conf.Configuration()
+        </td>
+      </tr><tr>
+        <td>
+          433
+        </td>
+        <td>
+          3354
+        </td>
+        <td>
+          17902
+          -
+          17915
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.net.URI.toURL
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          f.toURI().toURL()
+        </td>
+      </tr><tr>
+        <td>
+          433
+        </td>
+        <td>
+          3355
+        </td>
+        <td>
+          17885
+          -
+          17916
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.conf.Configuration.addResource
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.conf.addResource(f.toURI().toURL())
+        </td>
+      </tr><tr>
+        <td>
+          433
+        </td>
+        <td>
+          3356
+        </td>
+        <td>
+          17864
+          -
+          17917
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.configs.foreach[Unit](((f: java.io.File) =&gt; Cluster.this.conf.addResource(f.toURI().toURL())))
+        </td>
+      </tr><tr>
+        <td>
+          436
+        </td>
+        <td>
+          3357
+        </td>
+        <td>
+          17992
+          -
+          17998
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.params
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.params
+        </td>
+      </tr><tr>
+        <td>
+          436
+        </td>
+        <td>
+          3358
+        </td>
+        <td>
+          17992
+          -
+          18005
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](Cluster.this.params).asJava
+        </td>
+      </tr><tr>
+        <td>
+          436
+        </td>
+        <td>
+          3359
+        </td>
+        <td>
+          17963
+          -
+          18038
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Any.asInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.geotools.api.data.DataStoreFinder.getDataStore(scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](Cluster.this.params).asJava).asInstanceOf[org.locationtech.geomesa.accumulo.data.AccumuloDataStore]
+        </td>
+      </tr><tr>
+        <td>
+          436
+        </td>
+        <td>
+          3360
+        </td>
+        <td>
+          17963
+          -
+          18038
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Any.asInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.geotools.api.data.DataStoreFinder.getDataStore(scala.collection.JavaConverters.mapAsJavaMapConverter[String, String](Cluster.this.params).asJava).asInstanceOf[org.locationtech.geomesa.accumulo.data.AccumuloDataStore]
+        </td>
+      </tr><tr>
+        <td>
+          437
+        </td>
+        <td>
+          3361
+        </td>
+        <td>
+          18077
+          -
+          18130
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.io.IOException(&quot;Unable to load datastore:&quot;, e)
+        </td>
+      </tr><tr>
+        <td>
+          437
+        </td>
+        <td>
+          3362
+        </td>
+        <td>
+          18077
+          -
+          18130
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.io.IOException(&quot;Unable to load datastore:&quot;, e)
+        </td>
+      </tr><tr>
+        <td>
+          440
+        </td>
+        <td>
+          3363
+        </td>
+        <td>
+          18148
+          -
+          18158
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.ds.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          440
+        </td>
+        <td>
+          3374
+        </td>
+        <td>
+          18160
+          -
+          18476
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  val maskedParams: scala.collection.immutable.Iterable[String] = Cluster.this.params.map[String, scala.collection.immutable.Iterable[String]](((x0$1: (String, String)) =&gt; x0$1 match {
+    case (_1: String, _2: String)(String, String)(org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.PasswordParam.key, _) =&gt; scala.StringContext.apply(&quot;&quot;, &quot;=******&quot;).s(org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.PasswordParam.key)
+    case (_1: String, _2: String)(String, String)((k @ _), (v @ _)) =&gt; scala.StringContext.apply(&quot;&quot;, &quot;=&quot;, &quot;&quot;).s(k, v)
+  }))(immutable.this.Iterable.canBuildFrom[String]);
+  throw new java.io.IOException(scala.StringContext.apply(&quot;Unable to load datastore using provided values: &quot;, &quot;&quot;).s(maskedParams.mkString(&quot;, &quot;)))
+}
+        </td>
+      </tr><tr>
+        <td>
+          440
+        </td>
+        <td>
+          3375
+        </td>
+        <td>
+          18144
+          -
+          18144
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          440
+        </td>
+        <td>
+          3376
+        </td>
+        <td>
+          18144
+          -
+          18144
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          441
+        </td>
+        <td>
+          3371
+        </td>
+        <td>
+          18198
+          -
+          18198
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.immutable.Iterable.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          immutable.this.Iterable.canBuildFrom[String]
+        </td>
+      </tr><tr>
+        <td>
+          441
+        </td>
+        <td>
+          3372
+        </td>
+        <td>
+          18187
+          -
+          18359
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.params.map[String, scala.collection.immutable.Iterable[String]](((x0$1: (String, String)) =&gt; x0$1 match {
+  case (_1: String, _2: String)(String, String)(org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.PasswordParam.key, _) =&gt; scala.StringContext.apply(&quot;&quot;, &quot;=******&quot;).s(org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.PasswordParam.key)
+  case (_1: String, _2: String)(String, String)((k @ _), (v @ _)) =&gt; scala.StringContext.apply(&quot;&quot;, &quot;=&quot;, &quot;&quot;).s(k, v)
+}))(immutable.this.Iterable.canBuildFrom[String])
+        </td>
+      </tr><tr>
+        <td>
+          442
+        </td>
+        <td>
+          3364
+        </td>
+        <td>
+          18266
+          -
+          18267
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          442
+        </td>
+        <td>
+          3365
+        </td>
+        <td>
+          18311
+          -
+          18319
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;=******&quot;
+        </td>
+      </tr><tr>
+        <td>
+          442
+        </td>
+        <td>
+          3366
+        </td>
+        <td>
+          18268
+          -
+          18309
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Parameter.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.PasswordParam.key
+        </td>
+      </tr><tr>
+        <td>
+          442
+        </td>
+        <td>
+          3367
+        </td>
+        <td>
+          18264
+          -
+          18319
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;&quot;, &quot;=******&quot;).s(org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.PasswordParam.key)
+        </td>
+      </tr><tr>
+        <td>
+          442
+        </td>
+        <td>
+          3368
+        </td>
+        <td>
+          18264
+          -
+          18319
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;&quot;, &quot;=******&quot;).s(org.locationtech.geomesa.accumulo.data.AccumuloDataStoreParams.PasswordParam.key)
+        </td>
+      </tr><tr>
+        <td>
+          443
+        </td>
+        <td>
+          3369
+        </td>
+        <td>
+          18343
+          -
+          18351
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;&quot;, &quot;=&quot;, &quot;&quot;).s(k, v)
+        </td>
+      </tr><tr>
+        <td>
+          443
+        </td>
+        <td>
+          3370
+        </td>
+        <td>
+          18343
+          -
+          18351
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;&quot;, &quot;=&quot;, &quot;&quot;).s(k, v)
+        </td>
+      </tr><tr>
+        <td>
+          445
+        </td>
+        <td>
+          3373
+        </td>
+        <td>
+          18366
+          -
+          18470
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.io.IOException(scala.StringContext.apply(&quot;Unable to load datastore using provided values: &quot;, &quot;&quot;).s(maskedParams.mkString(&quot;, &quot;)))
+        </td>
+      </tr><tr>
+        <td>
+          448
+        </td>
+        <td>
+          3377
+        </td>
+        <td>
+          18514
+          -
+          18544
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.AccumuloClient.tableOperations
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.ds.connector.tableOperations()
+        </td>
+      </tr><tr>
+        <td>
+          450
+        </td>
+        <td>
+          3378
+        </td>
+        <td>
+          18579
+          -
+          18591
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.AccumuloDataStore.dispose
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Cluster.this.ds.dispose()
+        </td>
+      </tr><tr>
+        <td>
+          455
+        </td>
+        <td>
+          3379
+        </td>
+        <td>
+          18690
+          -
+          18709
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.ClusterConfig.instanceName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          config.instanceName
+        </td>
+      </tr><tr>
+        <td>
+          455
+        </td>
+        <td>
+          3380
+        </td>
+        <td>
+          18711
+          -
+          18728
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.ClusterConfig.zookeepers
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          config.zookeepers
+        </td>
+      </tr><tr>
+        <td>
+          455
+        </td>
+        <td>
+          3381
+        </td>
+        <td>
+          18730
+          -
+          18741
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.ClusterConfig.user
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          config.user
+        </td>
+      </tr><tr>
+        <td>
+          455
+        </td>
+        <td>
+          3382
+        </td>
+        <td>
+          18743
+          -
+          18761
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.ClusterConfig.credentials
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          config.credentials
+        </td>
+      </tr><tr>
+        <td>
+          455
+        </td>
+        <td>
+          3383
+        </td>
+        <td>
+          18763
+          -
+          18777
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.ClusterConfig.catalog
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          config.catalog
+        </td>
+      </tr><tr>
+        <td>
+          455
+        </td>
+        <td>
+          3384
+        </td>
+        <td>
+          18779
+          -
+          18797
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.ClusterConfig.configFiles
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          config.configFiles
+        </td>
+      </tr><tr>
+        <td>
+          455
+        </td>
+        <td>
+          3385
+        </td>
+        <td>
+          18678
+          -
+          18798
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.SchemaCopier.Cluster.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new SchemaCopier.this.Cluster(config.instanceName, config.zookeepers, config.user, config.credentials, config.catalog, config.configFiles)
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>
