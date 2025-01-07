@@ -41,248 +41,249 @@
 </span>17 <span style=''>import org.apache.hadoop.hbase.{HBaseConfiguration, HConstants}
 </span>18 <span style=''>import org.apache.hadoop.security.authentication.util.KerberosUtil
 </span>19 <span style=''>import org.apache.hadoop.security.{SecurityUtil, UserGroupInformation}
-</span>20 <span style=''>import org.locationtech.geomesa.hbase.data.HBaseDataStoreFactory.{HBaseGeoMesaKeyTab, HBaseGeoMesaPrincipal}
-</span>21 <span style=''>import org.locationtech.geomesa.hbase.data.HBaseDataStoreParams.{ConfigPathsParam, ConfigsParam, ConnectionParam, ZookeeperParam}
-</span>22 <span style=''>import org.locationtech.geomesa.hbase.utils.HBaseVersions
-</span>23 <span style=''>import org.locationtech.geomesa.utils.hadoop.HadoopUtils
-</span>24 <span style=''>import org.locationtech.geomesa.utils.io.CloseWithLogging
-</span>25 <span style=''>
-</span>26 <span style=''>import java.io.{ByteArrayInputStream, Closeable}
-</span>27 <span style=''>import java.nio.charset.StandardCharsets
-</span>28 <span style=''>import java.security.PrivilegedExceptionAction
-</span>29 <span style=''>import scala.util.{Failure, Success, Try}
-</span>30 <span style=''>
-</span>31 <span style=''>object HBaseConnectionPool extends LazyLogging {
-</span>32 <span style=''>
-</span>33 <span style=''>  import scala.collection.JavaConverters._
-</span>34 <span style=''>
-</span>35 <span style=''>  private val configs: LoadingCache[ConfigKey, Configuration] = </span><span style='background: #AEF1AE'>Caffeine.newBuilder().build(
-</span>36 <span style=''></span><span style='background: #AEF1AE'>    new CacheLoader[ConfigKey, Configuration] {
-</span>37 <span style=''></span><span style='background: #AEF1AE'>
-</span>38 <span style=''></span><span style='background: #AEF1AE'>      // add common resources from system property - lazy to allow object initialization if there's an error
-</span>39 <span style=''></span><span style='background: #AEF1AE'>      private lazy val configuration = {
-</span>40 <span style=''></span><span style='background: #AEF1AE'>        val base = HBaseConfiguration.create()
-</span>41 <span style=''></span><span style='background: #AEF1AE'>        HBaseDataStoreFactory.ConfigPathProperty.option.foreach(addResources(base, _))
-</span>42 <span style=''></span><span style='background: #AEF1AE'>        base
-</span>43 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>44 <span style=''></span><span style='background: #AEF1AE'>
-</span>45 <span style=''></span><span style='background: #AEF1AE'>      override def load(key: ConfigKey): Configuration = {
-</span>46 <span style=''></span><span style='background: #AEF1AE'>        val conf = new Configuration(configuration)
-</span>47 <span style=''></span><span style='background: #AEF1AE'>        // Make sure that current user is always logged-in user
-</span>48 <span style=''></span><span style='background: #AEF1AE'>        conf.set(&quot;hbase.client.userprovider.class&quot;, &quot;org.locationtech.geomesa.hbase.data.LoginUserProvider&quot;)
-</span>49 <span style=''></span><span style='background: #AEF1AE'>        // add the explicit props first, they may be needed for loading the path resources
-</span>50 <span style=''></span><span style='background: #AEF1AE'>        key.xml.foreach(xml =&gt; conf.addResource(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8))))
-</span>51 <span style=''></span><span style='background: #AEF1AE'>        key.paths.foreach(addResources(conf, _))
-</span>52 <span style=''></span><span style='background: #AEF1AE'>        key.zookeepers.foreach(zk =&gt; </span><span style='background: #F0ADAD'>conf.set(HConstants.ZOOKEEPER_QUORUM, zk)</span><span style='background: #AEF1AE'>)
-</span>53 <span style=''></span><span style='background: #AEF1AE'>        if (key.zookeepers.isEmpty &amp;&amp; conf.get(HConstants.ZOOKEEPER_QUORUM) == &quot;localhost&quot;) {
-</span>54 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>logger.warn(&quot;HBase connection is set to localhost - &quot; +
-</span>55 <span style=''></span><span style='background: #F0ADAD'>              &quot;this may indicate that 'hbase-site.xml' is not on the classpath&quot;)</span><span style='background: #AEF1AE'>
-</span>56 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>57 <span style=''></span><span style='background: #AEF1AE'>        conf
-</span>58 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>59 <span style=''></span><span style='background: #AEF1AE'>
-</span>60 <span style=''></span><span style='background: #AEF1AE'>      private def addResources(conf: Configuration, paths: String): Unit =
-</span>61 <span style=''></span><span style='background: #AEF1AE'>        paths.split(',').map(_.trim).filterNot(_.isEmpty).foreach(HadoopUtils.addResource(conf, _))
-</span>62 <span style=''></span><span style='background: #AEF1AE'>    }
-</span>63 <span style=''></span><span style='background: #AEF1AE'>  )</span><span style=''>
-</span>64 <span style=''>
-</span>65 <span style=''>  private val connections: LoadingCache[(Configuration, Boolean), CachedConnection] =  </span><span style='background: #AEF1AE'>Caffeine.newBuilder().build(
-</span>66 <span style=''></span><span style='background: #AEF1AE'>    new CacheLoader[(Configuration, Boolean), CachedConnection] {
-</span>67 <span style=''></span><span style='background: #AEF1AE'>      override def load(key: (Configuration, Boolean)): CachedConnection = {
-</span>68 <span style=''></span><span style='background: #AEF1AE'>        createConnection(key._1, key._2) match {
-</span>69 <span style=''></span><span style='background: #AEF1AE'>          case SingletonConnection(connection, kerberos) =&gt; CachedConnection(connection, kerberos)
-</span>70 <span style=''></span><span style='background: #AEF1AE'>          case c =&gt; </span><span style='background: #F0ADAD'>throw new NotImplementedError(s&quot;Expected SingletonConnection but got $c&quot;)</span><span style='background: #AEF1AE'>
-</span>71 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>72 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>73 <span style=''></span><span style='background: #AEF1AE'>    }
-</span>74 <span style=''></span><span style='background: #AEF1AE'>  )</span><span style=''>
-</span>75 <span style=''>
-</span>76 <span style=''>  </span><span style='background: #AEF1AE'>Runtime.getRuntime.addShutdownHook(new Thread() {
-</span>77 <span style=''></span><span style='background: #AEF1AE'>    override def run(): Unit =
-</span>78 <span style=''></span><span style='background: #AEF1AE'>      CloseWithLogging(connections.asMap().values().asScala.flatMap { case CachedConnection(c, k) =&gt; Seq(c) ++ k })
-</span>79 <span style=''></span><span style='background: #AEF1AE'>  })</span><span style=''>
-</span>80 <span style=''>
-</span>81 <span style=''>  /**
-</span>82 <span style=''>   * Get (or create) a cached configuration
-</span>83 <span style=''>   *
-</span>84 <span style=''>   * @param params data store params
-</span>85 <span style=''>   * @return
-</span>86 <span style=''>   */
-</span>87 <span style=''>  def getConfiguration(params: java.util.Map[String, _]): Configuration = {
-</span>88 <span style=''>    val zk = </span><span style='background: #AEF1AE'>ZookeeperParam.lookupOpt(params)</span><span style=''>
-</span>89 <span style=''>    val paths = </span><span style='background: #AEF1AE'>ConfigPathsParam.lookupOpt(params)</span><span style=''>
-</span>90 <span style=''>    val xml = </span><span style='background: #AEF1AE'>ConfigsParam.lookupOpt(params)</span><span style=''>
-</span>91 <span style=''>    </span><span style='background: #AEF1AE'>configs.get(ConfigKey(zk, paths, xml))</span><span style=''>
-</span>92 <span style=''>  }
-</span>93 <span style=''>
-</span>94 <span style=''>  /**
-</span>95 <span style=''>   * Get (or create) a cached connection
-</span>96 <span style=''>   *
-</span>97 <span style=''>   * @param params data store params
-</span>98 <span style=''>   * @param validate validate the connection after creation, or not
-</span>99 <span style=''>   * @return
-</span>100 <span style=''>   */
-</span>101 <span style=''>  def getConnection(params: java.util.Map[String, _], validate: Boolean): ConnectionWrapper = {
-</span>102 <span style=''>    if (</span><span style='background: #AEF1AE'>ConnectionParam.exists(params)</span><span style=''>) {
-</span>103 <span style=''>      </span><span style='background: #AEF1AE'>ProvidedConnection(ConnectionParam.lookup(params))</span><span style=''>
-</span>104 <span style=''>    } else </span><span style='background: #AEF1AE'>{
-</span>105 <span style=''></span><span style='background: #AEF1AE'>      val conf = getConfiguration(params)
-</span>106 <span style=''></span><span style='background: #AEF1AE'>      logger.debug(s&quot;Connecting to HBase instance at ${conf.get(HConstants.ZOOKEEPER_QUORUM)}&quot;)
-</span>107 <span style=''></span><span style='background: #AEF1AE'>      if (HBaseDataStoreParams.CacheConnectionsParam.lookup(params)) {
-</span>108 <span style=''></span><span style='background: #AEF1AE'>        connections.get((conf, validate))
-</span>109 <span style=''></span><span style='background: #AEF1AE'>      } else {
-</span>110 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>createConnection(conf, validate)</span><span style='background: #AEF1AE'>
-</span>111 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>112 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>113 <span style=''>  }
-</span>114 <span style=''>
-</span>115 <span style=''>  /**
-</span>116 <span style=''>   * Create a new connection (not pooled)
-</span>117 <span style=''>   *
-</span>118 <span style=''>   * @param conf hbase configuration
-</span>119 <span style=''>   * @param validate validate the connection after creation, or not
-</span>120 <span style=''>   * @return
-</span>121 <span style=''>   */
-</span>122 <span style=''>  def createConnection(conf: Configuration, validate: Boolean): ConnectionWrapper = {
-</span>123 <span style=''>    if (</span><span style='background: #AEF1AE'>User.isHBaseSecurityEnabled(conf)</span><span style=''>) </span><span style='background: #F0ADAD'>{
-</span>124 <span style=''></span><span style='background: #F0ADAD'>      configureSecurity(conf)
-</span>125 <span style=''></span><span style='background: #F0ADAD'>      val action = new PrivilegedExceptionAction[ConnectionWrapper]() {
-</span>126 <span style=''></span><span style='background: #F0ADAD'>        override def run(): ConnectionWrapper = doCreateConnection(conf, validate)
-</span>127 <span style=''></span><span style='background: #F0ADAD'>      }
-</span>128 <span style=''></span><span style='background: #F0ADAD'>      val user = UserGroupInformation.getLoginUser
-</span>129 <span style=''></span><span style='background: #F0ADAD'>      logger.info(s&quot;Creating Secured HBase connection with user $user&quot;)
-</span>130 <span style=''></span><span style='background: #F0ADAD'>      user.doAs(action)
-</span>131 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''> else </span><span style='background: #AEF1AE'>{
-</span>132 <span style=''></span><span style='background: #AEF1AE'>      logger.info(s&quot;Creating unsecured HBase connection&quot;)
-</span>133 <span style=''></span><span style='background: #AEF1AE'>      doCreateConnection(conf, validate)
-</span>134 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>135 <span style=''>  }
-</span>136 <span style=''>
-</span>137 <span style=''>  private def doCreateConnection(conf: Configuration, validate: Boolean): ConnectionWrapper = {
-</span>138 <span style=''>    if (validate) </span><span style='background: #AEF1AE'>{
-</span>139 <span style=''></span><span style='background: #AEF1AE'>      logger.debug(&quot;Checking configuration availability&quot;)
-</span>140 <span style=''></span><span style='background: #AEF1AE'>      HBaseVersions.checkAvailable(conf)
-</span>141 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>142 <span style=''>    val connection = </span><span style='background: #AEF1AE'>ConnectionFactory.createConnection(conf)</span><span style=''>
-</span>143 <span style=''>    val kerberos = if (</span><span style='background: #AEF1AE'>User.isHBaseSecurityEnabled(conf)</span><span style=''>) { </span><span style='background: #F0ADAD'>Some(HadoopUtils.kerberosTicketRenewer())</span><span style=''> } else { </span><span style='background: #AEF1AE'>None</span><span style=''> }
-</span>144 <span style=''>    </span><span style='background: #AEF1AE'>SingletonConnection(connection, kerberos)</span><span style=''>
-</span>145 <span style=''>  }
-</span>146 <span style=''>
-</span>147 <span style=''>  /**
-</span>148 <span style=''>   * Configures hadoop security, based on the configuration.
-</span>149 <span style=''>   *
-</span>150 <span style=''>   * Note: hadoop security is configured globally - having different security settings in a single JVM
-</span>151 <span style=''>   * will likely result in errors
-</span>152 <span style=''>   *
-</span>153 <span style=''>   * @param conf conf
-</span>154 <span style=''>   */
-</span>155 <span style=''>  def configureSecurity(conf: Configuration): Unit = </span><span style='background: #F0ADAD'>synchronized {
-</span>156 <span style=''></span><span style='background: #F0ADAD'>    import AuthenticationTokenIdentifier.AUTH_TOKEN_TYPE
-</span>157 <span style=''></span><span style='background: #F0ADAD'>
-</span>158 <span style=''></span><span style='background: #F0ADAD'>    if (User.isHBaseSecurityEnabled(conf)) {
-</span>159 <span style=''></span><span style='background: #F0ADAD'>      val currentUser = UserGroupInformation.getLoginUser
-</span>160 <span style=''></span><span style='background: #F0ADAD'>      if (currentUser.getCredentials.getAllTokens.asScala.exists(_.getKind == AUTH_TOKEN_TYPE)) {
-</span>161 <span style=''></span><span style='background: #F0ADAD'>        logger.debug(&quot;Using existing HBase authentication token&quot;)
-</span>162 <span style=''></span><span style='background: #F0ADAD'>      } else {
-</span>163 <span style=''></span><span style='background: #F0ADAD'>        val keytab = conf.get(HBaseGeoMesaKeyTab)
-</span>164 <span style=''></span><span style='background: #F0ADAD'>        val rawPrincipal = conf.get(HBaseGeoMesaPrincipal)
-</span>165 <span style=''></span><span style='background: #F0ADAD'>
-</span>166 <span style=''></span><span style='background: #F0ADAD'>        if (keytab == null || rawPrincipal == null) {
-</span>167 <span style=''></span><span style='background: #F0ADAD'>          lazy val missing =
-</span>168 <span style=''></span><span style='background: #F0ADAD'>            Seq(HBaseGeoMesaKeyTab -&gt; keytab, HBaseGeoMesaPrincipal -&gt; rawPrincipal).collect { case (k, null) =&gt; k }
-</span>169 <span style=''></span><span style='background: #F0ADAD'>          logger.warn(s&quot;Security is enabled but missing credentials under '${missing.mkString(&quot;' and '&quot;)}'&quot;)
-</span>170 <span style=''></span><span style='background: #F0ADAD'>        } else {
-</span>171 <span style=''></span><span style='background: #F0ADAD'>          val principal = fullPrincipal(rawPrincipal)
-</span>172 <span style=''></span><span style='background: #F0ADAD'>
-</span>173 <span style=''></span><span style='background: #F0ADAD'>          lazy val principalMsg =
-</span>174 <span style=''></span><span style='background: #F0ADAD'>            s&quot;'$principal'${if (principal == rawPrincipal) { &quot;&quot; } else { s&quot; (original '$rawPrincipal')&quot;}}&quot;
-</span>175 <span style=''></span><span style='background: #F0ADAD'>          logger.debug(
-</span>176 <span style=''></span><span style='background: #F0ADAD'>            s&quot;Using Kerberos with principal $principalMsg, keytab '$keytab', &quot; +
-</span>177 <span style=''></span><span style='background: #F0ADAD'>                s&quot;and Hadoop authentication method '${SecurityUtil.getAuthenticationMethod(conf)}'&quot;)
-</span>178 <span style=''></span><span style='background: #F0ADAD'>
-</span>179 <span style=''></span><span style='background: #F0ADAD'>          if (currentUser.hasKerberosCredentials &amp;&amp; currentUser.getUserName == principal) {
-</span>180 <span style=''></span><span style='background: #F0ADAD'>            logger.debug(s&quot;User '$principal' is already authenticated&quot;)
-</span>181 <span style=''></span><span style='background: #F0ADAD'>          } else {
-</span>182 <span style=''></span><span style='background: #F0ADAD'>            if (currentUser.hasKerberosCredentials) {
-</span>183 <span style=''></span><span style='background: #F0ADAD'>              logger.warn(
-</span>184 <span style=''></span><span style='background: #F0ADAD'>                s&quot;Changing global authenticated Hadoop user from '${currentUser.getUserName}' to '$principal' -&quot; +
-</span>185 <span style=''></span><span style='background: #F0ADAD'>                    &quot;this will affect any connections still using the old user&quot;)
-</span>186 <span style=''></span><span style='background: #F0ADAD'>            }
-</span>187 <span style=''></span><span style='background: #F0ADAD'>            UserGroupInformation.setConfiguration(conf)
-</span>188 <span style=''></span><span style='background: #F0ADAD'>            UserGroupInformation.loginUserFromKeytab(principal, keytab)
-</span>189 <span style=''></span><span style='background: #F0ADAD'>
-</span>190 <span style=''></span><span style='background: #F0ADAD'>            logger.debug(s&quot;Logged into Hadoop with user '${UserGroupInformation.getLoginUser.getUserName}'&quot;)
-</span>191 <span style=''></span><span style='background: #F0ADAD'>          }
-</span>192 <span style=''></span><span style='background: #F0ADAD'>        }
-</span>193 <span style=''></span><span style='background: #F0ADAD'>      }
-</span>194 <span style=''></span><span style='background: #F0ADAD'>    }
-</span>195 <span style=''></span><span style='background: #F0ADAD'>  }</span><span style=''>
-</span>196 <span style=''>
-</span>197 <span style=''>  /**
-</span>198 <span style=''>   * Replace _HOST with the current host and add the default realm if nothing is specified.
-</span>199 <span style=''>   *
-</span>200 <span style=''>   * `SecurityUtil.getServerPrincipal` will replace the _HOST but only if there is already a realm.
-</span>201 <span style=''>   *
-</span>202 <span style=''>   * @param principal kerberos principal
-</span>203 <span style=''>   * @return
-</span>204 <span style=''>   */
-</span>205 <span style=''>  private def fullPrincipal(principal: String): String = {
-</span>206 <span style=''>    if (</span><span style='background: #F0ADAD'>principal.indexOf('@') != -1</span><span style=''>) {
-</span>207 <span style=''>      // we have a realm so this should be work to replace _HOST if present
-</span>208 <span style=''>      </span><span style='background: #F0ADAD'>SecurityUtil.getServerPrincipal(principal, null: String)</span><span style=''>
-</span>209 <span style=''>    } else {
-</span>210 <span style=''>      // try to add the default realm and replace _HOST if present
-</span>211 <span style=''>      </span><span style='background: #F0ADAD'>Try(KerberosUtil.getDefaultRealm) match {
-</span>212 <span style=''></span><span style='background: #F0ADAD'>        case Success(realm) =&gt; SecurityUtil.getServerPrincipal(s&quot;$principal@$realm&quot;, null: String)
-</span>213 <span style=''></span><span style='background: #F0ADAD'>        case Failure(e) =&gt;
-</span>214 <span style=''></span><span style='background: #F0ADAD'>          logger.warn(s&quot;Unable to get default Kerberos realm: $e&quot;)
-</span>215 <span style=''></span><span style='background: #F0ADAD'>          if (!principal.contains(SecurityUtil.HOSTNAME_PATTERN)) { principal } else {
-</span>216 <span style=''></span><span style='background: #F0ADAD'>            // append a fake realm so that the _HOST replacement works and then remove it afterwards
-</span>217 <span style=''></span><span style='background: #F0ADAD'>            SecurityUtil.getServerPrincipal(s&quot;$principal@foo&quot;, null: String).dropRight(4)
-</span>218 <span style=''></span><span style='background: #F0ADAD'>          }
-</span>219 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
-</span>220 <span style=''>    }
-</span>221 <span style=''>  }
-</span>222 <span style=''>
-</span>223 <span style=''>  /**
-</span>224 <span style=''>   * Managed connection. The connection itself should not be closed - instead close the wrapper to handle
-</span>225 <span style=''>   * lifecycle events appropriately.
-</span>226 <span style=''>   */
-</span>227 <span style=''>  sealed trait ConnectionWrapper extends Closeable {
-</span>228 <span style=''>    val connection: Connection
-</span>229 <span style=''>  }
-</span>230 <span style=''>
-</span>231 <span style=''>  /**
-</span>232 <span style=''>   * An unshared connection
-</span>233 <span style=''>   *
-</span>234 <span style=''>   * @param connection connection
-</span>235 <span style=''>   * @param kerberos kerberos ticket renewal thread
-</span>236 <span style=''>   */
-</span>237 <span style=''>  case class SingletonConnection(connection: Connection, kerberos: Option[Closeable]) extends ConnectionWrapper {
-</span>238 <span style=''>    override def close(): Unit = </span><span style='background: #F0ADAD'>CloseWithLogging(kerberos.toSeq ++ Seq(connection))</span><span style=''>
-</span>239 <span style=''>  }
-</span>240 <span style=''>
-</span>241 <span style=''>  /**
-</span>242 <span style=''>   * A shared, cached connection
-</span>243 <span style=''>   *
-</span>244 <span style=''>   * @param connection connection
-</span>245 <span style=''>   * @param kerberos kerberos ticket renewal thread
-</span>246 <span style=''>   */
-</span>247 <span style=''>  case class CachedConnection(connection: Connection, kerberos: Option[Closeable]) extends ConnectionWrapper {
-</span>248 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
-</span>249 <span style=''>  }
-</span>250 <span style=''>
-</span>251 <span style=''>  /**
-</span>252 <span style=''>   * Provided connection - no lifecycle management is performed
-</span>253 <span style=''>   *
-</span>254 <span style=''>   * @param connection connection
-</span>255 <span style=''>   */
-</span>256 <span style=''>  case class ProvidedConnection(connection: Connection) extends ConnectionWrapper {
-</span>257 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
-</span>258 <span style=''>  }
-</span>259 <span style=''>
-</span>260 <span style=''>  private case class ConfigKey(zookeepers: Option[String], paths: Option[String], xml: Option[String])
-</span>261 <span style=''>}
+</span>20 <span style=''>import org.locationtech.geomesa.hbase.HBaseSystemProperties
+</span>21 <span style=''>import org.locationtech.geomesa.hbase.data.HBaseDataStoreFactory.{HBaseGeoMesaKeyTab, HBaseGeoMesaPrincipal}
+</span>22 <span style=''>import org.locationtech.geomesa.hbase.data.HBaseDataStoreParams.{ConfigPathsParam, ConfigsParam, ConnectionParam, ZookeeperParam}
+</span>23 <span style=''>import org.locationtech.geomesa.hbase.utils.HBaseVersions
+</span>24 <span style=''>import org.locationtech.geomesa.utils.hadoop.HadoopUtils
+</span>25 <span style=''>import org.locationtech.geomesa.utils.io.CloseWithLogging
+</span>26 <span style=''>
+</span>27 <span style=''>import java.io.{ByteArrayInputStream, Closeable}
+</span>28 <span style=''>import java.nio.charset.StandardCharsets
+</span>29 <span style=''>import java.security.PrivilegedExceptionAction
+</span>30 <span style=''>import scala.util.{Failure, Success, Try}
+</span>31 <span style=''>
+</span>32 <span style=''>object HBaseConnectionPool extends LazyLogging {
+</span>33 <span style=''>
+</span>34 <span style=''>  import scala.collection.JavaConverters._
+</span>35 <span style=''>
+</span>36 <span style=''>  private val configs: LoadingCache[ConfigKey, Configuration] = </span><span style='background: #AEF1AE'>Caffeine.newBuilder().build(
+</span>37 <span style=''></span><span style='background: #AEF1AE'>    new CacheLoader[ConfigKey, Configuration] {
+</span>38 <span style=''></span><span style='background: #AEF1AE'>
+</span>39 <span style=''></span><span style='background: #AEF1AE'>      // add common resources from system property - lazy to allow object initialization if there's an error
+</span>40 <span style=''></span><span style='background: #AEF1AE'>      private lazy val configuration = {
+</span>41 <span style=''></span><span style='background: #AEF1AE'>        val base = HBaseConfiguration.create()
+</span>42 <span style=''></span><span style='background: #AEF1AE'>        HBaseSystemProperties.ConfigPathProperty.option.foreach(addResources(base, _))
+</span>43 <span style=''></span><span style='background: #AEF1AE'>        base
+</span>44 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>45 <span style=''></span><span style='background: #AEF1AE'>
+</span>46 <span style=''></span><span style='background: #AEF1AE'>      override def load(key: ConfigKey): Configuration = {
+</span>47 <span style=''></span><span style='background: #AEF1AE'>        val conf = new Configuration(configuration)
+</span>48 <span style=''></span><span style='background: #AEF1AE'>        // Make sure that current user is always logged-in user
+</span>49 <span style=''></span><span style='background: #AEF1AE'>        conf.set(&quot;hbase.client.userprovider.class&quot;, &quot;org.locationtech.geomesa.hbase.data.LoginUserProvider&quot;)
+</span>50 <span style=''></span><span style='background: #AEF1AE'>        // add the explicit props first, they may be needed for loading the path resources
+</span>51 <span style=''></span><span style='background: #AEF1AE'>        key.xml.foreach(xml =&gt; conf.addResource(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8))))
+</span>52 <span style=''></span><span style='background: #AEF1AE'>        key.paths.foreach(addResources(conf, _))
+</span>53 <span style=''></span><span style='background: #AEF1AE'>        key.zookeepers.foreach(zk =&gt; </span><span style='background: #F0ADAD'>conf.set(HConstants.ZOOKEEPER_QUORUM, zk)</span><span style='background: #AEF1AE'>)
+</span>54 <span style=''></span><span style='background: #AEF1AE'>        if (key.zookeepers.isEmpty &amp;&amp; conf.get(HConstants.ZOOKEEPER_QUORUM) == &quot;localhost&quot;) {
+</span>55 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>logger.warn(&quot;HBase connection is set to localhost - &quot; +
+</span>56 <span style=''></span><span style='background: #F0ADAD'>              &quot;this may indicate that 'hbase-site.xml' is not on the classpath&quot;)</span><span style='background: #AEF1AE'>
+</span>57 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>58 <span style=''></span><span style='background: #AEF1AE'>        conf
+</span>59 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>60 <span style=''></span><span style='background: #AEF1AE'>
+</span>61 <span style=''></span><span style='background: #AEF1AE'>      private def addResources(conf: Configuration, paths: String): Unit =
+</span>62 <span style=''></span><span style='background: #AEF1AE'>        paths.split(',').map(_.trim).filterNot(_.isEmpty).foreach(HadoopUtils.addResource(conf, _))
+</span>63 <span style=''></span><span style='background: #AEF1AE'>    }
+</span>64 <span style=''></span><span style='background: #AEF1AE'>  )</span><span style=''>
+</span>65 <span style=''>
+</span>66 <span style=''>  private val connections: LoadingCache[(Configuration, Boolean), CachedConnection] =  </span><span style='background: #AEF1AE'>Caffeine.newBuilder().build(
+</span>67 <span style=''></span><span style='background: #AEF1AE'>    new CacheLoader[(Configuration, Boolean), CachedConnection] {
+</span>68 <span style=''></span><span style='background: #AEF1AE'>      override def load(key: (Configuration, Boolean)): CachedConnection = {
+</span>69 <span style=''></span><span style='background: #AEF1AE'>        createConnection(key._1, key._2) match {
+</span>70 <span style=''></span><span style='background: #AEF1AE'>          case SingletonConnection(connection, kerberos) =&gt; CachedConnection(connection, kerberos)
+</span>71 <span style=''></span><span style='background: #AEF1AE'>          case c =&gt; </span><span style='background: #F0ADAD'>throw new NotImplementedError(s&quot;Expected SingletonConnection but got $c&quot;)</span><span style='background: #AEF1AE'>
+</span>72 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>73 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>74 <span style=''></span><span style='background: #AEF1AE'>    }
+</span>75 <span style=''></span><span style='background: #AEF1AE'>  )</span><span style=''>
+</span>76 <span style=''>
+</span>77 <span style=''>  </span><span style='background: #AEF1AE'>Runtime.getRuntime.addShutdownHook(new Thread() {
+</span>78 <span style=''></span><span style='background: #AEF1AE'>    override def run(): Unit =
+</span>79 <span style=''></span><span style='background: #AEF1AE'>      CloseWithLogging(connections.asMap().values().asScala.flatMap { case CachedConnection(c, k) =&gt; Seq(c) ++ k })
+</span>80 <span style=''></span><span style='background: #AEF1AE'>  })</span><span style=''>
+</span>81 <span style=''>
+</span>82 <span style=''>  /**
+</span>83 <span style=''>   * Get (or create) a cached configuration
+</span>84 <span style=''>   *
+</span>85 <span style=''>   * @param params data store params
+</span>86 <span style=''>   * @return
+</span>87 <span style=''>   */
+</span>88 <span style=''>  def getConfiguration(params: java.util.Map[String, _]): Configuration = {
+</span>89 <span style=''>    val zk = </span><span style='background: #AEF1AE'>ZookeeperParam.lookupOpt(params)</span><span style=''>
+</span>90 <span style=''>    val paths = </span><span style='background: #AEF1AE'>ConfigPathsParam.lookupOpt(params)</span><span style=''>
+</span>91 <span style=''>    val xml = </span><span style='background: #AEF1AE'>ConfigsParam.lookupOpt(params)</span><span style=''>
+</span>92 <span style=''>    </span><span style='background: #AEF1AE'>configs.get(ConfigKey(zk, paths, xml))</span><span style=''>
+</span>93 <span style=''>  }
+</span>94 <span style=''>
+</span>95 <span style=''>  /**
+</span>96 <span style=''>   * Get (or create) a cached connection
+</span>97 <span style=''>   *
+</span>98 <span style=''>   * @param params data store params
+</span>99 <span style=''>   * @param validate validate the connection after creation, or not
+</span>100 <span style=''>   * @return
+</span>101 <span style=''>   */
+</span>102 <span style=''>  def getConnection(params: java.util.Map[String, _], validate: Boolean): ConnectionWrapper = {
+</span>103 <span style=''>    if (</span><span style='background: #AEF1AE'>ConnectionParam.exists(params)</span><span style=''>) {
+</span>104 <span style=''>      </span><span style='background: #AEF1AE'>ProvidedConnection(ConnectionParam.lookup(params))</span><span style=''>
+</span>105 <span style=''>    } else </span><span style='background: #AEF1AE'>{
+</span>106 <span style=''></span><span style='background: #AEF1AE'>      val conf = getConfiguration(params)
+</span>107 <span style=''></span><span style='background: #AEF1AE'>      logger.debug(s&quot;Connecting to HBase instance at ${conf.get(HConstants.ZOOKEEPER_QUORUM)}&quot;)
+</span>108 <span style=''></span><span style='background: #AEF1AE'>      if (HBaseDataStoreParams.CacheConnectionsParam.lookup(params)) {
+</span>109 <span style=''></span><span style='background: #AEF1AE'>        connections.get((conf, validate))
+</span>110 <span style=''></span><span style='background: #AEF1AE'>      } else {
+</span>111 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>createConnection(conf, validate)</span><span style='background: #AEF1AE'>
+</span>112 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>113 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>114 <span style=''>  }
+</span>115 <span style=''>
+</span>116 <span style=''>  /**
+</span>117 <span style=''>   * Create a new connection (not pooled)
+</span>118 <span style=''>   *
+</span>119 <span style=''>   * @param conf hbase configuration
+</span>120 <span style=''>   * @param validate validate the connection after creation, or not
+</span>121 <span style=''>   * @return
+</span>122 <span style=''>   */
+</span>123 <span style=''>  def createConnection(conf: Configuration, validate: Boolean): ConnectionWrapper = {
+</span>124 <span style=''>    if (</span><span style='background: #AEF1AE'>User.isHBaseSecurityEnabled(conf)</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>125 <span style=''></span><span style='background: #F0ADAD'>      configureSecurity(conf)
+</span>126 <span style=''></span><span style='background: #F0ADAD'>      val action = new PrivilegedExceptionAction[ConnectionWrapper]() {
+</span>127 <span style=''></span><span style='background: #F0ADAD'>        override def run(): ConnectionWrapper = doCreateConnection(conf, validate)
+</span>128 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>129 <span style=''></span><span style='background: #F0ADAD'>      val user = UserGroupInformation.getLoginUser
+</span>130 <span style=''></span><span style='background: #F0ADAD'>      logger.info(s&quot;Creating Secured HBase connection with user $user&quot;)
+</span>131 <span style=''></span><span style='background: #F0ADAD'>      user.doAs(action)
+</span>132 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''> else </span><span style='background: #AEF1AE'>{
+</span>133 <span style=''></span><span style='background: #AEF1AE'>      logger.info(s&quot;Creating unsecured HBase connection&quot;)
+</span>134 <span style=''></span><span style='background: #AEF1AE'>      doCreateConnection(conf, validate)
+</span>135 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>136 <span style=''>  }
+</span>137 <span style=''>
+</span>138 <span style=''>  private def doCreateConnection(conf: Configuration, validate: Boolean): ConnectionWrapper = {
+</span>139 <span style=''>    if (validate) </span><span style='background: #AEF1AE'>{
+</span>140 <span style=''></span><span style='background: #AEF1AE'>      logger.debug(&quot;Checking configuration availability&quot;)
+</span>141 <span style=''></span><span style='background: #AEF1AE'>      HBaseVersions.checkAvailable(conf)
+</span>142 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>143 <span style=''>    val connection = </span><span style='background: #AEF1AE'>ConnectionFactory.createConnection(conf)</span><span style=''>
+</span>144 <span style=''>    val kerberos = if (</span><span style='background: #AEF1AE'>User.isHBaseSecurityEnabled(conf)</span><span style=''>) { </span><span style='background: #F0ADAD'>Some(HadoopUtils.kerberosTicketRenewer())</span><span style=''> } else { </span><span style='background: #AEF1AE'>None</span><span style=''> }
+</span>145 <span style=''>    </span><span style='background: #AEF1AE'>SingletonConnection(connection, kerberos)</span><span style=''>
+</span>146 <span style=''>  }
+</span>147 <span style=''>
+</span>148 <span style=''>  /**
+</span>149 <span style=''>   * Configures hadoop security, based on the configuration.
+</span>150 <span style=''>   *
+</span>151 <span style=''>   * Note: hadoop security is configured globally - having different security settings in a single JVM
+</span>152 <span style=''>   * will likely result in errors
+</span>153 <span style=''>   *
+</span>154 <span style=''>   * @param conf conf
+</span>155 <span style=''>   */
+</span>156 <span style=''>  def configureSecurity(conf: Configuration): Unit = </span><span style='background: #F0ADAD'>synchronized {
+</span>157 <span style=''></span><span style='background: #F0ADAD'>    import AuthenticationTokenIdentifier.AUTH_TOKEN_TYPE
+</span>158 <span style=''></span><span style='background: #F0ADAD'>
+</span>159 <span style=''></span><span style='background: #F0ADAD'>    if (User.isHBaseSecurityEnabled(conf)) {
+</span>160 <span style=''></span><span style='background: #F0ADAD'>      val currentUser = UserGroupInformation.getLoginUser
+</span>161 <span style=''></span><span style='background: #F0ADAD'>      if (currentUser.getCredentials.getAllTokens.asScala.exists(_.getKind == AUTH_TOKEN_TYPE)) {
+</span>162 <span style=''></span><span style='background: #F0ADAD'>        logger.debug(&quot;Using existing HBase authentication token&quot;)
+</span>163 <span style=''></span><span style='background: #F0ADAD'>      } else {
+</span>164 <span style=''></span><span style='background: #F0ADAD'>        val keytab = conf.get(HBaseGeoMesaKeyTab)
+</span>165 <span style=''></span><span style='background: #F0ADAD'>        val rawPrincipal = conf.get(HBaseGeoMesaPrincipal)
+</span>166 <span style=''></span><span style='background: #F0ADAD'>
+</span>167 <span style=''></span><span style='background: #F0ADAD'>        if (keytab == null || rawPrincipal == null) {
+</span>168 <span style=''></span><span style='background: #F0ADAD'>          lazy val missing =
+</span>169 <span style=''></span><span style='background: #F0ADAD'>            Seq(HBaseGeoMesaKeyTab -&gt; keytab, HBaseGeoMesaPrincipal -&gt; rawPrincipal).collect { case (k, null) =&gt; k }
+</span>170 <span style=''></span><span style='background: #F0ADAD'>          logger.warn(s&quot;Security is enabled but missing credentials under '${missing.mkString(&quot;' and '&quot;)}'&quot;)
+</span>171 <span style=''></span><span style='background: #F0ADAD'>        } else {
+</span>172 <span style=''></span><span style='background: #F0ADAD'>          val principal = fullPrincipal(rawPrincipal)
+</span>173 <span style=''></span><span style='background: #F0ADAD'>
+</span>174 <span style=''></span><span style='background: #F0ADAD'>          lazy val principalMsg =
+</span>175 <span style=''></span><span style='background: #F0ADAD'>            s&quot;'$principal'${if (principal == rawPrincipal) { &quot;&quot; } else { s&quot; (original '$rawPrincipal')&quot;}}&quot;
+</span>176 <span style=''></span><span style='background: #F0ADAD'>          logger.debug(
+</span>177 <span style=''></span><span style='background: #F0ADAD'>            s&quot;Using Kerberos with principal $principalMsg, keytab '$keytab', &quot; +
+</span>178 <span style=''></span><span style='background: #F0ADAD'>                s&quot;and Hadoop authentication method '${SecurityUtil.getAuthenticationMethod(conf)}'&quot;)
+</span>179 <span style=''></span><span style='background: #F0ADAD'>
+</span>180 <span style=''></span><span style='background: #F0ADAD'>          if (currentUser.hasKerberosCredentials &amp;&amp; currentUser.getUserName == principal) {
+</span>181 <span style=''></span><span style='background: #F0ADAD'>            logger.debug(s&quot;User '$principal' is already authenticated&quot;)
+</span>182 <span style=''></span><span style='background: #F0ADAD'>          } else {
+</span>183 <span style=''></span><span style='background: #F0ADAD'>            if (currentUser.hasKerberosCredentials) {
+</span>184 <span style=''></span><span style='background: #F0ADAD'>              logger.warn(
+</span>185 <span style=''></span><span style='background: #F0ADAD'>                s&quot;Changing global authenticated Hadoop user from '${currentUser.getUserName}' to '$principal' -&quot; +
+</span>186 <span style=''></span><span style='background: #F0ADAD'>                    &quot;this will affect any connections still using the old user&quot;)
+</span>187 <span style=''></span><span style='background: #F0ADAD'>            }
+</span>188 <span style=''></span><span style='background: #F0ADAD'>            UserGroupInformation.setConfiguration(conf)
+</span>189 <span style=''></span><span style='background: #F0ADAD'>            UserGroupInformation.loginUserFromKeytab(principal, keytab)
+</span>190 <span style=''></span><span style='background: #F0ADAD'>
+</span>191 <span style=''></span><span style='background: #F0ADAD'>            logger.debug(s&quot;Logged into Hadoop with user '${UserGroupInformation.getLoginUser.getUserName}'&quot;)
+</span>192 <span style=''></span><span style='background: #F0ADAD'>          }
+</span>193 <span style=''></span><span style='background: #F0ADAD'>        }
+</span>194 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>195 <span style=''></span><span style='background: #F0ADAD'>    }
+</span>196 <span style=''></span><span style='background: #F0ADAD'>  }</span><span style=''>
+</span>197 <span style=''>
+</span>198 <span style=''>  /**
+</span>199 <span style=''>   * Replace _HOST with the current host and add the default realm if nothing is specified.
+</span>200 <span style=''>   *
+</span>201 <span style=''>   * `SecurityUtil.getServerPrincipal` will replace the _HOST but only if there is already a realm.
+</span>202 <span style=''>   *
+</span>203 <span style=''>   * @param principal kerberos principal
+</span>204 <span style=''>   * @return
+</span>205 <span style=''>   */
+</span>206 <span style=''>  private def fullPrincipal(principal: String): String = {
+</span>207 <span style=''>    if (</span><span style='background: #F0ADAD'>principal.indexOf('@') != -1</span><span style=''>) {
+</span>208 <span style=''>      // we have a realm so this should be work to replace _HOST if present
+</span>209 <span style=''>      </span><span style='background: #F0ADAD'>SecurityUtil.getServerPrincipal(principal, null: String)</span><span style=''>
+</span>210 <span style=''>    } else {
+</span>211 <span style=''>      // try to add the default realm and replace _HOST if present
+</span>212 <span style=''>      </span><span style='background: #F0ADAD'>Try(KerberosUtil.getDefaultRealm) match {
+</span>213 <span style=''></span><span style='background: #F0ADAD'>        case Success(realm) =&gt; SecurityUtil.getServerPrincipal(s&quot;$principal@$realm&quot;, null: String)
+</span>214 <span style=''></span><span style='background: #F0ADAD'>        case Failure(e) =&gt;
+</span>215 <span style=''></span><span style='background: #F0ADAD'>          logger.warn(s&quot;Unable to get default Kerberos realm: $e&quot;)
+</span>216 <span style=''></span><span style='background: #F0ADAD'>          if (!principal.contains(SecurityUtil.HOSTNAME_PATTERN)) { principal } else {
+</span>217 <span style=''></span><span style='background: #F0ADAD'>            // append a fake realm so that the _HOST replacement works and then remove it afterwards
+</span>218 <span style=''></span><span style='background: #F0ADAD'>            SecurityUtil.getServerPrincipal(s&quot;$principal@foo&quot;, null: String).dropRight(4)
+</span>219 <span style=''></span><span style='background: #F0ADAD'>          }
+</span>220 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
+</span>221 <span style=''>    }
+</span>222 <span style=''>  }
+</span>223 <span style=''>
+</span>224 <span style=''>  /**
+</span>225 <span style=''>   * Managed connection. The connection itself should not be closed - instead close the wrapper to handle
+</span>226 <span style=''>   * lifecycle events appropriately.
+</span>227 <span style=''>   */
+</span>228 <span style=''>  sealed trait ConnectionWrapper extends Closeable {
+</span>229 <span style=''>    val connection: Connection
+</span>230 <span style=''>  }
+</span>231 <span style=''>
+</span>232 <span style=''>  /**
+</span>233 <span style=''>   * An unshared connection
+</span>234 <span style=''>   *
+</span>235 <span style=''>   * @param connection connection
+</span>236 <span style=''>   * @param kerberos kerberos ticket renewal thread
+</span>237 <span style=''>   */
+</span>238 <span style=''>  case class SingletonConnection(connection: Connection, kerberos: Option[Closeable]) extends ConnectionWrapper {
+</span>239 <span style=''>    override def close(): Unit = </span><span style='background: #F0ADAD'>CloseWithLogging(kerberos.toSeq ++ Seq(connection))</span><span style=''>
+</span>240 <span style=''>  }
+</span>241 <span style=''>
+</span>242 <span style=''>  /**
+</span>243 <span style=''>   * A shared, cached connection
+</span>244 <span style=''>   *
+</span>245 <span style=''>   * @param connection connection
+</span>246 <span style=''>   * @param kerberos kerberos ticket renewal thread
+</span>247 <span style=''>   */
+</span>248 <span style=''>  case class CachedConnection(connection: Connection, kerberos: Option[Closeable]) extends ConnectionWrapper {
+</span>249 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
+</span>250 <span style=''>  }
+</span>251 <span style=''>
+</span>252 <span style=''>  /**
+</span>253 <span style=''>   * Provided connection - no lifecycle management is performed
+</span>254 <span style=''>   *
+</span>255 <span style=''>   * @param connection connection
+</span>256 <span style=''>   */
+</span>257 <span style=''>  case class ProvidedConnection(connection: Connection) extends ConnectionWrapper {
+</span>258 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
+</span>259 <span style=''>  }
+</span>260 <span style=''>
+</span>261 <span style=''>  private case class ConfigKey(zookeepers: Option[String], paths: Option[String], xml: Option[String])
+</span>262 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -297,15 +298,15 @@
         <th>Code</th>
       </tr><tr>
         <td>
-          35
+          36
         </td>
         <td>
           154
         </td>
         <td>
-          1823
+          1883
           -
-          3281
+          3341
         </td>
         <td>
           Apply
@@ -325,7 +326,7 @@
     };
     &lt;stable&gt; &lt;accessor&gt; lazy private val configuration: org.apache.hadoop.conf.Configuration = {
       val base: org.apache.hadoop.conf.Configuration = org.apache.hadoop.hbase.HBaseConfiguration.create();
-      HBaseDataStoreFactory.ConfigPathProperty.option.foreach[Unit](((x$1: String) =&gt; $anon.this.addResources(base, x$1)));
+      org.locationtech.geomesa.hbase.`package`.HBaseSystemProperties.ConfigPathProperty.option.foreach[Unit](((x$1: String) =&gt; $anon.this.addResources(base, x$1)));
       base
     };
     override def load(key: org.locationtech.geomesa.hbase.data.HBaseConnectionPool.ConfigKey): org.apache.hadoop.conf.Configuration = {
@@ -350,15 +351,15 @@
         </td>
       </tr><tr>
         <td>
-          36
+          37
         </td>
         <td>
           153
         </td>
         <td>
-          1856
+          1916
           -
-          1859
+          1919
         </td>
         <td>
           Apply
@@ -374,15 +375,15 @@
         </td>
       </tr><tr>
         <td>
-          46
+          47
         </td>
         <td>
           129
         </td>
         <td>
-          2285
+          2345
           -
-          2317
+          2377
         </td>
         <td>
           Apply
@@ -398,15 +399,15 @@
         </td>
       </tr><tr>
         <td>
-          48
+          49
         </td>
         <td>
           130
         </td>
         <td>
-          2390
+          2450
           -
-          2490
+          2550
         </td>
         <td>
           Apply
@@ -422,15 +423,15 @@
         </td>
       </tr><tr>
         <td>
-          50
+          51
         </td>
         <td>
           131
         </td>
         <td>
-          2668
+          2728
           -
-          2690
+          2750
         </td>
         <td>
           Select
@@ -446,15 +447,15 @@
         </td>
       </tr><tr>
         <td>
-          50
+          51
         </td>
         <td>
           132
         </td>
         <td>
-          2655
+          2715
           -
-          2691
+          2751
         </td>
         <td>
           Apply
@@ -470,15 +471,15 @@
         </td>
       </tr><tr>
         <td>
-          50
+          51
         </td>
         <td>
           133
         </td>
         <td>
-          2630
+          2690
           -
-          2692
+          2752
         </td>
         <td>
           Apply
@@ -494,15 +495,15 @@
         </td>
       </tr><tr>
         <td>
-          50
+          51
         </td>
         <td>
           134
         </td>
         <td>
-          2613
+          2673
           -
-          2693
+          2753
         </td>
         <td>
           Apply
@@ -518,15 +519,15 @@
         </td>
       </tr><tr>
         <td>
-          50
+          51
         </td>
         <td>
           135
         </td>
         <td>
-          2590
+          2650
           -
-          2694
+          2754
         </td>
         <td>
           Apply
@@ -542,15 +543,15 @@
         </td>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
           136
         </td>
         <td>
-          2721
+          2781
           -
-          2742
+          2802
         </td>
         <td>
           Apply
@@ -566,15 +567,15 @@
         </td>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
           137
         </td>
         <td>
-          2703
+          2763
           -
-          2743
+          2803
         </td>
         <td>
           Apply
@@ -590,15 +591,15 @@
         </td>
       </tr><tr>
         <td>
-          52
+          53
         </td>
         <td>
           138
         </td>
         <td>
-          2781
+          2841
           -
-          2822
+          2882
         </td>
         <td>
           Apply
@@ -614,15 +615,15 @@
         </td>
       </tr><tr>
         <td>
-          52
+          53
         </td>
         <td>
           139
         </td>
         <td>
-          2752
+          2812
           -
-          2823
+          2883
         </td>
         <td>
           Apply
@@ -638,15 +639,15 @@
         </td>
       </tr><tr>
         <td>
-          53
+          54
         </td>
         <td>
           140
         </td>
         <td>
-          2862
+          2922
           -
-          2914
+          2974
         </td>
         <td>
           Apply
@@ -662,15 +663,15 @@
         </td>
       </tr><tr>
         <td>
-          53
+          54
         </td>
         <td>
           141
         </td>
         <td>
-          2836
+          2896
           -
-          2914
+          2974
         </td>
         <td>
           Apply
@@ -686,15 +687,15 @@
         </td>
       </tr><tr>
         <td>
-          53
+          54
         </td>
         <td>
           143
         </td>
         <td>
-          2832
+          2892
           -
-          2832
+          2892
         </td>
         <td>
           Literal
@@ -710,15 +711,15 @@
         </td>
       </tr><tr>
         <td>
-          53
+          54
         </td>
         <td>
           144
         </td>
         <td>
-          2832
+          2892
           -
-          2832
+          2892
         </td>
         <td>
           Block
@@ -734,15 +735,15 @@
         </td>
       </tr><tr>
         <td>
-          54
+          55
         </td>
         <td>
           142
         </td>
         <td>
-          2928
+          2988
           -
-          3064
+          3124
         </td>
         <td>
           Typed
@@ -761,15 +762,15 @@ else
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           145
         </td>
         <td>
-          3180
+          3240
           -
-          3196
+          3256
         </td>
         <td>
           Apply
@@ -785,15 +786,15 @@ else
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           146
         </td>
         <td>
-          3201
+          3261
           -
-          3207
+          3267
         </td>
         <td>
           Apply
@@ -809,15 +810,15 @@ else
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           147
         </td>
         <td>
-          3200
+          3260
           -
-          3200
+          3260
         </td>
         <td>
           ApplyToImplicitArgs
@@ -833,15 +834,15 @@ else
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           148
         </td>
         <td>
-          3180
+          3240
           -
-          3208
+          3268
         </td>
         <td>
           ApplyToImplicitArgs
@@ -857,15 +858,15 @@ else
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           149
         </td>
         <td>
-          3219
+          3279
           -
-          3228
+          3288
         </td>
         <td>
           Apply
@@ -881,15 +882,15 @@ else
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           150
         </td>
         <td>
-          3180
+          3240
           -
-          3229
+          3289
         </td>
         <td>
           Apply
@@ -905,15 +906,15 @@ else
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           151
         </td>
         <td>
-          3238
+          3298
           -
-          3270
+          3330
         </td>
         <td>
           Apply
@@ -929,15 +930,15 @@ else
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           152
         </td>
         <td>
-          3180
+          3240
           -
-          3271
+          3331
         </td>
         <td>
           Apply
@@ -953,15 +954,15 @@ else
         </td>
       </tr><tr>
         <td>
-          65
+          66
         </td>
         <td>
           163
         </td>
         <td>
-          3370
+          3430
           -
-          3811
+          3871
         </td>
         <td>
           Apply
@@ -989,15 +990,15 @@ else
         </td>
       </tr><tr>
         <td>
-          66
+          67
         </td>
         <td>
           162
         </td>
         <td>
-          3403
+          3463
           -
-          3406
+          3466
         </td>
         <td>
           Apply
@@ -1013,15 +1014,15 @@ else
         </td>
       </tr><tr>
         <td>
-          68
+          69
         </td>
         <td>
           155
         </td>
         <td>
-          3567
+          3627
           -
-          3573
+          3633
         </td>
         <td>
           Select
@@ -1037,15 +1038,15 @@ else
         </td>
       </tr><tr>
         <td>
-          68
+          69
         </td>
         <td>
           156
         </td>
         <td>
-          3575
+          3635
           -
-          3581
+          3641
         </td>
         <td>
           Select
@@ -1061,15 +1062,15 @@ else
         </td>
       </tr><tr>
         <td>
-          68
+          69
         </td>
         <td>
           157
         </td>
         <td>
-          3550
+          3610
           -
-          3582
+          3642
         </td>
         <td>
           Apply
@@ -1085,15 +1086,15 @@ else
         </td>
       </tr><tr>
         <td>
-          69
+          70
         </td>
         <td>
           158
         </td>
         <td>
-          3651
+          3711
           -
-          3689
+          3749
         </td>
         <td>
           Apply
@@ -1109,15 +1110,15 @@ else
         </td>
       </tr><tr>
         <td>
-          69
+          70
         </td>
         <td>
           159
         </td>
         <td>
-          3651
+          3711
           -
-          3689
+          3749
         </td>
         <td>
           Block
@@ -1133,15 +1134,15 @@ else
         </td>
       </tr><tr>
         <td>
-          70
+          71
         </td>
         <td>
           160
         </td>
         <td>
-          3710
+          3770
           -
-          3783
+          3843
         </td>
         <td>
           Throw
@@ -1157,15 +1158,15 @@ else
         </td>
       </tr><tr>
         <td>
-          70
+          71
         </td>
         <td>
           161
         </td>
         <td>
-          3710
+          3770
           -
-          3783
+          3843
         </td>
         <td>
           Block
@@ -1181,15 +1182,15 @@ else
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
           174
         </td>
         <td>
-          3850
+          3910
           -
-          3853
+          3913
         </td>
         <td>
           Apply
@@ -1205,15 +1206,15 @@ else
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
           175
         </td>
         <td>
-          3815
+          3875
           -
-          4016
+          4076
         </td>
         <td>
           Apply
@@ -1243,15 +1244,15 @@ else
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
           164
         </td>
         <td>
-          3919
+          3979
           -
-          3947
+          4007
         </td>
         <td>
           Apply
@@ -1267,15 +1268,15 @@ else
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
           165
         </td>
         <td>
-          4007
+          4067
           -
-          4008
+          4068
         </td>
         <td>
           ApplyImplicitView
@@ -1291,15 +1292,15 @@ else
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
           166
         </td>
         <td>
-          4004
+          4064
           -
-          4004
+          4064
         </td>
         <td>
           TypeApply
@@ -1315,15 +1316,15 @@ else
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
           167
         </td>
         <td>
-          3997
+          4057
           -
-          4008
+          4068
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1339,15 +1340,15 @@ else
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
           168
         </td>
         <td>
-          3997
+          4057
           -
-          4008
+          4068
         </td>
         <td>
           Block
@@ -1363,15 +1364,15 @@ else
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
           169
         </td>
         <td>
-          3964
+          4024
           -
-          3964
+          4024
         </td>
         <td>
           TypeApply
@@ -1387,15 +1388,15 @@ else
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
           170
         </td>
         <td>
-          3919
+          3979
           -
-          4010
+          4070
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1413,15 +1414,15 @@ else
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
           171
         </td>
         <td>
-          3918
+          3978
           -
-          3918
+          3978
         </td>
         <td>
           Select
@@ -1437,15 +1438,15 @@ else
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
           172
         </td>
         <td>
-          3902
+          3962
           -
-          4011
+          4071
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1463,15 +1464,15 @@ else
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
           173
         </td>
         <td>
-          3918
+          3978
           -
-          3918
+          3978
         </td>
         <td>
           Literal
@@ -1487,15 +1488,15 @@ else
         </td>
       </tr><tr>
         <td>
-          88
+          89
         </td>
         <td>
           176
         </td>
         <td>
-          4218
+          4278
           -
-          4250
+          4310
         </td>
         <td>
           Apply
@@ -1511,15 +1512,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           177
         </td>
         <td>
-          4267
+          4327
           -
-          4301
+          4361
         </td>
         <td>
           Apply
@@ -1535,15 +1536,15 @@ else
         </td>
       </tr><tr>
         <td>
-          90
+          91
         </td>
         <td>
           178
         </td>
         <td>
-          4316
+          4376
           -
-          4346
+          4406
         </td>
         <td>
           Apply
@@ -1559,15 +1560,15 @@ else
         </td>
       </tr><tr>
         <td>
-          91
+          92
         </td>
         <td>
           179
         </td>
         <td>
-          4363
+          4423
           -
-          4388
+          4448
         </td>
         <td>
           Apply
@@ -1583,15 +1584,15 @@ else
         </td>
       </tr><tr>
         <td>
-          91
+          92
         </td>
         <td>
           180
         </td>
         <td>
-          4351
+          4411
           -
-          4389
+          4449
         </td>
         <td>
           Apply
@@ -1607,15 +1608,15 @@ else
         </td>
       </tr><tr>
         <td>
-          102
+          103
         </td>
         <td>
           181
         </td>
         <td>
-          4675
+          4735
           -
-          4705
+          4765
         </td>
         <td>
           Apply
@@ -1631,15 +1632,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
           182
         </td>
         <td>
-          4734
+          4794
           -
-          4764
+          4824
         </td>
         <td>
           Apply
@@ -1655,15 +1656,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
           183
         </td>
         <td>
-          4715
+          4775
           -
-          4765
+          4825
         </td>
         <td>
           Apply
@@ -1679,15 +1680,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
           184
         </td>
         <td>
-          4715
+          4775
           -
-          4765
+          4825
         </td>
         <td>
           Block
@@ -1703,15 +1704,15 @@ else
         </td>
       </tr><tr>
         <td>
-          104
+          105
         </td>
         <td>
           193
         </td>
         <td>
-          4777
+          4837
           -
-          5099
+          5159
         </td>
         <td>
           Block
@@ -1737,15 +1738,15 @@ else
         </td>
       </tr><tr>
         <td>
-          105
+          106
         </td>
         <td>
           185
         </td>
         <td>
-          4796
+          4856
           -
-          4820
+          4880
         </td>
         <td>
           Apply
@@ -1761,15 +1762,15 @@ else
         </td>
       </tr><tr>
         <td>
-          107
+          108
         </td>
         <td>
           186
         </td>
         <td>
-          4927
+          4987
           -
-          4984
+          5044
         </td>
         <td>
           Apply
@@ -1785,15 +1786,15 @@ else
         </td>
       </tr><tr>
         <td>
-          107
+          108
         </td>
         <td>
           187
         </td>
         <td>
-          4927
+          4987
           -
-          4984
+          5044
         </td>
         <td>
           ApplyImplicitView
@@ -1809,15 +1810,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           188
         </td>
         <td>
-          5012
+          5072
           -
-          5028
+          5088
         </td>
         <td>
           Apply
@@ -1833,15 +1834,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           189
         </td>
         <td>
-          4996
+          5056
           -
-          5029
+          5089
         </td>
         <td>
           Apply
@@ -1857,15 +1858,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           190
         </td>
         <td>
-          4996
+          5056
           -
-          5029
+          5089
         </td>
         <td>
           Block
@@ -1881,15 +1882,15 @@ else
         </td>
       </tr><tr>
         <td>
-          110
+          111
         </td>
         <td>
           191
         </td>
         <td>
-          5053
+          5113
           -
-          5085
+          5145
         </td>
         <td>
           Apply
@@ -1905,15 +1906,15 @@ else
         </td>
       </tr><tr>
         <td>
-          110
+          111
         </td>
         <td>
           192
         </td>
         <td>
-          5053
+          5113
           -
-          5085
+          5145
         </td>
         <td>
           Block
@@ -1929,15 +1930,15 @@ else
         </td>
       </tr><tr>
         <td>
-          123
+          124
         </td>
         <td>
           194
         </td>
         <td>
-          5376
+          5436
           -
-          5409
+          5469
         </td>
         <td>
           Apply
@@ -1953,15 +1954,15 @@ else
         </td>
       </tr><tr>
         <td>
-          123
+          124
         </td>
         <td>
           200
         </td>
         <td>
-          5411
+          5471
           -
-          5758
+          5818
         </td>
         <td>
           Block
@@ -1995,15 +1996,15 @@ else
         </td>
       </tr><tr>
         <td>
-          124
+          125
         </td>
         <td>
           195
         </td>
         <td>
-          5419
+          5479
           -
-          5442
+          5502
         </td>
         <td>
           Apply
@@ -2019,15 +2020,15 @@ else
         </td>
       </tr><tr>
         <td>
-          125
+          126
         </td>
         <td>
           197
         </td>
         <td>
-          5462
+          5522
           -
-          5465
+          5525
         </td>
         <td>
           Apply
@@ -2043,15 +2044,15 @@ else
         </td>
       </tr><tr>
         <td>
-          126
+          127
         </td>
         <td>
           196
         </td>
         <td>
-          5563
+          5623
           -
-          5597
+          5657
         </td>
         <td>
           Apply
@@ -2067,15 +2068,15 @@ else
         </td>
       </tr><tr>
         <td>
-          128
+          129
         </td>
         <td>
           198
         </td>
         <td>
-          5623
+          5683
           -
-          5656
+          5716
         </td>
         <td>
           Apply
@@ -2091,15 +2092,15 @@ else
         </td>
       </tr><tr>
         <td>
-          130
+          131
         </td>
         <td>
           199
         </td>
         <td>
-          5735
+          5795
           -
-          5752
+          5812
         </td>
         <td>
           Apply
@@ -2115,15 +2116,15 @@ else
         </td>
       </tr><tr>
         <td>
-          131
+          132
         </td>
         <td>
           202
         </td>
         <td>
-          5764
+          5824
           -
-          5870
+          5930
         </td>
         <td>
           Block
@@ -2145,15 +2146,15 @@ else
         </td>
       </tr><tr>
         <td>
-          133
+          134
         </td>
         <td>
           201
         </td>
         <td>
-          5830
+          5890
           -
-          5864
+          5924
         </td>
         <td>
           Apply
@@ -2169,15 +2170,15 @@ else
         </td>
       </tr><tr>
         <td>
-          138
+          139
         </td>
         <td>
           204
         </td>
         <td>
-          5990
+          6050
           -
-          6096
+          6156
         </td>
         <td>
           Block
@@ -2199,15 +2200,15 @@ else
         </td>
       </tr><tr>
         <td>
-          138
+          139
         </td>
         <td>
           205
         </td>
         <td>
-          5976
+          6036
           -
-          5976
+          6036
         </td>
         <td>
           Literal
@@ -2223,15 +2224,15 @@ else
         </td>
       </tr><tr>
         <td>
-          138
+          139
         </td>
         <td>
           206
         </td>
         <td>
-          5976
+          6036
           -
-          5976
+          6036
         </td>
         <td>
           Block
@@ -2247,15 +2248,15 @@ else
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           203
         </td>
         <td>
-          6056
+          6116
           -
-          6090
+          6150
         </td>
         <td>
           Apply
@@ -2271,15 +2272,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           207
         </td>
         <td>
-          6118
+          6178
           -
-          6158
+          6218
         </td>
         <td>
           Apply
@@ -2295,15 +2296,15 @@ else
         </td>
       </tr><tr>
         <td>
-          143
+          144
         </td>
         <td>
           208
         </td>
         <td>
-          6182
+          6242
           -
-          6215
+          6275
         </td>
         <td>
           Apply
@@ -2319,15 +2320,15 @@ else
         </td>
       </tr><tr>
         <td>
-          143
+          144
         </td>
         <td>
           209
         </td>
         <td>
-          6224
+          6284
           -
-          6259
+          6319
         </td>
         <td>
           Apply
@@ -2343,15 +2344,15 @@ else
         </td>
       </tr><tr>
         <td>
-          143
+          144
         </td>
         <td>
           210
         </td>
         <td>
-          6219
+          6279
           -
-          6260
+          6320
         </td>
         <td>
           Apply
@@ -2367,15 +2368,15 @@ else
         </td>
       </tr><tr>
         <td>
-          143
+          144
         </td>
         <td>
           211
         </td>
         <td>
-          6219
+          6279
           -
-          6260
+          6320
         </td>
         <td>
           Block
@@ -2391,15 +2392,15 @@ else
         </td>
       </tr><tr>
         <td>
-          143
+          144
         </td>
         <td>
           212
         </td>
         <td>
-          6270
+          6330
           -
-          6274
+          6334
         </td>
         <td>
           Select
@@ -2415,15 +2416,15 @@ else
         </td>
       </tr><tr>
         <td>
-          143
+          144
         </td>
         <td>
           213
         </td>
         <td>
-          6270
+          6330
           -
-          6274
+          6334
         </td>
         <td>
           Block
@@ -2439,15 +2440,15 @@ else
         </td>
       </tr><tr>
         <td>
-          144
+          145
         </td>
         <td>
           214
         </td>
         <td>
-          6281
+          6341
           -
-          6322
+          6382
         </td>
         <td>
           Apply
@@ -2463,15 +2464,15 @@ else
         </td>
       </tr><tr>
         <td>
-          155
+          156
         </td>
         <td>
           246
         </td>
         <td>
-          6623
+          6683
           -
-          8568
+          8628
         </td>
         <td>
           Apply
@@ -2562,15 +2563,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
           215
         </td>
         <td>
-          6704
+          6764
           -
-          6737
+          6797
         </td>
         <td>
           Apply
@@ -2586,15 +2587,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
           243
         </td>
         <td>
-          6739
+          6799
           -
-          8564
+          8624
         </td>
         <td>
           Block
@@ -2679,15 +2680,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
           244
         </td>
         <td>
-          6700
+          6760
           -
-          6700
+          6760
         </td>
         <td>
           Literal
@@ -2703,15 +2704,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
           245
         </td>
         <td>
-          6700
+          6760
           -
-          6700
+          6760
         </td>
         <td>
           Block
@@ -2727,15 +2728,15 @@ else
         </td>
       </tr><tr>
         <td>
-          159
+          160
         </td>
         <td>
           216
         </td>
         <td>
-          6765
+          6825
           -
-          6798
+          6858
         </td>
         <td>
           Apply
@@ -2751,15 +2752,15 @@ else
         </td>
       </tr><tr>
         <td>
-          160
+          161
         </td>
         <td>
           217
         </td>
         <td>
-          6809
+          6869
           -
-          6848
+          6908
         </td>
         <td>
           Apply
@@ -2775,15 +2776,15 @@ else
         </td>
       </tr><tr>
         <td>
-          160
+          161
         </td>
         <td>
           218
         </td>
         <td>
-          6877
+          6937
           -
-          6892
+          6952
         </td>
         <td>
           Select
@@ -2799,15 +2800,15 @@ else
         </td>
       </tr><tr>
         <td>
-          160
+          161
         </td>
         <td>
           219
         </td>
         <td>
-          6864
+          6924
           -
-          6892
+          6952
         </td>
         <td>
           Apply
@@ -2823,15 +2824,15 @@ else
         </td>
       </tr><tr>
         <td>
-          160
+          161
         </td>
         <td>
           220
         </td>
         <td>
-          6809
+          6869
           -
-          6893
+          6953
         </td>
         <td>
           Apply
@@ -2847,15 +2848,15 @@ else
         </td>
       </tr><tr>
         <td>
-          161
+          162
         </td>
         <td>
           221
         </td>
         <td>
-          6905
+          6965
           -
-          6962
+          7022
         </td>
         <td>
           Typed
@@ -2874,15 +2875,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          163
         </td>
         <td>
           242
         </td>
         <td>
-          6976
+          7036
           -
-          8558
+          8618
         </td>
         <td>
           Block
@@ -2958,15 +2959,15 @@ else
         </td>
       </tr><tr>
         <td>
-          163
+          164
         </td>
         <td>
           222
         </td>
         <td>
-          7008
+          7068
           -
-          7026
+          7086
         </td>
         <td>
           Select
@@ -2982,15 +2983,15 @@ else
         </td>
       </tr><tr>
         <td>
-          163
+          164
         </td>
         <td>
           223
         </td>
         <td>
-          6999
+          7059
           -
-          7027
+          7087
         </td>
         <td>
           Apply
@@ -3006,15 +3007,15 @@ else
         </td>
       </tr><tr>
         <td>
-          164
+          165
         </td>
         <td>
           224
         </td>
         <td>
-          7064
+          7124
           -
-          7085
+          7145
         </td>
         <td>
           Select
@@ -3030,15 +3031,15 @@ else
         </td>
       </tr><tr>
         <td>
-          164
+          165
         </td>
         <td>
           225
         </td>
         <td>
-          7055
+          7115
           -
-          7086
+          7146
         </td>
         <td>
           Apply
@@ -3054,15 +3055,15 @@ else
         </td>
       </tr><tr>
         <td>
-          166
+          167
         </td>
         <td>
           226
         </td>
         <td>
-          7110
+          7170
           -
-          7114
+          7174
         </td>
         <td>
           Literal
@@ -3078,15 +3079,15 @@ else
         </td>
       </tr><tr>
         <td>
-          166
+          167
         </td>
         <td>
           227
         </td>
         <td>
-          7118
+          7178
           -
-          7138
+          7198
         </td>
         <td>
           Apply
@@ -3102,15 +3103,15 @@ else
         </td>
       </tr><tr>
         <td>
-          166
+          167
         </td>
         <td>
           228
         </td>
         <td>
-          7100
+          7160
           -
-          7138
+          7198
         </td>
         <td>
           Apply
@@ -3126,15 +3127,15 @@ else
         </td>
       </tr><tr>
         <td>
-          166
+          167
         </td>
         <td>
           229
         </td>
         <td>
-          7140
+          7200
           -
-          7406
+          7466
         </td>
         <td>
           Block
@@ -3172,15 +3173,15 @@ else
         </td>
       </tr><tr>
         <td>
-          170
+          171
         </td>
         <td>
           241
         </td>
         <td>
-          7412
+          7472
           -
-          8550
+          8610
         </td>
         <td>
           Block
@@ -3227,15 +3228,15 @@ else
         </td>
       </tr><tr>
         <td>
-          171
+          172
         </td>
         <td>
           230
         </td>
         <td>
-          7440
+          7500
           -
-          7467
+          7527
         </td>
         <td>
           Apply
@@ -3251,15 +3252,15 @@ else
         </td>
       </tr><tr>
         <td>
-          179
+          180
         </td>
         <td>
           231
         </td>
         <td>
-          7869
+          7929
           -
-          7905
+          7965
         </td>
         <td>
           Apply
@@ -3275,15 +3276,15 @@ else
         </td>
       </tr><tr>
         <td>
-          179
+          180
         </td>
         <td>
           232
         </td>
         <td>
-          7831
+          7891
           -
-          7905
+          7965
         </td>
         <td>
           Apply
@@ -3299,15 +3300,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          181
         </td>
         <td>
           233
         </td>
         <td>
-          7921
+          7981
           -
-          7980
+          8040
         </td>
         <td>
           Typed
@@ -3326,15 +3327,15 @@ else
         </td>
       </tr><tr>
         <td>
-          181
+          182
         </td>
         <td>
           240
         </td>
         <td>
-          7998
+          8058
           -
-          8540
+          8600
         </td>
         <td>
           Block
@@ -3364,15 +3365,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          183
         </td>
         <td>
           234
         </td>
         <td>
-          8016
+          8076
           -
-          8050
+          8110
         </td>
         <td>
           Apply
@@ -3388,15 +3389,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          183
         </td>
         <td>
           236
         </td>
         <td>
-          8012
+          8072
           -
-          8012
+          8072
         </td>
         <td>
           Literal
@@ -3412,15 +3413,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          183
         </td>
         <td>
           237
         </td>
         <td>
-          8012
+          8072
           -
-          8012
+          8072
         </td>
         <td>
           Block
@@ -3436,15 +3437,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          184
         </td>
         <td>
           235
         </td>
         <td>
-          8068
+          8128
           -
-          8276
+          8336
         </td>
         <td>
           Typed
@@ -3463,15 +3464,15 @@ else
         </td>
       </tr><tr>
         <td>
-          187
+          188
         </td>
         <td>
           238
         </td>
         <td>
-          8303
+          8363
           -
-          8346
+          8406
         </td>
         <td>
           Apply
@@ -3487,15 +3488,15 @@ else
         </td>
       </tr><tr>
         <td>
-          188
+          189
         </td>
         <td>
           239
         </td>
         <td>
-          8359
+          8419
           -
-          8418
+          8478
         </td>
         <td>
           Apply
@@ -3511,15 +3512,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          207
         </td>
         <td>
           247
         </td>
         <td>
-          8905
+          8965
           -
-          8933
+          8993
         </td>
         <td>
           Apply
@@ -3535,15 +3536,15 @@ else
         </td>
       </tr><tr>
         <td>
-          208
+          209
         </td>
         <td>
           248
         </td>
         <td>
-          9062
+          9122
           -
-          9066
+          9126
         </td>
         <td>
           Literal
@@ -3559,15 +3560,15 @@ else
         </td>
       </tr><tr>
         <td>
-          208
+          209
         </td>
         <td>
           249
         </td>
         <td>
-          9019
+          9079
           -
-          9075
+          9135
         </td>
         <td>
           Apply
@@ -3583,15 +3584,15 @@ else
         </td>
       </tr><tr>
         <td>
-          208
+          209
         </td>
         <td>
           250
         </td>
         <td>
-          9019
+          9079
           -
-          9075
+          9135
         </td>
         <td>
           Block
@@ -3607,15 +3608,15 @@ else
         </td>
       </tr><tr>
         <td>
-          211
+          212
         </td>
         <td>
           251
         </td>
         <td>
-          9166
+          9226
           -
-          9194
+          9254
         </td>
         <td>
           Apply
@@ -3631,15 +3632,15 @@ else
         </td>
       </tr><tr>
         <td>
-          211
+          212
         </td>
         <td>
           252
         </td>
         <td>
-          9162
+          9222
           -
-          9195
+          9255
         </td>
         <td>
           Apply
@@ -3655,15 +3656,15 @@ else
         </td>
       </tr><tr>
         <td>
-          211
+          212
         </td>
         <td>
           263
         </td>
         <td>
-          9162
+          9222
           -
-          9694
+          9754
         </td>
         <td>
           Match
@@ -3691,15 +3692,15 @@ else
         </td>
       </tr><tr>
         <td>
-          212
+          213
         </td>
         <td>
           253
         </td>
         <td>
-          9267
+          9327
           -
-          9287
+          9347
         </td>
         <td>
           Apply
@@ -3715,15 +3716,15 @@ else
         </td>
       </tr><tr>
         <td>
-          212
+          213
         </td>
         <td>
           254
         </td>
         <td>
-          9289
+          9349
           -
-          9293
+          9353
         </td>
         <td>
           Literal
@@ -3739,15 +3740,15 @@ else
         </td>
       </tr><tr>
         <td>
-          212
+          213
         </td>
         <td>
           255
         </td>
         <td>
-          9235
+          9295
           -
-          9302
+          9362
         </td>
         <td>
           Apply
@@ -3763,15 +3764,15 @@ else
         </td>
       </tr><tr>
         <td>
-          212
+          213
         </td>
         <td>
           256
         </td>
         <td>
-          9235
+          9295
           -
-          9302
+          9362
         </td>
         <td>
           Block
@@ -3787,15 +3788,15 @@ else
         </td>
       </tr><tr>
         <td>
-          213
+          214
         </td>
         <td>
           262
         </td>
         <td>
-          9327
+          9387
           -
-          9686
+          9746
         </td>
         <td>
           Block
@@ -3820,15 +3821,15 @@ else
         </td>
       </tr><tr>
         <td>
-          215
+          216
         </td>
         <td>
           257
         </td>
         <td>
-          9431
+          9491
           -
-          9460
+          9520
         </td>
         <td>
           Literal
@@ -3844,15 +3845,15 @@ else
         </td>
       </tr><tr>
         <td>
-          215
+          216
         </td>
         <td>
           258
         </td>
         <td>
-          9411
+          9471
           -
-          9461
+          9521
         </td>
         <td>
           Select
@@ -3868,15 +3869,15 @@ else
         </td>
       </tr><tr>
         <td>
-          215
+          216
         </td>
         <td>
           259
         </td>
         <td>
-          9465
+          9525
           -
-          9474
+          9534
         </td>
         <td>
           Ident
@@ -3892,15 +3893,15 @@ else
         </td>
       </tr><tr>
         <td>
-          217
+          218
         </td>
         <td>
           260
         </td>
         <td>
-          9597
+          9657
           -
-          9674
+          9734
         </td>
         <td>
           Apply
@@ -3916,15 +3917,15 @@ else
         </td>
       </tr><tr>
         <td>
-          217
+          218
         </td>
         <td>
           261
         </td>
         <td>
-          9597
+          9657
           -
-          9674
+          9734
         </td>
         <td>
           Block
@@ -3940,15 +3941,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
           264
         </td>
         <td>
-          10245
+          10305
           -
-          10253
+          10313
         </td>
         <td>
           Select
@@ -3964,15 +3965,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
           265
         </td>
         <td>
-          10267
+          10327
           -
-          10277
+          10337
         </td>
         <td>
           Select
@@ -3988,15 +3989,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
           266
         </td>
         <td>
-          10263
+          10323
           -
-          10278
+          10338
         </td>
         <td>
           Apply
@@ -4012,15 +4013,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
           267
         </td>
         <td>
-          10260
+          10320
           -
-          10260
+          10320
         </td>
         <td>
           TypeApply
@@ -4036,15 +4037,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
           268
         </td>
         <td>
-          10245
+          10305
           -
-          10278
+          10338
         </td>
         <td>
           ApplyToImplicitArgs
@@ -4060,15 +4061,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
           269
         </td>
         <td>
-          10244
+          10304
           -
-          10244
+          10304
         </td>
         <td>
           Select
@@ -4084,15 +4085,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
           270
         </td>
         <td>
-          10228
+          10288
           -
-          10279
+          10339
         </td>
         <td>
           ApplyToImplicitArgs
@@ -4108,15 +4109,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
           271
         </td>
         <td>
-          10244
+          10304
           -
-          10244
+          10304
         </td>
         <td>
           Literal
@@ -4132,15 +4133,15 @@ else
         </td>
       </tr><tr>
         <td>
-          248
+          249
         </td>
         <td>
           272
         </td>
         <td>
-          10565
+          10625
           -
-          10567
+          10627
         </td>
         <td>
           Literal
@@ -4156,15 +4157,15 @@ else
         </td>
       </tr><tr>
         <td>
-          257
+          258
         </td>
         <td>
           273
         </td>
         <td>
-          10805
+          10865
           -
-          10807
+          10867
         </td>
         <td>
           Literal
