@@ -1,0 +1,5265 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/accumulo/data/writer/tx/AccumuloAtomicIndexWriter.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2024 Commonwealth Computer Research, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * http://www.opensource.org/licenses/apache2.0.php.
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.accumulo.data.writer
+</span>10 <span style=''>package tx
+</span>11 <span style=''>
+</span>12 <span style=''>import org.apache.accumulo.core.client.{ConditionalWriter, ConditionalWriterConfig, IsolatedScanner}
+</span>13 <span style=''>import org.apache.accumulo.core.conf.ClientProperty
+</span>14 <span style=''>import org.apache.accumulo.core.data.{Key, PartialKey}
+</span>15 <span style=''>import org.apache.hadoop.io.Text
+</span>16 <span style=''>import org.geotools.api.feature.simple.SimpleFeatureType
+</span>17 <span style=''>import org.locationtech.geomesa.accumulo.data.AccumuloDataStore
+</span>18 <span style=''>import org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus
+</span>19 <span style=''>import org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.{AppendBuilder, DeleteBuilder, UpdateBuilder}
+</span>20 <span style=''>import org.locationtech.geomesa.index.api.IndexAdapter.BaseIndexWriter
+</span>21 <span style=''>import org.locationtech.geomesa.index.api.WritableFeature.FeatureWrapper
+</span>22 <span style=''>import org.locationtech.geomesa.index.api._
+</span>23 <span style=''>import org.locationtech.geomesa.utils.io.{CloseQuietly, WithClose}
+</span>24 <span style=''>
+</span>25 <span style=''>import java.util.concurrent.TimeUnit
+</span>26 <span style=''>import scala.collection.mutable.ArrayBuffer
+</span>27 <span style=''>
+</span>28 <span style=''>/**
+</span>29 <span style=''> * Accumulo atomic index writer implementation
+</span>30 <span style=''> *
+</span>31 <span style=''> * @param ds data store
+</span>32 <span style=''> * @param sft simple feature type
+</span>33 <span style=''> * @param indices indices to write to
+</span>34 <span style=''> * @param wrapper feature wrapper
+</span>35 <span style=''> * @param partition partition to write to (if partitioned schema)
+</span>36 <span style=''> */
+</span>37 <span style=''>class AccumuloAtomicIndexWriter(
+</span>38 <span style=''>    ds: AccumuloDataStore,
+</span>39 <span style=''>    sft: SimpleFeatureType,
+</span>40 <span style=''>    indices: Seq[GeoMesaFeatureIndex[_, _]],
+</span>41 <span style=''>    wrapper: FeatureWrapper[WritableFeature],
+</span>42 <span style=''>    partition: Option[String]
+</span>43 <span style=''>  ) extends BaseIndexWriter[WritableFeature](indices, wrapper) {
+</span>44 <span style=''>
+</span>45 <span style=''>  import scala.collection.JavaConverters._
+</span>46 <span style=''>
+</span>47 <span style=''>  // should always be writing to a single table here
+</span>48 <span style=''>  private val tables = </span><span style='background: #AEF1AE'>indices.map(_.getTableName(partition))</span><span style=''>
+</span>49 <span style=''>
+</span>50 <span style=''>  private val writers: Array[ConditionalWriter] = {
+</span>51 <span style=''>    val config = </span><span style='background: #AEF1AE'>new ConditionalWriterConfig()</span><span style=''>
+</span>52 <span style=''>    </span><span style='background: #AEF1AE'>config.setAuthorizations(ds.auths)</span><span style=''>
+</span>53 <span style=''>    val maxThreads = </span><span style='background: #AEF1AE'>ClientProperty.BATCH_WRITER_THREADS_MAX.getInteger(ds.connector.properties())</span><span style=''>
+</span>54 <span style=''>    if (</span><span style='background: #AEF1AE'>maxThreads != null</span><span style=''>) {
+</span>55 <span style=''>      </span><span style='background: #AEF1AE'>config.setMaxWriteThreads(maxThreads)</span><span style=''>
+</span>56 <span style=''>    }
+</span>57 <span style=''>    val timeout = </span><span style='background: #AEF1AE'>ClientProperty.BATCH_WRITER_TIMEOUT_MAX.getTimeInMillis(ds.connector.properties())</span><span style=''>
+</span>58 <span style=''>    if (</span><span style='background: #AEF1AE'>timeout != null</span><span style=''>) {
+</span>59 <span style=''>      </span><span style='background: #AEF1AE'>config.setTimeout(timeout, TimeUnit.MILLISECONDS)</span><span style=''>
+</span>60 <span style=''>    }
+</span>61 <span style=''>    </span><span style='background: #AEF1AE'>tables.map(ds.connector.createConditionalWriter(_, config)).toArray</span><span style=''>
+</span>62 <span style=''>  }
+</span>63 <span style=''>
+</span>64 <span style=''>  private val colFamilyMappings = </span><span style='background: #AEF1AE'>indices.map(ColumnFamilyMapper.apply).toArray</span><span style=''>
+</span>65 <span style=''>  private val visCache = </span><span style='background: #AEF1AE'>new VisibilityCache()</span><span style=''>
+</span>66 <span style=''>
+</span>67 <span style=''>  override protected def append(feature: WritableFeature, values: Array[RowKeyValue[_]]): Unit =
+</span>68 <span style=''>    </span><span style='background: #AEF1AE'>mutate(feature.feature.getID, buildMutations(values, AppendBuilder.apply))</span><span style=''>
+</span>69 <span style=''>
+</span>70 <span style=''>  override protected def delete(feature: WritableFeature, values: Array[RowKeyValue[_]]): Unit =
+</span>71 <span style=''>    </span><span style='background: #AEF1AE'>mutate(feature.feature.getID, buildMutations(values, DeleteBuilder.apply))</span><span style=''>
+</span>72 <span style=''>
+</span>73 <span style=''>  override protected def update(
+</span>74 <span style=''>      feature: WritableFeature,
+</span>75 <span style=''>      values: Array[RowKeyValue[_]],
+</span>76 <span style=''>      previous: WritableFeature,
+</span>77 <span style=''>      previousValues: Array[RowKeyValue[_]]): Unit = {
+</span>78 <span style=''>    val mutations = </span><span style='background: #AEF1AE'>Array.ofDim[Seq[MutationBuilder]](values.length)</span><span style=''>
+</span>79 <span style=''>    // note: these are temporary conditions - we update them below
+</span>80 <span style=''>    val updates = </span><span style='background: #AEF1AE'>buildMutations(values, AppendBuilder.apply)</span><span style=''>
+</span>81 <span style=''>    val deletes = </span><span style='background: #AEF1AE'>buildMutations(previousValues, DeleteBuilder.apply)</span><span style=''>
+</span>82 <span style=''>    var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
+</span>83 <span style=''>    while (</span><span style='background: #AEF1AE'>i &lt; values.length</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>84 <span style=''></span><span style='background: #AEF1AE'>      val dels = ArrayBuffer(deletes(i): _*)
+</span>85 <span style=''></span><span style='background: #AEF1AE'>      val puts = updates(i).map { mutations =&gt;
+</span>86 <span style=''></span><span style='background: #AEF1AE'>        // find any previous values that will be updated
+</span>87 <span style=''></span><span style='background: #AEF1AE'>        val d = dels.indexWhere(p =&gt; java.util.Arrays.equals(p.row, mutations.row))
+</span>88 <span style=''></span><span style='background: #AEF1AE'>        if (d == -1) { mutations } else {
+</span>89 <span style=''></span><span style='background: #AEF1AE'>          // note: side-effect
+</span>90 <span style=''></span><span style='background: #AEF1AE'>          val toUpdate = dels.remove(d)
+</span>91 <span style=''></span><span style='background: #AEF1AE'>          // any previous values that are overwritten are added as conditions on the put
+</span>92 <span style=''></span><span style='background: #AEF1AE'>          // any previous values that aren't overwritten need to be deleted
+</span>93 <span style=''></span><span style='background: #AEF1AE'>          val remaining = toUpdate.kvs.filterNot(kv =&gt; mutations.kvs.exists(_.equalKey(kv)))
+</span>94 <span style=''></span><span style='background: #AEF1AE'>          if (remaining.nonEmpty) {
+</span>95 <span style=''></span><span style='background: #AEF1AE'>            dels.append(toUpdate.copy(kvs = remaining))
+</span>96 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>97 <span style=''></span><span style='background: #AEF1AE'>          UpdateBuilder(mutations.row, mutations.kvs, toUpdate.kvs)
+</span>98 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>99 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>100 <span style=''></span><span style='background: #AEF1AE'>      // note: order here is important, we need puts to operate before deletes in order for conditions to succeed
+</span>101 <span style=''></span><span style='background: #AEF1AE'>      mutations(i) = puts ++ dels
+</span>102 <span style=''></span><span style='background: #AEF1AE'>      i += 1
+</span>103 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>104 <span style=''>    </span><span style='background: #AEF1AE'>mutate(feature.feature.getID, mutations)</span><span style=''>
+</span>105 <span style=''>  }
+</span>106 <span style=''>
+</span>107 <span style=''>  /**
+</span>108 <span style=''>   * Apply the mutations
+</span>109 <span style=''>   *
+</span>110 <span style=''>   * @param id feature id
+</span>111 <span style=''>   * @param mutations mutations to apply
+</span>112 <span style=''>   */
+</span>113 <span style=''>  @throws[ConditionalWriteException]
+</span>114 <span style=''>  private def mutate(id: String, mutations: Array[Seq[MutationBuilder]]): Unit = {
+</span>115 <span style=''>    val errors = </span><span style='background: #AEF1AE'>ArrayBuffer.empty[ConditionalWriteStatus]</span><span style=''>
+</span>116 <span style=''>    val successes = </span><span style='background: #AEF1AE'>ArrayBuffer.empty[(Int, MutationBuilder)]</span><span style=''>
+</span>117 <span style=''>    var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
+</span>118 <span style=''>    while (</span><span style='background: #AEF1AE'>i &lt; mutations.length</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>119 <span style=''></span><span style='background: #AEF1AE'>      // note: mutations need to be applied in order so that conditions are correct
+</span>120 <span style=''></span><span style='background: #AEF1AE'>      mutations(i).foreach { m =&gt;
+</span>121 <span style=''></span><span style='background: #AEF1AE'>        val status = writers(i).write(m.apply()).getStatus
+</span>122 <span style=''></span><span style='background: #AEF1AE'>        if (status == ConditionalWriter.Status.ACCEPTED ||
+</span>123 <span style=''></span><span style='background: #AEF1AE'>            (status == ConditionalWriter.Status.UNKNOWN &amp;&amp; </span><span style='background: #F0ADAD'>verifyWrite(tables(i), m)</span><span style='background: #AEF1AE'>)) {
+</span>124 <span style=''></span><span style='background: #AEF1AE'>          successes += i -&gt; m
+</span>125 <span style=''></span><span style='background: #AEF1AE'>        } else {
+</span>126 <span style=''></span><span style='background: #AEF1AE'>          errors += ConditionalWriteStatus(indices(i), m.name, status)
+</span>127 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>128 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>129 <span style=''></span><span style='background: #AEF1AE'>      i += 1
+</span>130 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>131 <span style=''>    if (</span><span style='background: #AEF1AE'>errors.nonEmpty</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>132 <span style=''></span><span style='background: #AEF1AE'>      // revert any writes we made
+</span>133 <span style=''></span><span style='background: #AEF1AE'>      successes.foreach { case (i, m) =&gt;
+</span>134 <span style=''></span><span style='background: #AEF1AE'>        // note: if these are rejected, some other update has come through and we don't want to overwrite it
+</span>135 <span style=''></span><span style='background: #AEF1AE'>        writers(i).write(m.invert())
+</span>136 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>137 <span style=''></span><span style='background: #AEF1AE'>      throw ConditionalWriteException(id, errors.toSeq)
+</span>138 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>139 <span style=''>  }
+</span>140 <span style=''>
+</span>141 <span style=''>  /**
+</span>142 <span style=''>   * Verify if a mutation was successfully applied or not
+</span>143 <span style=''>   *
+</span>144 <span style=''>   * @param table table being mutated
+</span>145 <span style=''>   * @param mutation mutation being applied
+</span>146 <span style=''>   * @return true if the current state of the table reflects the mutation's intended result
+</span>147 <span style=''>   */
+</span>148 <span style=''>  private def verifyWrite(table: String, mutation: MutationBuilder): Boolean = {
+</span>149 <span style=''>    </span><span style='background: #F0ADAD'>WithClose(new IsolatedScanner(ds.connector.createScanner(table, ds.auths))) { scanner =&gt;
+</span>150 <span style=''></span><span style='background: #F0ADAD'>      val key = new Key(mutation.row)
+</span>151 <span style=''></span><span style='background: #F0ADAD'>      scanner.setRange(new org.apache.accumulo.core.data.Range(key, true, key.followingKey(PartialKey.ROW), false))
+</span>152 <span style=''></span><span style='background: #F0ADAD'>      val found = scanner.iterator().asScala.toList
+</span>153 <span style=''></span><span style='background: #F0ADAD'>      mutation.apply().getUpdates.asScala.forall { update =&gt;
+</span>154 <span style=''></span><span style='background: #F0ADAD'>        if (update.isDeleted) {
+</span>155 <span style=''></span><span style='background: #F0ADAD'>          found.forall { entry =&gt;
+</span>156 <span style=''></span><span style='background: #F0ADAD'>            !compare(entry.getKey.getColumnFamily, update.getColumnFamily) ||
+</span>157 <span style=''></span><span style='background: #F0ADAD'>                !compare(entry.getKey.getColumnQualifier, update.getColumnQualifier) ||
+</span>158 <span style=''></span><span style='background: #F0ADAD'>                !compare(entry.getKey.getColumnVisibility, update.getColumnVisibility) ||
+</span>159 <span style=''></span><span style='background: #F0ADAD'>                entry.getKey.isDeleted
+</span>160 <span style=''></span><span style='background: #F0ADAD'>          }
+</span>161 <span style=''></span><span style='background: #F0ADAD'>        } else {
+</span>162 <span style=''></span><span style='background: #F0ADAD'>          found.exists { entry =&gt;
+</span>163 <span style=''></span><span style='background: #F0ADAD'>            compare(entry.getKey.getColumnFamily, update.getColumnFamily) &amp;&amp;
+</span>164 <span style=''></span><span style='background: #F0ADAD'>                compare(entry.getKey.getColumnQualifier, update.getColumnQualifier) &amp;&amp;
+</span>165 <span style=''></span><span style='background: #F0ADAD'>                compare(entry.getKey.getColumnVisibility, update.getColumnVisibility) &amp;&amp;
+</span>166 <span style=''></span><span style='background: #F0ADAD'>                entry.getValue.compareTo(update.getValue) == 0
+</span>167 <span style=''></span><span style='background: #F0ADAD'>          }
+</span>168 <span style=''></span><span style='background: #F0ADAD'>        }
+</span>169 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>170 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>171 <span style=''>  }
+</span>172 <span style=''>
+</span>173 <span style=''>  private def buildMutations[T &lt;: MutationBuilder](
+</span>174 <span style=''>      values: Array[RowKeyValue[_]],
+</span>175 <span style=''>      builderFactory: (Array[Byte], Seq[MutationValue]) =&gt; T): Array[Seq[T]] = {
+</span>176 <span style=''>    val mutations = </span><span style='background: #AEF1AE'>Array.ofDim[Seq[T]](values.length)</span><span style=''>
+</span>177 <span style=''>    var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
+</span>178 <span style=''>    while (</span><span style='background: #AEF1AE'>i &lt; values.length</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>179 <span style=''></span><span style='background: #AEF1AE'>      mutations(i) = values(i) match {
+</span>180 <span style=''></span><span style='background: #AEF1AE'>        case kv: SingleRowKeyValue[_] =&gt;
+</span>181 <span style=''></span><span style='background: #AEF1AE'>          val values = kv.values.map { v =&gt;
+</span>182 <span style=''></span><span style='background: #AEF1AE'>            MutationValue(colFamilyMappings(i)(v.cf), v.cq, visCache(v.vis), v.value)
+</span>183 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>184 <span style=''></span><span style='background: #AEF1AE'>          Seq(builderFactory(kv.row, values))
+</span>185 <span style=''></span><span style='background: #AEF1AE'>
+</span>186 <span style=''></span><span style='background: #AEF1AE'>        case mkv: MultiRowKeyValue[_] =&gt;
+</span>187 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>mkv.rows.map { row =&gt;
+</span>188 <span style=''></span><span style='background: #F0ADAD'>            val values = mkv.values.map { v =&gt;
+</span>189 <span style=''></span><span style='background: #F0ADAD'>              MutationValue(colFamilyMappings(i)(v.cf), v.cq, visCache(v.vis), v.value)
+</span>190 <span style=''></span><span style='background: #F0ADAD'>            }
+</span>191 <span style=''></span><span style='background: #F0ADAD'>            builderFactory(row, values)
+</span>192 <span style=''></span><span style='background: #F0ADAD'>          }</span><span style='background: #AEF1AE'>
+</span>193 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>194 <span style=''></span><span style='background: #AEF1AE'>      i += 1
+</span>195 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>196 <span style=''>    mutations
+</span>197 <span style=''>  }
+</span>198 <span style=''>
+</span>199 <span style=''>  private def compare(text: Text, bytes: Array[Byte]): Boolean = </span><span style='background: #F0ADAD'>text.compareTo(bytes, 0, bytes.length) == 0</span><span style=''>
+</span>200 <span style=''>
+</span>201 <span style=''>  override def flush(): Unit = </span><span style='background: #F0ADAD'>{}</span><span style=''> // there is no batching here, every single write gets flushed
+</span>202 <span style=''>
+</span>203 <span style=''>  override def close(): Unit = </span><span style='background: #AEF1AE'>CloseQuietly(writers).foreach(e =&gt; </span><span style='background: #F0ADAD'>throw e</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>204 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          52237
+        </td>
+        <td>
+          2130
+          -
+          2139
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.partition
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          52238
+        </td>
+        <td>
+          2115
+          -
+          2140
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.getTableName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1.getTableName(AccumuloAtomicIndexWriter.this.partition)
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          52239
+        </td>
+        <td>
+          2114
+          -
+          2114
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[String]
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          52240
+        </td>
+        <td>
+          2103
+          -
+          2141
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.indices.map[String, Seq[String]](((x$1: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[_, _]) =&gt; x$1.getTableName(AccumuloAtomicIndexWriter.this.partition)))(collection.this.Seq.canBuildFrom[String])
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          52241
+        </td>
+        <td>
+          2212
+          -
+          2241
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.ConditionalWriterConfig.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.accumulo.core.client.ConditionalWriterConfig()
+        </td>
+      </tr><tr>
+        <td>
+          52
+        </td>
+        <td>
+          52242
+        </td>
+        <td>
+          2271
+          -
+          2279
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.AccumuloDataStore.auths
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.ds.auths
+        </td>
+      </tr><tr>
+        <td>
+          52
+        </td>
+        <td>
+          52243
+        </td>
+        <td>
+          2246
+          -
+          2280
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.ConditionalWriterConfig.setAuthorizations
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          config.setAuthorizations(AccumuloAtomicIndexWriter.this.ds.auths)
+        </td>
+      </tr><tr>
+        <td>
+          53
+        </td>
+        <td>
+          52244
+        </td>
+        <td>
+          2302
+          -
+          2341
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BATCH_WRITER_THREADS_MAX
+        </td>
+      </tr><tr>
+        <td>
+          53
+        </td>
+        <td>
+          52245
+        </td>
+        <td>
+          2353
+          -
+          2378
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.AccumuloClient.properties
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.ds.connector.properties()
+        </td>
+      </tr><tr>
+        <td>
+          53
+        </td>
+        <td>
+          52246
+        </td>
+        <td>
+          2302
+          -
+          2379
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.conf.ClientProperty.getInteger
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BATCH_WRITER_THREADS_MAX.getInteger(AccumuloAtomicIndexWriter.this.ds.connector.properties())
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          52247
+        </td>
+        <td>
+          2388
+          -
+          2406
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          maxThreads.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          52251
+        </td>
+        <td>
+          2384
+          -
+          2384
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          52252
+        </td>
+        <td>
+          2384
+          -
+          2384
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          52248
+        </td>
+        <td>
+          2442
+          -
+          2452
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Predef.Integer2int
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.Integer2int(maxThreads)
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          52249
+        </td>
+        <td>
+          2416
+          -
+          2453
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.ConditionalWriterConfig.setMaxWriteThreads
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          config.setMaxWriteThreads(scala.Predef.Integer2int(maxThreads))
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          52250
+        </td>
+        <td>
+          2416
+          -
+          2453
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.accumulo.core.client.ConditionalWriterConfig.setMaxWriteThreads
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          config.setMaxWriteThreads(scala.Predef.Integer2int(maxThreads))
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          52253
+        </td>
+        <td>
+          2478
+          -
+          2517
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BATCH_WRITER_TIMEOUT_MAX
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          52254
+        </td>
+        <td>
+          2534
+          -
+          2559
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.AccumuloClient.properties
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.ds.connector.properties()
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          52255
+        </td>
+        <td>
+          2478
+          -
+          2560
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.conf.ClientProperty.getTimeInMillis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BATCH_WRITER_TIMEOUT_MAX.getTimeInMillis(AccumuloAtomicIndexWriter.this.ds.connector.properties())
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          52256
+        </td>
+        <td>
+          2569
+          -
+          2584
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          timeout.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          52261
+        </td>
+        <td>
+          2565
+          -
+          2565
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          52262
+        </td>
+        <td>
+          2565
+          -
+          2565
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          52257
+        </td>
+        <td>
+          2612
+          -
+          2619
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Predef.Long2long
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.Long2long(timeout)
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          52258
+        </td>
+        <td>
+          2621
+          -
+          2642
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MILLISECONDS
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          52259
+        </td>
+        <td>
+          2594
+          -
+          2643
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.ConditionalWriterConfig.setTimeout
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          config.setTimeout(scala.Predef.Long2long(timeout), MILLISECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          52260
+        </td>
+        <td>
+          2594
+          -
+          2643
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.accumulo.core.client.ConditionalWriterConfig.setTimeout
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          config.setTimeout(scala.Predef.Long2long(timeout), MILLISECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          52263
+        </td>
+        <td>
+          2665
+          -
+          2712
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.AccumuloClient.createConditionalWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.ds.connector.createConditionalWriter(x$2, config)
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          52264
+        </td>
+        <td>
+          2664
+          -
+          2664
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.apache.accumulo.core.client.ConditionalWriter]
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          52265
+        </td>
+        <td>
+          2654
+          -
+          2721
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toArray
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.tables.map[org.apache.accumulo.core.client.ConditionalWriter, Seq[org.apache.accumulo.core.client.ConditionalWriter]](((x$2: String) =&gt; AccumuloAtomicIndexWriter.this.ds.connector.createConditionalWriter(x$2, config)))(collection.this.Seq.canBuildFrom[org.apache.accumulo.core.client.ConditionalWriter]).toArray[org.apache.accumulo.core.client.ConditionalWriter]((ClassTag.apply[org.apache.accumulo.core.client.ConditionalWriter](classOf[org.apache.accumulo.core.client.ConditionalWriter]): scala.reflect.ClassTag[org.apache.accumulo.core.client.ConditionalWriter]))
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          52266
+        </td>
+        <td>
+          2773
+          -
+          2797
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.ColumnFamilyMapper.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ColumnFamilyMapper.apply(index)
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          52267
+        </td>
+        <td>
+          2772
+          -
+          2772
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.ColumnFamilyMapper]
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          52268
+        </td>
+        <td>
+          2761
+          -
+          2806
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toArray
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.indices.map[org.locationtech.geomesa.accumulo.data.writer.ColumnFamilyMapper, Seq[org.locationtech.geomesa.accumulo.data.writer.ColumnFamilyMapper]]({
+  ((index: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[_, _]) =&gt; ColumnFamilyMapper.apply(index))
+})(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.ColumnFamilyMapper]).toArray[org.locationtech.geomesa.accumulo.data.writer.ColumnFamilyMapper]((ClassTag.apply[org.locationtech.geomesa.accumulo.data.writer.ColumnFamilyMapper](classOf[org.locationtech.geomesa.accumulo.data.writer.ColumnFamilyMapper]): scala.reflect.ClassTag[org.locationtech.geomesa.accumulo.data.writer.ColumnFamilyMapper]))
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          52269
+        </td>
+        <td>
+          2832
+          -
+          2853
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.VisibilityCache.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new writer.this.`package`.VisibilityCache()
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          52270
+        </td>
+        <td>
+          2963
+          -
+          2984
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.feature.getID()
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          52271
+        </td>
+        <td>
+          3009
+          -
+          3028
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.AppendBuilder.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.AppendBuilder.apply(row, kvs)
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          52272
+        </td>
+        <td>
+          2986
+          -
+          3029
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.buildMutations
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.buildMutations[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder](values, {
+  ((row: Array[Byte], kvs: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]) =&gt; org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.AppendBuilder.apply(row, kvs))
+})
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          52273
+        </td>
+        <td>
+          2956
+          -
+          3030
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.mutate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.mutate(feature.feature.getID(), AccumuloAtomicIndexWriter.this.buildMutations[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder](values, {
+  ((row: Array[Byte], kvs: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]) =&gt; org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.AppendBuilder.apply(row, kvs))
+}))
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          52274
+        </td>
+        <td>
+          3140
+          -
+          3161
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.feature.getID()
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          52275
+        </td>
+        <td>
+          3186
+          -
+          3205
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.DeleteBuilder.apply(row, kvs)
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          52276
+        </td>
+        <td>
+          3163
+          -
+          3206
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.buildMutations
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.buildMutations[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder](values, {
+  ((row: Array[Byte], kvs: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]) =&gt; org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.DeleteBuilder.apply(row, kvs))
+})
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          52277
+        </td>
+        <td>
+          3133
+          -
+          3207
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.mutate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.mutate(feature.feature.getID(), AccumuloAtomicIndexWriter.this.buildMutations[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder](values, {
+  ((row: Array[Byte], kvs: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]) =&gt; org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.DeleteBuilder.apply(row, kvs))
+}))
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          52278
+        </td>
+        <td>
+          3453
+          -
+          3466
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Array.length
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          values.length
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          52279
+        </td>
+        <td>
+          3419
+          -
+          3467
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Array.ofDim
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Array.ofDim[Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]](values.length)((ClassTag.apply[Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]](classOf[scala.collection.Seq]): scala.reflect.ClassTag[Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]]))
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          52280
+        </td>
+        <td>
+          3576
+          -
+          3595
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.AppendBuilder.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.AppendBuilder.apply(row, kvs)
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          52281
+        </td>
+        <td>
+          3553
+          -
+          3596
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.buildMutations
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.buildMutations[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.AppendBuilder](values, {
+  ((row: Array[Byte], kvs: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]) =&gt; org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.AppendBuilder.apply(row, kvs))
+})
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          52282
+        </td>
+        <td>
+          3646
+          -
+          3665
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.DeleteBuilder.apply(row, kvs)
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          52283
+        </td>
+        <td>
+          3615
+          -
+          3666
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.buildMutations
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.buildMutations[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder](previousValues, {
+  ((row: Array[Byte], kvs: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]) =&gt; org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.DeleteBuilder.apply(row, kvs))
+})
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          52284
+        </td>
+        <td>
+          3679
+          -
+          3680
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          52285
+        </td>
+        <td>
+          3696
+          -
+          3709
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Array.length
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          values.length
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          52286
+        </td>
+        <td>
+          3692
+          -
+          3709
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.&lt;(values.length)
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          52316
+        </td>
+        <td>
+          3711
+          -
+          3711
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.while$1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$1()
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          52317
+        </td>
+        <td>
+          3711
+          -
+          4673
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    val dels: scala.collection.mutable.ArrayBuffer[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder] = scala.collection.mutable.ArrayBuffer.apply[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder]((deletes.apply(i): _*));
+    val puts: Seq[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder] = updates.apply(i).map[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder, Seq[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]](((mutations: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.AppendBuilder) =&gt; {
+      val d: Int = dels.indexWhere(((p: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder) =&gt; java.util.Arrays.equals(p.row, mutations.row)));
+      if (d.==(-1))
+        mutations
+      else
+        {
+          val toUpdate: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder = dels.remove(d);
+          val remaining: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] = toUpdate.kvs.filterNot(((kv: org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue) =&gt; mutations.kvs.exists(((x$3: org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue) =&gt; x$3.equalKey(kv)))));
+          if (remaining.nonEmpty)
+            dels.append({
+              &lt;artifact&gt; val x$1: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] @scala.reflect.internal.annotations.uncheckedBounds = remaining;
+              &lt;artifact&gt; val x$2: Array[Byte] @scala.reflect.internal.annotations.uncheckedBounds = toUpdate.copy$default$1;
+              toUpdate.copy(x$2, x$1)
+            })
+          else
+            ();
+          org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.UpdateBuilder.apply(mutations.row, mutations.kvs, toUpdate.kvs)
+        }
+    }))(collection.this.Seq.canBuildFrom[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]);
+    mutations.update(i, puts.++[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]](dels)(collection.this.Seq.canBuildFrom[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]));
+    i = i.+(1)
+  };
+  while$1()
+}
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          52318
+        </td>
+        <td>
+          3685
+          -
+          3685
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          52319
+        </td>
+        <td>
+          3685
+          -
+          3685
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          52287
+        </td>
+        <td>
+          3742
+          -
+          3752
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Array.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          deletes.apply(i)
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          52288
+        </td>
+        <td>
+          3730
+          -
+          3757
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.ArrayBuffer.apply[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder]((deletes.apply(i): _*))
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          52310
+        </td>
+        <td>
+          3790
+          -
+          3790
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          52311
+        </td>
+        <td>
+          3775
+          -
+          4506
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          updates.apply(i).map[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder, Seq[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]](((mutations: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.AppendBuilder) =&gt; {
+  val d: Int = dels.indexWhere(((p: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder) =&gt; java.util.Arrays.equals(p.row, mutations.row)));
+  if (d.==(-1))
+    mutations
+  else
+    {
+      val toUpdate: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder = dels.remove(d);
+      val remaining: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] = toUpdate.kvs.filterNot(((kv: org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue) =&gt; mutations.kvs.exists(((x$3: org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue) =&gt; x$3.equalKey(kv)))));
+      if (remaining.nonEmpty)
+        dels.append({
+          &lt;artifact&gt; val x$1: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] @scala.reflect.internal.annotations.uncheckedBounds = remaining;
+          &lt;artifact&gt; val x$2: Array[Byte] @scala.reflect.internal.annotations.uncheckedBounds = toUpdate.copy$default$1;
+          toUpdate.copy(x$2, x$1)
+        })
+      else
+        ();
+      org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.UpdateBuilder.apply(mutations.row, mutations.kvs, toUpdate.kvs)
+    }
+}))(collection.this.Seq.canBuildFrom[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder])
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          52289
+        </td>
+        <td>
+          3923
+          -
+          3928
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder.row
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          p.row
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          52290
+        </td>
+        <td>
+          3930
+          -
+          3943
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.AppendBuilder.row
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutations.row
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          52291
+        </td>
+        <td>
+          3899
+          -
+          3944
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Arrays.equals
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Arrays.equals(p.row, mutations.row)
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          52292
+        </td>
+        <td>
+          3878
+          -
+          3945
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.GenSeqLike.indexWhere
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dels.indexWhere(((p: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder) =&gt; java.util.Arrays.equals(p.row, mutations.row)))
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          52293
+        </td>
+        <td>
+          3958
+          -
+          3965
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          d.==(-1)
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          52294
+        </td>
+        <td>
+          3969
+          -
+          3978
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.mutations
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutations
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          52309
+        </td>
+        <td>
+          3986
+          -
+          4498
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val toUpdate: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder = dels.remove(d);
+  val remaining: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] = toUpdate.kvs.filterNot(((kv: org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue) =&gt; mutations.kvs.exists(((x$3: org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue) =&gt; x$3.equalKey(kv)))));
+  if (remaining.nonEmpty)
+    dels.append({
+      &lt;artifact&gt; val x$1: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] @scala.reflect.internal.annotations.uncheckedBounds = remaining;
+      &lt;artifact&gt; val x$2: Array[Byte] @scala.reflect.internal.annotations.uncheckedBounds = toUpdate.copy$default$1;
+      toUpdate.copy(x$2, x$1)
+    })
+  else
+    ();
+  org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.UpdateBuilder.apply(mutations.row, mutations.kvs, toUpdate.kvs)
+}
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          52295
+        </td>
+        <td>
+          4044
+          -
+          4058
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dels.remove(d)
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          52296
+        </td>
+        <td>
+          4300
+          -
+          4314
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue.equalKey
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$3.equalKey(kv)
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          52297
+        </td>
+        <td>
+          4279
+          -
+          4315
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutations.kvs.exists(((x$3: org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue) =&gt; x$3.equalKey(kv)))
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          52298
+        </td>
+        <td>
+          4250
+          -
+          4316
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.TraversableLike.filterNot
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          toUpdate.kvs.filterNot(((kv: org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue) =&gt; mutations.kvs.exists(((x$3: org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue) =&gt; x$3.equalKey(kv)))))
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          52299
+        </td>
+        <td>
+          4331
+          -
+          4349
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.nonEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          remaining.nonEmpty
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          52303
+        </td>
+        <td>
+          4327
+          -
+          4327
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          52304
+        </td>
+        <td>
+          4327
+          -
+          4327
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          52300
+        </td>
+        <td>
+          4377
+          -
+          4407
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder.copy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          toUpdate.copy(x$2, x$1)
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          52301
+        </td>
+        <td>
+          4365
+          -
+          4408
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.BufferLike.append
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dels.append({
+  &lt;artifact&gt; val x$1: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] @scala.reflect.internal.annotations.uncheckedBounds = remaining;
+  &lt;artifact&gt; val x$2: Array[Byte] @scala.reflect.internal.annotations.uncheckedBounds = toUpdate.copy$default$1;
+  toUpdate.copy(x$2, x$1)
+})
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          52302
+        </td>
+        <td>
+          4365
+          -
+          4408
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.mutable.BufferLike.append
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dels.append({
+  &lt;artifact&gt; val x$1: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] @scala.reflect.internal.annotations.uncheckedBounds = remaining;
+  &lt;artifact&gt; val x$2: Array[Byte] @scala.reflect.internal.annotations.uncheckedBounds = toUpdate.copy$default$1;
+  toUpdate.copy(x$2, x$1)
+})
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          52305
+        </td>
+        <td>
+          4445
+          -
+          4458
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.AppendBuilder.row
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutations.row
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          52306
+        </td>
+        <td>
+          4460
+          -
+          4473
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.AppendBuilder.kvs
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutations.kvs
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          52307
+        </td>
+        <td>
+          4475
+          -
+          4487
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.DeleteBuilder.kvs
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          toUpdate.kvs
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          52308
+        </td>
+        <td>
+          4431
+          -
+          4488
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.UpdateBuilder.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.accumulo.data.writer.tx.`package`.MutationBuilder.UpdateBuilder.apply(mutations.row, mutations.kvs, toUpdate.kvs)
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          52312
+        </td>
+        <td>
+          4647
+          -
+          4647
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          52313
+        </td>
+        <td>
+          4642
+          -
+          4654
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.++
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          puts.++[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]](dels)(collection.this.Seq.canBuildFrom[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder])
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          52314
+        </td>
+        <td>
+          4627
+          -
+          4654
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Array.update
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutations.update(i, puts.++[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]](dels)(collection.this.Seq.canBuildFrom[Product with Serializable with org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder]))
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          52315
+        </td>
+        <td>
+          4661
+          -
+          4667
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          52320
+        </td>
+        <td>
+          4685
+          -
+          4706
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.feature.getID()
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          52321
+        </td>
+        <td>
+          4678
+          -
+          4718
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.mutate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.mutate(feature.feature.getID(), mutations)
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          52322
+        </td>
+        <td>
+          4970
+          -
+          5011
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.ArrayBuffer.empty[org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus]
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          52323
+        </td>
+        <td>
+          5032
+          -
+          5073
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.ArrayBuffer.empty[(Int, org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder)]
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          52324
+        </td>
+        <td>
+          5086
+          -
+          5087
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          52325
+        </td>
+        <td>
+          5103
+          -
+          5119
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Array.length
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutations.length
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          52326
+        </td>
+        <td>
+          5099
+          -
+          5119
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.&lt;(mutations.length)
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          52344
+        </td>
+        <td>
+          5121
+          -
+          5121
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.while$2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$2()
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          52345
+        </td>
+        <td>
+          5121
+          -
+          5602
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    mutations.apply(i).foreach[scala.collection.mutable.ArrayBuffer[_ &gt;: (Int, org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder) with org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus &lt;: Product with Serializable]](((m: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder) =&gt; {
+      val status: org.apache.accumulo.core.client.ConditionalWriter.Status = AccumuloAtomicIndexWriter.this.writers.apply(i).write(m.apply()).getStatus();
+      if (status.==(ACCEPTED).||(status.==(UNKNOWN).&amp;&amp;(AccumuloAtomicIndexWriter.this.verifyWrite(AccumuloAtomicIndexWriter.this.tables.apply(i), m))))
+        successes.+=(scala.Predef.ArrowAssoc[Int](i).-&gt;[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder](m))
+      else
+        errors.+=(org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus.apply(AccumuloAtomicIndexWriter.this.indices.apply(i), m.name, status))
+    }));
+    i = i.+(1)
+  };
+  while$2()
+}
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          52346
+        </td>
+        <td>
+          5092
+          -
+          5092
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          52347
+        </td>
+        <td>
+          5092
+          -
+          5092
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          52342
+        </td>
+        <td>
+          5213
+          -
+          5583
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutations.apply(i).foreach[scala.collection.mutable.ArrayBuffer[_ &gt;: (Int, org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder) with org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus &lt;: Product with Serializable]](((m: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder) =&gt; {
+  val status: org.apache.accumulo.core.client.ConditionalWriter.Status = AccumuloAtomicIndexWriter.this.writers.apply(i).write(m.apply()).getStatus();
+  if (status.==(ACCEPTED).||(status.==(UNKNOWN).&amp;&amp;(AccumuloAtomicIndexWriter.this.verifyWrite(AccumuloAtomicIndexWriter.this.tables.apply(i), m))))
+    successes.+=(scala.Predef.ArrowAssoc[Int](i).-&gt;[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder](m))
+  else
+    errors.+=(org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus.apply(AccumuloAtomicIndexWriter.this.indices.apply(i), m.name, status))
+}))
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          52327
+        </td>
+        <td>
+          5262
+          -
+          5299
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.ConditionalWriter.Result.getStatus
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.writers.apply(i).write(m.apply()).getStatus()
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          52328
+        </td>
+        <td>
+          5322
+          -
+          5355
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ACCEPTED
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          52333
+        </td>
+        <td>
+          5312
+          -
+          5444
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          status.==(ACCEPTED).||(status.==(UNKNOWN).&amp;&amp;(AccumuloAtomicIndexWriter.this.verifyWrite(AccumuloAtomicIndexWriter.this.tables.apply(i), m)))
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          52329
+        </td>
+        <td>
+          5382
+          -
+          5414
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          UNKNOWN
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          52330
+        </td>
+        <td>
+          5430
+          -
+          5439
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.SeqLike.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.tables.apply(i)
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          52331
+        </td>
+        <td>
+          5418
+          -
+          5443
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.verifyWrite
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.verifyWrite(AccumuloAtomicIndexWriter.this.tables.apply(i), m)
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          52332
+        </td>
+        <td>
+          5372
+          -
+          5443
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          status.==(UNKNOWN).&amp;&amp;(AccumuloAtomicIndexWriter.this.verifyWrite(AccumuloAtomicIndexWriter.this.tables.apply(i), m))
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          52334
+        </td>
+        <td>
+          5471
+          -
+          5477
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.ArrowAssoc[Int](i).-&gt;[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder](m)
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          52335
+        </td>
+        <td>
+          5458
+          -
+          5477
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          successes.+=(scala.Predef.ArrowAssoc[Int](i).-&gt;[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder](m))
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          52336
+        </td>
+        <td>
+          5458
+          -
+          5477
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          successes.+=(scala.Predef.ArrowAssoc[Int](i).-&gt;[org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder](m))
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          52337
+        </td>
+        <td>
+          5538
+          -
+          5548
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.SeqLike.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.indices.apply(i)
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          52338
+        </td>
+        <td>
+          5550
+          -
+          5556
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.name
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          m.name
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          52339
+        </td>
+        <td>
+          5515
+          -
+          5565
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus.apply(AccumuloAtomicIndexWriter.this.indices.apply(i), m.name, status)
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          52340
+        </td>
+        <td>
+          5505
+          -
+          5565
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          errors.+=(org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus.apply(AccumuloAtomicIndexWriter.this.indices.apply(i), m.name, status))
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          52341
+        </td>
+        <td>
+          5505
+          -
+          5565
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          errors.+=(org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus.apply(AccumuloAtomicIndexWriter.this.indices.apply(i), m.name, status))
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          52343
+        </td>
+        <td>
+          5590
+          -
+          5596
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          52348
+        </td>
+        <td>
+          5611
+          -
+          5626
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.nonEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          errors.nonEmpty
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          52354
+        </td>
+        <td>
+          5628
+          -
+          5921
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  successes.foreach[org.apache.accumulo.core.client.ConditionalWriter.Result](((x0$1: (Int, org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder)) =&gt; x0$1 match {
+    case (_1: Int, _2: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder)(Int, org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder)((i @ _), (m @ _)) =&gt; AccumuloAtomicIndexWriter.this.writers.apply(i).write(m.invert())
+  }));
+  throw ConditionalWriteException.apply(id, errors.toSeq)
+}
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          52355
+        </td>
+        <td>
+          5607
+          -
+          5607
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          52356
+        </td>
+        <td>
+          5607
+          -
+          5607
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          52352
+        </td>
+        <td>
+          5671
+          -
+          5859
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ResizableArray.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          successes.foreach[org.apache.accumulo.core.client.ConditionalWriter.Result](((x0$1: (Int, org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder)) =&gt; x0$1 match {
+  case (_1: Int, _2: org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder)(Int, org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder)((i @ _), (m @ _)) =&gt; AccumuloAtomicIndexWriter.this.writers.apply(i).write(m.invert())
+}))
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          52349
+        </td>
+        <td>
+          5840
+          -
+          5850
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.invert
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          m.invert()
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          52350
+        </td>
+        <td>
+          5823
+          -
+          5851
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.ConditionalWriter.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.writers.apply(i).write(m.invert())
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          52351
+        </td>
+        <td>
+          5823
+          -
+          5851
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.accumulo.core.client.ConditionalWriter.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.writers.apply(i).write(m.invert())
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          52353
+        </td>
+        <td>
+          5866
+          -
+          5915
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw ConditionalWriteException.apply(id, errors.toSeq)
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          52357
+        </td>
+        <td>
+          6325
+          -
+          6333
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.AccumuloDataStore.auths
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.ds.auths
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          52358
+        </td>
+        <td>
+          6291
+          -
+          6334
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.AccumuloClient.createScanner
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.ds.connector.createScanner(table, AccumuloAtomicIndexWriter.this.ds.auths)
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          52359
+        </td>
+        <td>
+          6271
+          -
+          6335
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.IsolatedScanner.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.accumulo.core.client.IsolatedScanner(AccumuloAtomicIndexWriter.this.ds.connector.createScanner(table, AccumuloAtomicIndexWriter.this.ds.auths))
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          52396
+        </td>
+        <td>
+          6337
+          -
+          6337
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          52397
+        </td>
+        <td>
+          6261
+          -
+          7392
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.apache.accumulo.core.client.IsolatedScanner, Boolean](new org.apache.accumulo.core.client.IsolatedScanner(AccumuloAtomicIndexWriter.this.ds.connector.createScanner(table, AccumuloAtomicIndexWriter.this.ds.auths)))(((scanner: org.apache.accumulo.core.client.IsolatedScanner) =&gt; {
+  val key: org.apache.accumulo.core.data.Key = new org.apache.accumulo.core.data.Key(mutation.row);
+  scanner.setRange(new org.apache.accumulo.core.data.Range(key, true, key.followingKey(ROW), false));
+  val found: List[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] = scala.collection.JavaConverters.asScalaIteratorConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](scanner.iterator()).asScala.toList;
+  scala.collection.JavaConverters.asScalaBufferConverter[org.apache.accumulo.core.data.ColumnUpdate](mutation.apply().getUpdates()).asScala.forall(((update: org.apache.accumulo.core.data.ColumnUpdate) =&gt; if (update.isDeleted())
+    found.forall(((entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnFamily(), update.getColumnFamily()).unary_!.||(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier()).unary_!).||(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility()).unary_!).||(entry.getKey().isDeleted())))
+  else
+    found.exists(((entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnFamily(), update.getColumnFamily()).&amp;&amp;(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier())).&amp;&amp;(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility())).&amp;&amp;(entry.getValue().compareTo(update.getValue()).==(0))))))
+}))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          52360
+        </td>
+        <td>
+          6374
+          -
+          6386
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.row
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          mutation.row
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          52361
+        </td>
+        <td>
+          6366
+          -
+          6387
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Key.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.accumulo.core.data.Key(mutation.row)
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          52362
+        </td>
+        <td>
+          6456
+          -
+          6460
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          52363
+        </td>
+        <td>
+          6462
+          -
+          6494
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Key.followingKey
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          key.followingKey(ROW)
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          52364
+        </td>
+        <td>
+          6496
+          -
+          6501
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          52365
+        </td>
+        <td>
+          6411
+          -
+          6502
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Range.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.accumulo.core.data.Range(key, true, key.followingKey(ROW), false)
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          52366
+        </td>
+        <td>
+          6394
+          -
+          6503
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.IsolatedScanner.setRange
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scanner.setRange(new org.apache.accumulo.core.data.Range(key, true, key.followingKey(ROW), false))
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          52367
+        </td>
+        <td>
+          6522
+          -
+          6540
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.IsolatedScanner.iterator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scanner.iterator()
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          52368
+        </td>
+        <td>
+          6522
+          -
+          6555
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toList
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.collection.JavaConverters.asScalaIteratorConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](scanner.iterator()).asScala.toList
+        </td>
+      </tr><tr>
+        <td>
+          153
+        </td>
+        <td>
+          52369
+        </td>
+        <td>
+          6562
+          -
+          6589
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Mutation.getUpdates
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          mutation.apply().getUpdates()
+        </td>
+      </tr><tr>
+        <td>
+          153
+        </td>
+        <td>
+          52395
+        </td>
+        <td>
+          6562
+          -
+          7386
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.forall
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.collection.JavaConverters.asScalaBufferConverter[org.apache.accumulo.core.data.ColumnUpdate](mutation.apply().getUpdates()).asScala.forall(((update: org.apache.accumulo.core.data.ColumnUpdate) =&gt; if (update.isDeleted())
+  found.forall(((entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnFamily(), update.getColumnFamily()).unary_!.||(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier()).unary_!).||(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility()).unary_!).||(entry.getKey().isDeleted())))
+else
+  found.exists(((entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnFamily(), update.getColumnFamily()).&amp;&amp;(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier())).&amp;&amp;(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility())).&amp;&amp;(entry.getValue().compareTo(update.getValue()).==(0))))))
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          52370
+        </td>
+        <td>
+          6629
+          -
+          6645
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.ColumnUpdate.isDeleted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          update.isDeleted()
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          52381
+        </td>
+        <td>
+          6659
+          -
+          6989
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.LinearSeqOptimized.forall
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          found.forall(((entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnFamily(), update.getColumnFamily()).unary_!.||(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier()).unary_!).||(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility()).unary_!).||(entry.getKey().isDeleted())))
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          52382
+        </td>
+        <td>
+          6659
+          -
+          6989
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.LinearSeqOptimized.forall
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          found.forall(((entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnFamily(), update.getColumnFamily()).unary_!.||(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier()).unary_!).||(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility()).unary_!).||(entry.getKey().isDeleted())))
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          52371
+        </td>
+        <td>
+          6704
+          -
+          6732
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Key.getColumnFamily
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          entry.getKey().getColumnFamily()
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          52372
+        </td>
+        <td>
+          6734
+          -
+          6756
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.ColumnUpdate.getColumnFamily
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          update.getColumnFamily()
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          52373
+        </td>
+        <td>
+          6786
+          -
+          6817
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Key.getColumnQualifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          entry.getKey().getColumnQualifier()
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          52374
+        </td>
+        <td>
+          6819
+          -
+          6844
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.ColumnUpdate.getColumnQualifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          update.getColumnQualifier()
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          52375
+        </td>
+        <td>
+          6777
+          -
+          6845
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier()).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          52376
+        </td>
+        <td>
+          6874
+          -
+          6906
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Key.getColumnVisibility
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          entry.getKey().getColumnVisibility()
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          52377
+        </td>
+        <td>
+          6908
+          -
+          6934
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.ColumnUpdate.getColumnVisibility
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          update.getColumnVisibility()
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          52378
+        </td>
+        <td>
+          6865
+          -
+          6935
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility()).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          52380
+        </td>
+        <td>
+          6695
+          -
+          6977
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnFamily(), update.getColumnFamily()).unary_!.||(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier()).unary_!).||(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility()).unary_!).||(entry.getKey().isDeleted())
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          52379
+        </td>
+        <td>
+          6955
+          -
+          6977
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Key.isDeleted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          entry.getKey().isDeleted()
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          52393
+        </td>
+        <td>
+          7017
+          -
+          7368
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.LinearSeqOptimized.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          found.exists(((entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnFamily(), update.getColumnFamily()).&amp;&amp;(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier())).&amp;&amp;(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility())).&amp;&amp;(entry.getValue().compareTo(update.getValue()).==(0))))
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          52394
+        </td>
+        <td>
+          7017
+          -
+          7368
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.LinearSeqOptimized.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          found.exists(((entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnFamily(), update.getColumnFamily()).&amp;&amp;(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier())).&amp;&amp;(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility())).&amp;&amp;(entry.getValue().compareTo(update.getValue()).==(0))))
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          52383
+        </td>
+        <td>
+          7061
+          -
+          7089
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Key.getColumnFamily
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          entry.getKey().getColumnFamily()
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          52384
+        </td>
+        <td>
+          7091
+          -
+          7113
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.ColumnUpdate.getColumnFamily
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          update.getColumnFamily()
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          52385
+        </td>
+        <td>
+          7142
+          -
+          7173
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Key.getColumnQualifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          entry.getKey().getColumnQualifier()
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          52386
+        </td>
+        <td>
+          7175
+          -
+          7200
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.ColumnUpdate.getColumnQualifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          update.getColumnQualifier()
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          52387
+        </td>
+        <td>
+          7134
+          -
+          7201
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.compare
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier())
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          52388
+        </td>
+        <td>
+          7229
+          -
+          7261
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.Key.getColumnVisibility
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          entry.getKey().getColumnVisibility()
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          52389
+        </td>
+        <td>
+          7263
+          -
+          7289
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.data.ColumnUpdate.getColumnVisibility
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          update.getColumnVisibility()
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          52390
+        </td>
+        <td>
+          7221
+          -
+          7290
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.compare
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility())
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          52392
+        </td>
+        <td>
+          7053
+          -
+          7356
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnFamily(), update.getColumnFamily()).&amp;&amp;(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnQualifier(), update.getColumnQualifier())).&amp;&amp;(AccumuloAtomicIndexWriter.this.compare(entry.getKey().getColumnVisibility(), update.getColumnVisibility())).&amp;&amp;(entry.getValue().compareTo(update.getValue()).==(0))
+        </td>
+      </tr><tr>
+        <td>
+          166
+        </td>
+        <td>
+          52391
+        </td>
+        <td>
+          7310
+          -
+          7356
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          entry.getValue().compareTo(update.getValue()).==(0)
+        </td>
+      </tr><tr>
+        <td>
+          176
+        </td>
+        <td>
+          52398
+        </td>
+        <td>
+          7608
+          -
+          7621
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Array.length
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          values.length
+        </td>
+      </tr><tr>
+        <td>
+          176
+        </td>
+        <td>
+          52399
+        </td>
+        <td>
+          7588
+          -
+          7622
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Array.ofDim
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Array.ofDim[Seq[T]](values.length)((ClassTag.apply[Seq[T]](classOf[scala.collection.Seq]): scala.reflect.ClassTag[Seq[T]]))
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          52400
+        </td>
+        <td>
+          7635
+          -
+          7636
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          178
+        </td>
+        <td>
+          52401
+        </td>
+        <td>
+          7652
+          -
+          7665
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Array.length
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          values.length
+        </td>
+      </tr><tr>
+        <td>
+          178
+        </td>
+        <td>
+          52402
+        </td>
+        <td>
+          7648
+          -
+          7665
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.&lt;(values.length)
+        </td>
+      </tr><tr>
+        <td>
+          178
+        </td>
+        <td>
+          52430
+        </td>
+        <td>
+          7667
+          -
+          7667
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.while$3
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$3()
+        </td>
+      </tr><tr>
+        <td>
+          178
+        </td>
+        <td>
+          52431
+        </td>
+        <td>
+          7667
+          -
+          8238
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    mutations.update(i, values.apply(i) match {
+      case (kv @ (_: org.locationtech.geomesa.index.api.SingleRowKeyValue[_])) =&gt; {
+        val values: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] = kv.values.map[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]](((v: org.locationtech.geomesa.index.api.KeyValue) =&gt; tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]);
+        scala.collection.Seq.apply[T](builderFactory.apply(kv.row, values))
+      }
+      case (mkv @ (_: org.locationtech.geomesa.index.api.MultiRowKeyValue[_])) =&gt; mkv.rows.map[T, Seq[T]](((row: Array[Byte]) =&gt; {
+        val values: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] = mkv.values.map[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]](((v: org.locationtech.geomesa.index.api.KeyValue) =&gt; tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]);
+        builderFactory.apply(row, values)
+      }))(collection.this.Seq.canBuildFrom[T])
+    });
+    i = i.+(1)
+  };
+  while$3()
+}
+        </td>
+      </tr><tr>
+        <td>
+          178
+        </td>
+        <td>
+          52432
+        </td>
+        <td>
+          7641
+          -
+          7641
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          178
+        </td>
+        <td>
+          52433
+        </td>
+        <td>
+          7641
+          -
+          7641
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          52403
+        </td>
+        <td>
+          7690
+          -
+          7699
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Array.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          values.apply(i)
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          52428
+        </td>
+        <td>
+          7675
+          -
+          8219
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Array.update
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutations.update(i, values.apply(i) match {
+  case (kv @ (_: org.locationtech.geomesa.index.api.SingleRowKeyValue[_])) =&gt; {
+    val values: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] = kv.values.map[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]](((v: org.locationtech.geomesa.index.api.KeyValue) =&gt; tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]);
+    scala.collection.Seq.apply[T](builderFactory.apply(kv.row, values))
+  }
+  case (mkv @ (_: org.locationtech.geomesa.index.api.MultiRowKeyValue[_])) =&gt; mkv.rows.map[T, Seq[T]](((row: Array[Byte]) =&gt; {
+    val values: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] = mkv.values.map[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]](((v: org.locationtech.geomesa.index.api.KeyValue) =&gt; tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]);
+    builderFactory.apply(row, values)
+  }))(collection.this.Seq.canBuildFrom[T])
+})
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          52415
+        </td>
+        <td>
+          7746
+          -
+          7936
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val values: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] = kv.values.map[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]](((v: org.locationtech.geomesa.index.api.KeyValue) =&gt; tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]);
+  scala.collection.Seq.apply[T](builderFactory.apply(kv.row, values))
+}
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          52410
+        </td>
+        <td>
+          7786
+          -
+          7786
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          52411
+        </td>
+        <td>
+          7772
+          -
+          7890
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          kv.values.map[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]](((v: org.locationtech.geomesa.index.api.KeyValue) =&gt; tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue])
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          52404
+        </td>
+        <td>
+          7840
+          -
+          7844
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.KeyValue.cf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          v.cf
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          52405
+        </td>
+        <td>
+          7819
+          -
+          7845
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Function1.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf)
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          52406
+        </td>
+        <td>
+          7847
+          -
+          7851
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.KeyValue.cq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          v.cq
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          52407
+        </td>
+        <td>
+          7862
+          -
+          7867
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.KeyValue.vis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          v.vis
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          52408
+        </td>
+        <td>
+          7853
+          -
+          7868
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.VisibilityCache.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.visCache.apply(v.vis)
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          52409
+        </td>
+        <td>
+          7805
+          -
+          7878
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)
+        </td>
+      </tr><tr>
+        <td>
+          184
+        </td>
+        <td>
+          52412
+        </td>
+        <td>
+          7920
+          -
+          7926
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.SingleRowKeyValue.row
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          kv.row
+        </td>
+      </tr><tr>
+        <td>
+          184
+        </td>
+        <td>
+          52413
+        </td>
+        <td>
+          7905
+          -
+          7935
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Function2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          builderFactory.apply(kv.row, values)
+        </td>
+      </tr><tr>
+        <td>
+          184
+        </td>
+        <td>
+          52414
+        </td>
+        <td>
+          7901
+          -
+          7936
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[T](builderFactory.apply(kv.row, values))
+        </td>
+      </tr><tr>
+        <td>
+          187
+        </td>
+        <td>
+          52425
+        </td>
+        <td>
+          8002
+          -
+          8002
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          collection.this.Seq.canBuildFrom[T]
+        </td>
+      </tr><tr>
+        <td>
+          187
+        </td>
+        <td>
+          52426
+        </td>
+        <td>
+          7989
+          -
+          8211
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          mkv.rows.map[T, Seq[T]](((row: Array[Byte]) =&gt; {
+  val values: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] = mkv.values.map[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]](((v: org.locationtech.geomesa.index.api.KeyValue) =&gt; tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]);
+  builderFactory.apply(row, values)
+}))(collection.this.Seq.canBuildFrom[T])
+        </td>
+      </tr><tr>
+        <td>
+          187
+        </td>
+        <td>
+          52427
+        </td>
+        <td>
+          7989
+          -
+          8211
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          mkv.rows.map[T, Seq[T]](((row: Array[Byte]) =&gt; {
+  val values: Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue] = mkv.values.map[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]](((v: org.locationtech.geomesa.index.api.KeyValue) =&gt; tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]);
+  builderFactory.apply(row, values)
+}))(collection.this.Seq.canBuildFrom[T])
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          52422
+        </td>
+        <td>
+          8051
+          -
+          8051
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          52423
+        </td>
+        <td>
+          8036
+          -
+          8159
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          mkv.values.map[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue, Seq[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue]](((v: org.locationtech.geomesa.index.api.KeyValue) =&gt; tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue])
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          52416
+        </td>
+        <td>
+          8107
+          -
+          8111
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.KeyValue.cf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          v.cf
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          52417
+        </td>
+        <td>
+          8086
+          -
+          8112
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Function1.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf)
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          52418
+        </td>
+        <td>
+          8114
+          -
+          8118
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.KeyValue.cq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          v.cq
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          52419
+        </td>
+        <td>
+          8129
+          -
+          8134
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.KeyValue.vis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          v.vis
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          52420
+        </td>
+        <td>
+          8120
+          -
+          8135
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.VisibilityCache.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AccumuloAtomicIndexWriter.this.visCache.apply(v.vis)
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          52421
+        </td>
+        <td>
+          8072
+          -
+          8145
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.MutationValue.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          tx.this.`package`.MutationValue.apply(AccumuloAtomicIndexWriter.this.colFamilyMappings.apply(i).apply(v.cf), v.cq, AccumuloAtomicIndexWriter.this.visCache.apply(v.vis), v.value)
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          52424
+        </td>
+        <td>
+          8172
+          -
+          8199
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Function2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          builderFactory.apply(row, values)
+        </td>
+      </tr><tr>
+        <td>
+          194
+        </td>
+        <td>
+          52429
+        </td>
+        <td>
+          8226
+          -
+          8232
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          199
+        </td>
+        <td>
+          52434
+        </td>
+        <td>
+          8323
+          -
+          8366
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          text.compareTo(bytes, 0, bytes.length).==(0)
+        </td>
+      </tr><tr>
+        <td>
+          201
+        </td>
+        <td>
+          52435
+        </td>
+        <td>
+          8399
+          -
+          8401
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          203
+        </td>
+        <td>
+          52436
+        </td>
+        <td>
+          8509
+          -
+          8516
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter.writers
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAtomicIndexWriter.this.writers
+        </td>
+      </tr><tr>
+        <td>
+          203
+        </td>
+        <td>
+          52437
+        </td>
+        <td>
+          8508
+          -
+          8508
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.arrayIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.arrayIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          203
+        </td>
+        <td>
+          52438
+        </td>
+        <td>
+          8531
+          -
+          8538
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw e
+        </td>
+      </tr><tr>
+        <td>
+          203
+        </td>
+        <td>
+          52439
+        </td>
+        <td>
+          8496
+          -
+          8539
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[Array[org.apache.accumulo.core.client.ConditionalWriter]](AccumuloAtomicIndexWriter.this.writers)(io.this.IsCloseable.arrayIsCloseable).foreach[Nothing](((e: Throwable) =&gt; throw e))
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>

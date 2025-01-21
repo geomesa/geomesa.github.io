@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","url":"allpackages-index.html"},{"l":"org.locationtech.geomesa.arrow.jts"},{"l":"org.locationtech.geomesa.arrow.jts.impl"}]

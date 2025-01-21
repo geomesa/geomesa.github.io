@@ -1,0 +1,1 @@
+memberSearchIndex = [{"p":"org.locationtech.geomesa.features.interop","c":"SerializationOptions","l":"SerializationOptions()","url":"%3Cinit%3E()"},{"p":"org.locationtech.geomesa.features.interop","c":"SerializationOptions","l":"withoutId()"},{"p":"org.locationtech.geomesa.features.interop","c":"SerializationOptions","l":"withUserData()"}]
