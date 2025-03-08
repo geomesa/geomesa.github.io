@@ -33,245 +33,284 @@
 </span>9 <span style=''>package org.locationtech.geomesa.kafka.data
 </span>10 <span style=''>
 </span>11 <span style=''>import com.typesafe.scalalogging.LazyLogging
-</span>12 <span style=''>import org.apache.kafka.clients.consumer.{Consumer, ConsumerRecord}
+</span>12 <span style=''>import org.apache.kafka.clients.consumer.{Consumer, ConsumerRecord, ConsumerRecords}
 </span>13 <span style=''>import org.geotools.api.feature.simple.SimpleFeatureType
 </span>14 <span style=''>import org.geotools.api.filter.Filter
 </span>15 <span style=''>import org.locationtech.geomesa.kafka.consumer.ThreadedConsumer
-</span>16 <span style=''>import org.locationtech.geomesa.kafka.data.KafkaDataStore.ExpiryTimeConfig
-</span>17 <span style=''>import org.locationtech.geomesa.kafka.index.KafkaFeatureCache
-</span>18 <span style=''>import org.locationtech.geomesa.kafka.utils.GeoMessage.{Change, Clear, Delete}
-</span>19 <span style=''>import org.locationtech.geomesa.kafka.utils.GeoMessageSerializer
-</span>20 <span style=''>import org.locationtech.geomesa.kafka.versions.{KafkaConsumerVersions, RecordVersions}
-</span>21 <span style=''>import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
-</span>22 <span style=''>import org.locationtech.geomesa.utils.io.CloseWithLogging
-</span>23 <span style=''>
-</span>24 <span style=''>import java.io.Closeable
-</span>25 <span style=''>import java.time.Duration
-</span>26 <span style=''>import java.util.Collections
-</span>27 <span style=''>import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
-</span>28 <span style=''>import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Future}
-</span>29 <span style=''>import scala.util.control.NonFatal
-</span>30 <span style=''>
-</span>31 <span style=''>/**
-</span>32 <span style=''>  * Reads from Kafka and populates a `KafkaFeatureCache`.
-</span>33 <span style=''>  * Manages geotools feature listeners
-</span>34 <span style=''>  */
-</span>35 <span style=''>trait KafkaCacheLoader extends Closeable with LazyLogging {
-</span>36 <span style=''>  def cache: KafkaFeatureCache
-</span>37 <span style=''>}
-</span>38 <span style=''>
-</span>39 <span style=''>object KafkaCacheLoader extends LazyLogging {
-</span>40 <span style=''>
-</span>41 <span style=''>  object LoaderStatus {
-</span>42 <span style=''>
-</span>43 <span style=''>    private val loading = </span><span style='background: #AEF1AE'>Collections.newSetFromMap(new ConcurrentHashMap[AnyRef, java.lang.Boolean]())</span><span style=''>
-</span>44 <span style=''>    private val firstLoadStartTime = </span><span style='background: #AEF1AE'>new AtomicLong(0L)</span><span style=''>
-</span>45 <span style=''>
-</span>46 <span style=''>    def startLoad(loader: AnyRef): Boolean = </span><span style='background: #AEF1AE'>synchronized {
-</span>47 <span style=''></span><span style='background: #AEF1AE'>      if (!loading.add(loader)) {
-</span>48 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>logger.warn(s&quot;Called startLoad for a loader that was already registered and has not yet completed: $loader&quot;)</span><span style='background: #AEF1AE'>
-</span>49 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>50 <span style=''></span><span style='background: #AEF1AE'>      firstLoadStartTime.compareAndSet(0L, System.currentTimeMillis())
-</span>51 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>52 <span style=''>
-</span>53 <span style=''>    def completedLoad(loader: AnyRef): Unit = </span><span style='background: #AEF1AE'>synchronized {
-</span>54 <span style=''></span><span style='background: #AEF1AE'>      if (!loading.remove(loader)) {
-</span>55 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>logger.warn(s&quot;Called completedLoad for a loader that was not registered or already deregistered: $loader&quot;)</span><span style='background: #AEF1AE'>
-</span>56 <span style=''></span><span style='background: #AEF1AE'>      } else if (loading.isEmpty) {
-</span>57 <span style=''></span><span style='background: #AEF1AE'>        logger.info(s&quot;Last active initial load completed.  &quot; +
-</span>58 <span style=''></span><span style='background: #AEF1AE'>          s&quot;Initial loads took ${System.currentTimeMillis() - firstLoadStartTime.get} milliseconds.&quot;)
-</span>59 <span style=''></span><span style='background: #AEF1AE'>        firstLoadStartTime.set(0L)
-</span>60 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>61 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>62 <span style=''>
-</span>63 <span style=''>    def allLoaded(): Boolean = </span><span style='background: #F0ADAD'>loading.isEmpty</span><span style=''>
-</span>64 <span style=''>  }
-</span>65 <span style=''>
-</span>66 <span style=''>  object NoOpLoader extends KafkaCacheLoader {
-</span>67 <span style=''>    override val cache: KafkaFeatureCache = </span><span style='background: #AEF1AE'>KafkaFeatureCache.empty()</span><span style=''>
-</span>68 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
-</span>69 <span style=''>  }
-</span>70 <span style=''>
-</span>71 <span style=''>  class KafkaCacheLoaderImpl(
-</span>72 <span style=''>      sft: SimpleFeatureType,
-</span>73 <span style=''>      override val cache: KafkaFeatureCache,
-</span>74 <span style=''>      consumers: Seq[Consumer[Array[Byte], Array[Byte]]],
-</span>75 <span style=''>      topic: String,
-</span>76 <span style=''>      frequency: Long,
-</span>77 <span style=''>      serializer: GeoMessageSerializer,
-</span>78 <span style=''>      doInitialLoad: Boolean,
-</span>79 <span style=''>      initialLoadConfig: ExpiryTimeConfig,
-</span>80 <span style=''>      offsetCommitIntervalMs: Long
-</span>81 <span style=''>    ) extends ThreadedConsumer(consumers, Duration.ofMillis(frequency), offsetCommitIntervalMs) with KafkaCacheLoader {
-</span>82 <span style=''>    try { </span><span style='background: #AEF1AE'>classOf[ConsumerRecord[Any, Any]].getMethod(&quot;timestamp&quot;)</span><span style=''> } catch {
-</span>83 <span style=''>      case _: NoSuchMethodException =&gt; </span><span style='background: #F0ADAD'>logger.warn(&quot;This version of Kafka doesn't support timestamps, using system time&quot;)</span><span style=''>
-</span>84 <span style=''>    }
-</span>85 <span style=''>
-</span>86 <span style=''>    private val initialLoader =
-</span>87 <span style=''>      if (</span><span style='background: #AEF1AE'>doInitialLoad</span><span style=''>) {
-</span>88 <span style=''>        // for the initial load, don't bother spatially indexing until we have the final state
-</span>89 <span style=''>        </span><span style='background: #AEF1AE'>Some(new InitialLoader(sft, consumers, topic, frequency, offsetCommitIntervalMs, serializer, initialLoadConfig, this))</span><span style=''>
-</span>90 <span style=''>      } else {
-</span>91 <span style=''>        </span><span style='background: #F0ADAD'>None</span><span style=''>
-</span>92 <span style=''>      }
-</span>93 <span style=''>
-</span>94 <span style=''>    def start(): Unit = {
-</span>95 <span style=''>      </span><span style='background: #AEF1AE'>initialLoader</span><span style=''> match {
-</span>96 <span style=''>        case None =&gt; </span><span style='background: #F0ADAD'>startConsumers()</span><span style=''>
-</span>97 <span style=''>        case Some(loader) =&gt; </span><span style='background: #AEF1AE'>loader.start()</span><span style=''>
-</span>98 <span style=''>      }
-</span>99 <span style=''>    }
-</span>100 <span style=''>
-</span>101 <span style=''>    override def close(): Unit = {
-</span>102 <span style=''>      try { </span><span style='background: #AEF1AE'>super.close()</span><span style=''> } finally </span><span style='background: #AEF1AE'>{
-</span>103 <span style=''></span><span style='background: #AEF1AE'>        CloseWithLogging(initialLoader)
-</span>104 <span style=''></span><span style='background: #AEF1AE'>        cache.close()
-</span>105 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>106 <span style=''>    }
-</span>107 <span style=''>
-</span>108 <span style=''>    override protected [KafkaCacheLoader] def consume(record: ConsumerRecord[Array[Byte], Array[Byte]]): Unit = {
-</span>109 <span style=''>      val headers = </span><span style='background: #AEF1AE'>RecordVersions.getHeaders(record)</span><span style=''>
-</span>110 <span style=''>      val timestamp = </span><span style='background: #AEF1AE'>RecordVersions.getTimestamp(record)</span><span style=''>
-</span>111 <span style=''>      val message = </span><span style='background: #AEF1AE'>serializer.deserialize(record.key(), record.value(), headers, timestamp)</span><span style=''>
-</span>112 <span style=''>      logger.trace(s&quot;Consumed message [$topic:${record.partition}:${record.offset}] $message&quot;)
-</span>113 <span style=''>      message match {
-</span>114 <span style=''>        case m: Change </span><span style='background: #AEF1AE'>=&gt; cache.fireChange(timestamp, m.feature); cache.put(m.feature)</span><span style=''>
-</span>115 <span style=''>        case m: Delete </span><span style='background: #AEF1AE'>=&gt; cache.fireDelete(timestamp, m.id, cache.query(m.id).orNull); cache.remove(m.id)</span><span style=''>
-</span>116 <span style=''>        case _: Clear  </span><span style='background: #AEF1AE'>=&gt; cache.fireClear(timestamp); cache.clear()</span><span style=''>
-</span>117 <span style=''>        case m =&gt; </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Unknown message: $m&quot;)</span><span style=''>
-</span>118 <span style=''>      }
-</span>119 <span style=''>    }
-</span>120 <span style=''>  }
-</span>121 <span style=''>
-</span>122 <span style=''>  /**
-</span>123 <span style=''>    * Handles initial loaded 'from-beginning' without indexing features in the spatial index. Will still
-</span>124 <span style=''>    * trigger message events.
-</span>125 <span style=''>    *
-</span>126 <span style=''>    * @param consumers consumers, won't be closed even on call to 'close()'
-</span>127 <span style=''>    * @param topic kafka topic
-</span>128 <span style=''>    * @param frequency polling frequency in milliseconds
-</span>129 <span style=''>    * @param serializer message serializer
-</span>130 <span style=''>    * @param toLoad main cache loader, used for callback when bulk loading is done
-</span>131 <span style=''>    */
-</span>132 <span style=''>  private class InitialLoader(
-</span>133 <span style=''>      sft: SimpleFeatureType,
-</span>134 <span style=''>      consumers: Seq[Consumer[Array[Byte], Array[Byte]]],
-</span>135 <span style=''>      topic: String,
-</span>136 <span style=''>      frequency: Long,
-</span>137 <span style=''>      offsetCommitIntervalMs: Long,
-</span>138 <span style=''>      serializer: GeoMessageSerializer,
-</span>139 <span style=''>      ordering: ExpiryTimeConfig,
-</span>140 <span style=''>      toLoad: KafkaCacheLoaderImpl
-</span>141 <span style=''>    ) extends ThreadedConsumer(consumers, Duration.ofMillis(frequency), offsetCommitIntervalMs, false) with Runnable {
-</span>142 <span style=''>
-</span>143 <span style=''>    import scala.collection.JavaConverters._
-</span>144 <span style=''>
-</span>145 <span style=''>    private val cache = </span><span style='background: #AEF1AE'>KafkaFeatureCache.nonIndexing(sft, ordering)</span><span style=''>
-</span>146 <span style=''>
-</span>147 <span style=''>    // track the offsets that we want to read to
-</span>148 <span style=''>    private val offsets = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[Int, Long]()</span><span style=''>
-</span>149 <span style=''>    private val done = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
-</span>150 <span style=''>    private var latch: CountDownLatch = _
-</span>151 <span style=''>    @volatile
-</span>152 <span style=''>    private var submission: Future[_] = _
-</span>153 <span style=''>
-</span>154 <span style=''>    override protected def consume(record: ConsumerRecord[Array[Byte], Array[Byte]]): Unit = {
-</span>155 <span style=''>      if (</span><span style='background: #AEF1AE'>done.get</span><span style=''>) { </span><span style='background: #F0ADAD'>toLoad.consume(record)</span><span style=''> } else </span><span style='background: #AEF1AE'>{
-</span>156 <span style=''></span><span style='background: #AEF1AE'>        val headers = RecordVersions.getHeaders(record)
-</span>157 <span style=''></span><span style='background: #AEF1AE'>        val timestamp = RecordVersions.getTimestamp(record)
-</span>158 <span style=''></span><span style='background: #AEF1AE'>        val message = serializer.deserialize(record.key, record.value, headers, timestamp)
-</span>159 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(s&quot;Consumed message [$topic:${record.partition}:${record.offset}] $message&quot;)
-</span>160 <span style=''></span><span style='background: #AEF1AE'>        message match {
-</span>161 <span style=''></span><span style='background: #AEF1AE'>          case m: Change =&gt; toLoad.cache.fireChange(timestamp, m.feature); cache.put(m.feature)
-</span>162 <span style=''></span><span style='background: #AEF1AE'>          case m: Delete </span><span style='background: #F0ADAD'>=&gt; toLoad.cache.fireDelete(timestamp, m.id, cache.query(m.id).orNull); cache.remove(m.id)</span><span style='background: #AEF1AE'>
-</span>163 <span style=''></span><span style='background: #AEF1AE'>          case _: Clear  </span><span style='background: #F0ADAD'>=&gt; toLoad.cache.fireClear(timestamp); cache.clear()</span><span style='background: #AEF1AE'>
-</span>164 <span style=''></span><span style='background: #AEF1AE'>          case m =&gt; </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Unknown message: $m&quot;)</span><span style='background: #AEF1AE'>
-</span>165 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>166 <span style=''></span><span style='background: #AEF1AE'>        // once we've hit the max offset for the partition, remove from the offset map to indicate we're done
-</span>167 <span style=''></span><span style='background: #AEF1AE'>        val maxOffset = offsets.getOrDefault(record.partition, Long.MaxValue)
-</span>168 <span style=''></span><span style='background: #AEF1AE'>        if (maxOffset &lt;= record.offset) {
-</span>169 <span style=''></span><span style='background: #AEF1AE'>          offsets.remove(record.partition)
-</span>170 <span style=''></span><span style='background: #AEF1AE'>          latch.countDown()
-</span>171 <span style=''></span><span style='background: #AEF1AE'>          logger.info(s&quot;Initial load: consumed [$topic:${record.partition}:${record.offset}] of $maxOffset, &quot; +
-</span>172 <span style=''></span><span style='background: #AEF1AE'>              s&quot;${latch.getCount} partitions remaining&quot;)
-</span>173 <span style=''></span><span style='background: #AEF1AE'>        } else if (record.offset &gt; 0 &amp;&amp; </span><span style='background: #F0ADAD'>record.offset % 1048576 == 0</span><span style='background: #AEF1AE'>) { // magic number 2^20
-</span>174 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>logger.info(s&quot;Initial load: consumed [$topic:${record.partition}:${record.offset}] of $maxOffset&quot;)</span><span style='background: #AEF1AE'>
-</span>175 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>176 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>177 <span style=''>    }
-</span>178 <span style=''>
-</span>179 <span style=''>    def start(): Unit = {
-</span>180 <span style=''>      </span><span style='background: #AEF1AE'>LoaderStatus.startLoad(this)</span><span style=''>
-</span>181 <span style=''>      try {
-</span>182 <span style=''>        </span><span style='background: #AEF1AE'>val partitions = consumers.head.partitionsFor(topic).asScala.map(_.partition)
-</span>183 <span style=''></span><span style='background: #AEF1AE'>        try {
-</span>184 <span style=''></span><span style='background: #AEF1AE'>          // note: these methods are not available in kafka 0.9, which will cause it to fall back to normal loading
-</span>185 <span style=''></span><span style='background: #AEF1AE'>          val beginningOffsets = KafkaConsumerVersions.beginningOffsets(consumers.head, topic, partitions.toSeq)
-</span>186 <span style=''></span><span style='background: #AEF1AE'>          val endOffsets = KafkaConsumerVersions.endOffsets(consumers.head, topic, partitions.toSeq)
-</span>187 <span style=''></span><span style='background: #AEF1AE'>          partitions.foreach { p =&gt;
-</span>188 <span style=''></span><span style='background: #AEF1AE'>            // end offsets are the *next* offset that will be returned, so subtract one to track the last offset
-</span>189 <span style=''></span><span style='background: #AEF1AE'>            // we will actually consume
-</span>190 <span style=''></span><span style='background: #AEF1AE'>            val endOffset = endOffsets.getOrElse(p, 0L) - 1L
-</span>191 <span style=''></span><span style='background: #AEF1AE'>            // note: not sure if start offsets are also off by one, but at the worst we would skip bulk loading
-</span>192 <span style=''></span><span style='background: #AEF1AE'>            // for the last message per topic
-</span>193 <span style=''></span><span style='background: #AEF1AE'>            val beginningOffset = beginningOffsets.getOrElse(p, 0L)
-</span>194 <span style=''></span><span style='background: #AEF1AE'>            if (beginningOffset &lt; endOffset) {
-</span>195 <span style=''></span><span style='background: #AEF1AE'>              offsets.put(p, endOffset)
-</span>196 <span style=''></span><span style='background: #AEF1AE'>            }
-</span>197 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>198 <span style=''></span><span style='background: #AEF1AE'>        } catch {
-</span>199 <span style=''></span><span style='background: #AEF1AE'>          case e: NoSuchMethodException =&gt; </span><span style='background: #F0ADAD'>logger.warn(s&quot;Can't support initial bulk loading for current Kafka version: $e&quot;)</span><span style='background: #AEF1AE'>
-</span>200 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>201 <span style=''></span><span style='background: #AEF1AE'>        if (offsets.isEmpty) {
-</span>202 <span style=''></span><span style='background: #AEF1AE'>          // don't bother spinning up the consumer threads if we don't need to actually bulk load anything
-</span>203 <span style=''></span><span style='background: #AEF1AE'>          startNormalLoad()
-</span>204 <span style=''></span><span style='background: #AEF1AE'>          LoaderStatus.completedLoad(this)
-</span>205 <span style=''></span><span style='background: #AEF1AE'>        } else {
-</span>206 <span style=''></span><span style='background: #AEF1AE'>          logger.info(s&quot;Starting initial load for [$topic] with ${offsets.size} partitions&quot;)
-</span>207 <span style=''></span><span style='background: #AEF1AE'>          latch = new CountDownLatch(offsets.size)
-</span>208 <span style=''></span><span style='background: #AEF1AE'>          startConsumers() // kick off the asynchronous consumer threads
-</span>209 <span style=''></span><span style='background: #AEF1AE'>          submission = CachedThreadPool.submit(this)
-</span>210 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
-</span>211 <span style=''>      } catch {
-</span>212 <span style=''>        case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt;
-</span>213 <span style=''></span><span style='background: #F0ADAD'>          LoaderStatus.completedLoad(this)
-</span>214 <span style=''></span><span style='background: #F0ADAD'>          throw e</span><span style=''>
-</span>215 <span style=''>      }
-</span>216 <span style=''>    }
-</span>217 <span style=''>
-</span>218 <span style=''>    override def run(): Unit = {
-</span>219 <span style=''>      try {
-</span>220 <span style=''>        </span><span style='background: #AEF1AE'>try { latch.await() } finally {
-</span>221 <span style=''></span><span style='background: #AEF1AE'>          // stop the consumer threads, but won't close the consumers due to `closeConsumers`
-</span>222 <span style=''></span><span style='background: #AEF1AE'>          // note: don't call this.close() as it would interrupt this thread
-</span>223 <span style=''></span><span style='background: #AEF1AE'>          super.close()
-</span>224 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>225 <span style=''></span><span style='background: #AEF1AE'>        // set a flag just in case the consumer threads haven't finished spinning down, so that we will
-</span>226 <span style=''></span><span style='background: #AEF1AE'>        // pass any additional messages back to the main loader
-</span>227 <span style=''></span><span style='background: #AEF1AE'>        done.set(true)
-</span>228 <span style=''></span><span style='background: #AEF1AE'>        logger.info(s&quot;Finished initial load, transferring to indexed cache for [$topic]&quot;)
-</span>229 <span style=''></span><span style='background: #AEF1AE'>        cache.query(Filter.INCLUDE).foreach(toLoad.cache.put)
-</span>230 <span style=''></span><span style='background: #AEF1AE'>        logger.info(s&quot;Finished transfer for [$topic]&quot;)
-</span>231 <span style=''></span><span style='background: #AEF1AE'>        startNormalLoad()</span><span style=''>
-</span>232 <span style=''>      } finally {
-</span>233 <span style=''>        </span><span style='background: #AEF1AE'>LoaderStatus.completedLoad(this)</span><span style=''>
-</span>234 <span style=''>      }
-</span>235 <span style=''>    }
-</span>236 <span style=''>
-</span>237 <span style=''>    override def close(): Unit = {
-</span>238 <span style=''>      try { </span><span style='background: #AEF1AE'>super.close()</span><span style=''> } finally {
-</span>239 <span style=''>        </span><span style='background: #AEF1AE'>if (submission != null &amp;&amp; !submission.isDone) {
-</span>240 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>submission.cancel(true)</span><span style='background: #AEF1AE'>
-</span>241 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
-</span>242 <span style=''>      }
-</span>243 <span style=''>    }
-</span>244 <span style=''>    // start the normal loading
-</span>245 <span style=''>    private def startNormalLoad(): Unit = {
-</span>246 <span style=''>      logger.info(s&quot;Starting normal load for [$topic]&quot;)
-</span>247 <span style=''>      </span><span style='background: #AEF1AE'>toLoad.startConsumers()</span><span style=''>
-</span>248 <span style=''>    }
-</span>249 <span style=''>  }
-</span>250 <span style=''>}
+</span>16 <span style=''>import org.locationtech.geomesa.kafka.consumer.ThreadedConsumer.ConsumerErrorHandler
+</span>17 <span style=''>import org.locationtech.geomesa.kafka.data.KafkaDataStore.ExpiryTimeConfig
+</span>18 <span style=''>import org.locationtech.geomesa.kafka.index.KafkaFeatureCache
+</span>19 <span style=''>import org.locationtech.geomesa.kafka.utils.GeoMessage.{Change, Clear, Delete}
+</span>20 <span style=''>import org.locationtech.geomesa.kafka.utils.GeoMessageSerializer
+</span>21 <span style=''>import org.locationtech.geomesa.kafka.versions.{KafkaConsumerVersions, RecordVersions}
+</span>22 <span style=''>import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+</span>23 <span style=''>import org.locationtech.geomesa.utils.io.CloseWithLogging
+</span>24 <span style=''>
+</span>25 <span style=''>import java.io.Closeable
+</span>26 <span style=''>import java.time.Duration
+</span>27 <span style=''>import java.util.Collections
+</span>28 <span style=''>import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
+</span>29 <span style=''>import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Future}
+</span>30 <span style=''>import scala.util.control.NonFatal
+</span>31 <span style=''>
+</span>32 <span style=''>/**
+</span>33 <span style=''>  * Reads from Kafka and populates a `KafkaFeatureCache`.
+</span>34 <span style=''>  * Manages geotools feature listeners
+</span>35 <span style=''>  */
+</span>36 <span style=''>trait KafkaCacheLoader extends Closeable with LazyLogging {
+</span>37 <span style=''>  def cache: KafkaFeatureCache
+</span>38 <span style=''>}
+</span>39 <span style=''>
+</span>40 <span style=''>object KafkaCacheLoader extends LazyLogging {
+</span>41 <span style=''>
+</span>42 <span style=''>  object LoaderStatus {
+</span>43 <span style=''>
+</span>44 <span style=''>    private val loading = </span><span style='background: #AEF1AE'>Collections.newSetFromMap(new ConcurrentHashMap[AnyRef, java.lang.Boolean]())</span><span style=''>
+</span>45 <span style=''>    private val firstLoadStartTime = </span><span style='background: #AEF1AE'>new AtomicLong(0L)</span><span style=''>
+</span>46 <span style=''>
+</span>47 <span style=''>    def startLoad(loader: AnyRef): Boolean = </span><span style='background: #AEF1AE'>synchronized {
+</span>48 <span style=''></span><span style='background: #AEF1AE'>      if (!loading.add(loader)) {
+</span>49 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>logger.warn(s&quot;Called startLoad for a loader that was already registered and has not yet completed: $loader&quot;)</span><span style='background: #AEF1AE'>
+</span>50 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>51 <span style=''></span><span style='background: #AEF1AE'>      firstLoadStartTime.compareAndSet(0L, System.currentTimeMillis())
+</span>52 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>53 <span style=''>
+</span>54 <span style=''>    def completedLoad(loader: AnyRef): Unit = </span><span style='background: #AEF1AE'>synchronized {
+</span>55 <span style=''></span><span style='background: #AEF1AE'>      if (!loading.remove(loader)) {
+</span>56 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>logger.warn(s&quot;Called completedLoad for a loader that was not registered or already deregistered: $loader&quot;)</span><span style='background: #AEF1AE'>
+</span>57 <span style=''></span><span style='background: #AEF1AE'>      } else if (loading.isEmpty) {
+</span>58 <span style=''></span><span style='background: #AEF1AE'>        logger.info(s&quot;Last active initial load completed.  &quot; +
+</span>59 <span style=''></span><span style='background: #AEF1AE'>          s&quot;Initial loads took ${System.currentTimeMillis() - firstLoadStartTime.get} milliseconds.&quot;)
+</span>60 <span style=''></span><span style='background: #AEF1AE'>        firstLoadStartTime.set(0L)
+</span>61 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>62 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>63 <span style=''>
+</span>64 <span style=''>    def allLoaded(): Boolean = </span><span style='background: #F0ADAD'>loading.isEmpty</span><span style=''>
+</span>65 <span style=''>  }
+</span>66 <span style=''>
+</span>67 <span style=''>  object NoOpLoader extends KafkaCacheLoader {
+</span>68 <span style=''>    override val cache: KafkaFeatureCache = </span><span style='background: #AEF1AE'>KafkaFeatureCache.empty()</span><span style=''>
+</span>69 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
+</span>70 <span style=''>  }
+</span>71 <span style=''>
+</span>72 <span style=''>  class KafkaCacheLoaderImpl(
+</span>73 <span style=''>      sft: SimpleFeatureType,
+</span>74 <span style=''>      override val cache: KafkaFeatureCache,
+</span>75 <span style=''>      consumers: Seq[Consumer[Array[Byte], Array[Byte]]],
+</span>76 <span style=''>      topic: String,
+</span>77 <span style=''>      frequency: Long,
+</span>78 <span style=''>      serializer: GeoMessageSerializer,
+</span>79 <span style=''>      doInitialLoad: Boolean,
+</span>80 <span style=''>      initialLoadConfig: ExpiryTimeConfig,
+</span>81 <span style=''>      offsetCommitIntervalMs: Long
+</span>82 <span style=''>    ) extends ThreadedConsumer(consumers, Duration.ofMillis(frequency), offsetCommitIntervalMs) with KafkaCacheLoader {
+</span>83 <span style=''>    try { </span><span style='background: #AEF1AE'>classOf[ConsumerRecord[Any, Any]].getMethod(&quot;timestamp&quot;)</span><span style=''> } catch {
+</span>84 <span style=''>      case _: NoSuchMethodException =&gt; </span><span style='background: #F0ADAD'>logger.warn(&quot;This version of Kafka doesn't support timestamps, using system time&quot;)</span><span style=''>
+</span>85 <span style=''>    }
+</span>86 <span style=''>
+</span>87 <span style=''>    private val initialLoader =
+</span>88 <span style=''>      if (</span><span style='background: #AEF1AE'>doInitialLoad</span><span style=''>) {
+</span>89 <span style=''>        // for the initial load, don't bother spatially indexing until we have the final state
+</span>90 <span style=''>        </span><span style='background: #AEF1AE'>Some(new InitialLoader(sft, consumers, topic, frequency, offsetCommitIntervalMs, serializer, initialLoadConfig, this))</span><span style=''>
+</span>91 <span style=''>      } else {
+</span>92 <span style=''>        </span><span style='background: #F0ADAD'>None</span><span style=''>
+</span>93 <span style=''>      }
+</span>94 <span style=''>
+</span>95 <span style=''>    def start(): Unit = {
+</span>96 <span style=''>      </span><span style='background: #AEF1AE'>initialLoader</span><span style=''> match {
+</span>97 <span style=''>        case None =&gt; </span><span style='background: #F0ADAD'>startConsumers()</span><span style=''>
+</span>98 <span style=''>        case Some(loader) =&gt; </span><span style='background: #AEF1AE'>loader.start()</span><span style=''>
+</span>99 <span style=''>      }
+</span>100 <span style=''>    }
+</span>101 <span style=''>
+</span>102 <span style=''>    override def close(): Unit = {
+</span>103 <span style=''>      try { </span><span style='background: #AEF1AE'>super.close()</span><span style=''> } finally </span><span style='background: #AEF1AE'>{
+</span>104 <span style=''></span><span style='background: #AEF1AE'>        CloseWithLogging(initialLoader)
+</span>105 <span style=''></span><span style='background: #AEF1AE'>        cache.close()
+</span>106 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>107 <span style=''>    }
+</span>108 <span style=''>
+</span>109 <span style=''>    override protected [KafkaCacheLoader] def consume(record: ConsumerRecord[Array[Byte], Array[Byte]]): Unit = {
+</span>110 <span style=''>      val headers = </span><span style='background: #AEF1AE'>RecordVersions.getHeaders(record)</span><span style=''>
+</span>111 <span style=''>      val timestamp = </span><span style='background: #AEF1AE'>RecordVersions.getTimestamp(record)</span><span style=''>
+</span>112 <span style=''>      val message = </span><span style='background: #AEF1AE'>serializer.deserialize(record.key(), record.value(), headers, timestamp)</span><span style=''>
+</span>113 <span style=''>      logger.trace(s&quot;Consumed message [$topic:${record.partition}:${record.offset}] $message&quot;)
+</span>114 <span style=''>      message match {
+</span>115 <span style=''>        case m: Change </span><span style='background: #AEF1AE'>=&gt; cache.fireChange(timestamp, m.feature); cache.put(m.feature)</span><span style=''>
+</span>116 <span style=''>        case m: Delete </span><span style='background: #AEF1AE'>=&gt; cache.fireDelete(timestamp, m.id, cache.query(m.id).orNull); cache.remove(m.id)</span><span style=''>
+</span>117 <span style=''>        case _: Clear  </span><span style='background: #AEF1AE'>=&gt; cache.fireClear(timestamp); cache.clear()</span><span style=''>
+</span>118 <span style=''>        case m =&gt; </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Unknown message: $m&quot;)</span><span style=''>
+</span>119 <span style=''>      }
+</span>120 <span style=''>    }
+</span>121 <span style=''>  }
+</span>122 <span style=''>
+</span>123 <span style=''>  /**
+</span>124 <span style=''>    * Handles initial loaded 'from-beginning' without indexing features in the spatial index. Will still
+</span>125 <span style=''>    * trigger message events.
+</span>126 <span style=''>    *
+</span>127 <span style=''>    * @param consumers consumers, won't be closed even on call to 'close()'
+</span>128 <span style=''>    * @param topic kafka topic
+</span>129 <span style=''>    * @param frequency polling frequency in milliseconds
+</span>130 <span style=''>    * @param serializer message serializer
+</span>131 <span style=''>    * @param toLoad main cache loader, used for callback when bulk loading is done
+</span>132 <span style=''>    */
+</span>133 <span style=''>  private class InitialLoader(
+</span>134 <span style=''>      sft: SimpleFeatureType,
+</span>135 <span style=''>      consumers: Seq[Consumer[Array[Byte], Array[Byte]]],
+</span>136 <span style=''>      topic: String,
+</span>137 <span style=''>      frequency: Long,
+</span>138 <span style=''>      offsetCommitIntervalMs: Long,
+</span>139 <span style=''>      serializer: GeoMessageSerializer,
+</span>140 <span style=''>      ordering: ExpiryTimeConfig,
+</span>141 <span style=''>      toLoad: KafkaCacheLoaderImpl
+</span>142 <span style=''>    ) extends ThreadedConsumer(consumers, Duration.ofMillis(frequency), offsetCommitIntervalMs, false) with Runnable {
+</span>143 <span style=''>
+</span>144 <span style=''>    import scala.collection.JavaConverters._
+</span>145 <span style=''>
+</span>146 <span style=''>    private val cache = </span><span style='background: #AEF1AE'>KafkaFeatureCache.nonIndexing(sft, ordering)</span><span style=''>
+</span>147 <span style=''>
+</span>148 <span style=''>    // track the offsets that we want to read to
+</span>149 <span style=''>    private val offsets = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[Int, Long]()</span><span style=''>
+</span>150 <span style=''>    private val done = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
+</span>151 <span style=''>    private var latch: CountDownLatch = _
+</span>152 <span style=''>    @volatile
+</span>153 <span style=''>    private var submission: Future[_] = _
+</span>154 <span style=''>
+</span>155 <span style=''>    override protected def createConsumerRunnable(
+</span>156 <span style=''>        id: String,
+</span>157 <span style=''>        consumer: Consumer[Array[Byte], Array[Byte]],
+</span>158 <span style=''>        handler: ConsumerErrorHandler): Runnable = {
+</span>159 <span style=''>      </span><span style='background: #AEF1AE'>new InitialLoaderConsumerRunnable(id, consumer, handler)</span><span style=''>
+</span>160 <span style=''>    }
+</span>161 <span style=''>
+</span>162 <span style=''>    override protected def consume(record: ConsumerRecord[Array[Byte], Array[Byte]]): Unit = {
+</span>163 <span style=''>      if (</span><span style='background: #AEF1AE'>done.get</span><span style=''>) { </span><span style='background: #F0ADAD'>toLoad.consume(record)</span><span style=''> } else </span><span style='background: #AEF1AE'>{
+</span>164 <span style=''></span><span style='background: #AEF1AE'>        val headers = RecordVersions.getHeaders(record)
+</span>165 <span style=''></span><span style='background: #AEF1AE'>        val timestamp = RecordVersions.getTimestamp(record)
+</span>166 <span style=''></span><span style='background: #AEF1AE'>        val message = serializer.deserialize(record.key, record.value, headers, timestamp)
+</span>167 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(s&quot;Consumed message [$topic:${record.partition}:${record.offset}] $message&quot;)
+</span>168 <span style=''></span><span style='background: #AEF1AE'>        message match {
+</span>169 <span style=''></span><span style='background: #AEF1AE'>          case m: Change =&gt; toLoad.cache.fireChange(timestamp, m.feature); cache.put(m.feature)
+</span>170 <span style=''></span><span style='background: #AEF1AE'>          case m: Delete </span><span style='background: #F0ADAD'>=&gt; toLoad.cache.fireDelete(timestamp, m.id, cache.query(m.id).orNull); cache.remove(m.id)</span><span style='background: #AEF1AE'>
+</span>171 <span style=''></span><span style='background: #AEF1AE'>          case _: Clear  </span><span style='background: #F0ADAD'>=&gt; toLoad.cache.fireClear(timestamp); cache.clear()</span><span style='background: #AEF1AE'>
+</span>172 <span style=''></span><span style='background: #AEF1AE'>          case m =&gt; </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Unknown message: $m&quot;)</span><span style='background: #AEF1AE'>
+</span>173 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>174 <span style=''></span><span style='background: #AEF1AE'>        if (record.offset &gt; 0 &amp;&amp; record.offset % 1048576 == 0) { // magic number 2^20
+</span>175 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>logger.info(s&quot;Initial load: consumed [$topic:${record.partition}:${record.offset}]&quot;)</span><span style='background: #AEF1AE'>
+</span>176 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>177 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>178 <span style=''>    }
+</span>179 <span style=''>
+</span>180 <span style=''>    def start(): Unit = {
+</span>181 <span style=''>      </span><span style='background: #AEF1AE'>LoaderStatus.startLoad(this)</span><span style=''>
+</span>182 <span style=''>      try {
+</span>183 <span style=''>        </span><span style='background: #AEF1AE'>val partitions = consumers.head.partitionsFor(topic).asScala.map(_.partition)
+</span>184 <span style=''></span><span style='background: #AEF1AE'>        val doInitialLoad =
+</span>185 <span style=''></span><span style='background: #AEF1AE'>          try {
+</span>186 <span style=''></span><span style='background: #AEF1AE'>            // note: these methods are not available in kafka 0.9, which will cause it to fall back to normal loading
+</span>187 <span style=''></span><span style='background: #AEF1AE'>            val beginningOffsets = KafkaConsumerVersions.beginningOffsets(consumers.head, topic, partitions.toSeq)
+</span>188 <span style=''></span><span style='background: #AEF1AE'>            val endOffsets = KafkaConsumerVersions.endOffsets(consumers.head, topic, partitions.toSeq)
+</span>189 <span style=''></span><span style='background: #AEF1AE'>            partitions.exists(p =&gt; beginningOffsets.getOrElse(p, </span><span style='background: #F0ADAD'>0L</span><span style='background: #AEF1AE'>) &lt; endOffsets.getOrElse(p, 0L))
+</span>190 <span style=''></span><span style='background: #AEF1AE'>          } catch {
+</span>191 <span style=''></span><span style='background: #AEF1AE'>            case e: NoSuchMethodException </span><span style='background: #F0ADAD'>=&gt;
+</span>192 <span style=''></span><span style='background: #F0ADAD'>              logger.warn(s&quot;Can't support initial bulk loading for current Kafka version: $e&quot;)
+</span>193 <span style=''></span><span style='background: #F0ADAD'>              false</span><span style='background: #AEF1AE'>
+</span>194 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>195 <span style=''></span><span style='background: #AEF1AE'>        if (doInitialLoad) {
+</span>196 <span style=''></span><span style='background: #AEF1AE'>          logger.info(s&quot;Starting initial load for [$topic] with ${partitions.size} partitions&quot;)
+</span>197 <span style=''></span><span style='background: #AEF1AE'>          latch = new CountDownLatch(partitions.size)
+</span>198 <span style=''></span><span style='background: #AEF1AE'>          startConsumers() // kick off the asynchronous consumer threads
+</span>199 <span style=''></span><span style='background: #AEF1AE'>          submission = CachedThreadPool.submit(this)
+</span>200 <span style=''></span><span style='background: #AEF1AE'>        } else {
+</span>201 <span style=''></span><span style='background: #AEF1AE'>          // don't bother spinning up the consumer threads if we don't need to actually bulk load anything
+</span>202 <span style=''></span><span style='background: #AEF1AE'>          startNormalLoad()
+</span>203 <span style=''></span><span style='background: #AEF1AE'>          LoaderStatus.completedLoad(this)
+</span>204 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>205 <span style=''>      } catch {
+</span>206 <span style=''>        case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt;
+</span>207 <span style=''></span><span style='background: #F0ADAD'>          LoaderStatus.completedLoad(this)
+</span>208 <span style=''></span><span style='background: #F0ADAD'>          throw e</span><span style=''>
+</span>209 <span style=''>      }
+</span>210 <span style=''>    }
+</span>211 <span style=''>
+</span>212 <span style=''>    override def run(): Unit = {
+</span>213 <span style=''>      try {
+</span>214 <span style=''>        </span><span style='background: #AEF1AE'>try { latch.await() } finally {
+</span>215 <span style=''></span><span style='background: #AEF1AE'>          // stop the consumer threads, but won't close the consumers due to `closeConsumers`
+</span>216 <span style=''></span><span style='background: #AEF1AE'>          // note: don't call this.close() as it would interrupt this thread
+</span>217 <span style=''></span><span style='background: #AEF1AE'>          super.close()
+</span>218 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>219 <span style=''></span><span style='background: #AEF1AE'>        // set a flag just in case the consumer threads haven't finished spinning down, so that we will
+</span>220 <span style=''></span><span style='background: #AEF1AE'>        // pass any additional messages back to the main loader
+</span>221 <span style=''></span><span style='background: #AEF1AE'>        done.set(true)
+</span>222 <span style=''></span><span style='background: #AEF1AE'>        logger.info(s&quot;Finished initial load, transferring to indexed cache for [$topic]&quot;)
+</span>223 <span style=''></span><span style='background: #AEF1AE'>        cache.query(Filter.INCLUDE).foreach(toLoad.cache.put)
+</span>224 <span style=''></span><span style='background: #AEF1AE'>        logger.info(s&quot;Finished transfer for [$topic]&quot;)
+</span>225 <span style=''></span><span style='background: #AEF1AE'>        startNormalLoad()</span><span style=''>
+</span>226 <span style=''>      } finally {
+</span>227 <span style=''>        </span><span style='background: #AEF1AE'>LoaderStatus.completedLoad(this)</span><span style=''>
+</span>228 <span style=''>      }
+</span>229 <span style=''>    }
+</span>230 <span style=''>
+</span>231 <span style=''>    override def close(): Unit = {
+</span>232 <span style=''>      try { </span><span style='background: #AEF1AE'>super.close()</span><span style=''> } finally {
+</span>233 <span style=''>        </span><span style='background: #AEF1AE'>if (submission != null &amp;&amp; !submission.isDone) {
+</span>234 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>submission.cancel(true)</span><span style='background: #AEF1AE'>
+</span>235 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>236 <span style=''>      }
+</span>237 <span style=''>    }
+</span>238 <span style=''>    // start the normal loading
+</span>239 <span style=''>    private def startNormalLoad(): Unit = {
+</span>240 <span style=''>      logger.info(s&quot;Starting normal load for [$topic]&quot;)
+</span>241 <span style=''>      </span><span style='background: #AEF1AE'>toLoad.startConsumers()</span><span style=''>
+</span>242 <span style=''>    }
+</span>243 <span style=''>
+</span>244 <span style=''>    /**
+</span>245 <span style=''>     * Consumer runnable for the initial load. It's not possible to check assignments until after poll() has been called,
+</span>246 <span style=''>     * and checking endOffsets is not reliable as a high water mark, due to transaction markers or other issues that
+</span>247 <span style=''>     * may advance the endOffset past where the consumer can actually reach (unless new messages are written).
+</span>248 <span style=''>     *
+</span>249 <span style=''>     * @param id id
+</span>250 <span style=''>     * @param consumer consumer
+</span>251 <span style=''>     * @param handler error handler
+</span>252 <span style=''>     */
+</span>253 <span style=''>    private class InitialLoaderConsumerRunnable(id: String, consumer: Consumer[Array[Byte], Array[Byte]], handler: ConsumerErrorHandler)
+</span>254 <span style=''>        extends ConsumerRunnable(id, consumer, handler) {
+</span>255 <span style=''>
+</span>256 <span style=''>      private var checkOffsets = </span><span style='background: #AEF1AE'>true</span><span style=''>
+</span>257 <span style=''>
+</span>258 <span style=''>      override protected def processPoll(result: ConsumerRecords[Array[Byte], Array[Byte]]): Unit = {
+</span>259 <span style=''>        if (</span><span style='background: #AEF1AE'>checkOffsets</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>260 <span style=''></span><span style='background: #AEF1AE'>          consumer.assignment().asScala.foreach { tp =&gt;
+</span>261 <span style=''></span><span style='background: #AEF1AE'>            // the only reliable way we've found to check max offset is to seek to the end and check the position there
+</span>262 <span style=''></span><span style='background: #AEF1AE'>            val position = consumer.position(tp)
+</span>263 <span style=''></span><span style='background: #AEF1AE'>            consumer.seekToEnd(Collections.singleton(tp))
+</span>264 <span style=''></span><span style='background: #AEF1AE'>            val end = consumer.position(tp)
+</span>265 <span style=''></span><span style='background: #AEF1AE'>            // return to the original position
+</span>266 <span style=''></span><span style='background: #AEF1AE'>            consumer.seek(tp, position)
+</span>267 <span style=''></span><span style='background: #AEF1AE'>            logger.debug(s&quot;Setting max offset to [${tp.topic}:${tp.partition}:${end - 1}]&quot;)
+</span>268 <span style=''></span><span style='background: #AEF1AE'>            offsets.put(tp.partition(), end - 1)
+</span>269 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>270 <span style=''></span><span style='background: #AEF1AE'>          checkOffsets = false
+</span>271 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>272 <span style=''>        try {
+</span>273 <span style=''>          </span><span style='background: #AEF1AE'>super.processPoll(result)</span><span style=''>
+</span>274 <span style=''>        } finally {
+</span>275 <span style=''>          </span><span style='background: #AEF1AE'>result.partitions().asScala.foreach { tp =&gt;
+</span>276 <span style=''></span><span style='background: #AEF1AE'>            val position = consumer.position(tp)
+</span>277 <span style=''></span><span style='background: #AEF1AE'>            // once we've hit the max offset for the partition, remove from the offset map so we don't double count it
+</span>278 <span style=''></span><span style='background: #AEF1AE'>            if (position &gt;= offsets.getOrDefault(tp.partition(), Long.MaxValue)) {
+</span>279 <span style=''></span><span style='background: #AEF1AE'>              offsets.remove(tp.partition)
+</span>280 <span style=''></span><span style='background: #AEF1AE'>              latch.countDown()
+</span>281 <span style=''></span><span style='background: #AEF1AE'>              logger.info(s&quot;Initial load: consumed [$topic:${tp.partition}:${position - 1}]&quot;)
+</span>282 <span style=''></span><span style='background: #AEF1AE'>              logger.info(s&quot;Initial load completed for [$topic:${tp.partition}], ${latch.getCount} partitions remaining&quot;)
+</span>283 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>284 <span style=''></span><span style='background: #AEF1AE'>          }</span><span style=''>
+</span>285 <span style=''>        }
+</span>286 <span style=''>      }
+</span>287 <span style=''>    }
+</span>288 <span style=''>  }
+</span>289 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -286,15 +325,15 @@
         <th>Code</th>
       </tr><tr>
         <td>
-          43
+          44
         </td>
         <td>
           1
         </td>
         <td>
-          1850
+          1952
           -
-          1900
+          2002
         </td>
         <td>
           Apply
@@ -310,15 +349,15 @@
         </td>
       </tr><tr>
         <td>
-          43
+          44
         </td>
         <td>
           2
         </td>
         <td>
-          1824
+          1926
           -
-          1901
+          2003
         </td>
         <td>
           Apply
@@ -334,15 +373,15 @@
         </td>
       </tr><tr>
         <td>
-          44
+          45
         </td>
         <td>
           3
         </td>
         <td>
-          1939
+          2041
           -
-          1957
+          2059
         </td>
         <td>
           Apply
@@ -358,15 +397,15 @@
         </td>
       </tr><tr>
         <td>
-          46
+          47
         </td>
         <td>
           11
         </td>
         <td>
-          2004
+          2106
           -
-          2254
+          2356
         </td>
         <td>
           Apply
@@ -391,15 +430,15 @@
         </td>
       </tr><tr>
         <td>
-          47
+          48
         </td>
         <td>
           4
         </td>
         <td>
-          2029
+          2131
           -
-          2049
+          2151
         </td>
         <td>
           Select
@@ -415,15 +454,15 @@
         </td>
       </tr><tr>
         <td>
-          47
+          48
         </td>
         <td>
           6
         </td>
         <td>
-          2025
+          2127
           -
-          2025
+          2127
         </td>
         <td>
           Literal
@@ -439,15 +478,15 @@
         </td>
       </tr><tr>
         <td>
-          47
+          48
         </td>
         <td>
           7
         </td>
         <td>
-          2025
+          2127
           -
-          2025
+          2127
         </td>
         <td>
           Block
@@ -463,15 +502,15 @@
         </td>
       </tr><tr>
         <td>
-          48
+          49
         </td>
         <td>
           5
         </td>
         <td>
-          2061
+          2163
           -
-          2169
+          2271
         </td>
         <td>
           Typed
@@ -490,15 +529,15 @@ else
         </td>
       </tr><tr>
         <td>
-          50
+          51
         </td>
         <td>
           8
         </td>
         <td>
-          2217
+          2319
           -
-          2219
+          2321
         </td>
         <td>
           Literal
@@ -514,15 +553,15 @@ else
         </td>
       </tr><tr>
         <td>
-          50
+          51
         </td>
         <td>
           9
         </td>
         <td>
-          2221
+          2323
           -
-          2247
+          2349
         </td>
         <td>
           Apply
@@ -538,15 +577,15 @@ else
         </td>
       </tr><tr>
         <td>
-          50
+          51
         </td>
         <td>
           10
         </td>
         <td>
-          2184
+          2286
           -
-          2248
+          2350
         </td>
         <td>
           Apply
@@ -562,15 +601,15 @@ else
         </td>
       </tr><tr>
         <td>
-          53
+          54
         </td>
         <td>
           20
         </td>
         <td>
-          2302
+          2404
           -
-          2718
+          2820
         </td>
         <td>
           Apply
@@ -601,15 +640,15 @@ else
         </td>
       </tr><tr>
         <td>
-          54
+          55
         </td>
         <td>
           12
         </td>
         <td>
-          2327
+          2429
           -
-          2350
+          2452
         </td>
         <td>
           Select
@@ -625,15 +664,15 @@ else
         </td>
       </tr><tr>
         <td>
-          55
+          56
         </td>
         <td>
           13
         </td>
         <td>
-          2362
+          2464
           -
-          2468
+          2570
         </td>
         <td>
           Typed
@@ -652,15 +691,15 @@ else
         </td>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
           14
         </td>
         <td>
-          2486
+          2588
           -
-          2501
+          2603
         </td>
         <td>
           Apply
@@ -676,15 +715,15 @@ else
         </td>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
           16
         </td>
         <td>
-          2503
+          2605
           -
-          2712
+          2814
         </td>
         <td>
           Block
@@ -706,15 +745,15 @@ else
         </td>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
           17
         </td>
         <td>
-          2482
+          2584
           -
-          2482
+          2584
         </td>
         <td>
           Literal
@@ -730,15 +769,15 @@ else
         </td>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
           18
         </td>
         <td>
-          2482
+          2584
           -
-          2482
+          2584
         </td>
         <td>
           Block
@@ -754,15 +793,15 @@ else
         </td>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
           19
         </td>
         <td>
-          2482
+          2584
           -
-          2712
+          2814
         </td>
         <td>
           If
@@ -787,15 +826,15 @@ else
         </td>
       </tr><tr>
         <td>
-          59
+          60
         </td>
         <td>
           15
         </td>
         <td>
-          2678
+          2780
           -
-          2704
+          2806
         </td>
         <td>
           Apply
@@ -811,15 +850,15 @@ else
         </td>
       </tr><tr>
         <td>
-          63
+          64
         </td>
         <td>
           21
         </td>
         <td>
-          2751
+          2853
           -
-          2766
+          2868
         </td>
         <td>
           Apply
@@ -835,15 +874,15 @@ else
         </td>
       </tr><tr>
         <td>
-          67
+          68
         </td>
         <td>
           22
         </td>
         <td>
-          2863
+          2965
           -
-          2888
+          2990
         </td>
         <td>
           Apply
@@ -859,15 +898,15 @@ else
         </td>
       </tr><tr>
         <td>
-          68
+          69
         </td>
         <td>
           23
         </td>
         <td>
-          2922
+          3024
           -
-          2924
+          3026
         </td>
         <td>
           Literal
@@ -883,15 +922,15 @@ else
         </td>
       </tr><tr>
         <td>
-          82
+          83
         </td>
         <td>
           24
         </td>
         <td>
-          3415
+          3517
           -
-          3471
+          3573
         </td>
         <td>
           Apply
@@ -907,15 +946,15 @@ else
         </td>
       </tr><tr>
         <td>
-          82
+          83
         </td>
         <td>
           25
         </td>
         <td>
-          3415
+          3517
           -
-          3471
+          3573
         </td>
         <td>
           Block
@@ -931,15 +970,15 @@ else
         </td>
       </tr><tr>
         <td>
-          83
+          84
         </td>
         <td>
           26
         </td>
         <td>
-          3521
+          3623
           -
-          3603
+          3705
         </td>
         <td>
           Typed
@@ -958,15 +997,15 @@ else
         </td>
       </tr><tr>
         <td>
-          87
+          88
         </td>
         <td>
           27
         </td>
         <td>
-          3653
+          3755
           -
-          3666
+          3768
         </td>
         <td>
           Select
@@ -982,15 +1021,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           28
         </td>
         <td>
-          3796
+          3898
           -
-          3799
+          3901
         </td>
         <td>
           Select
@@ -1006,15 +1045,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           29
         </td>
         <td>
-          3801
+          3903
           -
-          3810
+          3912
         </td>
         <td>
           Select
@@ -1030,15 +1069,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           30
         </td>
         <td>
-          3812
+          3914
           -
-          3817
+          3919
         </td>
         <td>
           Select
@@ -1054,15 +1093,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           31
         </td>
         <td>
-          3819
+          3921
           -
-          3828
+          3930
         </td>
         <td>
           Select
@@ -1078,15 +1117,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           32
         </td>
         <td>
-          3830
+          3932
           -
-          3852
+          3954
         </td>
         <td>
           Select
@@ -1102,15 +1141,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           33
         </td>
         <td>
-          3854
+          3956
           -
-          3864
+          3966
         </td>
         <td>
           Select
@@ -1126,15 +1165,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           34
         </td>
         <td>
-          3866
+          3968
           -
-          3883
+          3985
         </td>
         <td>
           Select
@@ -1150,15 +1189,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           35
         </td>
         <td>
-          3778
+          3880
           -
-          3890
+          3992
         </td>
         <td>
           Apply
@@ -1174,15 +1213,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           36
         </td>
         <td>
-          3773
+          3875
           -
-          3891
+          3993
         </td>
         <td>
           Apply
@@ -1198,15 +1237,15 @@ else
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           37
         </td>
         <td>
-          3773
+          3875
           -
-          3891
+          3993
         </td>
         <td>
           Block
@@ -1222,15 +1261,15 @@ else
         </td>
       </tr><tr>
         <td>
-          91
+          92
         </td>
         <td>
           38
         </td>
         <td>
-          3915
+          4017
           -
-          3919
+          4021
         </td>
         <td>
           Select
@@ -1246,15 +1285,15 @@ else
         </td>
       </tr><tr>
         <td>
-          91
+          92
         </td>
         <td>
           39
         </td>
         <td>
-          3915
+          4017
           -
-          3919
+          4021
         </td>
         <td>
           Block
@@ -1270,15 +1309,15 @@ else
         </td>
       </tr><tr>
         <td>
-          95
+          96
         </td>
         <td>
           40
         </td>
         <td>
-          3961
+          4063
           -
-          3974
+          4076
         </td>
         <td>
           Select
@@ -1294,15 +1333,15 @@ else
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
           41
         </td>
         <td>
-          4004
+          4106
           -
-          4020
+          4122
         </td>
         <td>
           Apply
@@ -1318,15 +1357,15 @@ else
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
           42
         </td>
         <td>
-          4004
+          4106
           -
-          4020
+          4122
         </td>
         <td>
           Block
@@ -1342,15 +1381,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          98
         </td>
         <td>
           43
         </td>
         <td>
-          4050
+          4152
           -
-          4064
+          4166
         </td>
         <td>
           Apply
@@ -1366,15 +1405,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          98
         </td>
         <td>
           44
         </td>
         <td>
-          4050
+          4152
           -
-          4064
+          4166
         </td>
         <td>
           Block
@@ -1390,15 +1429,15 @@ else
         </td>
       </tr><tr>
         <td>
-          102
+          103
         </td>
         <td>
           45
         </td>
         <td>
-          4127
+          4229
           -
-          4140
+          4242
         </td>
         <td>
           Apply
@@ -1414,15 +1453,15 @@ else
         </td>
       </tr><tr>
         <td>
-          102
+          103
         </td>
         <td>
           46
         </td>
         <td>
-          4127
+          4229
           -
-          4140
+          4242
         </td>
         <td>
           Block
@@ -1438,15 +1477,15 @@ else
         </td>
       </tr><tr>
         <td>
-          102
+          103
         </td>
         <td>
           51
         </td>
         <td>
-          4151
+          4253
           -
-          4222
+          4324
         </td>
         <td>
           Block
@@ -1465,15 +1504,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
           47
         </td>
         <td>
-          4178
+          4280
           -
-          4191
+          4293
         </td>
         <td>
           Select
@@ -1489,15 +1528,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
           48
         </td>
         <td>
-          4177
+          4279
           -
-          4177
+          4279
         </td>
         <td>
           Select
@@ -1513,15 +1552,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
           49
         </td>
         <td>
-          4161
+          4263
           -
-          4192
+          4294
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1537,15 +1576,15 @@ else
         </td>
       </tr><tr>
         <td>
-          104
+          105
         </td>
         <td>
           50
         </td>
         <td>
-          4201
+          4303
           -
-          4214
+          4316
         </td>
         <td>
           Apply
@@ -1561,15 +1600,15 @@ else
         </td>
       </tr><tr>
         <td>
-          109
+          110
         </td>
         <td>
           52
         </td>
         <td>
-          4364
+          4466
           -
-          4397
+          4499
         </td>
         <td>
           Apply
@@ -1585,15 +1624,15 @@ else
         </td>
       </tr><tr>
         <td>
-          110
+          111
         </td>
         <td>
           53
         </td>
         <td>
-          4420
+          4522
           -
-          4455
+          4557
         </td>
         <td>
           Apply
@@ -1609,15 +1648,15 @@ else
         </td>
       </tr><tr>
         <td>
-          111
+          112
         </td>
         <td>
           54
         </td>
         <td>
-          4499
+          4601
           -
-          4511
+          4613
         </td>
         <td>
           Apply
@@ -1633,15 +1672,15 @@ else
         </td>
       </tr><tr>
         <td>
-          111
+          112
         </td>
         <td>
           55
         </td>
         <td>
-          4513
+          4615
           -
-          4527
+          4629
         </td>
         <td>
           Apply
@@ -1657,15 +1696,15 @@ else
         </td>
       </tr><tr>
         <td>
-          111
+          112
         </td>
         <td>
           56
         </td>
         <td>
-          4476
+          4578
           -
-          4548
+          4650
         </td>
         <td>
           Apply
@@ -1681,15 +1720,15 @@ else
         </td>
       </tr><tr>
         <td>
-          114
+          115
         </td>
         <td>
           57
         </td>
         <td>
-          4720
+          4822
           -
-          4729
+          4831
         </td>
         <td>
           Select
@@ -1705,15 +1744,15 @@ else
         </td>
       </tr><tr>
         <td>
-          114
+          115
         </td>
         <td>
           58
         </td>
         <td>
-          4692
+          4794
           -
-          4730
+          4832
         </td>
         <td>
           Apply
@@ -1729,15 +1768,15 @@ else
         </td>
       </tr><tr>
         <td>
-          114
+          115
         </td>
         <td>
           59
         </td>
         <td>
-          4742
+          4844
           -
-          4751
+          4853
         </td>
         <td>
           Select
@@ -1753,15 +1792,15 @@ else
         </td>
       </tr><tr>
         <td>
-          114
+          115
         </td>
         <td>
           60
         </td>
         <td>
-          4732
+          4834
           -
-          4752
+          4854
         </td>
         <td>
           Apply
@@ -1777,15 +1816,15 @@ else
         </td>
       </tr><tr>
         <td>
-          114
+          115
         </td>
         <td>
           61
         </td>
         <td>
-          4689
+          4791
           -
-          4752
+          4854
         </td>
         <td>
           Block
@@ -1804,15 +1843,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
           62
         </td>
         <td>
-          4807
+          4909
           -
-          4811
+          4913
         </td>
         <td>
           Select
@@ -1828,15 +1867,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
           63
         </td>
         <td>
-          4825
+          4927
           -
-          4829
+          4931
         </td>
         <td>
           Select
@@ -1852,15 +1891,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
           64
         </td>
         <td>
-          4831
+          4933
           -
-          4831
+          4933
         </td>
         <td>
           TypeApply
@@ -1876,15 +1915,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
           65
         </td>
         <td>
-          4813
+          4915
           -
-          4837
+          4939
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1900,15 +1939,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
           66
         </td>
         <td>
-          4779
+          4881
           -
-          4838
+          4940
         </td>
         <td>
           Apply
@@ -1924,15 +1963,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
           67
         </td>
         <td>
-          4853
+          4955
           -
-          4857
+          4959
         </td>
         <td>
           Select
@@ -1948,15 +1987,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
           68
         </td>
         <td>
-          4840
+          4942
           -
-          4858
+          4960
         </td>
         <td>
           Apply
@@ -1972,15 +2011,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
           69
         </td>
         <td>
-          4776
+          4878
           -
-          4858
+          4960
         </td>
         <td>
           Block
@@ -1999,15 +2038,15 @@ else
         </td>
       </tr><tr>
         <td>
-          116
+          117
         </td>
         <td>
           70
         </td>
         <td>
-          4885
+          4987
           -
-          4911
+          5013
         </td>
         <td>
           Apply
@@ -2023,15 +2062,15 @@ else
         </td>
       </tr><tr>
         <td>
-          116
+          117
         </td>
         <td>
           71
         </td>
         <td>
-          4913
+          5015
           -
-          4926
+          5028
         </td>
         <td>
           Apply
@@ -2047,15 +2086,15 @@ else
         </td>
       </tr><tr>
         <td>
-          116
+          117
         </td>
         <td>
           72
         </td>
         <td>
-          4882
+          4984
           -
-          4926
+          5028
         </td>
         <td>
           Block
@@ -2074,15 +2113,15 @@ else
         </td>
       </tr><tr>
         <td>
-          117
+          118
         </td>
         <td>
           73
         </td>
         <td>
-          4945
+          5047
           -
-          5003
+          5105
         </td>
         <td>
           Throw
@@ -2098,15 +2137,15 @@ else
         </td>
       </tr><tr>
         <td>
-          117
+          118
         </td>
         <td>
           74
         </td>
         <td>
-          4945
+          5047
           -
-          5003
+          5105
         </td>
         <td>
           Block
@@ -2122,15 +2161,15 @@ else
         </td>
       </tr><tr>
         <td>
-          145
+          146
         </td>
         <td>
           75
         </td>
         <td>
-          5995
+          6097
           -
-          5998
+          6100
         </td>
         <td>
           Select
@@ -2146,15 +2185,15 @@ else
         </td>
       </tr><tr>
         <td>
-          145
+          146
         </td>
         <td>
           76
         </td>
         <td>
-          6000
+          6102
           -
-          6008
+          6110
         </td>
         <td>
           Select
@@ -2170,15 +2209,15 @@ else
         </td>
       </tr><tr>
         <td>
-          145
+          146
         </td>
         <td>
           77
         </td>
         <td>
-          5965
+          6067
           -
-          6009
+          6111
         </td>
         <td>
           Apply
@@ -2194,15 +2233,15 @@ else
         </td>
       </tr><tr>
         <td>
-          148
+          149
         </td>
         <td>
           78
         </td>
         <td>
-          6086
+          6188
           -
-          6120
+          6222
         </td>
         <td>
           Apply
@@ -2218,15 +2257,15 @@ else
         </td>
       </tr><tr>
         <td>
-          149
+          150
         </td>
         <td>
           79
         </td>
         <td>
-          6144
+          6246
           -
-          6168
+          6270
         </td>
         <td>
           Apply
@@ -2242,15 +2281,39 @@ else
         </td>
       </tr><tr>
         <td>
-          155
+          159
         </td>
         <td>
           80
         </td>
         <td>
-          6373
+          6554
           -
-          6381
+          6610
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.InitialLoaderConsumerRunnable.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new InitialLoader.this.InitialLoaderConsumerRunnable(id, consumer, handler)
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          81
+        </td>
+        <td>
+          6723
+          -
+          6731
         </td>
         <td>
           Apply
@@ -2266,15 +2329,15 @@ else
         </td>
       </tr><tr>
         <td>
-          155
+          163
         </td>
         <td>
-          81
+          82
         </td>
         <td>
-          6385
+          6735
           -
-          6407
+          6757
         </td>
         <td>
           Apply
@@ -2290,15 +2353,15 @@ else
         </td>
       </tr><tr>
         <td>
-          155
+          163
         </td>
         <td>
-          82
+          83
         </td>
         <td>
-          6385
+          6735
           -
-          6407
+          6757
         </td>
         <td>
           Block
@@ -2314,15 +2377,15 @@ else
         </td>
       </tr><tr>
         <td>
-          155
+          163
         </td>
         <td>
-          122
+          113
         </td>
         <td>
-          6415
+          6765
           -
-          7811
+          7670
         </td>
         <td>
           Block
@@ -2357,37 +2420,26 @@ else
     }
     case (m @ _) =&gt; throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unknown message: &quot;, &quot;&quot;).s(m))
   };
-  val maxOffset: Long = InitialLoader.this.offsets.getOrDefault(record.partition(), 9223372036854775807L);
-  if (maxOffset.&lt;=(record.offset()))
-    {
-      InitialLoader.this.offsets.remove(record.partition());
-      InitialLoader.this.latch.countDown();
-      (if (InitialLoader.this.logger.underlying.isInfoEnabled())
-        InitialLoader.this.logger.underlying.info(scala.StringContext.apply(&quot;Initial load: consumed [&quot;, &quot;:&quot;, &quot;:&quot;, &quot;] of &quot;, &quot;, &quot;).s(InitialLoader.this.topic, record.partition(), record.offset(), maxOffset).+(scala.StringContext.apply(&quot;&quot;, &quot; partitions remaining&quot;).s(InitialLoader.this.latch.getCount())))
-      else
-        (): Unit)
-    }
-  else
-    if (record.offset().&gt;(0).&amp;&amp;(record.offset().%(1048576).==(0)))
-      (if (InitialLoader.this.logger.underlying.isInfoEnabled())
-        InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}] of {}&quot;, (InitialLoader.this.topic: AnyRef), record.partition().asInstanceOf[AnyRef], record.offset().asInstanceOf[AnyRef], maxOffset.asInstanceOf[AnyRef])
-      else
-        (): Unit)
+  if (record.offset().&gt;(0).&amp;&amp;(record.offset().%(1048576).==(0)))
+    (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+      InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}]&quot;, (InitialLoader.this.topic: AnyRef), record.partition().asInstanceOf[AnyRef], record.offset().asInstanceOf[AnyRef])
     else
-      ()
+      (): Unit)
+  else
+    ()
 }
         </td>
       </tr><tr>
         <td>
-          156
+          164
         </td>
         <td>
-          83
+          84
         </td>
         <td>
-          6439
+          6789
           -
-          6472
+          6822
         </td>
         <td>
           Apply
@@ -2403,15 +2455,15 @@ else
         </td>
       </tr><tr>
         <td>
-          157
+          165
         </td>
         <td>
-          84
+          85
         </td>
         <td>
-          6497
+          6847
           -
-          6532
+          6882
         </td>
         <td>
           Apply
@@ -2427,15 +2479,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          166
         </td>
         <td>
-          85
+          86
         </td>
         <td>
-          6578
+          6928
           -
-          6588
+          6938
         </td>
         <td>
           Apply
@@ -2451,15 +2503,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          166
         </td>
         <td>
-          86
+          87
         </td>
         <td>
-          6590
+          6940
           -
-          6602
+          6952
         </td>
         <td>
           Apply
@@ -2475,15 +2527,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          166
         </td>
         <td>
-          87
+          88
         </td>
         <td>
-          6555
+          6905
           -
-          6623
+          6973
         </td>
         <td>
           Apply
@@ -2499,15 +2551,15 @@ else
         </td>
       </tr><tr>
         <td>
-          161
+          169
         </td>
         <td>
-          88
+          89
         </td>
         <td>
-          6808
+          7158
           -
-          6817
+          7167
         </td>
         <td>
           Select
@@ -2523,15 +2575,15 @@ else
         </td>
       </tr><tr>
         <td>
-          161
+          169
         </td>
         <td>
-          89
+          90
         </td>
         <td>
-          6773
+          7123
           -
-          6818
+          7168
         </td>
         <td>
           Apply
@@ -2547,15 +2599,15 @@ else
         </td>
       </tr><tr>
         <td>
-          161
+          169
         </td>
         <td>
-          90
+          91
         </td>
         <td>
-          6830
+          7180
           -
-          6839
+          7189
         </td>
         <td>
           Select
@@ -2571,15 +2623,15 @@ else
         </td>
       </tr><tr>
         <td>
-          161
+          169
         </td>
         <td>
-          91
+          92
         </td>
         <td>
-          6820
+          7170
           -
-          6840
+          7190
         </td>
         <td>
           Apply
@@ -2595,15 +2647,15 @@ else
         </td>
       </tr><tr>
         <td>
-          161
+          169
         </td>
         <td>
-          92
+          93
         </td>
         <td>
-          6770
+          7120
           -
-          6840
+          7190
         </td>
         <td>
           Block
@@ -2622,39 +2674,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
-        </td>
-        <td>
-          93
-        </td>
-        <td>
-          6904
-          -
-          6908
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.id
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          m.id
-        </td>
-      </tr><tr>
-        <td>
-          162
+          170
         </td>
         <td>
           94
         </td>
         <td>
-          6922
+          7254
           -
-          6926
+          7258
         </td>
         <td>
           Select
@@ -2670,15 +2698,39 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          170
         </td>
         <td>
           95
         </td>
         <td>
-          6928
+          7272
           -
-          6928
+          7276
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          m.id
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          96
+        </td>
+        <td>
+          7278
+          -
+          7278
         </td>
         <td>
           TypeApply
@@ -2694,15 +2746,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          170
         </td>
         <td>
-          96
+          97
         </td>
         <td>
-          6910
+          7260
           -
-          6934
+          7284
         </td>
         <td>
           ApplyToImplicitArgs
@@ -2718,15 +2770,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          170
         </td>
         <td>
-          97
+          98
         </td>
         <td>
-          6869
+          7219
           -
-          6935
+          7285
         </td>
         <td>
           Apply
@@ -2742,15 +2794,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          170
         </td>
         <td>
-          98
+          99
         </td>
         <td>
-          6950
+          7300
           -
-          6954
+          7304
         </td>
         <td>
           Select
@@ -2766,15 +2818,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          170
         </td>
         <td>
-          99
+          100
         </td>
         <td>
-          6937
+          7287
           -
-          6955
+          7305
         </td>
         <td>
           Apply
@@ -2790,15 +2842,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          170
         </td>
         <td>
-          100
+          101
         </td>
         <td>
-          6866
+          7216
           -
-          6955
+          7305
         </td>
         <td>
           Block
@@ -2817,15 +2869,15 @@ else
         </td>
       </tr><tr>
         <td>
-          163
+          171
         </td>
         <td>
-          101
+          102
         </td>
         <td>
-          6984
+          7334
           -
-          7017
+          7367
         </td>
         <td>
           Apply
@@ -2841,15 +2893,15 @@ else
         </td>
       </tr><tr>
         <td>
-          163
+          171
         </td>
         <td>
-          102
+          103
         </td>
         <td>
-          7019
+          7369
           -
-          7032
+          7382
         </td>
         <td>
           Apply
@@ -2865,15 +2917,15 @@ else
         </td>
       </tr><tr>
         <td>
-          163
+          171
         </td>
         <td>
-          103
+          104
         </td>
         <td>
-          6981
+          7331
           -
-          7032
+          7382
         </td>
         <td>
           Block
@@ -2892,15 +2944,15 @@ else
         </td>
       </tr><tr>
         <td>
-          164
+          172
         </td>
         <td>
-          104
+          105
         </td>
         <td>
-          7053
+          7403
           -
-          7111
+          7461
         </td>
         <td>
           Throw
@@ -2916,15 +2968,15 @@ else
         </td>
       </tr><tr>
         <td>
-          164
+          172
         </td>
         <td>
-          105
+          106
         </td>
         <td>
-          7053
+          7403
           -
-          7111
+          7461
         </td>
         <td>
           Block
@@ -2940,238 +2992,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
-        </td>
-        <td>
-          106
-        </td>
-        <td>
-          7277
-          -
-          7293
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.consumer.ConsumerRecord.partition
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          record.partition()
-        </td>
-      </tr><tr>
-        <td>
-          167
+          174
         </td>
         <td>
           107
         </td>
         <td>
-          7295
+          7500
           -
-          7308
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          9223372036854775807L
-        </td>
-      </tr><tr>
-        <td>
-          167
-        </td>
-        <td>
-          108
-        </td>
-        <td>
-          7256
-          -
-          7309
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.concurrent.ConcurrentHashMap.getOrDefault
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          InitialLoader.this.offsets.getOrDefault(record.partition(), 9223372036854775807L)
-        </td>
-      </tr><tr>
-        <td>
-          168
-        </td>
-        <td>
-          109
-        </td>
-        <td>
-          7335
-          -
-          7348
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.consumer.ConsumerRecord.offset
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          record.offset()
-        </td>
-      </tr><tr>
-        <td>
-          168
-        </td>
-        <td>
-          110
-        </td>
-        <td>
-          7322
-          -
-          7348
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Long.&lt;=
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          maxOffset.&lt;=(record.offset())
-        </td>
-      </tr><tr>
-        <td>
-          168
-        </td>
-        <td>
-          114
-        </td>
-        <td>
-          7350
-          -
-          7601
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          {
-  InitialLoader.this.offsets.remove(record.partition());
-  InitialLoader.this.latch.countDown();
-  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
-    InitialLoader.this.logger.underlying.info(scala.StringContext.apply(&quot;Initial load: consumed [&quot;, &quot;:&quot;, &quot;:&quot;, &quot;] of &quot;, &quot;, &quot;).s(InitialLoader.this.topic, record.partition(), record.offset(), maxOffset).+(scala.StringContext.apply(&quot;&quot;, &quot; partitions remaining&quot;).s(InitialLoader.this.latch.getCount())))
-  else
-    (): Unit)
-}
-        </td>
-      </tr><tr>
-        <td>
-          169
-        </td>
-        <td>
-          111
-        </td>
-        <td>
-          7377
-          -
-          7393
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.consumer.ConsumerRecord.partition
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          record.partition()
-        </td>
-      </tr><tr>
-        <td>
-          169
-        </td>
-        <td>
-          112
-        </td>
-        <td>
-          7362
-          -
-          7394
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.concurrent.ConcurrentHashMap.remove
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          InitialLoader.this.offsets.remove(record.partition())
-        </td>
-      </tr><tr>
-        <td>
-          170
-        </td>
-        <td>
-          113
-        </td>
-        <td>
-          7405
-          -
-          7422
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.concurrent.CountDownLatch.countDown
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          InitialLoader.this.latch.countDown()
-        </td>
-      </tr><tr>
-        <td>
-          173
-        </td>
-        <td>
-          115
-        </td>
-        <td>
-          7627
-          -
-          7628
+          7501
         </td>
         <td>
           Literal
@@ -3187,15 +3016,15 @@ else
         </td>
       </tr><tr>
         <td>
-          173
+          174
         </td>
         <td>
-          116
+          108
         </td>
         <td>
-          7632
+          7505
           -
-          7660
+          7533
         </td>
         <td>
           Apply
@@ -3206,20 +3035,20 @@ else
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
+        <td style="background: #AEF1AE">
           record.offset().%(1048576).==(0)
         </td>
       </tr><tr>
         <td>
-          173
+          174
         </td>
         <td>
-          117
+          109
         </td>
         <td>
-          7611
+          7484
           -
-          7660
+          7533
         </td>
         <td>
           Apply
@@ -3235,15 +3064,15 @@ else
         </td>
       </tr><tr>
         <td>
-          173
+          174
         </td>
         <td>
-          119
+          111
         </td>
         <td>
-          7607
+          7480
           -
-          7607
+          7480
         </td>
         <td>
           Literal
@@ -3259,15 +3088,15 @@ else
         </td>
       </tr><tr>
         <td>
-          173
+          174
         </td>
         <td>
-          120
+          112
         </td>
         <td>
-          7607
+          7480
           -
-          7607
+          7480
         </td>
         <td>
           Block
@@ -3283,45 +3112,15 @@ else
         </td>
       </tr><tr>
         <td>
-          173
+          175
         </td>
         <td>
-          121
+          110
         </td>
         <td>
-          7607
+          7568
           -
-          7803
-        </td>
-        <td>
-          If
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          if (record.offset().&gt;(0).&amp;&amp;(record.offset().%(1048576).==(0)))
-  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
-    InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}] of {}&quot;, (InitialLoader.this.topic: AnyRef), record.partition().asInstanceOf[AnyRef], record.offset().asInstanceOf[AnyRef], maxOffset.asInstanceOf[AnyRef])
-  else
-    (): Unit)
-else
-  ()
-        </td>
-      </tr><tr>
-        <td>
-          174
-        </td>
-        <td>
-          118
-        </td>
-        <td>
-          7695
-          -
-          7793
+          7652
         </td>
         <td>
           Typed
@@ -3334,21 +3133,21 @@ else
         </td>
         <td style="background: #F0ADAD">
           (if (InitialLoader.this.logger.underlying.isInfoEnabled())
-  InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}] of {}&quot;, (InitialLoader.this.topic: AnyRef), record.partition().asInstanceOf[AnyRef], record.offset().asInstanceOf[AnyRef], maxOffset.asInstanceOf[AnyRef])
+  InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}]&quot;, (InitialLoader.this.topic: AnyRef), record.partition().asInstanceOf[AnyRef], record.offset().asInstanceOf[AnyRef])
 else
   (): Unit)
         </td>
       </tr><tr>
         <td>
-          180
+          181
         </td>
         <td>
-          123
+          114
         </td>
         <td>
-          7851
+          7710
           -
-          7879
+          7738
         </td>
         <td>
           Apply
@@ -3364,15 +3163,15 @@ else
         </td>
       </tr><tr>
         <td>
-          181
+          182
         </td>
         <td>
-          158
+          145
         </td>
         <td>
-          7900
+          7759
           -
-          9568
+          9018
         </td>
         <td>
           Block
@@ -3386,51 +3185,47 @@ else
         <td style="background: #AEF1AE">
           {
   val partitions: scala.collection.mutable.Buffer[Int] = scala.collection.JavaConverters.asScalaBufferConverter[org.apache.kafka.common.PartitionInfo](InitialLoader.this.consumers.head.partitionsFor(InitialLoader.this.topic)).asScala.map[Int, scala.collection.mutable.Buffer[Int]](((x$1: org.apache.kafka.common.PartitionInfo) =&gt; x$1.partition()))(mutable.this.Buffer.canBuildFrom[Int]);
-  try {
+  val doInitialLoad: Boolean = try {
     val beginningOffsets: Map[Int,Long] = org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.beginningOffsets(InitialLoader.this.consumers.head, InitialLoader.this.topic, partitions.toSeq);
     val endOffsets: Map[Int,Long] = org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.endOffsets(InitialLoader.this.consumers.head, InitialLoader.this.topic, partitions.toSeq);
-    partitions.foreach[AnyVal](((p: Int) =&gt; {
-      val endOffset: Long = endOffsets.getOrElse[Long](p, 0L).-(1L);
-      val beginningOffset: Long = beginningOffsets.getOrElse[Long](p, 0L);
-      if (beginningOffset.&lt;(endOffset))
-        InitialLoader.this.offsets.put(p, endOffset)
-      else
-        ()
-    }))
+    partitions.exists(((p: Int) =&gt; beginningOffsets.getOrElse[Long](p, 0L).&lt;(endOffsets.getOrElse[Long](p, 0L))))
   } catch {
-    case (e @ (_: NoSuchMethodException)) =&gt; (if (InitialLoader.this.logger.underlying.isWarnEnabled())
-      InitialLoader.this.logger.underlying.warn(&quot;Can\'t support initial bulk loading for current Kafka version: {}&quot;, (e: AnyRef))
-    else
-      (): Unit)
+    case (e @ (_: NoSuchMethodException)) =&gt; {
+      (if (InitialLoader.this.logger.underlying.isWarnEnabled())
+        InitialLoader.this.logger.underlying.warn(&quot;Can\'t support initial bulk loading for current Kafka version: {}&quot;, (e: AnyRef))
+      else
+        (): Unit);
+      false
+    }
   };
-  if (InitialLoader.this.offsets.isEmpty())
+  if (doInitialLoad)
     {
-      InitialLoader.this.startNormalLoad();
-      KafkaCacheLoader.this.LoaderStatus.completedLoad(this)
+      (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+        InitialLoader.this.logger.underlying.info(&quot;Starting initial load for [{}] with {} partitions&quot;, (scala.Array.apply[AnyRef]((InitialLoader.this.topic: AnyRef), partitions.size.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+      else
+        (): Unit);
+      InitialLoader.this.latch_=(new java.util.concurrent.CountDownLatch(partitions.size));
+      InitialLoader.this.startConsumers(InitialLoader.this.startConsumers$default$1);
+      InitialLoader.this.submission_=(org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit(this))
     }
   else
     {
-      (if (InitialLoader.this.logger.underlying.isInfoEnabled())
-        InitialLoader.this.logger.underlying.info(&quot;Starting initial load for [{}] with {} partitions&quot;, (scala.Array.apply[AnyRef]((InitialLoader.this.topic: AnyRef), InitialLoader.this.offsets.size().asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
-      else
-        (): Unit);
-      InitialLoader.this.latch_=(new java.util.concurrent.CountDownLatch(InitialLoader.this.offsets.size()));
-      InitialLoader.this.startConsumers(InitialLoader.this.startConsumers$default$1);
-      InitialLoader.this.submission_=(org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit(this))
+      InitialLoader.this.startNormalLoad();
+      KafkaCacheLoader.this.LoaderStatus.completedLoad(this)
     }
 }
         </td>
       </tr><tr>
         <td>
-          182
+          183
         </td>
         <td>
-          124
+          115
         </td>
         <td>
-          7946
+          7805
           -
-          7951
+          7810
         </td>
         <td>
           Select
@@ -3446,15 +3241,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          183
         </td>
         <td>
-          125
+          116
         </td>
         <td>
-          7917
+          7776
           -
-          7952
+          7811
         </td>
         <td>
           Apply
@@ -3470,15 +3265,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          183
         </td>
         <td>
-          126
+          117
         </td>
         <td>
-          7965
+          7824
           -
-          7976
+          7835
         </td>
         <td>
           Apply
@@ -3494,15 +3289,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          183
         </td>
         <td>
-          127
+          118
         </td>
         <td>
-          7964
+          7823
           -
-          7964
+          7823
         </td>
         <td>
           TypeApply
@@ -3518,15 +3313,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          183
         </td>
         <td>
-          128
+          119
         </td>
         <td>
-          7917
+          7776
           -
-          7977
+          7836
         </td>
         <td>
           ApplyToImplicitArgs
@@ -3542,15 +3337,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          185
         </td>
         <td>
-          145
+          132
         </td>
         <td>
-          8118
+          8011
           -
-          8910
+          8316
         </td>
         <td>
           Block
@@ -3565,27 +3360,20 @@ else
           {
   val beginningOffsets: Map[Int,Long] = org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.beginningOffsets(InitialLoader.this.consumers.head, InitialLoader.this.topic, partitions.toSeq);
   val endOffsets: Map[Int,Long] = org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.endOffsets(InitialLoader.this.consumers.head, InitialLoader.this.topic, partitions.toSeq);
-  partitions.foreach[AnyVal](((p: Int) =&gt; {
-    val endOffset: Long = endOffsets.getOrElse[Long](p, 0L).-(1L);
-    val beginningOffset: Long = beginningOffsets.getOrElse[Long](p, 0L);
-    if (beginningOffset.&lt;(endOffset))
-      InitialLoader.this.offsets.put(p, endOffset)
-    else
-      ()
-  }))
+  partitions.exists(((p: Int) =&gt; beginningOffsets.getOrElse[Long](p, 0L).&lt;(endOffsets.getOrElse[Long](p, 0L))))
 }
         </td>
       </tr><tr>
         <td>
-          185
+          187
         </td>
         <td>
-          129
+          120
         </td>
         <td>
-          8180
+          8073
           -
-          8194
+          8087
         </td>
         <td>
           Select
@@ -3601,15 +3389,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          187
         </td>
         <td>
-          130
+          121
         </td>
         <td>
-          8196
+          8089
           -
-          8201
+          8094
         </td>
         <td>
           Select
@@ -3625,15 +3413,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          187
         </td>
         <td>
-          131
+          122
         </td>
         <td>
-          8203
+          8096
           -
-          8219
+          8112
         </td>
         <td>
           Select
@@ -3649,15 +3437,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          187
         </td>
         <td>
-          132
+          123
         </td>
         <td>
-          8141
+          8034
           -
-          8220
+          8113
         </td>
         <td>
           Apply
@@ -3673,15 +3461,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          188
         </td>
         <td>
-          133
+          124
         </td>
         <td>
-          8281
+          8176
           -
-          8295
+          8190
         </td>
         <td>
           Select
@@ -3697,15 +3485,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          188
         </td>
         <td>
-          134
+          125
         </td>
         <td>
-          8297
+          8192
           -
-          8302
+          8197
         </td>
         <td>
           Select
@@ -3721,15 +3509,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          188
         </td>
         <td>
-          135
+          126
         </td>
         <td>
-          8304
+          8199
           -
-          8320
+          8215
         </td>
         <td>
           Select
@@ -3745,15 +3533,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          188
         </td>
         <td>
-          136
+          127
         </td>
         <td>
-          8248
+          8143
           -
-          8321
+          8216
         </td>
         <td>
           Apply
@@ -3769,70 +3557,39 @@ else
         </td>
       </tr><tr>
         <td>
-          187
+          189
         </td>
         <td>
-          144
+          128
         </td>
         <td>
-          8332
+          8282
           -
-          8910
+          8284
         </td>
         <td>
-          Apply
+          Literal
         </td>
         <td>
-          scala.collection.IterableLike.foreach
+          &lt;nosymbol&gt;
         </td>
         <td>
           
         </td>
-        <td style="background: #AEF1AE">
-          partitions.foreach[AnyVal](((p: Int) =&gt; {
-  val endOffset: Long = endOffsets.getOrElse[Long](p, 0L).-(1L);
-  val beginningOffset: Long = beginningOffsets.getOrElse[Long](p, 0L);
-  if (beginningOffset.&lt;(endOffset))
-    InitialLoader.this.offsets.put(p, endOffset)
-  else
-    ()
-}))
+        <td style="background: #F0ADAD">
+          0L
         </td>
       </tr><tr>
         <td>
-          190
+          189
         </td>
         <td>
-          137
+          129
         </td>
         <td>
-          8539
+          8288
           -
-          8571
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Long.-
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          endOffsets.getOrElse[Long](p, 0L).-(1L)
-        </td>
-      </tr><tr>
-        <td>
-          193
-        </td>
-        <td>
-          138
-        </td>
-        <td>
-          8764
-          -
-          8797
+          8315
         </td>
         <td>
           Apply
@@ -3844,19 +3601,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          beginningOffsets.getOrElse[Long](p, 0L)
+          endOffsets.getOrElse[Long](p, 0L)
         </td>
       </tr><tr>
         <td>
-          194
+          189
         </td>
         <td>
-          139
+          130
         </td>
         <td>
-          8814
+          8252
           -
-          8841
+          8315
         </td>
         <td>
           Apply
@@ -3868,19 +3625,73 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          beginningOffset.&lt;(endOffset)
+          beginningOffsets.getOrElse[Long](p, 0L).&lt;(endOffsets.getOrElse[Long](p, 0L))
         </td>
       </tr><tr>
         <td>
-          194
+          189
         </td>
         <td>
-          142
+          131
         </td>
         <td>
-          8810
+          8229
           -
-          8810
+          8316
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          partitions.exists(((p: Int) =&gt; beginningOffsets.getOrElse[Long](p, 0L).&lt;(endOffsets.getOrElse[Long](p, 0L))))
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          134
+        </td>
+        <td>
+          8379
+          -
+          8496
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (InitialLoader.this.logger.underlying.isWarnEnabled())
+    InitialLoader.this.logger.underlying.warn(&quot;Can\'t support initial bulk loading for current Kafka version: {}&quot;, (e: AnyRef))
+  else
+    (): Unit);
+  false
+}
+        </td>
+      </tr><tr>
+        <td>
+          193
+        </td>
+        <td>
+          133
+        </td>
+        <td>
+          8491
+          -
+          8496
         </td>
         <td>
           Literal
@@ -3891,56 +3702,8 @@ else
         <td>
           
         </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          194
-        </td>
-        <td>
-          143
-        </td>
-        <td>
-          8810
-          -
-          8810
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          195
-        </td>
-        <td>
-          140
-        </td>
-        <td>
-          8859
-          -
-          8884
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.concurrent.ConcurrentHashMap.put
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          InitialLoader.this.offsets.put(p, endOffset)
+        <td style="background: #F0ADAD">
+          false
         </td>
       </tr><tr>
         <td>
@@ -3950,36 +3713,12 @@ else
           141
         </td>
         <td>
-          8859
+          8536
           -
-          8884
+          8823
         </td>
         <td>
           Block
-        </td>
-        <td>
-          java.util.concurrent.ConcurrentHashMap.put
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          InitialLoader.this.offsets.put(p, endOffset)
-        </td>
-      </tr><tr>
-        <td>
-          199
-        </td>
-        <td>
-          146
-        </td>
-        <td>
-          8972
-          -
-          9052
-        </td>
-        <td>
-          Typed
         </td>
         <td>
           &lt;nosymbol&gt;
@@ -3987,47 +3726,172 @@ else
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
-          (if (InitialLoader.this.logger.underlying.isWarnEnabled())
-  InitialLoader.this.logger.underlying.warn(&quot;Can\'t support initial bulk loading for current Kafka version: {}&quot;, (e: AnyRef))
-else
-  (): Unit)
+        <td style="background: #AEF1AE">
+          {
+  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+    InitialLoader.this.logger.underlying.info(&quot;Starting initial load for [{}] with {} partitions&quot;, (scala.Array.apply[AnyRef]((InitialLoader.this.topic: AnyRef), partitions.size.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  InitialLoader.this.latch_=(new java.util.concurrent.CountDownLatch(partitions.size));
+  InitialLoader.this.startConsumers(InitialLoader.this.startConsumers$default$1);
+  InitialLoader.this.submission_=(org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit(this))
+}
         </td>
       </tr><tr>
         <td>
-          201
+          197
         </td>
         <td>
-          147
+          135
         </td>
         <td>
-          9075
+          8671
           -
-          9090
+          8686
         </td>
         <td>
-          Apply
+          Select
         </td>
         <td>
-          java.util.concurrent.ConcurrentHashMap.isEmpty
+          scala.collection.SeqLike.size
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          InitialLoader.this.offsets.isEmpty()
+          partitions.size
         </td>
       </tr><tr>
         <td>
-          201
+          197
         </td>
         <td>
-          150
+          136
         </td>
         <td>
-          9092
+          8652
           -
-          9281
+          8687
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.CountDownLatch.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.CountDownLatch(partitions.size)
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          137
+        </td>
+        <td>
+          8644
+          -
+          8687
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.latch_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.latch_=(new java.util.concurrent.CountDownLatch(partitions.size))
+        </td>
+      </tr><tr>
+        <td>
+          198
+        </td>
+        <td>
+          138
+        </td>
+        <td>
+          8698
+          -
+          8714
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BaseThreadedConsumer.startConsumers
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.startConsumers(InitialLoader.this.startConsumers$default$1)
+        </td>
+      </tr><tr>
+        <td>
+          199
+        </td>
+        <td>
+          139
+        </td>
+        <td>
+          8784
+          -
+          8813
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit(this)
+        </td>
+      </tr><tr>
+        <td>
+          199
+        </td>
+        <td>
+          140
+        </td>
+        <td>
+          8771
+          -
+          8813
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.submission_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.submission_=(org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit(this))
+        </td>
+      </tr><tr>
+        <td>
+          200
+        </td>
+        <td>
+          144
+        </td>
+        <td>
+          8829
+          -
+          9018
         </td>
         <td>
           Block
@@ -4046,15 +3910,15 @@ else
         </td>
       </tr><tr>
         <td>
-          203
+          202
         </td>
         <td>
-          148
+          142
         </td>
         <td>
-          9211
+          8948
           -
-          9228
+          8965
         </td>
         <td>
           Apply
@@ -4070,15 +3934,15 @@ else
         </td>
       </tr><tr>
         <td>
-          204
+          203
         </td>
         <td>
-          149
+          143
         </td>
         <td>
-          9239
+          8976
           -
-          9271
+          9008
         </td>
         <td>
           Apply
@@ -4094,191 +3958,15 @@ else
         </td>
       </tr><tr>
         <td>
-          205
+          206
         </td>
         <td>
-          157
+          148
         </td>
         <td>
-          9287
+          9060
           -
-          9568
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          {
-  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
-    InitialLoader.this.logger.underlying.info(&quot;Starting initial load for [{}] with {} partitions&quot;, (scala.Array.apply[AnyRef]((InitialLoader.this.topic: AnyRef), InitialLoader.this.offsets.size().asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
-  else
-    (): Unit);
-  InitialLoader.this.latch_=(new java.util.concurrent.CountDownLatch(InitialLoader.this.offsets.size()));
-  InitialLoader.this.startConsumers(InitialLoader.this.startConsumers$default$1);
-  InitialLoader.this.submission_=(org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit(this))
-}
-        </td>
-      </tr><tr>
-        <td>
-          207
-        </td>
-        <td>
-          151
-        </td>
-        <td>
-          9419
-          -
-          9431
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.concurrent.ConcurrentHashMap.size
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          InitialLoader.this.offsets.size()
-        </td>
-      </tr><tr>
-        <td>
-          207
-        </td>
-        <td>
-          152
-        </td>
-        <td>
-          9400
-          -
-          9432
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.concurrent.CountDownLatch.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new java.util.concurrent.CountDownLatch(InitialLoader.this.offsets.size())
-        </td>
-      </tr><tr>
-        <td>
-          207
-        </td>
-        <td>
-          153
-        </td>
-        <td>
-          9392
-          -
-          9432
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.latch_=
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          InitialLoader.this.latch_=(new java.util.concurrent.CountDownLatch(InitialLoader.this.offsets.size()))
-        </td>
-      </tr><tr>
-        <td>
-          208
-        </td>
-        <td>
-          154
-        </td>
-        <td>
-          9443
-          -
-          9459
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.consumer.BaseThreadedConsumer.startConsumers
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          InitialLoader.this.startConsumers(InitialLoader.this.startConsumers$default$1)
-        </td>
-      </tr><tr>
-        <td>
-          209
-        </td>
-        <td>
-          155
-        </td>
-        <td>
-          9529
-          -
-          9558
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit(this)
-        </td>
-      </tr><tr>
-        <td>
-          209
-        </td>
-        <td>
-          156
-        </td>
-        <td>
-          9516
-          -
-          9558
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.submission_=
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          InitialLoader.this.submission_=(org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit(this))
-        </td>
-      </tr><tr>
-        <td>
-          212
-        </td>
-        <td>
-          161
-        </td>
-        <td>
-          9610
-          -
-          9673
+          9123
         </td>
         <td>
           Block
@@ -4297,15 +3985,15 @@ else
         </td>
       </tr><tr>
         <td>
-          213
+          207
         </td>
         <td>
-          159
+          146
         </td>
         <td>
-          9623
+          9073
           -
-          9655
+          9105
         </td>
         <td>
           Apply
@@ -4321,15 +4009,15 @@ else
         </td>
       </tr><tr>
         <td>
-          214
+          208
         </td>
         <td>
-          160
+          147
         </td>
         <td>
-          9666
+          9116
           -
-          9673
+          9123
         </td>
         <td>
           Throw
@@ -4345,15 +4033,15 @@ else
         </td>
       </tr><tr>
         <td>
-          219
+          213
         </td>
         <td>
-          171
+          158
         </td>
         <td>
-          9742
+          9192
           -
-          10402
+          9852
         </td>
         <td>
           Block
@@ -4386,15 +4074,15 @@ else
         </td>
       </tr><tr>
         <td>
-          220
+          214
         </td>
         <td>
-          162
+          149
         </td>
         <td>
-          9748
+          9198
           -
-          9761
+          9211
         </td>
         <td>
           Apply
@@ -4410,15 +4098,15 @@ else
         </td>
       </tr><tr>
         <td>
-          220
+          214
         </td>
         <td>
-          163
+          150
         </td>
         <td>
-          9748
+          9198
           -
-          9761
+          9211
         </td>
         <td>
           Block
@@ -4434,15 +4122,15 @@ else
         </td>
       </tr><tr>
         <td>
-          223
+          217
         </td>
         <td>
-          164
+          151
         </td>
         <td>
-          9955
+          9405
           -
-          9968
+          9418
         </td>
         <td>
           Apply
@@ -4458,15 +4146,15 @@ else
         </td>
       </tr><tr>
         <td>
-          223
+          217
         </td>
         <td>
-          165
+          152
         </td>
         <td>
-          9955
+          9405
           -
-          9968
+          9418
         </td>
         <td>
           Block
@@ -4482,15 +4170,15 @@ else
         </td>
       </tr><tr>
         <td>
-          227
+          221
         </td>
         <td>
-          166
+          153
         </td>
         <td>
-          10155
+          9605
           -
-          10169
+          9619
         </td>
         <td>
           Apply
@@ -4506,15 +4194,15 @@ else
         </td>
       </tr><tr>
         <td>
-          229
+          223
         </td>
         <td>
-          167
+          154
         </td>
         <td>
-          10280
+          9730
           -
-          10294
+          9744
         </td>
         <td>
           Select
@@ -4530,15 +4218,15 @@ else
         </td>
       </tr><tr>
         <td>
-          229
+          223
         </td>
         <td>
-          168
+          155
         </td>
         <td>
-          10304
+          9754
           -
-          10320
+          9770
         </td>
         <td>
           Apply
@@ -4554,15 +4242,15 @@ else
         </td>
       </tr><tr>
         <td>
-          229
+          223
         </td>
         <td>
-          169
+          156
         </td>
         <td>
-          10268
+          9718
           -
-          10321
+          9771
         </td>
         <td>
           Apply
@@ -4580,15 +4268,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          225
         </td>
         <td>
-          170
+          157
         </td>
         <td>
-          10385
+          9835
           -
-          10402
+          9852
         </td>
         <td>
           Apply
@@ -4604,15 +4292,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          227
         </td>
         <td>
-          172
+          159
         </td>
         <td>
-          10429
+          9879
           -
-          10461
+          9911
         </td>
         <td>
           Apply
@@ -4628,15 +4316,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          227
         </td>
         <td>
-          173
+          160
         </td>
         <td>
-          10429
+          9879
           -
-          10461
+          9911
         </td>
         <td>
           Block
@@ -4652,15 +4340,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          232
         </td>
         <td>
-          174
+          161
         </td>
         <td>
-          10524
+          9974
           -
-          10537
+          9987
         </td>
         <td>
           Apply
@@ -4676,15 +4364,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          232
         </td>
         <td>
-          175
+          162
         </td>
         <td>
-          10524
+          9974
           -
-          10537
+          9987
         </td>
         <td>
           Block
@@ -4700,15 +4388,15 @@ else
         </td>
       </tr><tr>
         <td>
-          239
+          233
         </td>
         <td>
-          176
+          163
         </td>
         <td>
-          10576
+          10026
           -
-          10580
+          10030
         </td>
         <td>
           Literal
@@ -4724,15 +4412,15 @@ else
         </td>
       </tr><tr>
         <td>
-          239
+          233
         </td>
         <td>
-          177
+          164
         </td>
         <td>
-          10584
+          10034
           -
-          10602
+          10052
         </td>
         <td>
           Select
@@ -4748,15 +4436,15 @@ else
         </td>
       </tr><tr>
         <td>
-          239
+          233
         </td>
         <td>
-          178
+          165
         </td>
         <td>
-          10562
+          10012
           -
-          10602
+          10052
         </td>
         <td>
           Apply
@@ -4772,15 +4460,15 @@ else
         </td>
       </tr><tr>
         <td>
-          239
+          233
         </td>
         <td>
-          182
+          169
         </td>
         <td>
-          10558
+          10008
           -
-          10558
+          10008
         </td>
         <td>
           Literal
@@ -4796,15 +4484,15 @@ else
         </td>
       </tr><tr>
         <td>
-          239
+          233
         </td>
         <td>
-          183
+          170
         </td>
         <td>
-          10558
+          10008
           -
-          10558
+          10008
         </td>
         <td>
           Block
@@ -4820,15 +4508,15 @@ else
         </td>
       </tr><tr>
         <td>
-          239
+          233
         </td>
         <td>
-          184
+          171
         </td>
         <td>
-          10558
+          10008
           -
-          10649
+          10099
         </td>
         <td>
           If
@@ -4850,15 +4538,15 @@ else
         </td>
       </tr><tr>
         <td>
-          240
+          234
         </td>
         <td>
-          179
+          166
         </td>
         <td>
-          10616
+          10066
           -
-          10639
+          10089
         </td>
         <td>
           Apply
@@ -4874,15 +4562,15 @@ else
         </td>
       </tr><tr>
         <td>
-          240
+          234
         </td>
         <td>
-          180
+          167
         </td>
         <td>
-          10633
+          10083
           -
-          10633
+          10083
         </td>
         <td>
           Literal
@@ -4898,15 +4586,15 @@ else
         </td>
       </tr><tr>
         <td>
-          240
+          234
         </td>
         <td>
-          181
+          168
         </td>
         <td>
-          10616
+          10066
           -
-          10639
+          10089
         </td>
         <td>
           Block
@@ -4925,15 +4613,15 @@ else
         </td>
       </tr><tr>
         <td>
-          247
+          241
         </td>
         <td>
-          185
+          172
         </td>
         <td>
-          10802
+          10252
           -
-          10825
+          10275
         </td>
         <td>
           Apply
@@ -4946,6 +4634,842 @@ else
         </td>
         <td style="background: #AEF1AE">
           InitialLoader.this.toLoad.startConsumers(InitialLoader.this.toLoad.startConsumers$default$1)
+        </td>
+      </tr><tr>
+        <td>
+          256
+        </td>
+        <td>
+          173
+        </td>
+        <td>
+          10973
+          -
+          10977
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          259
+        </td>
+        <td>
+          174
+        </td>
+        <td>
+          11093
+          -
+          11105
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.InitialLoaderConsumerRunnable.checkOffsets
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoaderConsumerRunnable.this.checkOffsets
+        </td>
+      </tr><tr>
+        <td>
+          259
+        </td>
+        <td>
+          186
+        </td>
+        <td>
+          11107
+          -
+          11716
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  scala.collection.JavaConverters.asScalaSetConverter[org.apache.kafka.common.TopicPartition](InitialLoaderConsumerRunnable.this.consumer.assignment()).asScala.foreach[Long](((tp: org.apache.kafka.common.TopicPartition) =&gt; {
+    val position: Long = InitialLoaderConsumerRunnable.this.consumer.position(tp);
+    InitialLoaderConsumerRunnable.this.consumer.seekToEnd(java.util.Collections.singleton[org.apache.kafka.common.TopicPartition](tp));
+    val end: Long = InitialLoaderConsumerRunnable.this.consumer.position(tp);
+    InitialLoaderConsumerRunnable.this.consumer.seek(tp, position);
+    (if (InitialLoader.this.logger.underlying.isDebugEnabled())
+      InitialLoader.this.logger.underlying.debug(&quot;Setting max offset to [{}:{}:{}]&quot;, (tp.topic(): AnyRef), tp.partition().asInstanceOf[AnyRef], end.-(1).asInstanceOf[AnyRef])
+    else
+      (): Unit);
+    InitialLoader.this.offsets.put(tp.partition(), end.-(1))
+  }));
+  InitialLoaderConsumerRunnable.this.checkOffsets_=(false)
+}
+        </td>
+      </tr><tr>
+        <td>
+          259
+        </td>
+        <td>
+          187
+        </td>
+        <td>
+          11089
+          -
+          11089
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          259
+        </td>
+        <td>
+          188
+        </td>
+        <td>
+          11089
+          -
+          11089
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          260
+        </td>
+        <td>
+          175
+        </td>
+        <td>
+          11119
+          -
+          11140
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.assignment
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoaderConsumerRunnable.this.consumer.assignment()
+        </td>
+      </tr><tr>
+        <td>
+          260
+        </td>
+        <td>
+          184
+        </td>
+        <td>
+          11119
+          -
+          11675
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaSetConverter[org.apache.kafka.common.TopicPartition](InitialLoaderConsumerRunnable.this.consumer.assignment()).asScala.foreach[Long](((tp: org.apache.kafka.common.TopicPartition) =&gt; {
+  val position: Long = InitialLoaderConsumerRunnable.this.consumer.position(tp);
+  InitialLoaderConsumerRunnable.this.consumer.seekToEnd(java.util.Collections.singleton[org.apache.kafka.common.TopicPartition](tp));
+  val end: Long = InitialLoaderConsumerRunnable.this.consumer.position(tp);
+  InitialLoaderConsumerRunnable.this.consumer.seek(tp, position);
+  (if (InitialLoader.this.logger.underlying.isDebugEnabled())
+    InitialLoader.this.logger.underlying.debug(&quot;Setting max offset to [{}:{}:{}]&quot;, (tp.topic(): AnyRef), tp.partition().asInstanceOf[AnyRef], end.-(1).asInstanceOf[AnyRef])
+  else
+    (): Unit);
+  InitialLoader.this.offsets.put(tp.partition(), end.-(1))
+}))
+        </td>
+      </tr><tr>
+        <td>
+          262
+        </td>
+        <td>
+          176
+        </td>
+        <td>
+          11312
+          -
+          11333
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.position
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoaderConsumerRunnable.this.consumer.position(tp)
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          177
+        </td>
+        <td>
+          11365
+          -
+          11390
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collections.singleton
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Collections.singleton[org.apache.kafka.common.TopicPartition](tp)
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          178
+        </td>
+        <td>
+          11346
+          -
+          11391
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.seekToEnd
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoaderConsumerRunnable.this.consumer.seekToEnd(java.util.Collections.singleton[org.apache.kafka.common.TopicPartition](tp))
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          179
+        </td>
+        <td>
+          11414
+          -
+          11435
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.position
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoaderConsumerRunnable.this.consumer.position(tp)
+        </td>
+      </tr><tr>
+        <td>
+          266
+        </td>
+        <td>
+          180
+        </td>
+        <td>
+          11495
+          -
+          11522
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.seek
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoaderConsumerRunnable.this.consumer.seek(tp, position)
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          181
+        </td>
+        <td>
+          11639
+          -
+          11653
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.common.TopicPartition.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tp.partition()
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          182
+        </td>
+        <td>
+          11655
+          -
+          11662
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          end.-(1)
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          183
+        </td>
+        <td>
+          11627
+          -
+          11663
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.offsets.put(tp.partition(), end.-(1))
+        </td>
+      </tr><tr>
+        <td>
+          270
+        </td>
+        <td>
+          185
+        </td>
+        <td>
+          11686
+          -
+          11706
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaCacheLoader.InitialLoader.InitialLoaderConsumerRunnable.checkOffsets_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoaderConsumerRunnable.this.checkOffsets_=(false)
+        </td>
+      </tr><tr>
+        <td>
+          273
+        </td>
+        <td>
+          189
+        </td>
+        <td>
+          11741
+          -
+          11766
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.ThreadedConsumer.ConsumerRunnable.processPoll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoaderConsumerRunnable.super.processPoll(result)
+        </td>
+      </tr><tr>
+        <td>
+          273
+        </td>
+        <td>
+          190
+        </td>
+        <td>
+          11741
+          -
+          11766
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.ThreadedConsumer.ConsumerRunnable.processPoll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoaderConsumerRunnable.super.processPoll(result)
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          191
+        </td>
+        <td>
+          11797
+          -
+          11816
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecords.partitions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          result.partitions()
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          203
+        </td>
+        <td>
+          11797
+          -
+          12408
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaSetConverter[org.apache.kafka.common.TopicPartition](result.partitions()).asScala.foreach[Unit](((tp: org.apache.kafka.common.TopicPartition) =&gt; {
+  val position: Long = InitialLoaderConsumerRunnable.this.consumer.position(tp);
+  if (position.&gt;=(InitialLoader.this.offsets.getOrDefault(tp.partition(), 9223372036854775807L)))
+    {
+      InitialLoader.this.offsets.remove(tp.partition());
+      InitialLoader.this.latch.countDown();
+      (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+        InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}]&quot;, (InitialLoader.this.topic: AnyRef), tp.partition().asInstanceOf[AnyRef], position.-(1).asInstanceOf[AnyRef])
+      else
+        (): Unit);
+      (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+        InitialLoader.this.logger.underlying.info(&quot;Initial load completed for [{}:{}], {} partitions remaining&quot;, (InitialLoader.this.topic: AnyRef), tp.partition().asInstanceOf[AnyRef], InitialLoader.this.latch.getCount().asInstanceOf[AnyRef])
+      else
+        (): Unit)
+    }
+  else
+    ()
+}))
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          204
+        </td>
+        <td>
+          11797
+          -
+          12408
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaSetConverter[org.apache.kafka.common.TopicPartition](result.partitions()).asScala.foreach[Unit](((tp: org.apache.kafka.common.TopicPartition) =&gt; {
+  val position: Long = InitialLoaderConsumerRunnable.this.consumer.position(tp);
+  if (position.&gt;=(InitialLoader.this.offsets.getOrDefault(tp.partition(), 9223372036854775807L)))
+    {
+      InitialLoader.this.offsets.remove(tp.partition());
+      InitialLoader.this.latch.countDown();
+      (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+        InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}]&quot;, (InitialLoader.this.topic: AnyRef), tp.partition().asInstanceOf[AnyRef], position.-(1).asInstanceOf[AnyRef])
+      else
+        (): Unit);
+      (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+        InitialLoader.this.logger.underlying.info(&quot;Initial load completed for [{}:{}], {} partitions remaining&quot;, (InitialLoader.this.topic: AnyRef), tp.partition().asInstanceOf[AnyRef], InitialLoader.this.latch.getCount().asInstanceOf[AnyRef])
+      else
+        (): Unit)
+    }
+  else
+    ()
+}))
+        </td>
+      </tr><tr>
+        <td>
+          276
+        </td>
+        <td>
+          192
+        </td>
+        <td>
+          11868
+          -
+          11889
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.position
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoaderConsumerRunnable.this.consumer.position(tp)
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          193
+        </td>
+        <td>
+          12058
+          -
+          12072
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.common.TopicPartition.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tp.partition()
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          194
+        </td>
+        <td>
+          12074
+          -
+          12087
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          9223372036854775807L
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          195
+        </td>
+        <td>
+          12037
+          -
+          12088
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.getOrDefault
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.offsets.getOrDefault(tp.partition(), 9223372036854775807L)
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          196
+        </td>
+        <td>
+          12025
+          -
+          12088
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&gt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          position.&gt;=(InitialLoader.this.offsets.getOrDefault(tp.partition(), 9223372036854775807L))
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          200
+        </td>
+        <td>
+          12090
+          -
+          12396
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  InitialLoader.this.offsets.remove(tp.partition());
+  InitialLoader.this.latch.countDown();
+  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+    InitialLoader.this.logger.underlying.info(&quot;Initial load: consumed [{}:{}:{}]&quot;, (InitialLoader.this.topic: AnyRef), tp.partition().asInstanceOf[AnyRef], position.-(1).asInstanceOf[AnyRef])
+  else
+    (): Unit);
+  (if (InitialLoader.this.logger.underlying.isInfoEnabled())
+    InitialLoader.this.logger.underlying.info(&quot;Initial load completed for [{}:{}], {} partitions remaining&quot;, (InitialLoader.this.topic: AnyRef), tp.partition().asInstanceOf[AnyRef], InitialLoader.this.latch.getCount().asInstanceOf[AnyRef])
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          201
+        </td>
+        <td>
+          12021
+          -
+          12021
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          202
+        </td>
+        <td>
+          12021
+          -
+          12021
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          279
+        </td>
+        <td>
+          197
+        </td>
+        <td>
+          12121
+          -
+          12133
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.common.TopicPartition.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tp.partition()
+        </td>
+      </tr><tr>
+        <td>
+          279
+        </td>
+        <td>
+          198
+        </td>
+        <td>
+          12106
+          -
+          12134
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.offsets.remove(tp.partition())
+        </td>
+      </tr><tr>
+        <td>
+          280
+        </td>
+        <td>
+          199
+        </td>
+        <td>
+          12149
+          -
+          12166
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.CountDownLatch.countDown
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          InitialLoader.this.latch.countDown()
         </td>
       </tr>
     </table>
