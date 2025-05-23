@@ -1,0 +1,1755 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/fs/data/FileSystemStorageManager.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 Commonwealth Computer Research, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * http://www.opensource.org/licenses/apache2.0.php.
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.fs.data
+</span>10 <span style=''>
+</span>11 <span style=''>import com.github.benmanes.caffeine.cache.{CacheLoader, Caffeine}
+</span>12 <span style=''>import com.typesafe.scalalogging.LazyLogging
+</span>13 <span style=''>import org.apache.hadoop.conf.Configuration
+</span>14 <span style=''>import org.apache.hadoop.fs.{FileSystem, Path}
+</span>15 <span style=''>import org.locationtech.geomesa.fs.storage.api._
+</span>16 <span style=''>import org.locationtech.geomesa.fs.storage.common.utils.PathCache
+</span>17 <span style=''>import org.locationtech.geomesa.utils.io.CloseQuietly
+</span>18 <span style=''>import org.locationtech.geomesa.utils.stats.MethodProfiling
+</span>19 <span style=''>
+</span>20 <span style=''>import java.util.concurrent.ConcurrentHashMap
+</span>21 <span style=''>import scala.util.control.NonFatal
+</span>22 <span style=''>
+</span>23 <span style=''>/**
+</span>24 <span style=''>  * Manages the storages and associated simple feature types underneath a given path
+</span>25 <span style=''>  *
+</span>26 <span style=''>  * @param fs file system
+</span>27 <span style=''>  * @param conf configuration
+</span>28 <span style=''>  * @param root root path for the data store
+</span>29 <span style=''>  */
+</span>30 <span style=''>class FileSystemStorageManager private (fs: FileSystem, conf: Configuration, root: Path, namespace: Option[String])
+</span>31 <span style=''>    extends MethodProfiling with LazyLogging {
+</span>32 <span style=''>
+</span>33 <span style=''>  import scala.collection.JavaConverters._
+</span>34 <span style=''>
+</span>35 <span style=''>  private val cache = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[String, (Path, FileSystemStorage)]().asScala</span><span style=''>
+</span>36 <span style=''>
+</span>37 <span style=''>  /**
+</span>38 <span style=''>    * Gets the storage associated with the given simple feature type, if any
+</span>39 <span style=''>    *
+</span>40 <span style=''>    * @param typeName simple feature type name
+</span>41 <span style=''>    * @return
+</span>42 <span style=''>    */
+</span>43 <span style=''>  def storage(typeName: String): Option[FileSystemStorage] = {
+</span>44 <span style=''>    </span><span style='background: #AEF1AE'>cache.get(typeName).map(_._2) // check cached values
+</span>45 <span style=''></span><span style='background: #AEF1AE'>        .orElse(Some(defaultPath(typeName)).filter(PathCache.exists(fs, _)).flatMap(loadPath)) // check expected (default) path
+</span>46 <span style=''></span><span style='background: #AEF1AE'>        .orElse(loadAll().find(_.metadata.sft.getTypeName == typeName))</span><span style=''> // check other paths until we find it
+</span>47 <span style=''>  }
+</span>48 <span style=''>
+</span>49 <span style=''>  /**
+</span>50 <span style=''>    * Gets all storages under the root path
+</span>51 <span style=''>    *
+</span>52 <span style=''>    * @return
+</span>53 <span style=''>    */
+</span>54 <span style=''>  def storages(): Seq[FileSystemStorage] = {
+</span>55 <span style=''>    </span><span style='background: #AEF1AE'>loadAll().foreach(_ =&gt; ())</span><span style=''> // force loading of everything
+</span>56 <span style=''>    </span><span style='background: #AEF1AE'>cache.map { case (_, (_, storage)) =&gt; storage }.toSeq</span><span style=''>
+</span>57 <span style=''>  }
+</span>58 <span style=''>
+</span>59 <span style=''>  /**
+</span>60 <span style=''>    * Caches a storage instance for future use. Avoids loading it a second time if referenced later.
+</span>61 <span style=''>    *
+</span>62 <span style=''>    * @param path path for the storage
+</span>63 <span style=''>    * @param storage storage instance
+</span>64 <span style=''>    */
+</span>65 <span style=''>  def register(path: Path, storage: FileSystemStorage): Unit =
+</span>66 <span style=''>    </span><span style='background: #AEF1AE'>cache.put(storage.metadata.sft.getTypeName, (path, storage))</span><span style=''>
+</span>67 <span style=''>
+</span>68 <span style=''>  /**
+</span>69 <span style=''>    * Default path for a given simple feature type name. Generally the simple feature type will go under
+</span>70 <span style=''>    * a folder with the type name, but this is not required
+</span>71 <span style=''>    *
+</span>72 <span style=''>    * @param typeName simple feature type name
+</span>73 <span style=''>    * @return
+</span>74 <span style=''>    */
+</span>75 <span style=''>  def defaultPath(typeName: String): Path = </span><span style='background: #AEF1AE'>new Path(root, typeName)</span><span style=''>
+</span>76 <span style=''>
+</span>77 <span style=''>  /**
+</span>78 <span style=''>    * Loads all storages under this root (if they aren't already loaded)
+</span>79 <span style=''>    *
+</span>80 <span style=''>    * @return
+</span>81 <span style=''>    */
+</span>82 <span style=''>  private def loadAll(): Iterator[FileSystemStorage] = {
+</span>83 <span style=''>    if (</span><span style='background: #AEF1AE'>!PathCache.exists(fs, root)</span><span style=''>) { </span><span style='background: #AEF1AE'>Iterator.empty</span><span style=''> } else </span><span style='background: #AEF1AE'>{
+</span>84 <span style=''></span><span style='background: #AEF1AE'>      val dirs = PathCache.list(fs, root).filter(_.isDirectory).map(_.getPath)
+</span>85 <span style=''></span><span style='background: #AEF1AE'>      dirs.filterNot(path =&gt; cache.exists { case (_, (p, _)) =&gt; p == path }).flatMap(loadPath)
+</span>86 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>87 <span style=''>  }
+</span>88 <span style=''>
+</span>89 <span style=''>  /**
+</span>90 <span style=''>    * Attempt to load a storage under the given root path. Requires an appropriate storage implementation
+</span>91 <span style=''>    * to be available on the classpath.
+</span>92 <span style=''>    *
+</span>93 <span style=''>    * @param path storage root path
+</span>94 <span style=''>    * @return
+</span>95 <span style=''>    */
+</span>96 <span style=''>  private def loadPath(path: Path): Option[FileSystemStorage] = {
+</span>97 <span style=''>
+</span>98 <span style=''>    def complete(storage: Option[FileSystemStorage], time: Long): Unit =
+</span>99 <span style=''>      logger.debug(s&quot;${ if (storage.isDefined) &quot;Loaded&quot; else &quot;No&quot; } storage at path '$path' in ${time}ms&quot;)
+</span>100 <span style=''>
+</span>101 <span style=''>    </span><span style='background: #AEF1AE'>profile(complete _) {
+</span>102 <span style=''></span><span style='background: #AEF1AE'>      val context = FileSystemContext(fs, conf, path, namespace)
+</span>103 <span style=''></span><span style='background: #AEF1AE'>      StorageMetadataFactory.load(context).map { meta =&gt;
+</span>104 <span style=''></span><span style='background: #AEF1AE'>        try {
+</span>105 <span style=''></span><span style='background: #AEF1AE'>          val storage = FileSystemStorageFactory(context, meta)
+</span>106 <span style=''></span><span style='background: #AEF1AE'>          register(path, storage)
+</span>107 <span style=''></span><span style='background: #AEF1AE'>          storage
+</span>108 <span style=''></span><span style='background: #AEF1AE'>        } catch {
+</span>109 <span style=''></span><span style='background: #AEF1AE'>          case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt; CloseQuietly(meta).foreach(e.addSuppressed); throw e</span><span style='background: #AEF1AE'>
+</span>110 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>111 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>112 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>113 <span style=''>  }
+</span>114 <span style=''>}
+</span>115 <span style=''>
+</span>116 <span style=''>object FileSystemStorageManager {
+</span>117 <span style=''>
+</span>118 <span style=''>  private val cache = </span><span style='background: #AEF1AE'>Caffeine.newBuilder().build(
+</span>119 <span style=''></span><span style='background: #AEF1AE'>    new CacheLoader[(FileSystem, Configuration, Path, Option[String]), FileSystemStorageManager]() {
+</span>120 <span style=''></span><span style='background: #AEF1AE'>      override def load(key: (FileSystem, Configuration, Path, Option[String])): FileSystemStorageManager =
+</span>121 <span style=''></span><span style='background: #AEF1AE'>        new FileSystemStorageManager(key._1, key._2, key._3, key._4)
+</span>122 <span style=''></span><span style='background: #AEF1AE'>    }
+</span>123 <span style=''></span><span style='background: #AEF1AE'>  )</span><span style=''>
+</span>124 <span style=''>
+</span>125 <span style=''>  /**
+</span>126 <span style=''>    * Load a cached storage manager instance
+</span>127 <span style=''>    *
+</span>128 <span style=''>    * @param fs file system
+</span>129 <span style=''>    * @param conf configuration
+</span>130 <span style=''>    * @param root data store root path
+</span>131 <span style=''>    * @return
+</span>132 <span style=''>    */
+</span>133 <span style=''>  def apply(fs: FileSystem, conf: Configuration, root: Path, namespace: Option[String]): FileSystemStorageManager =
+</span>134 <span style=''>    </span><span style='background: #AEF1AE'>cache.get((fs, conf, root, namespace))</span><span style=''>
+</span>135 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          35
+        </td>
+        <td>
+          345
+        </td>
+        <td>
+          1450
+          -
+          1508
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.ConcurrentHashMap[String,(org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage)]()
+        </td>
+      </tr><tr>
+        <td>
+          35
+        </td>
+        <td>
+          346
+        </td>
+        <td>
+          1450
+          -
+          1516
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsScala.asScala
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.mapAsScalaConcurrentMapConverter[String, (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage)](new java.util.concurrent.ConcurrentHashMap[String,(org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage)]()).asScala
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          347
+        </td>
+        <td>
+          1766
+          -
+          1770
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple2._2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1._2
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          348
+        </td>
+        <td>
+          1816
+          -
+          1837
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.defaultPath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.defaultPath(typeName)
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          349
+        </td>
+        <td>
+          1863
+          -
+          1865
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.fs
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.fs
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          350
+        </td>
+        <td>
+          1846
+          -
+          1869
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.common.utils.PathCache.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.common.utils.PathCache.exists(FileSystemStorageManager.this.fs, x$2, org.locationtech.geomesa.fs.storage.common.utils.PathCache.exists$default$3)
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          351
+        </td>
+        <td>
+          1879
+          -
+          1887
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.loadPath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.loadPath(path)
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          352
+        </td>
+        <td>
+          1811
+          -
+          1888
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.apache.hadoop.fs.Path](FileSystemStorageManager.this.defaultPath(typeName)).filter(((x$2: org.apache.hadoop.fs.Path) =&gt; org.locationtech.geomesa.fs.storage.common.utils.PathCache.exists(FileSystemStorageManager.this.fs, x$2, org.locationtech.geomesa.fs.storage.common.utils.PathCache.exists$default$3))).flatMap[org.locationtech.geomesa.fs.storage.api.FileSystemStorage]({
+  ((path: org.apache.hadoop.fs.Path) =&gt; FileSystemStorageManager.this.loadPath(path))
+})
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          353
+        </td>
+        <td>
+          1954
+          -
+          1992
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$3.metadata.sft.getTypeName().==(typeName)
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          354
+        </td>
+        <td>
+          1939
+          -
+          1993
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.find
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.loadAll().find(((x$3: org.locationtech.geomesa.fs.storage.api.FileSystemStorage) =&gt; x$3.metadata.sft.getTypeName().==(typeName)))
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          355
+        </td>
+        <td>
+          1742
+          -
+          1994
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.orElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.cache.get(typeName).map[org.locationtech.geomesa.fs.storage.api.FileSystemStorage](((x$1: (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage)) =&gt; x$1._2)).orElse[org.locationtech.geomesa.fs.storage.api.FileSystemStorage](scala.Some.apply[org.apache.hadoop.fs.Path](FileSystemStorageManager.this.defaultPath(typeName)).filter(((x$2: org.apache.hadoop.fs.Path) =&gt; org.locationtech.geomesa.fs.storage.common.utils.PathCache.exists(FileSystemStorageManager.this.fs, x$2, org.locationtech.geomesa.fs.storage.common.utils.PathCache.exists$default$3))).flatMap[org.locationtech.geomesa.fs.storage.api.FileSystemStorage]({
+  ((path: org.apache.hadoop.fs.Path) =&gt; FileSystemStorageManager.this.loadPath(path))
+})).orElse[org.locationtech.geomesa.fs.storage.api.FileSystemStorage](FileSystemStorageManager.this.loadAll().find(((x$3: org.locationtech.geomesa.fs.storage.api.FileSystemStorage) =&gt; x$3.metadata.sft.getTypeName().==(typeName))))
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          356
+        </td>
+        <td>
+          2187
+          -
+          2189
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          357
+        </td>
+        <td>
+          2164
+          -
+          2190
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.loadAll().foreach[Unit](((x$4: org.locationtech.geomesa.fs.storage.api.FileSystemStorage) =&gt; ()))
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          358
+        </td>
+        <td>
+          2264
+          -
+          2271
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.storage
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          storage
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          359
+        </td>
+        <td>
+          2236
+          -
+          2236
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.mutable.Iterable.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutable.this.Iterable.canBuildFrom[org.locationtech.geomesa.fs.storage.api.FileSystemStorage]
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          360
+        </td>
+        <td>
+          2226
+          -
+          2279
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toSeq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.cache.map[org.locationtech.geomesa.fs.storage.api.FileSystemStorage, scala.collection.mutable.Iterable[org.locationtech.geomesa.fs.storage.api.FileSystemStorage]](((x0$1: (String, (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))) =&gt; x0$1 match {
+  case (_1: String, _2: (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))(String, (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))(_, (_1: org.apache.hadoop.fs.Path, _2: org.locationtech.geomesa.fs.storage.api.FileSystemStorage)(org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage)(_, (storage @ _))) =&gt; storage
+}))(mutable.this.Iterable.canBuildFrom[org.locationtech.geomesa.fs.storage.api.FileSystemStorage]).toSeq
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          361
+        </td>
+        <td>
+          2559
+          -
+          2591
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          storage.metadata.sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          362
+        </td>
+        <td>
+          2593
+          -
+          2608
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Tuple2.apply[org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage](path, storage)
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          363
+        </td>
+        <td>
+          2549
+          -
+          2609
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.MapLike.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.cache.put(storage.metadata.sft.getTypeName(), scala.Tuple2.apply[org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage](path, storage))
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          364
+        </td>
+        <td>
+          2558
+          -
+          2558
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          365
+        </td>
+        <td>
+          2909
+          -
+          2913
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.root
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.root
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          366
+        </td>
+        <td>
+          2900
+          -
+          2924
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.hadoop.fs.Path(FileSystemStorageManager.this.root, typeName)
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          367
+        </td>
+        <td>
+          3115
+          -
+          3117
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.fs
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.fs
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          368
+        </td>
+        <td>
+          3119
+          -
+          3123
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.root
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.root
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          369
+        </td>
+        <td>
+          3097
+          -
+          3124
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.common.utils.PathCache.exists(FileSystemStorageManager.this.fs, FileSystemStorageManager.this.root, org.locationtech.geomesa.fs.storage.common.utils.PathCache.exists$default$3).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          370
+        </td>
+        <td>
+          3128
+          -
+          3142
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.Iterator.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.`package`.Iterator.empty
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          371
+        </td>
+        <td>
+          3128
+          -
+          3142
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.Iterator.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.`package`.Iterator.empty
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          383
+        </td>
+        <td>
+          3150
+          -
+          3331
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val dirs: Iterator[org.apache.hadoop.fs.Path] = org.locationtech.geomesa.fs.storage.common.utils.PathCache.list(FileSystemStorageManager.this.fs, FileSystemStorageManager.this.root, org.locationtech.geomesa.fs.storage.common.utils.PathCache.list$default$3).filter(((x$5: org.apache.hadoop.fs.FileStatus) =&gt; x$5.isDirectory())).map[org.apache.hadoop.fs.Path](((x$6: org.apache.hadoop.fs.FileStatus) =&gt; x$6.getPath()));
+  dirs.filterNot(((path: org.apache.hadoop.fs.Path) =&gt; FileSystemStorageManager.this.cache.exists(((x0$1: (String, (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))) =&gt; x0$1 match {
+  case (_1: String, _2: (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))(String, (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))(_, (_1: org.apache.hadoop.fs.Path, _2: org.locationtech.geomesa.fs.storage.api.FileSystemStorage)(org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage)((p @ _), _)) =&gt; p.==(path)
+})))).flatMap[org.locationtech.geomesa.fs.storage.api.FileSystemStorage]({
+    ((path: org.apache.hadoop.fs.Path) =&gt; scala.this.Option.option2Iterable[org.locationtech.geomesa.fs.storage.api.FileSystemStorage](FileSystemStorageManager.this.loadPath(path)))
+  })
+}
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          372
+        </td>
+        <td>
+          3184
+          -
+          3186
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.fs
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.fs
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          373
+        </td>
+        <td>
+          3188
+          -
+          3192
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.root
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.root
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          374
+        </td>
+        <td>
+          3201
+          -
+          3214
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileStatus.isDirectory
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$5.isDirectory()
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          375
+        </td>
+        <td>
+          3220
+          -
+          3229
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.FileStatus.getPath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$6.getPath()
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          376
+        </td>
+        <td>
+          3169
+          -
+          3230
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.common.utils.PathCache.list(FileSystemStorageManager.this.fs, FileSystemStorageManager.this.root, org.locationtech.geomesa.fs.storage.common.utils.PathCache.list$default$3).filter(((x$5: org.apache.hadoop.fs.FileStatus) =&gt; x$5.isDirectory())).map[org.apache.hadoop.fs.Path](((x$6: org.apache.hadoop.fs.FileStatus) =&gt; x$6.getPath()))
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          377
+        </td>
+        <td>
+          3295
+          -
+          3304
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          p.==(path)
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          378
+        </td>
+        <td>
+          3295
+          -
+          3304
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          p.==(path)
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          379
+        </td>
+        <td>
+          3260
+          -
+          3306
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.cache.exists(((x0$1: (String, (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))) =&gt; x0$1 match {
+  case (_1: String, _2: (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))(String, (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))(_, (_1: org.apache.hadoop.fs.Path, _2: org.locationtech.geomesa.fs.storage.api.FileSystemStorage)(org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage)((p @ _), _)) =&gt; p.==(path)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          380
+        </td>
+        <td>
+          3316
+          -
+          3324
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.loadPath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.loadPath(path)
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          381
+        </td>
+        <td>
+          3316
+          -
+          3324
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Option.option2Iterable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Option.option2Iterable[org.locationtech.geomesa.fs.storage.api.FileSystemStorage](FileSystemStorageManager.this.loadPath(path))
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          382
+        </td>
+        <td>
+          3237
+          -
+          3325
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dirs.filterNot(((path: org.apache.hadoop.fs.Path) =&gt; FileSystemStorageManager.this.cache.exists(((x0$1: (String, (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))) =&gt; x0$1 match {
+  case (_1: String, _2: (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))(String, (org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage))(_, (_1: org.apache.hadoop.fs.Path, _2: org.locationtech.geomesa.fs.storage.api.FileSystemStorage)(org.apache.hadoop.fs.Path, org.locationtech.geomesa.fs.storage.api.FileSystemStorage)((p @ _), _)) =&gt; p.==(path)
+})))).flatMap[org.locationtech.geomesa.fs.storage.api.FileSystemStorage]({
+  ((path: org.apache.hadoop.fs.Path) =&gt; scala.this.Option.option2Iterable[org.locationtech.geomesa.fs.storage.api.FileSystemStorage](FileSystemStorageManager.this.loadPath(path)))
+})
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          384
+        </td>
+        <td>
+          3812
+          -
+          3820
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.complete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          complete(storage, time)
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          398
+        </td>
+        <td>
+          3804
+          -
+          4202
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.stats.MethodProfiling.profile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.profile[Option[org.locationtech.geomesa.fs.storage.api.FileSystemStorage]]({
+  ((storage: Option[org.locationtech.geomesa.fs.storage.api.FileSystemStorage], time: Long) =&gt; complete(storage, time))
+})({
+  val context: org.locationtech.geomesa.fs.storage.api.FileSystemContext = org.locationtech.geomesa.fs.storage.api.`package`.FileSystemContext.apply(FileSystemStorageManager.this.fs, FileSystemStorageManager.this.conf, path, FileSystemStorageManager.this.namespace);
+  org.locationtech.geomesa.fs.storage.api.StorageMetadataFactory.load(context).map[org.locationtech.geomesa.fs.storage.api.FileSystemStorage](((meta: org.locationtech.geomesa.fs.storage.api.StorageMetadata) =&gt; try {
+    val storage: org.locationtech.geomesa.fs.storage.api.FileSystemStorage = org.locationtech.geomesa.fs.storage.api.FileSystemStorageFactory.apply(context, meta);
+    FileSystemStorageManager.this.register(path, storage);
+    storage
+  } catch {
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; {
+      org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[org.locationtech.geomesa.fs.storage.api.StorageMetadata](meta)(io.this.IsCloseable.closeableIsCloseable).foreach[Unit]({
+        ((x$1: Throwable) =&gt; e.addSuppressed(x$1))
+      });
+      throw e
+    }
+  }))
+})
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          385
+        </td>
+        <td>
+          3864
+          -
+          3866
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.fs
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.fs
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          386
+        </td>
+        <td>
+          3868
+          -
+          3872
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.conf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.conf
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          387
+        </td>
+        <td>
+          3880
+          -
+          3889
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.namespace
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.namespace
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          388
+        </td>
+        <td>
+          3846
+          -
+          3890
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.api.FileSystemContext.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.api.`package`.FileSystemContext.apply(FileSystemStorageManager.this.fs, FileSystemStorageManager.this.conf, path, FileSystemStorageManager.this.namespace)
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          397
+        </td>
+        <td>
+          3897
+          -
+          4196
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.api.StorageMetadataFactory.load(context).map[org.locationtech.geomesa.fs.storage.api.FileSystemStorage](((meta: org.locationtech.geomesa.fs.storage.api.StorageMetadata) =&gt; try {
+  val storage: org.locationtech.geomesa.fs.storage.api.FileSystemStorage = org.locationtech.geomesa.fs.storage.api.FileSystemStorageFactory.apply(context, meta);
+  FileSystemStorageManager.this.register(path, storage);
+  storage
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; {
+    org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[org.locationtech.geomesa.fs.storage.api.StorageMetadata](meta)(io.this.IsCloseable.closeableIsCloseable).foreach[Unit]({
+      ((x$1: Throwable) =&gt; e.addSuppressed(x$1))
+    });
+    throw e
+  }
+}))
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          391
+        </td>
+        <td>
+          3972
+          -
+          4077
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val storage: org.locationtech.geomesa.fs.storage.api.FileSystemStorage = org.locationtech.geomesa.fs.storage.api.FileSystemStorageFactory.apply(context, meta);
+  FileSystemStorageManager.this.register(path, storage);
+  storage
+}
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          389
+        </td>
+        <td>
+          3986
+          -
+          4025
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.api.FileSystemStorageFactory.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.api.FileSystemStorageFactory.apply(context, meta)
+        </td>
+      </tr><tr>
+        <td>
+          106
+        </td>
+        <td>
+          390
+        </td>
+        <td>
+          4036
+          -
+          4059
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.register
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.register(path, storage)
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          392
+        </td>
+        <td>
+          4138
+          -
+          4138
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          393
+        </td>
+        <td>
+          4153
+          -
+          4168
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Throwable.addSuppressed
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          e.addSuppressed(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          394
+        </td>
+        <td>
+          4126
+          -
+          4169
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[org.locationtech.geomesa.fs.storage.api.StorageMetadata](meta)(io.this.IsCloseable.closeableIsCloseable).foreach[Unit]({
+  ((x$1: Throwable) =&gt; e.addSuppressed(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          395
+        </td>
+        <td>
+          4171
+          -
+          4178
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw e
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          396
+        </td>
+        <td>
+          4123
+          -
+          4178
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[org.locationtech.geomesa.fs.storage.api.StorageMetadata](meta)(io.this.IsCloseable.closeableIsCloseable).foreach[Unit]({
+    ((x$1: Throwable) =&gt; e.addSuppressed(x$1))
+  });
+  throw e
+}
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          405
+        </td>
+        <td>
+          4267
+          -
+          4583
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          com.github.benmanes.caffeine.cache.Caffeine.build
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          com.github.benmanes.caffeine.cache.Caffeine.newBuilder().build[(org.apache.hadoop.fs.FileSystem, org.apache.hadoop.conf.Configuration, org.apache.hadoop.fs.Path, Option[String]), org.locationtech.geomesa.fs.data.FileSystemStorageManager]({
+  final class $anon extends Object with com.github.benmanes.caffeine.cache.CacheLoader[(org.apache.hadoop.fs.FileSystem, org.apache.hadoop.conf.Configuration, org.apache.hadoop.fs.Path, Option[String]),org.locationtech.geomesa.fs.data.FileSystemStorageManager] {
+    def &lt;init&gt;(): &lt;$anon: com.github.benmanes.caffeine.cache.CacheLoader[(org.apache.hadoop.fs.FileSystem, org.apache.hadoop.conf.Configuration, org.apache.hadoop.fs.Path, Option[String]),org.locationtech.geomesa.fs.data.FileSystemStorageManager]&gt; = {
+      $anon.super.&lt;init&gt;();
+      ()
+    };
+    override def load(key: (org.apache.hadoop.fs.FileSystem, org.apache.hadoop.conf.Configuration, org.apache.hadoop.fs.Path, Option[String])): org.locationtech.geomesa.fs.data.FileSystemStorageManager = new FileSystemStorageManager(key._1, key._2, key._3, key._4)
+  };
+  new $anon()
+})
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          404
+        </td>
+        <td>
+          4300
+          -
+          4303
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.$anon.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new $anon()
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          399
+        </td>
+        <td>
+          4542
+          -
+          4548
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple4._1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          key._1
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          400
+        </td>
+        <td>
+          4550
+          -
+          4556
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple4._2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          key._2
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          401
+        </td>
+        <td>
+          4558
+          -
+          4564
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple4._3
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          key._3
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          402
+        </td>
+        <td>
+          4566
+          -
+          4572
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple4._4
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          key._4
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          403
+        </td>
+        <td>
+          4513
+          -
+          4573
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemStorageManager.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new FileSystemStorageManager(key._1, key._2, key._3, key._4)
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          406
+        </td>
+        <td>
+          4892
+          -
+          4919
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple4.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Tuple4.apply[org.apache.hadoop.fs.FileSystem, org.apache.hadoop.conf.Configuration, org.apache.hadoop.fs.Path, Option[String]](fs, conf, root, namespace)
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          407
+        </td>
+        <td>
+          4882
+          -
+          4920
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          com.github.benmanes.caffeine.cache.LoadingCache.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemStorageManager.this.cache.get(scala.Tuple4.apply[org.apache.hadoop.fs.FileSystem, org.apache.hadoop.conf.Configuration, org.apache.hadoop.fs.Path, Option[String]](fs, conf, root, namespace))
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>

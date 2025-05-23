@@ -1,0 +1,4066 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/kafka/utils/GeoMessageSerializer.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 Commonwealth Computer Research, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * http://www.opensource.org/licenses/apache2.0.php.
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.kafka.utils
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.LazyLogging
+</span>12 <span style=''>import org.apache.kafka.clients.producer.Partitioner
+</span>13 <span style=''>import org.apache.kafka.common.Cluster
+</span>14 <span style=''>import org.geotools.api.feature.simple.SimpleFeatureType
+</span>15 <span style=''>import org.locationtech.geomesa.features.SerializationOption.{SerializationOption, SerializationOptions}
+</span>16 <span style=''>import org.locationtech.geomesa.features.SerializationType.SerializationType
+</span>17 <span style=''>import org.locationtech.geomesa.features.avro.AvroFeatureSerializer
+</span>18 <span style=''>import org.locationtech.geomesa.features.kryo.KryoFeatureSerializer
+</span>19 <span style=''>import org.locationtech.geomesa.features.{SerializationOption, SerializationType, SimpleFeatureSerializer}
+</span>20 <span style=''>import org.locationtech.geomesa.kafka.utils.GeoMessage.{Change, Clear, Delete}
+</span>21 <span style=''>import org.locationtech.geomesa.utils.index.ByteArrays
+</span>22 <span style=''>
+</span>23 <span style=''>import java.nio.charset.StandardCharsets
+</span>24 <span style=''>import scala.util.Random
+</span>25 <span style=''>import scala.util.control.NonFatal
+</span>26 <span style=''>import scala.util.hashing.MurmurHash3
+</span>27 <span style=''>
+</span>28 <span style=''>/**
+</span>29 <span style=''>  * Serialized `GeoMessage`s
+</span>30 <span style=''>  *
+</span>31 <span style=''>  * Current encoding (version 2/3), designed to work with kafka log compaction.
+</span>32 <span style=''>  * See https://kafka.apache.org/10/documentation.html#design_compactionbasics
+</span>33 <span style=''>  *
+</span>34 <span style=''>  * Version 3 uses avro for serialized features, version 2 uses kryo
+</span>35 <span style=''>  *
+</span>36 <span style=''>  * change:
+</span>37 <span style=''>  *   key: n bytes feature id
+</span>38 <span style=''>  *   value: n bytes for serialized feature (without id)
+</span>39 <span style=''>  *   headers: &quot;v&quot; -&gt; serialization version
+</span>40 <span style=''>  *
+</span>41 <span style=''>  * delete:
+</span>42 <span style=''>  *   key: n bytes feature id
+</span>43 <span style=''>  *   value: null - this allows for log compaction to delete the feature out
+</span>44 <span style=''>  *   headers: &quot;v&quot; -&gt; serialization version
+</span>45 <span style=''>  *
+</span>46 <span style=''>  * clear:
+</span>47 <span style=''>  *   key: empty
+</span>48 <span style=''>  *   value: empty
+</span>49 <span style=''>  *   headers: &quot;v&quot; -&gt; serialization version
+</span>50 <span style=''>  *
+</span>51 <span style=''>  * Version 1 legacy encoding:
+</span>52 <span style=''>  *
+</span>53 <span style=''>  * change:
+</span>54 <span style=''>  *   key: 1 byte message version, 1 byte for message type ('C'), 8 byte long for epoch millis
+</span>55 <span style=''>  *   value: n bytes for serialized feature (with id)
+</span>56 <span style=''>  *
+</span>57 <span style=''>  * delete:
+</span>58 <span style=''>  *   key: 1 byte message version, 1 byte for message type ('D'), 8 byte long for epoch millis
+</span>59 <span style=''>  *   value: n bytes for feature id
+</span>60 <span style=''>  *
+</span>61 <span style=''>  * clear:
+</span>62 <span style=''>  *   key: 1 byte message version, 1 byte for message type ('X'), 8 byte long for epoch millis
+</span>63 <span style=''>  *   value: empty
+</span>64 <span style=''>  */
+</span>65 <span style=''>object GeoMessageSerializer {
+</span>66 <span style=''>
+</span>67 <span style=''>  val KryoVersion: Byte = </span><span style='background: #AEF1AE'>2</span><span style=''>
+</span>68 <span style=''>  val AvroVersion: Byte = </span><span style='background: #AEF1AE'>3</span><span style=''>
+</span>69 <span style=''>
+</span>70 <span style=''>  val VersionHeader = </span><span style='background: #AEF1AE'>&quot;v&quot;</span><span style=''>
+</span>71 <span style=''>
+</span>72 <span style=''>  private val Empty = </span><span style='background: #AEF1AE'>Array.empty[Byte]</span><span style=''>
+</span>73 <span style=''>
+</span>74 <span style=''>  /**
+</span>75 <span style=''>    * Create a message serializer
+</span>76 <span style=''>    *
+</span>77 <span style=''>    * @param sft simple feature type
+</span>78 <span style=''>    * @param serialization serialization type (avro or kryo)
+</span>79 <span style=''>    * @param `lazy` use lazy deserialization
+</span>80 <span style=''>    * @return
+</span>81 <span style=''>    */
+</span>82 <span style=''>  @deprecated(&quot;Use apply(SimpleFeatureType, SerializationType, Set[SerializationOption])&quot;)
+</span>83 <span style=''>  def apply(
+</span>84 <span style=''>      sft: SimpleFeatureType,
+</span>85 <span style=''>      serialization: SerializationType = SerializationType.KRYO,
+</span>86 <span style=''>      `lazy`: Boolean = false): GeoMessageSerializer = {
+</span>87 <span style=''>    </span><span style='background: #AEF1AE'>apply(sft, serialization, if (`lazy`) { </span><span style='background: #F0ADAD'>Set(SerializationOption.Lazy)</span><span style='background: #AEF1AE'> } else { Set.empty[SerializationOption] })</span><span style=''>
+</span>88 <span style=''>  }
+</span>89 <span style=''>
+</span>90 <span style=''>  /**
+</span>91 <span style=''>   * Create a message serializer
+</span>92 <span style=''>   *
+</span>93 <span style=''>   * @param sft simple feature type
+</span>94 <span style=''>   * @param serialization serialization type (avro or kryo)
+</span>95 <span style=''>   * @param opts extra serialization options
+</span>96 <span style=''>   * @return
+</span>97 <span style=''>   */
+</span>98 <span style=''>  def apply(
+</span>99 <span style=''>      sft: SimpleFeatureType,
+</span>100 <span style=''>      serialization: SerializationType,
+</span>101 <span style=''>      opts: Set[SerializationOption]): GeoMessageSerializer = {
+</span>102 <span style=''>    val options = </span><span style='background: #AEF1AE'>SerializationOptions.builder.withoutId.withUserData.immutable.build ++ opts</span><span style=''>
+</span>103 <span style=''>    val kryoSerializer = </span><span style='background: #AEF1AE'>KryoFeatureSerializer.builder(sft).opts(options).build()</span><span style=''>
+</span>104 <span style=''>    val avroSerializer = </span><span style='background: #AEF1AE'>AvroFeatureSerializer.builder(sft).opts(options).build()</span><span style=''>
+</span>105 <span style=''>    val (serializer, version) = serialization match {
+</span>106 <span style=''>      case SerializationType.KRYO =&gt; (kryoSerializer, KryoVersion)
+</span>107 <span style=''>      case SerializationType.AVRO =&gt; (avroSerializer, AvroVersion)
+</span>108 <span style=''>      case _ =&gt; throw new NotImplementedError(s&quot;Unhandled serialization type '$serialization'&quot;)
+</span>109 <span style=''>    }
+</span>110 <span style=''>    </span><span style='background: #AEF1AE'>new GeoMessageSerializer(sft, serializer, kryoSerializer, avroSerializer, version)</span><span style=''>
+</span>111 <span style=''>  }
+</span>112 <span style=''>
+</span>113 <span style=''>  def partition(numPartitions: Int, toKey: =&gt; Array[Byte]): Int = {
+</span>114 <span style=''>    // use the feature id if available, otherwise (for clear) use random shard
+</span>115 <span style=''>    if (</span><span style='background: #AEF1AE'>numPartitions &lt; 2</span><span style=''>) { </span><span style='background: #AEF1AE'>0</span><span style=''> } else </span><span style='background: #F0ADAD'>{
+</span>116 <span style=''></span><span style='background: #F0ADAD'>      val key = toKey
+</span>117 <span style=''></span><span style='background: #F0ADAD'>      if (key != null &amp;&amp; key.length &gt; 0) {
+</span>118 <span style=''></span><span style='background: #F0ADAD'>        Math.abs(MurmurHash3.bytesHash(key, MurmurHash3.arraySeed)) % numPartitions
+</span>119 <span style=''></span><span style='background: #F0ADAD'>      } else {
+</span>120 <span style=''></span><span style='background: #F0ADAD'>        Random.nextInt(numPartitions)
+</span>121 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>122 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>123 <span style=''>  }
+</span>124 <span style=''>
+</span>125 <span style=''>  /**
+</span>126 <span style=''>    * Ensures that updates to a given feature go to the same partition, so that they maintain order
+</span>127 <span style=''>    */
+</span>128 <span style=''>  class GeoMessagePartitioner extends Partitioner {
+</span>129 <span style=''>
+</span>130 <span style=''>    override def partition(topic: String,
+</span>131 <span style=''>                           key: Any,
+</span>132 <span style=''>                           keyBytes: Array[Byte],
+</span>133 <span style=''>                           value: Any,
+</span>134 <span style=''>                           valueBytes: Array[Byte],
+</span>135 <span style=''>                           cluster: Cluster): Int = {
+</span>136 <span style=''>      val count = </span><span style='background: #AEF1AE'>cluster.partitionsForTopic(topic).size</span><span style=''>
+</span>137 <span style=''>      try { </span><span style='background: #AEF1AE'>GeoMessageSerializer.partition(count, keyBytes)</span><span style=''> } catch {
+</span>138 <span style=''>        case NonFatal(e) =&gt;
+</span>139 <span style=''>          </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(
+</span>140 <span style=''></span><span style='background: #F0ADAD'>            s&quot;Unexpected message format: ${Option(keyBytes).map(ByteArrays.toHex).getOrElse(&quot;&quot;)} &quot; +
+</span>141 <span style=''></span><span style='background: #F0ADAD'>                s&quot;${Option(valueBytes).map(ByteArrays.toHex).getOrElse(&quot;&quot;)}&quot;, e)</span><span style=''>
+</span>142 <span style=''>      }
+</span>143 <span style=''>
+</span>144 <span style=''>    }
+</span>145 <span style=''>
+</span>146 <span style=''>    override def configure(configs: java.util.Map[String, _]): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
+</span>147 <span style=''>
+</span>148 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
+</span>149 <span style=''>  }
+</span>150 <span style=''>
+</span>151 <span style=''>  class GeoMessageSerializerFactory(serialization: SerializationType, opts: Set[SerializationOption] = Set.empty) {
+</span>152 <span style=''>    def apply(sft: SimpleFeatureType): GeoMessageSerializer = </span><span style='background: #AEF1AE'>GeoMessageSerializer.apply(sft, serialization, opts)</span><span style=''>
+</span>153 <span style=''>  }
+</span>154 <span style=''>}
+</span>155 <span style=''>
+</span>156 <span style=''>/**
+</span>157 <span style=''>  * Serializes `GeoMessage`s
+</span>158 <span style=''>  *
+</span>159 <span style=''>  * @param sft simple feature type being serialized
+</span>160 <span style=''>  * @param serializer serializer used for reading or writing messages
+</span>161 <span style=''>  * @param kryo kryo serializer used for deserializing kryo messages
+</span>162 <span style=''>  * @param avro avro serializer used for deserializing avro messages
+</span>163 <span style=''>  * @param version version byte corresponding to the serializer type
+</span>164 <span style=''>  */
+</span>165 <span style=''>class GeoMessageSerializer(sft: SimpleFeatureType,
+</span>166 <span style=''>                           val serializer: SimpleFeatureSerializer,
+</span>167 <span style=''>                           kryo: KryoFeatureSerializer,
+</span>168 <span style=''>                           avro: AvroFeatureSerializer,
+</span>169 <span style=''>                           version: Byte) extends LazyLogging {
+</span>170 <span style=''>
+</span>171 <span style=''>  private val headers = </span><span style='background: #AEF1AE'>Map(GeoMessageSerializer.VersionHeader -&gt; Array(version))</span><span style=''>
+</span>172 <span style=''>
+</span>173 <span style=''>  private lazy val serializerV1 = KryoFeatureSerializer.builder(sft).withUserData.immutable.build()
+</span>174 <span style=''>
+</span>175 <span style=''>  /**
+</span>176 <span style=''>    * Serializes a message
+</span>177 <span style=''>    *
+</span>178 <span style=''>    * @param msg message
+</span>179 <span style=''>    * @return (serialized key, serialized value)
+</span>180 <span style=''>    */
+</span>181 <span style=''>  def serialize(msg: GeoMessage): (Array[Byte], Array[Byte], Map[String, Array[Byte]]) = {
+</span>182 <span style=''>    msg match {
+</span>183 <span style=''>      case m: Change =&gt; </span><span style='background: #AEF1AE'>serialize(m)</span><span style=''>
+</span>184 <span style=''>      case m: Delete =&gt; </span><span style='background: #AEF1AE'>serialize(m)</span><span style=''>
+</span>185 <span style=''>      case m: Clear  =&gt; </span><span style='background: #AEF1AE'>serialize(m)</span><span style=''>
+</span>186 <span style=''>      case _ =&gt; </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Invalid message: '$msg'&quot;)</span><span style=''>
+</span>187 <span style=''>    }
+</span>188 <span style=''>  }
+</span>189 <span style=''>
+</span>190 <span style=''>  /**
+</span>191 <span style=''>    * Deserializes a serialized `GeoMessage`
+</span>192 <span style=''>    *
+</span>193 <span style=''>    * @param key the serialized message key
+</span>194 <span style=''>    * @param value the serialized message body
+</span>195 <span style=''>    * @param timestamp the kafka message timestamp
+</span>196 <span style=''>    * @return the deserialized message
+</span>197 <span style=''>    */
+</span>198 <span style=''>  def deserialize(
+</span>199 <span style=''>      key: Array[Byte],
+</span>200 <span style=''>      value: Array[Byte],
+</span>201 <span style=''>      headers: Map[String, Array[Byte]] = Map.empty,
+</span>202 <span style=''>      timestamp: Long = System.currentTimeMillis()): GeoMessage = {
+</span>203 <span style=''>    try {
+</span>204 <span style=''>      </span><span style='background: #AEF1AE'>headers.get(GeoMessageSerializer.VersionHeader) match {
+</span>205 <span style=''></span><span style='background: #AEF1AE'>        case Some(h) if h.length == 1 &amp;&amp; h(0) == GeoMessageSerializer.KryoVersion =&gt; deserialize(key, value, kryo)
+</span>206 <span style=''></span><span style='background: #AEF1AE'>        case Some(h) if h.length == 1 &amp;&amp; h(0) == GeoMessageSerializer.AvroVersion =&gt; deserialize(key, value, avro)
+</span>207 <span style=''></span><span style='background: #AEF1AE'>        case _ =&gt; tryDeserializeVersions(key, value)
+</span>208 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>209 <span style=''>    } catch {
+</span>210 <span style=''>      case NonFatal(e) =&gt;
+</span>211 <span style=''>        </span><span style='background: #AEF1AE'>throw new IllegalArgumentException(
+</span>212 <span style=''></span><span style='background: #AEF1AE'>          s&quot;Unexpected message format: ${Option(key).map(ByteArrays.toHex).getOrElse(&quot;&quot;)} &quot; +
+</span>213 <span style=''></span><span style='background: #AEF1AE'>              s&quot;${Option(value).map(ByteArrays.toHex).getOrElse(&quot;&quot;)}&quot;, e)</span><span style=''>
+</span>214 <span style=''>    }
+</span>215 <span style=''>  }
+</span>216 <span style=''>
+</span>217 <span style=''>  /**
+</span>218 <span style=''>    * Serializes a change message
+</span>219 <span style=''>    *
+</span>220 <span style=''>    * key: n bytes feature id
+</span>221 <span style=''>    * value: n bytes for serialized feature (without id)
+</span>222 <span style=''>    * headers: &quot;v&quot; -&gt; 1 byte message version
+</span>223 <span style=''>    *
+</span>224 <span style=''>    * @param msg msg
+</span>225 <span style=''>    * @return (serialized key, serialized value, headers)
+</span>226 <span style=''>    */
+</span>227 <span style=''>  private def serialize(msg: Change): (Array[Byte], Array[Byte], Map[String, Array[Byte]]) =
+</span>228 <span style=''>    </span><span style='background: #AEF1AE'>(msg.feature.getID.getBytes(StandardCharsets.UTF_8), serializer.serialize(msg.feature), headers)</span><span style=''>
+</span>229 <span style=''>
+</span>230 <span style=''>  /**
+</span>231 <span style=''>    * Serializes a delete message
+</span>232 <span style=''>    *
+</span>233 <span style=''>    * key: n bytes feature id
+</span>234 <span style=''>    * value: null
+</span>235 <span style=''>    * headers: &quot;v&quot; -&gt; 1 byte message version
+</span>236 <span style=''>    *
+</span>237 <span style=''>    * @param msg msg
+</span>238 <span style=''>    * @return (serialized key, serialized value, headers)
+</span>239 <span style=''>    */
+</span>240 <span style=''>  private def serialize(msg: Delete): (Array[Byte], Array[Byte], Map[String, Array[Byte]]) =
+</span>241 <span style=''>    </span><span style='background: #AEF1AE'>(msg.id.getBytes(StandardCharsets.UTF_8), null, headers)</span><span style=''>
+</span>242 <span style=''>
+</span>243 <span style=''>  /**
+</span>244 <span style=''>    * Serializes a clear message
+</span>245 <span style=''>    *
+</span>246 <span style=''>    * key: empty
+</span>247 <span style=''>    * value: empty
+</span>248 <span style=''>    * headers: &quot;v&quot; -&gt; 1 byte message version
+</span>249 <span style=''>    *
+</span>250 <span style=''>    * @param msg msg
+</span>251 <span style=''>    * @return (serialized key, serialized value, headers)
+</span>252 <span style=''>    */
+</span>253 <span style=''>  private def serialize(msg: Clear): (Array[Byte], Array[Byte], Map[String, Array[Byte]]) =
+</span>254 <span style=''>    </span><span style='background: #AEF1AE'>(GeoMessageSerializer.Empty, GeoMessageSerializer.Empty, headers)</span><span style=''>
+</span>255 <span style=''>
+</span>256 <span style=''>  /**
+</span>257 <span style=''>    * Deserialize a message using the appropriate serializer
+</span>258 <span style=''>    *
+</span>259 <span style=''>    * @param key message key
+</span>260 <span style=''>    * @param value message value
+</span>261 <span style=''>    * @param deserializer deserializer appropriate for the message encoding
+</span>262 <span style=''>    * @return
+</span>263 <span style=''>    */
+</span>264 <span style=''>  protected def deserialize(key: Array[Byte], value: Array[Byte], deserializer: SimpleFeatureSerializer): GeoMessage = {
+</span>265 <span style=''>    if (</span><span style='background: #AEF1AE'>key.isEmpty &amp;&amp; (value == null || value.isEmpty)</span><span style=''>) { </span><span style='background: #AEF1AE'>Clear</span><span style=''> } else </span><span style='background: #AEF1AE'>{
+</span>266 <span style=''></span><span style='background: #AEF1AE'>      val id = new String(key, StandardCharsets.UTF_8)
+</span>267 <span style=''></span><span style='background: #AEF1AE'>      if (value == null) { Delete(id) } else { Change(deserializer.deserialize(id, value)) }
+</span>268 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>269 <span style=''>  }
+</span>270 <span style=''>
+</span>271 <span style=''>  /**
+</span>272 <span style=''>    * Used to deserialize messages without headers, which may be caused by:
+</span>273 <span style=''>    *
+</span>274 <span style=''>    * a) version 1 messages
+</span>275 <span style=''>    * b) an older kafka version that doesn't support message headers
+</span>276 <span style=''>    *
+</span>277 <span style=''>    * @param key message key
+</span>278 <span style=''>    * @param value message value
+</span>279 <span style=''>    * @return
+</span>280 <span style=''>    */
+</span>281 <span style=''>  private def tryDeserializeVersions(key: Array[Byte], value: Array[Byte]): GeoMessage = {
+</span>282 <span style=''>    if (</span><span style='background: #AEF1AE'>key.length == 10 &amp;&amp; key(0) == 1 &amp;&amp; Seq('C', 'D', 'X').contains(key(1).toChar)</span><span style=''>) {
+</span>283 <span style=''>      </span><span style='background: #AEF1AE'>try { deserializeV1(key, value) } catch {
+</span>284 <span style=''></span><span style='background: #AEF1AE'>        case NonFatal(e) =&gt;
+</span>285 <span style=''></span><span style='background: #AEF1AE'>          try { tryDeserializeTypes(key, value) } catch {
+</span>286 <span style=''></span><span style='background: #AEF1AE'>            case NonFatal(suppressed) =&gt; e.addSuppressed(suppressed); throw e
+</span>287 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>288 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>289 <span style=''>    } else {
+</span>290 <span style=''>      </span><span style='background: #AEF1AE'>tryDeserializeTypes(key, value)</span><span style=''>
+</span>291 <span style=''>    }
+</span>292 <span style=''>  }
+</span>293 <span style=''>
+</span>294 <span style=''>  /**
+</span>295 <span style=''>    * Try to deserialize using both kryo and avro
+</span>296 <span style=''>    *
+</span>297 <span style=''>    * @param key message key
+</span>298 <span style=''>    * @param value message value
+</span>299 <span style=''>    * @return
+</span>300 <span style=''>    */
+</span>301 <span style=''>  private def tryDeserializeTypes(key: Array[Byte], value: Array[Byte]): GeoMessage = {
+</span>302 <span style=''>    try { </span><span style='background: #AEF1AE'>deserialize(key, value, serializer)</span><span style=''> } catch {
+</span>303 <span style=''>      case NonFatal(e) =&gt;
+</span>304 <span style=''>        </span><span style='background: #AEF1AE'>try { deserialize(key, value, if (serializer.eq(kryo)) { avro } else { kryo }) } catch {
+</span>305 <span style=''></span><span style='background: #AEF1AE'>          case NonFatal(suppressed) =&gt; e.addSuppressed(suppressed); throw e
+</span>306 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>307 <span style=''>    }
+</span>308 <span style=''>  }
+</span>309 <span style=''>
+</span>310 <span style=''>  /**
+</span>311 <span style=''>    * Deserialize version 1 messages
+</span>312 <span style=''>    *
+</span>313 <span style=''>    * @param key message key
+</span>314 <span style=''>    * @param value message value
+</span>315 <span style=''>    * @return
+</span>316 <span style=''>    */
+</span>317 <span style=''>  private def deserializeV1(key: Array[Byte], value: Array[Byte]): GeoMessage = {
+</span>318 <span style=''>    </span><span style='background: #AEF1AE'>key(1).toChar</span><span style=''> match {
+</span>319 <span style=''>      case 'C' =&gt; </span><span style='background: #AEF1AE'>Change(serializerV1.deserialize(value))</span><span style=''>
+</span>320 <span style=''>      case 'D' =&gt; </span><span style='background: #AEF1AE'>Delete(new String(value, StandardCharsets.UTF_8))</span><span style=''>
+</span>321 <span style=''>      case 'X' =&gt; </span><span style='background: #AEF1AE'>Clear</span><span style=''>
+</span>322 <span style=''>      case m   =&gt; </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Unknown message type: $m&quot; )</span><span style=''>
+</span>323 <span style=''>    }
+</span>324 <span style=''>  }
+</span>325 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          2876
+        </td>
+        <td>
+          2621
+          -
+          2622
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          2
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          2877
+        </td>
+        <td>
+          2649
+          -
+          2650
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          3
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          2878
+        </td>
+        <td>
+          2674
+          -
+          2677
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;v&quot;
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          2879
+        </td>
+        <td>
+          2701
+          -
+          2718
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Array.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Array.empty[Byte]((ClassTag.Byte: scala.reflect.ClassTag[Byte]))
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          2880
+        </td>
+        <td>
+          3234
+          -
+          3258
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.features.SerializationOption.Lazy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.features.SerializationOption.Lazy
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          2881
+        </td>
+        <td>
+          3230
+          -
+          3259
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.Set.apply[org.locationtech.geomesa.features.SerializationOption.Value](org.locationtech.geomesa.features.SerializationOption.Lazy)
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          2882
+        </td>
+        <td>
+          3230
+          -
+          3259
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.Set.apply[org.locationtech.geomesa.features.SerializationOption.Value](org.locationtech.geomesa.features.SerializationOption.Lazy)
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          2883
+        </td>
+        <td>
+          3269
+          -
+          3299
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.ImmutableSetFactory.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.Set.empty[org.locationtech.geomesa.features.SerializationOption.SerializationOption]
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          2884
+        </td>
+        <td>
+          3269
+          -
+          3299
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.generic.ImmutableSetFactory.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.Set.empty[org.locationtech.geomesa.features.SerializationOption.SerializationOption]
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          2885
+        </td>
+        <td>
+          3190
+          -
+          3302
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.apply(sft, serialization, if (``lazy``)
+  scala.Predef.Set.apply[org.locationtech.geomesa.features.SerializationOption.Value](org.locationtech.geomesa.features.SerializationOption.Lazy)
+else
+  scala.Predef.Set.empty[org.locationtech.geomesa.features.SerializationOption.SerializationOption])
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          2886
+        </td>
+        <td>
+          3677
+          -
+          3752
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.SetLike.++
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.features.SerializationOption.SerializationOptions.builder.withoutId.withUserData.immutable.build.++(opts)
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          2887
+        </td>
+        <td>
+          3778
+          -
+          3834
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.kryo.KryoFeatureSerializer.Builder.build
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.features.kryo.KryoFeatureSerializer.builder(sft).opts(options).build()
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          2888
+        </td>
+        <td>
+          3860
+          -
+          3916
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.avro.AvroFeatureSerializer.Builder.build
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.features.avro.AvroFeatureSerializer.builder(sft).opts(options).build()
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          2889
+        </td>
+        <td>
+          3926
+          -
+          3926
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple2._1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1._1
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          2890
+        </td>
+        <td>
+          3938
+          -
+          3938
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple2._2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1._2
+        </td>
+      </tr><tr>
+        <td>
+          110
+        </td>
+        <td>
+          2891
+        </td>
+        <td>
+          4211
+          -
+          4293
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new GeoMessageSerializer(sft, serializer, kryoSerializer, avroSerializer, version)
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          2892
+        </td>
+        <td>
+          4454
+          -
+          4471
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          numPartitions.&lt;(2)
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          2893
+        </td>
+        <td>
+          4475
+          -
+          4476
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          2894
+        </td>
+        <td>
+          4475
+          -
+          4476
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          2902
+        </td>
+        <td>
+          4484
+          -
+          4701
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  val key: Array[Byte] = toKey;
+  if (key.!=(null).&amp;&amp;(key.length.&gt;(0)))
+    java.lang.Math.abs(scala.util.hashing.MurmurHash3.bytesHash(key, 1007110753)).%(numPartitions)
+  else
+    scala.util.Random.nextInt(numPartitions)
+}
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          2895
+        </td>
+        <td>
+          4525
+          -
+          4529
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          2896
+        </td>
+        <td>
+          4533
+          -
+          4547
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          key.length.&gt;(0)
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          2897
+        </td>
+        <td>
+          4518
+          -
+          4547
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          key.!=(null).&amp;&amp;(key.length.&gt;(0))
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          2898
+        </td>
+        <td>
+          4559
+          -
+          4634
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.%
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          java.lang.Math.abs(scala.util.hashing.MurmurHash3.bytesHash(key, 1007110753)).%(numPartitions)
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          2899
+        </td>
+        <td>
+          4559
+          -
+          4634
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Int.%
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          java.lang.Math.abs(scala.util.hashing.MurmurHash3.bytesHash(key, 1007110753)).%(numPartitions)
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          2900
+        </td>
+        <td>
+          4658
+          -
+          4687
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.util.Random.nextInt
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.util.Random.nextInt(numPartitions)
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          2901
+        </td>
+        <td>
+          4658
+          -
+          4687
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.util.Random.nextInt
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.util.Random.nextInt(numPartitions)
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          2903
+        </td>
+        <td>
+          5165
+          -
+          5203
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.List.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          cluster.partitionsForTopic(topic).size()
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          2904
+        </td>
+        <td>
+          5216
+          -
+          5263
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.partition(count, keyBytes)
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          2905
+        </td>
+        <td>
+          5216
+          -
+          5263
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.partition(count, keyBytes)
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          2906
+        </td>
+        <td>
+          5312
+          -
+          5529
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unexpected message format: &quot;, &quot; &quot;).s(scala.Option.apply[Array[Byte]](keyBytes).map[String]({
+  ((bytes: Array[Byte]) =&gt; org.locationtech.geomesa.utils.index.ByteArrays.toHex(bytes))
+}).getOrElse[String](&quot;&quot;)).+(scala.StringContext.apply(&quot;&quot;, &quot;&quot;).s(scala.Option.apply[Array[Byte]](valueBytes).map[String]({
+  ((bytes: Array[Byte]) =&gt; org.locationtech.geomesa.utils.index.ByteArrays.toHex(bytes))
+}).getOrElse[String](&quot;&quot;))), e)
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          2907
+        </td>
+        <td>
+          5312
+          -
+          5529
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unexpected message format: &quot;, &quot; &quot;).s(scala.Option.apply[Array[Byte]](keyBytes).map[String]({
+  ((bytes: Array[Byte]) =&gt; org.locationtech.geomesa.utils.index.ByteArrays.toHex(bytes))
+}).getOrElse[String](&quot;&quot;)).+(scala.StringContext.apply(&quot;&quot;, &quot;&quot;).s(scala.Option.apply[Array[Byte]](valueBytes).map[String]({
+  ((bytes: Array[Byte]) =&gt; org.locationtech.geomesa.utils.index.ByteArrays.toHex(bytes))
+}).getOrElse[String](&quot;&quot;))), e)
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          2908
+        </td>
+        <td>
+          5616
+          -
+          5618
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          148
+        </td>
+        <td>
+          2909
+        </td>
+        <td>
+          5653
+          -
+          5655
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          2910
+        </td>
+        <td>
+          5871
+          -
+          5884
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.GeoMessageSerializerFactory.serialization
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializerFactory.this.serialization
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          2911
+        </td>
+        <td>
+          5886
+          -
+          5890
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.GeoMessageSerializerFactory.opts
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializerFactory.this.opts
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          2912
+        </td>
+        <td>
+          5839
+          -
+          5891
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.apply(sft, GeoMessageSerializerFactory.this.serialization, GeoMessageSerializerFactory.this.opts)
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          2913
+        </td>
+        <td>
+          6594
+          -
+          6628
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.VersionHeader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.VersionHeader
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          2914
+        </td>
+        <td>
+          6638
+          -
+          6645
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.version
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.version
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          2915
+        </td>
+        <td>
+          6632
+          -
+          6646
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Array.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Array.apply(GeoMessageSerializer.this.version)
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          2916
+        </td>
+        <td>
+          6594
+          -
+          6646
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.ArrowAssoc[String](GeoMessageSerializer.VersionHeader).-&gt;[Array[Byte]](scala.Array.apply(GeoMessageSerializer.this.version))
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          2917
+        </td>
+        <td>
+          6590
+          -
+          6647
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenMapFactory.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.Map.apply[String, Array[Byte]](scala.Predef.ArrowAssoc[String](GeoMessageSerializer.VersionHeader).-&gt;[Array[Byte]](scala.Array.apply(GeoMessageSerializer.this.version)))
+        </td>
+      </tr><tr>
+        <td>
+          183
+        </td>
+        <td>
+          2918
+        </td>
+        <td>
+          7001
+          -
+          7013
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.serialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.serialize(m)
+        </td>
+      </tr><tr>
+        <td>
+          183
+        </td>
+        <td>
+          2919
+        </td>
+        <td>
+          7001
+          -
+          7013
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.serialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.serialize(m)
+        </td>
+      </tr><tr>
+        <td>
+          184
+        </td>
+        <td>
+          2920
+        </td>
+        <td>
+          7038
+          -
+          7050
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.serialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.serialize(m)
+        </td>
+      </tr><tr>
+        <td>
+          184
+        </td>
+        <td>
+          2921
+        </td>
+        <td>
+          7038
+          -
+          7050
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.serialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.serialize(m)
+        </td>
+      </tr><tr>
+        <td>
+          185
+        </td>
+        <td>
+          2922
+        </td>
+        <td>
+          7075
+          -
+          7087
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.serialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.serialize(m)
+        </td>
+      </tr><tr>
+        <td>
+          185
+        </td>
+        <td>
+          2923
+        </td>
+        <td>
+          7075
+          -
+          7087
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.serialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.serialize(m)
+        </td>
+      </tr><tr>
+        <td>
+          186
+        </td>
+        <td>
+          2924
+        </td>
+        <td>
+          7104
+          -
+          7166
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Invalid message: \'&quot;, &quot;\'&quot;).s(msg))
+        </td>
+      </tr><tr>
+        <td>
+          186
+        </td>
+        <td>
+          2925
+        </td>
+        <td>
+          7104
+          -
+          7166
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Invalid message: \'&quot;, &quot;\'&quot;).s(msg))
+        </td>
+      </tr><tr>
+        <td>
+          204
+        </td>
+        <td>
+          2926
+        </td>
+        <td>
+          7641
+          -
+          7675
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.VersionHeader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.VersionHeader
+        </td>
+      </tr><tr>
+        <td>
+          204
+        </td>
+        <td>
+          2927
+        </td>
+        <td>
+          7629
+          -
+          7676
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.MapLike.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          headers.get(GeoMessageSerializer.VersionHeader)
+        </td>
+      </tr><tr>
+        <td>
+          204
+        </td>
+        <td>
+          2946
+        </td>
+        <td>
+          7629
+          -
+          7975
+        </td>
+        <td>
+          Match
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          headers.get(GeoMessageSerializer.VersionHeader) match {
+  case (value: Array[Byte])Some[Array[Byte]]((h @ _)) if h.length.==(1).&amp;&amp;(h.apply(0).==(GeoMessageSerializer.KryoVersion)) =&gt; GeoMessageSerializer.this.deserialize(key, value, GeoMessageSerializer.this.kryo)
+  case (value: Array[Byte])Some[Array[Byte]]((h @ _)) if h.length.==(1).&amp;&amp;(h.apply(0).==(GeoMessageSerializer.AvroVersion)) =&gt; GeoMessageSerializer.this.deserialize(key, value, GeoMessageSerializer.this.avro)
+  case _ =&gt; GeoMessageSerializer.this.tryDeserializeVersions(key, value)
+}
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          2928
+        </td>
+        <td>
+          7721
+          -
+          7722
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          2929
+        </td>
+        <td>
+          7728
+          -
+          7729
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          2930
+        </td>
+        <td>
+          7734
+          -
+          7766
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.KryoVersion
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.KryoVersion
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          2931
+        </td>
+        <td>
+          7726
+          -
+          7766
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Byte.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          h.apply(0).==(GeoMessageSerializer.KryoVersion)
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          2932
+        </td>
+        <td>
+          7709
+          -
+          7766
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          h.length.==(1).&amp;&amp;(h.apply(0).==(GeoMessageSerializer.KryoVersion))
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          2933
+        </td>
+        <td>
+          7794
+          -
+          7798
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.kryo
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.kryo
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          2934
+        </td>
+        <td>
+          7770
+          -
+          7799
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.deserialize(key, value, GeoMessageSerializer.this.kryo)
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          2935
+        </td>
+        <td>
+          7770
+          -
+          7799
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.deserialize(key, value, GeoMessageSerializer.this.kryo)
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          2936
+        </td>
+        <td>
+          7836
+          -
+          7837
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          2937
+        </td>
+        <td>
+          7843
+          -
+          7844
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          2938
+        </td>
+        <td>
+          7849
+          -
+          7881
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.AvroVersion
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.AvroVersion
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          2939
+        </td>
+        <td>
+          7841
+          -
+          7881
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Byte.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          h.apply(0).==(GeoMessageSerializer.AvroVersion)
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          2940
+        </td>
+        <td>
+          7824
+          -
+          7881
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          h.length.==(1).&amp;&amp;(h.apply(0).==(GeoMessageSerializer.AvroVersion))
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          2941
+        </td>
+        <td>
+          7909
+          -
+          7913
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.avro
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.avro
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          2942
+        </td>
+        <td>
+          7885
+          -
+          7914
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.deserialize(key, value, GeoMessageSerializer.this.avro)
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          2943
+        </td>
+        <td>
+          7885
+          -
+          7914
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.deserialize(key, value, GeoMessageSerializer.this.avro)
+        </td>
+      </tr><tr>
+        <td>
+          207
+        </td>
+        <td>
+          2944
+        </td>
+        <td>
+          7933
+          -
+          7967
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.tryDeserializeVersions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.tryDeserializeVersions(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          207
+        </td>
+        <td>
+          2945
+        </td>
+        <td>
+          7933
+          -
+          7967
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.tryDeserializeVersions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.tryDeserializeVersions(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          2947
+        </td>
+        <td>
+          8024
+          -
+          8227
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unexpected message format: &quot;, &quot; &quot;).s(scala.Option.apply[Array[Byte]](key).map[String]({
+  ((bytes: Array[Byte]) =&gt; org.locationtech.geomesa.utils.index.ByteArrays.toHex(bytes))
+}).getOrElse[String](&quot;&quot;)).+(scala.StringContext.apply(&quot;&quot;, &quot;&quot;).s(scala.Option.apply[Array[Byte]](value).map[String]({
+  ((bytes: Array[Byte]) =&gt; org.locationtech.geomesa.utils.index.ByteArrays.toHex(bytes))
+}).getOrElse[String](&quot;&quot;))), e)
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          2948
+        </td>
+        <td>
+          8024
+          -
+          8227
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unexpected message format: &quot;, &quot; &quot;).s(scala.Option.apply[Array[Byte]](key).map[String]({
+  ((bytes: Array[Byte]) =&gt; org.locationtech.geomesa.utils.index.ByteArrays.toHex(bytes))
+}).getOrElse[String](&quot;&quot;)).+(scala.StringContext.apply(&quot;&quot;, &quot;&quot;).s(scala.Option.apply[Array[Byte]](value).map[String]({
+  ((bytes: Array[Byte]) =&gt; org.locationtech.geomesa.utils.index.ByteArrays.toHex(bytes))
+}).getOrElse[String](&quot;&quot;))), e)
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          2949
+        </td>
+        <td>
+          8634
+          -
+          8656
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          2950
+        </td>
+        <td>
+          8607
+          -
+          8657
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.getBytes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          msg.feature.getID().getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          2951
+        </td>
+        <td>
+          8680
+          -
+          8691
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          msg.feature
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          2952
+        </td>
+        <td>
+          8659
+          -
+          8692
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.SimpleFeatureSerializer.serialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.serializer.serialize(msg.feature)
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          2953
+        </td>
+        <td>
+          8694
+          -
+          8701
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.headers
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.headers
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          2954
+        </td>
+        <td>
+          8606
+          -
+          8702
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple3.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Tuple3.apply[Array[Byte], Array[Byte], scala.collection.immutable.Map[String,Array[Byte]]](msg.feature.getID().getBytes(java.nio.charset.StandardCharsets.UTF_8), GeoMessageSerializer.this.serializer.serialize(msg.feature), GeoMessageSerializer.this.headers)
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          2955
+        </td>
+        <td>
+          9049
+          -
+          9071
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          2956
+        </td>
+        <td>
+          9033
+          -
+          9072
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.getBytes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          msg.id.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          2957
+        </td>
+        <td>
+          9074
+          -
+          9078
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          2958
+        </td>
+        <td>
+          9080
+          -
+          9087
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.headers
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.headers
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          2959
+        </td>
+        <td>
+          9032
+          -
+          9088
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple3.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Tuple3.apply[Array[Byte], Null, scala.collection.immutable.Map[String,Array[Byte]]](msg.id.getBytes(java.nio.charset.StandardCharsets.UTF_8), null, GeoMessageSerializer.this.headers)
+        </td>
+      </tr><tr>
+        <td>
+          254
+        </td>
+        <td>
+          2960
+        </td>
+        <td>
+          9405
+          -
+          9431
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.Empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.Empty
+        </td>
+      </tr><tr>
+        <td>
+          254
+        </td>
+        <td>
+          2961
+        </td>
+        <td>
+          9433
+          -
+          9459
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.Empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.Empty
+        </td>
+      </tr><tr>
+        <td>
+          254
+        </td>
+        <td>
+          2962
+        </td>
+        <td>
+          9461
+          -
+          9468
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.headers
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.headers
+        </td>
+      </tr><tr>
+        <td>
+          254
+        </td>
+        <td>
+          2963
+        </td>
+        <td>
+          9404
+          -
+          9469
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple3.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Tuple3.apply[Array[Byte], Array[Byte], scala.collection.immutable.Map[String,Array[Byte]]](GeoMessageSerializer.Empty, GeoMessageSerializer.Empty, GeoMessageSerializer.this.headers)
+        </td>
+      </tr><tr>
+        <td>
+          265
+        </td>
+        <td>
+          2964
+        </td>
+        <td>
+          9857
+          -
+          9861
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          265
+        </td>
+        <td>
+          2965
+        </td>
+        <td>
+          9865
+          -
+          9878
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.IndexedSeqOptimized.isEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.byteArrayOps(value).isEmpty
+        </td>
+      </tr><tr>
+        <td>
+          265
+        </td>
+        <td>
+          2966
+        </td>
+        <td>
+          9848
+          -
+          9878
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          value.==(null).||(scala.Predef.byteArrayOps(value).isEmpty)
+        </td>
+      </tr><tr>
+        <td>
+          265
+        </td>
+        <td>
+          2967
+        </td>
+        <td>
+          9832
+          -
+          9879
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.byteArrayOps(key).isEmpty.&amp;&amp;(value.==(null).||(scala.Predef.byteArrayOps(value).isEmpty))
+        </td>
+      </tr><tr>
+        <td>
+          265
+        </td>
+        <td>
+          2968
+        </td>
+        <td>
+          9883
+          -
+          9888
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Clear
+        </td>
+      </tr><tr>
+        <td>
+          265
+        </td>
+        <td>
+          2969
+        </td>
+        <td>
+          9883
+          -
+          9888
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Clear
+        </td>
+      </tr><tr>
+        <td>
+          265
+        </td>
+        <td>
+          2978
+        </td>
+        <td>
+          9896
+          -
+          10051
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val id: String = new scala.Predef.String(key, java.nio.charset.StandardCharsets.UTF_8);
+  if (value.==(null))
+    org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.apply(id)
+  else
+    org.locationtech.geomesa.kafka.utils.GeoMessage.Change.apply(deserializer.deserialize(id, value))
+}
+        </td>
+      </tr><tr>
+        <td>
+          266
+        </td>
+        <td>
+          2970
+        </td>
+        <td>
+          9929
+          -
+          9951
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+      </tr><tr>
+        <td>
+          266
+        </td>
+        <td>
+          2971
+        </td>
+        <td>
+          9913
+          -
+          9952
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new scala.Predef.String(key, java.nio.charset.StandardCharsets.UTF_8)
+        </td>
+      </tr><tr>
+        <td>
+          267
+        </td>
+        <td>
+          2972
+        </td>
+        <td>
+          9963
+          -
+          9976
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          value.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          267
+        </td>
+        <td>
+          2973
+        </td>
+        <td>
+          9980
+          -
+          9990
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.apply(id)
+        </td>
+      </tr><tr>
+        <td>
+          267
+        </td>
+        <td>
+          2974
+        </td>
+        <td>
+          9980
+          -
+          9990
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.apply(id)
+        </td>
+      </tr><tr>
+        <td>
+          267
+        </td>
+        <td>
+          2975
+        </td>
+        <td>
+          10007
+          -
+          10042
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.SimpleFeatureSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          deserializer.deserialize(id, value)
+        </td>
+      </tr><tr>
+        <td>
+          267
+        </td>
+        <td>
+          2976
+        </td>
+        <td>
+          10000
+          -
+          10043
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.apply(deserializer.deserialize(id, value))
+        </td>
+      </tr><tr>
+        <td>
+          267
+        </td>
+        <td>
+          2977
+        </td>
+        <td>
+          10000
+          -
+          10043
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.apply(deserializer.deserialize(id, value))
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          2979
+        </td>
+        <td>
+          10444
+          -
+          10446
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          10
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          2980
+        </td>
+        <td>
+          10450
+          -
+          10461
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Byte.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          key.apply(0).==(1)
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          2981
+        </td>
+        <td>
+          10469
+          -
+          10472
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          'C'
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          2982
+        </td>
+        <td>
+          10474
+          -
+          10477
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          'D'
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          2983
+        </td>
+        <td>
+          10479
+          -
+          10482
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          'X'
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          2984
+        </td>
+        <td>
+          10497
+          -
+          10498
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          2985
+        </td>
+        <td>
+          10493
+          -
+          10506
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Byte.toChar
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          key.apply(1).toChar
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          2986
+        </td>
+        <td>
+          10465
+          -
+          10507
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.SeqLike.contains
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[Char]('C', 'D', 'X').contains[Char](key.apply(1).toChar)
+        </td>
+      </tr><tr>
+        <td>
+          282
+        </td>
+        <td>
+          2987
+        </td>
+        <td>
+          10430
+          -
+          10507
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          key.length.==(10).&amp;&amp;(key.apply(0).==(1)).&amp;&amp;(scala.collection.Seq.apply[Char]('C', 'D', 'X').contains[Char](key.apply(1).toChar))
+        </td>
+      </tr><tr>
+        <td>
+          283
+        </td>
+        <td>
+          2988
+        </td>
+        <td>
+          10523
+          -
+          10548
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserializeV1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.deserializeV1(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          283
+        </td>
+        <td>
+          2989
+        </td>
+        <td>
+          10523
+          -
+          10548
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserializeV1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.deserializeV1(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          283
+        </td>
+        <td>
+          2996
+        </td>
+        <td>
+          10517
+          -
+          10742
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  GeoMessageSerializer.this.deserializeV1(key, value)
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; try {
+    GeoMessageSerializer.this.tryDeserializeTypes(key, value)
+  } catch {
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((suppressed @ _)) =&gt; {
+      e.addSuppressed(suppressed);
+      throw e
+    }
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          285
+        </td>
+        <td>
+          2990
+        </td>
+        <td>
+          10603
+          -
+          10634
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.tryDeserializeTypes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.tryDeserializeTypes(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          285
+        </td>
+        <td>
+          2991
+        </td>
+        <td>
+          10603
+          -
+          10634
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.tryDeserializeTypes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.tryDeserializeTypes(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          285
+        </td>
+        <td>
+          2995
+        </td>
+        <td>
+          10597
+          -
+          10734
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  GeoMessageSerializer.this.tryDeserializeTypes(key, value)
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((suppressed @ _)) =&gt; {
+    e.addSuppressed(suppressed);
+    throw e
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          286
+        </td>
+        <td>
+          2992
+        </td>
+        <td>
+          10686
+          -
+          10713
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Throwable.addSuppressed
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          e.addSuppressed(suppressed)
+        </td>
+      </tr><tr>
+        <td>
+          286
+        </td>
+        <td>
+          2993
+        </td>
+        <td>
+          10715
+          -
+          10722
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw e
+        </td>
+      </tr><tr>
+        <td>
+          286
+        </td>
+        <td>
+          2994
+        </td>
+        <td>
+          10683
+          -
+          10722
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  e.addSuppressed(suppressed);
+  throw e
+}
+        </td>
+      </tr><tr>
+        <td>
+          290
+        </td>
+        <td>
+          2997
+        </td>
+        <td>
+          10762
+          -
+          10793
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.tryDeserializeTypes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.tryDeserializeTypes(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          290
+        </td>
+        <td>
+          2998
+        </td>
+        <td>
+          10762
+          -
+          10793
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.tryDeserializeTypes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.tryDeserializeTypes(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          302
+        </td>
+        <td>
+          2999
+        </td>
+        <td>
+          11072
+          -
+          11082
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.serializer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.serializer
+        </td>
+      </tr><tr>
+        <td>
+          302
+        </td>
+        <td>
+          3000
+        </td>
+        <td>
+          11048
+          -
+          11083
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.deserialize(key, value, GeoMessageSerializer.this.serializer)
+        </td>
+      </tr><tr>
+        <td>
+          302
+        </td>
+        <td>
+          3001
+        </td>
+        <td>
+          11048
+          -
+          11083
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.deserialize(key, value, GeoMessageSerializer.this.serializer)
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          3002
+        </td>
+        <td>
+          11176
+          -
+          11180
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.kryo
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.kryo
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          3003
+        </td>
+        <td>
+          11162
+          -
+          11181
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.eq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.serializer.eq(GeoMessageSerializer.this.kryo)
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          3004
+        </td>
+        <td>
+          11185
+          -
+          11189
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.avro
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.avro
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          3005
+        </td>
+        <td>
+          11185
+          -
+          11189
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.avro
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.avro
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          3006
+        </td>
+        <td>
+          11199
+          -
+          11203
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.kryo
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.kryo
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          3007
+        </td>
+        <td>
+          11199
+          -
+          11203
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.kryo
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.kryo
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          3008
+        </td>
+        <td>
+          11134
+          -
+          11206
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.deserialize(key, value, if (GeoMessageSerializer.this.serializer.eq(GeoMessageSerializer.this.kryo))
+  GeoMessageSerializer.this.avro
+else
+  GeoMessageSerializer.this.kryo)
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          3009
+        </td>
+        <td>
+          11134
+          -
+          11206
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessageSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.deserialize(key, value, if (GeoMessageSerializer.this.serializer.eq(GeoMessageSerializer.this.kryo))
+  GeoMessageSerializer.this.avro
+else
+  GeoMessageSerializer.this.kryo)
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          3013
+        </td>
+        <td>
+          11128
+          -
+          11302
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  GeoMessageSerializer.this.deserialize(key, value, if (GeoMessageSerializer.this.serializer.eq(GeoMessageSerializer.this.kryo))
+    GeoMessageSerializer.this.avro
+  else
+    GeoMessageSerializer.this.kryo)
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((suppressed @ _)) =&gt; {
+    e.addSuppressed(suppressed);
+    throw e
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          305
+        </td>
+        <td>
+          3010
+        </td>
+        <td>
+          11256
+          -
+          11283
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Throwable.addSuppressed
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          e.addSuppressed(suppressed)
+        </td>
+      </tr><tr>
+        <td>
+          305
+        </td>
+        <td>
+          3011
+        </td>
+        <td>
+          11285
+          -
+          11292
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw e
+        </td>
+      </tr><tr>
+        <td>
+          305
+        </td>
+        <td>
+          3012
+        </td>
+        <td>
+          11253
+          -
+          11292
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  e.addSuppressed(suppressed);
+  throw e
+}
+        </td>
+      </tr><tr>
+        <td>
+          318
+        </td>
+        <td>
+          3014
+        </td>
+        <td>
+          11536
+          -
+          11537
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1
+        </td>
+      </tr><tr>
+        <td>
+          318
+        </td>
+        <td>
+          3015
+        </td>
+        <td>
+          11532
+          -
+          11545
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Byte.toChar
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          key.apply(1).toChar
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          3016
+        </td>
+        <td>
+          11579
+          -
+          11610
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.SimpleFeatureSerializer.deserialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMessageSerializer.this.serializerV1.deserialize(value)
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          3017
+        </td>
+        <td>
+          11572
+          -
+          11611
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.apply(GeoMessageSerializer.this.serializerV1.deserialize(value))
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          3018
+        </td>
+        <td>
+          11572
+          -
+          11611
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Change.apply(GeoMessageSerializer.this.serializerV1.deserialize(value))
+        </td>
+      </tr><tr>
+        <td>
+          320
+        </td>
+        <td>
+          3019
+        </td>
+        <td>
+          11655
+          -
+          11677
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+      </tr><tr>
+        <td>
+          320
+        </td>
+        <td>
+          3020
+        </td>
+        <td>
+          11637
+          -
+          11678
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new scala.Predef.String(value, java.nio.charset.StandardCharsets.UTF_8)
+        </td>
+      </tr><tr>
+        <td>
+          320
+        </td>
+        <td>
+          3021
+        </td>
+        <td>
+          11630
+          -
+          11679
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.apply(new scala.Predef.String(value, java.nio.charset.StandardCharsets.UTF_8))
+        </td>
+      </tr><tr>
+        <td>
+          320
+        </td>
+        <td>
+          3022
+        </td>
+        <td>
+          11630
+          -
+          11679
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Delete.apply(new scala.Predef.String(value, java.nio.charset.StandardCharsets.UTF_8))
+        </td>
+      </tr><tr>
+        <td>
+          321
+        </td>
+        <td>
+          3023
+        </td>
+        <td>
+          11698
+          -
+          11703
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Clear
+        </td>
+      </tr><tr>
+        <td>
+          321
+        </td>
+        <td>
+          3024
+        </td>
+        <td>
+          11698
+          -
+          11703
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.utils.GeoMessage.Clear
+        </td>
+      </tr><tr>
+        <td>
+          322
+        </td>
+        <td>
+          3025
+        </td>
+        <td>
+          11722
+          -
+          11786
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unknown message type: &quot;, &quot;&quot;).s(m))
+        </td>
+      </tr><tr>
+        <td>
+          322
+        </td>
+        <td>
+          3026
+        </td>
+        <td>
+          11722
+          -
+          11786
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Unknown message type: &quot;, &quot;&quot;).s(m))
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>

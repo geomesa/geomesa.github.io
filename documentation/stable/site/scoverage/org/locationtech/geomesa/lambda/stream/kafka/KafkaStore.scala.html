@@ -23,7 +23,7 @@
         <div class="tab-content">
           <div class="tab-pane active" id="codegrid">
             <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
-</span>2 <span style=''> * Copyright (c) 2013-2025 Commonwealth Computer Research, Inc.
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
 </span>3 <span style=''> * All rights reserved. This program and the accompanying materials
 </span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
 </span>5 <span style=''> * which accompanies this distribution and is available at
@@ -38,7 +38,7 @@
 </span>14 <span style=''>import org.apache.kafka.clients.producer._
 </span>15 <span style=''>import org.apache.kafka.common.serialization._
 </span>16 <span style=''>import org.apache.kafka.common.{Cluster, TopicPartition}
-</span>17 <span style=''>import org.geotools.api.data.{DataStore, Query, Transaction}
+</span>17 <span style=''>import org.geotools.api.data.{DataStore, Query}
 </span>18 <span style=''>import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
 </span>19 <span style=''>import org.geotools.api.filter.Filter
 </span>20 <span style=''>import org.geotools.util.factory.Hints
@@ -62,288 +62,264 @@
 </span>38 <span style=''>import java.io.Flushable
 </span>39 <span style=''>import java.time.Clock
 </span>40 <span style=''>import java.util.{Collections, Properties, UUID}
-</span>41 <span style=''>import scala.concurrent.duration.Duration
-</span>42 <span style=''>import scala.util.control.NonFatal
-</span>43 <span style=''>import scala.util.hashing.MurmurHash3
-</span>44 <span style=''>
-</span>45 <span style=''>class KafkaStore(
-</span>46 <span style=''>    ds: DataStore,
-</span>47 <span style=''>    val sft: SimpleFeatureType,
-</span>48 <span style=''>    authProvider: Option[AuthorizationsProvider],
+</span>41 <span style=''>import scala.util.control.NonFatal
+</span>42 <span style=''>import scala.util.hashing.MurmurHash3
+</span>43 <span style=''>
+</span>44 <span style=''>class KafkaStore(
+</span>45 <span style=''>    ds: DataStore,
+</span>46 <span style=''>    val sft: SimpleFeatureType,
+</span>47 <span style=''>    authProvider: Option[AuthorizationsProvider],
+</span>48 <span style=''>    offsetManager: OffsetManager,
 </span>49 <span style=''>    config: LambdaConfig)
 </span>50 <span style=''>   (implicit clock: Clock = Clock.systemUTC()
 </span>51 <span style=''>   ) extends TransientStore with Flushable with LazyLogging {
 </span>52 <span style=''>
-</span>53 <span style=''>  private val offsetManager = </span><span style='background: #AEF1AE'>config.offsetManager</span><span style=''>
+</span>53 <span style=''>  private val topic = </span><span style='background: #AEF1AE'>LambdaDataStore.topic(sft, config.zkNamespace)</span><span style=''>
 </span>54 <span style=''>
 </span>55 <span style=''>  private val producer = </span><span style='background: #AEF1AE'>KafkaStore.producer(sft, config.producerConfig)</span><span style=''>
 </span>56 <span style=''>
-</span>57 <span style=''>  private val topic = </span><span style='background: #AEF1AE'>LambdaDataStore.topic(sft, config.zkNamespace)</span><span style=''>
+</span>57 <span style=''>  private val cache = </span><span style='background: #AEF1AE'>new KafkaFeatureCache(ds, sft, offsetManager, topic, config.expiry, config.persistBatchSize)</span><span style=''>
 </span>58 <span style=''>
-</span>59 <span style=''>  private val cache = </span><span style='background: #AEF1AE'>new KafkaFeatureCache(topic)</span><span style=''>
-</span>60 <span style=''>
-</span>61 <span style=''>  private val serializer = {
-</span>62 <span style=''>    // use immutable so we can return query results without copying or worrying about user modification
-</span>63 <span style=''>    // use lazy so that we don't create lots of objects that get replaced/updated before actually being read
-</span>64 <span style=''>    val options = </span><span style='background: #AEF1AE'>SerializationOptions.builder.withUserData.withoutFidHints.immutable.`lazy`.build</span><span style=''>
-</span>65 <span style=''>    </span><span style='background: #AEF1AE'>KryoFeatureSerializer(sft, options)</span><span style=''>
-</span>66 <span style=''>  }
+</span>59 <span style=''>  private val serializer = {
+</span>60 <span style=''>    // use immutable so we can return query results without copying or worrying about user modification
+</span>61 <span style=''>    // use lazy so that we don't create lots of objects that get replaced/updated before actually being read
+</span>62 <span style=''>    val options = </span><span style='background: #AEF1AE'>SerializationOptions.builder.withUserData.withoutFidHints.immutable.`lazy`.build</span><span style=''>
+</span>63 <span style=''>    </span><span style='background: #AEF1AE'>KryoFeatureSerializer(sft, options)</span><span style=''>
+</span>64 <span style=''>  }
+</span>65 <span style=''>
+</span>66 <span style=''>  private val interceptors = </span><span style='background: #AEF1AE'>QueryInterceptorFactory(ds)</span><span style=''>
 </span>67 <span style=''>
-</span>68 <span style=''>  private val interceptors = </span><span style='background: #AEF1AE'>QueryInterceptorFactory(ds)</span><span style=''>
+</span>68 <span style=''>  private val queryRunner = </span><span style='background: #AEF1AE'>new KafkaQueryRunner(cache, authProvider, interceptors)</span><span style=''>
 </span>69 <span style=''>
-</span>70 <span style=''>  private val queryRunner = </span><span style='background: #AEF1AE'>new KafkaQueryRunner(cache, authProvider, interceptors)</span><span style=''>
-</span>71 <span style=''>
-</span>72 <span style=''>  private val loader = {
-</span>73 <span style=''>    val consumers = </span><span style='background: #AEF1AE'>KafkaStore.consumers(config.consumerConfig, topic, offsetManager, config.consumers, cache.partitionAssigned)</span><span style=''>
-</span>74 <span style=''>    val frequency = </span><span style='background: #AEF1AE'>KafkaStore.LoadIntervalProperty.toDuration.get.toMillis</span><span style=''>
-</span>75 <span style=''>    </span><span style='background: #AEF1AE'>new KafkaCacheLoader(consumers, topic, frequency, serializer, cache)</span><span style=''>
-</span>76 <span style=''>  }
-</span>77 <span style=''>
-</span>78 <span style=''>  private val persistence = if (</span><span style='background: #AEF1AE'>config.expiry == Duration.Inf</span><span style=''>) { </span><span style='background: #F0ADAD'>None</span><span style=''> } else {
-</span>79 <span style=''>    </span><span style='background: #AEF1AE'>Some(new DataStorePersistence(ds, sft, offsetManager, cache, topic, config.expiry.toMillis, config.persist))</span><span style=''>
-</span>80 <span style=''>  }
-</span>81 <span style=''>
-</span>82 <span style=''>  // register as a listener for offset changes
-</span>83 <span style=''>  </span><span style='background: #AEF1AE'>offsetManager.addOffsetListener(topic, cache)</span><span style=''>
-</span>84 <span style=''>
-</span>85 <span style=''>  override def createSchema(): Unit = {
-</span>86 <span style=''>    val props = </span><span style='background: #F0ADAD'>new Properties()</span><span style=''>
-</span>87 <span style=''>    </span><span style='background: #F0ADAD'>config.producerConfig.foreach { case (k, v) =&gt; props.put(k, v) }</span><span style=''>
-</span>88 <span style=''>
-</span>89 <span style=''>    </span><span style='background: #F0ADAD'>WithClose(AdminClient.create(props)) { admin =&gt;
-</span>90 <span style=''></span><span style='background: #F0ADAD'>      if (admin.listTopics().names().get.contains(topic)) {
-</span>91 <span style=''></span><span style='background: #F0ADAD'>        logger.warn(s&quot;Topic [$topic] already exists - it may contain stale data&quot;)
-</span>92 <span style=''></span><span style='background: #F0ADAD'>      } else {
-</span>93 <span style=''></span><span style='background: #F0ADAD'>        val replication = SystemProperty(&quot;geomesa.kafka.replication&quot;).option.map(_.toInt).getOrElse(1)
-</span>94 <span style=''></span><span style='background: #F0ADAD'>        val newTopic = new NewTopic(topic, config.partitions, replication.toShort)
-</span>95 <span style=''></span><span style='background: #F0ADAD'>        admin.createTopics(Collections.singletonList(newTopic)).all().get
-</span>96 <span style=''></span><span style='background: #F0ADAD'>      }
-</span>97 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
-</span>98 <span style=''>  }
-</span>99 <span style=''>
-</span>100 <span style=''>  override def removeSchema(): Unit = {
-</span>101 <span style=''>    </span><span style='background: #F0ADAD'>offsetManager.deleteOffsets(topic)</span><span style=''>
-</span>102 <span style=''>    val props = </span><span style='background: #F0ADAD'>new Properties()</span><span style=''>
-</span>103 <span style=''>    </span><span style='background: #F0ADAD'>config.producerConfig.foreach { case (k, v) =&gt; props.put(k, v) }</span><span style=''>
+</span>70 <span style=''>  private val loader = {
+</span>71 <span style=''>    val consumers = </span><span style='background: #AEF1AE'>KafkaStore.consumers(config.consumerConfig, topic, offsetManager, config.consumers, cache.partitionAssigned)</span><span style=''>
+</span>72 <span style=''>    val frequency = </span><span style='background: #AEF1AE'>KafkaStore.LoadIntervalProperty.toDuration.get.toMillis</span><span style=''>
+</span>73 <span style=''>    </span><span style='background: #AEF1AE'>new KafkaCacheLoader(consumers, topic, frequency, config.offsetCommitInterval, serializer, cache)</span><span style=''>
+</span>74 <span style=''>  }
+</span>75 <span style=''>
+</span>76 <span style=''>  override def createSchema(): Unit = {
+</span>77 <span style=''>    val props = </span><span style='background: #F0ADAD'>new Properties()</span><span style=''>
+</span>78 <span style=''>    </span><span style='background: #F0ADAD'>config.producerConfig.foreach { case (k, v) =&gt; props.put(k, v) }</span><span style=''>
+</span>79 <span style=''>
+</span>80 <span style=''>    </span><span style='background: #F0ADAD'>WithClose(AdminClient.create(props)) { admin =&gt;
+</span>81 <span style=''></span><span style='background: #F0ADAD'>      if (admin.listTopics().names().get.contains(topic)) {
+</span>82 <span style=''></span><span style='background: #F0ADAD'>        logger.warn(s&quot;Topic [$topic] already exists - it may contain stale data&quot;)
+</span>83 <span style=''></span><span style='background: #F0ADAD'>      } else {
+</span>84 <span style=''></span><span style='background: #F0ADAD'>        val replication = SystemProperty(&quot;geomesa.kafka.replication&quot;).option.map(_.toInt).getOrElse(1)
+</span>85 <span style=''></span><span style='background: #F0ADAD'>        val newTopic = new NewTopic(topic, config.partitions, replication.toShort)
+</span>86 <span style=''></span><span style='background: #F0ADAD'>        admin.createTopics(Collections.singletonList(newTopic)).all().get
+</span>87 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>88 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>89 <span style=''>  }
+</span>90 <span style=''>
+</span>91 <span style=''>  override def removeSchema(): Unit = {
+</span>92 <span style=''>    </span><span style='background: #F0ADAD'>offsetManager.deleteOffsets(topic)</span><span style=''>
+</span>93 <span style=''>    val props = </span><span style='background: #F0ADAD'>new Properties()</span><span style=''>
+</span>94 <span style=''>    </span><span style='background: #F0ADAD'>config.producerConfig.foreach { case (k, v) =&gt; props.put(k, v) }</span><span style=''>
+</span>95 <span style=''>
+</span>96 <span style=''>    </span><span style='background: #F0ADAD'>WithClose(AdminClient.create(props)) { admin =&gt;
+</span>97 <span style=''></span><span style='background: #F0ADAD'>      if (admin.listTopics().names().get.contains(topic)) {
+</span>98 <span style=''></span><span style='background: #F0ADAD'>        admin.deleteTopics(Collections.singletonList(topic)).all().get
+</span>99 <span style=''></span><span style='background: #F0ADAD'>      } else {
+</span>100 <span style=''></span><span style='background: #F0ADAD'>        logger.warn(s&quot;Topic [$topic] does not exist, can't delete it&quot;)
+</span>101 <span style=''></span><span style='background: #F0ADAD'>      }
+</span>102 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>103 <span style=''>  }
 </span>104 <span style=''>
-</span>105 <span style=''>    </span><span style='background: #F0ADAD'>WithClose(AdminClient.create(props)) { admin =&gt;
-</span>106 <span style=''></span><span style='background: #F0ADAD'>      if (admin.listTopics().names().get.contains(topic)) {
-</span>107 <span style=''></span><span style='background: #F0ADAD'>        admin.deleteTopics(Collections.singletonList(topic)).all().get
-</span>108 <span style=''></span><span style='background: #F0ADAD'>      } else {
-</span>109 <span style=''></span><span style='background: #F0ADAD'>        logger.warn(s&quot;Topic [$topic] does not exist, can't delete it&quot;)
-</span>110 <span style=''></span><span style='background: #F0ADAD'>      }
-</span>111 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
-</span>112 <span style=''>  }
-</span>113 <span style=''>
-</span>114 <span style=''>  override def read(
-</span>115 <span style=''>      filter: Option[Filter] = None,
-</span>116 <span style=''>      transforms: Option[Array[String]] = None,
-</span>117 <span style=''>      hints: Option[Hints] = None,
-</span>118 <span style=''>      explain: Explainer = new ExplainLogging): QueryResult = {
-</span>119 <span style=''>    val query = </span><span style='background: #AEF1AE'>new Query()</span><span style=''>
-</span>120 <span style=''>    </span><span style='background: #AEF1AE'>filter.foreach(query.setFilter)</span><span style=''>
-</span>121 <span style=''>    </span><span style='background: #AEF1AE'>transforms.foreach(query.setPropertyNames(_: _*))</span><span style=''>
-</span>122 <span style=''>    </span><span style='background: #AEF1AE'>hints.foreach(query.setHints)</span><span style=''>
-</span>123 <span style=''>    </span><span style='background: #AEF1AE'>queryRunner.runQuery(sft, query, explain)</span><span style=''>
-</span>124 <span style=''>  }
-</span>125 <span style=''>
-</span>126 <span style=''>  override def write(original: SimpleFeature): Unit = {
-</span>127 <span style=''>    val feature = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.featureWithFid(original)</span><span style=''>
-</span>128 <span style=''>    val key = </span><span style='background: #AEF1AE'>KafkaStore.serializeKey(clock.millis(), MessageTypes.Write)</span><span style=''>
-</span>129 <span style=''>    </span><span style='background: #AEF1AE'>producer.send(new ProducerRecord(topic, key, serializer.serialize(feature)))</span><span style=''>
-</span>130 <span style=''>    logger.trace(s&quot;Wrote feature to [$topic]: $feature&quot;)
-</span>131 <span style=''>  }
+</span>105 <span style=''>  override def read(
+</span>106 <span style=''>      filter: Option[Filter] = None,
+</span>107 <span style=''>      transforms: Option[Array[String]] = None,
+</span>108 <span style=''>      hints: Option[Hints] = None,
+</span>109 <span style=''>      explain: Explainer = new ExplainLogging): QueryResult = {
+</span>110 <span style=''>    val query = </span><span style='background: #AEF1AE'>new Query()</span><span style=''>
+</span>111 <span style=''>    </span><span style='background: #AEF1AE'>filter.foreach(query.setFilter)</span><span style=''>
+</span>112 <span style=''>    </span><span style='background: #AEF1AE'>transforms.foreach(query.setPropertyNames(_: _*))</span><span style=''>
+</span>113 <span style=''>    </span><span style='background: #AEF1AE'>hints.foreach(query.setHints)</span><span style=''>
+</span>114 <span style=''>    </span><span style='background: #AEF1AE'>queryRunner.runQuery(sft, query, explain)</span><span style=''>
+</span>115 <span style=''>  }
+</span>116 <span style=''>
+</span>117 <span style=''>  override def write(original: SimpleFeature): Unit = {
+</span>118 <span style=''>    val feature = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.featureWithFid(original)</span><span style=''>
+</span>119 <span style=''>    val key = </span><span style='background: #AEF1AE'>KafkaStore.serializeKey(clock.millis(), MessageTypes.Write)</span><span style=''>
+</span>120 <span style=''>    </span><span style='background: #AEF1AE'>producer.send(new ProducerRecord(topic, key, serializer.serialize(feature)))</span><span style=''>
+</span>121 <span style=''>    logger.trace(s&quot;Wrote feature to [$topic]: $feature&quot;)
+</span>122 <span style=''>  }
+</span>123 <span style=''>
+</span>124 <span style=''>  override def delete(original: SimpleFeature): Unit = {
+</span>125 <span style=''>    // send a message to delete from all transient stores
+</span>126 <span style=''>    val feature = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.featureWithFid(original)</span><span style=''>
+</span>127 <span style=''>    val key = </span><span style='background: #AEF1AE'>KafkaStore.serializeKey(clock.millis(), MessageTypes.Delete)</span><span style=''>
+</span>128 <span style=''>    </span><span style='background: #AEF1AE'>producer.send(new ProducerRecord(topic, key, serializer.serialize(feature)))</span><span style=''>
+</span>129 <span style=''>  }
+</span>130 <span style=''>
+</span>131 <span style=''>  override def persist(): Unit = </span><span style='background: #AEF1AE'>cache.persist()</span><span style=''>
 </span>132 <span style=''>
-</span>133 <span style=''>  override def delete(original: SimpleFeature): Unit = {
-</span>134 <span style=''>    import org.locationtech.geomesa.filter.ff
-</span>135 <span style=''>    // send a message to delete from all transient stores
-</span>136 <span style=''>    val feature = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.featureWithFid(original)</span><span style=''>
-</span>137 <span style=''>    val key = </span><span style='background: #AEF1AE'>KafkaStore.serializeKey(clock.millis(), MessageTypes.Delete)</span><span style=''>
-</span>138 <span style=''>    </span><span style='background: #AEF1AE'>producer.send(new ProducerRecord(topic, key, serializer.serialize(feature)))</span><span style=''>
-</span>139 <span style=''>    // also delete from persistent store
-</span>140 <span style=''>    if (</span><span style='background: #AEF1AE'>config.persist</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>141 <span style=''></span><span style='background: #AEF1AE'>      val filter = ff.id(ff.featureId(feature.getID))
-</span>142 <span style=''></span><span style='background: #AEF1AE'>      WithClose(ds.getFeatureWriter(sft.getTypeName, filter, Transaction.AUTO_COMMIT)) { writer =&gt;
-</span>143 <span style=''></span><span style='background: #AEF1AE'>        while (writer.hasNext) {
-</span>144 <span style=''></span><span style='background: #AEF1AE'>          writer.next()
-</span>145 <span style=''></span><span style='background: #AEF1AE'>          writer.remove()
-</span>146 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>147 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>148 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>149 <span style=''>  }
-</span>150 <span style=''>
-</span>151 <span style=''>  override def persist(): Unit = </span><span style='background: #AEF1AE'>persistence</span><span style=''> match {
-</span>152 <span style=''>    case Some(p) =&gt; </span><span style='background: #AEF1AE'>p.run()</span><span style=''>
-</span>153 <span style=''>    case None =&gt; </span><span style='background: #F0ADAD'>throw new IllegalStateException(&quot;Persistence disabled for this store&quot;)</span><span style=''>
-</span>154 <span style=''>  }
+</span>133 <span style=''>  override def flush(): Unit = </span><span style='background: #AEF1AE'>producer.flush()</span><span style=''>
+</span>134 <span style=''>
+</span>135 <span style=''>  override def close(): Unit = {
+</span>136 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(loader)</span><span style=''>
+</span>137 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(interceptors)</span><span style=''>
+</span>138 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(cache)</span><span style=''>
+</span>139 <span style=''>  }
+</span>140 <span style=''>}
+</span>141 <span style=''>
+</span>142 <span style=''>object KafkaStore {
+</span>143 <span style=''>
+</span>144 <span style=''>  val SimpleFeatureSpecConfig = </span><span style='background: #AEF1AE'>&quot;geomesa.sft.spec&quot;</span><span style=''>
+</span>145 <span style=''>
+</span>146 <span style=''>  val LoadIntervalProperty: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.lambda.load.interval&quot;, &quot;100ms&quot;)</span><span style=''>
+</span>147 <span style=''>
+</span>148 <span style=''>  object MessageTypes {
+</span>149 <span style=''>    val Write:  Byte = </span><span style='background: #AEF1AE'>0</span><span style=''>
+</span>150 <span style=''>    val Delete: Byte = </span><span style='background: #AEF1AE'>1</span><span style=''>
+</span>151 <span style=''>  }
+</span>152 <span style=''>
+</span>153 <span style=''>  @deprecated(&quot;Replaced with LambdaDataStore.topic&quot;)
+</span>154 <span style=''>  def topic(ns: String, sft: SimpleFeatureType): String = </span><span style='background: #F0ADAD'>LambdaDataStore.topic(sft, ns)</span><span style=''>
 </span>155 <span style=''>
-</span>156 <span style=''>  override def flush(): Unit = </span><span style='background: #AEF1AE'>producer.flush()</span><span style=''>
-</span>157 <span style=''>
-</span>158 <span style=''>  override def close(): Unit = {
-</span>159 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(loader)</span><span style=''>
-</span>160 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(interceptors)</span><span style=''>
-</span>161 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(persistence)</span><span style=''>
-</span>162 <span style=''>    </span><span style='background: #AEF1AE'>offsetManager.removeOffsetListener(topic, cache)</span><span style=''>
-</span>163 <span style=''>  }
-</span>164 <span style=''>}
-</span>165 <span style=''>
-</span>166 <span style=''>object KafkaStore {
-</span>167 <span style=''>
-</span>168 <span style=''>  val SimpleFeatureSpecConfig = </span><span style='background: #AEF1AE'>&quot;geomesa.sft.spec&quot;</span><span style=''>
-</span>169 <span style=''>
-</span>170 <span style=''>  val LoadIntervalProperty: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.lambda.load.interval&quot;, &quot;100ms&quot;)</span><span style=''>
-</span>171 <span style=''>
-</span>172 <span style=''>  object MessageTypes {
-</span>173 <span style=''>    val Write:  Byte = </span><span style='background: #AEF1AE'>0</span><span style=''>
-</span>174 <span style=''>    val Delete: Byte = </span><span style='background: #AEF1AE'>1</span><span style=''>
-</span>175 <span style=''>  }
-</span>176 <span style=''>
-</span>177 <span style=''>  @deprecated(&quot;Replaced with LambdaDataStore.topic&quot;)
-</span>178 <span style=''>  def topic(ns: String, sft: SimpleFeatureType): String = </span><span style='background: #F0ADAD'>LambdaDataStore.topic(sft, ns)</span><span style=''>
-</span>179 <span style=''>
-</span>180 <span style=''>  @deprecated(&quot;Does not return correct topic if topic is overridden in the feature type - replaced with LambdaDataStore.topic&quot;)
-</span>181 <span style=''>  def topic(ns: String, typeName: String): String = </span><span style='background: #F0ADAD'>s&quot;${ns}_$typeName&quot;.replaceAll(&quot;[^a-zA-Z0-9_\\-]&quot;, &quot;_&quot;)</span><span style=''>
-</span>182 <span style=''>
-</span>183 <span style=''>  def producer(sft: SimpleFeatureType, connect: Map[String, String]): Producer[Array[Byte], Array[Byte]] = {
-</span>184 <span style=''>    import org.apache.kafka.clients.producer.ProducerConfig._
-</span>185 <span style=''>    val props = </span><span style='background: #AEF1AE'>new Properties()</span><span style=''>
-</span>186 <span style=''>    // set some defaults but allow them to be overridden
-</span>187 <span style=''>    </span><span style='background: #AEF1AE'>props.put(ACKS_CONFIG, &quot;1&quot;)</span><span style=''> // mix of reliability and performance
-</span>188 <span style=''>    </span><span style='background: #AEF1AE'>props.put(RETRIES_CONFIG, Int.box(3))</span><span style=''>
-</span>189 <span style=''>    </span><span style='background: #AEF1AE'>props.put(LINGER_MS_CONFIG, Int.box(3))</span><span style=''> // helps improve batching at the expense of slight delays in write
-</span>190 <span style=''>    </span><span style='background: #AEF1AE'>props.put(PARTITIONER_CLASS_CONFIG, classOf[FeatureIdPartitioner].getName)</span><span style=''>
-</span>191 <span style=''>    </span><span style='background: #AEF1AE'>props.put(SimpleFeatureSpecConfig, SimpleFeatureTypes.encodeType(sft, includeUserData = false))</span><span style=''>
-</span>192 <span style=''>    </span><span style='background: #AEF1AE'>connect.foreach { case (k, v) =&gt; props.put(k, v) }</span><span style=''>
-</span>193 <span style=''>    </span><span style='background: #AEF1AE'>props.put(KEY_SERIALIZER_CLASS_CONFIG, classOf[ByteArraySerializer].getName)</span><span style=''>
-</span>194 <span style=''>    </span><span style='background: #AEF1AE'>props.put(VALUE_SERIALIZER_CLASS_CONFIG, classOf[ByteArraySerializer].getName)</span><span style=''>
-</span>195 <span style=''>    </span><span style='background: #AEF1AE'>new KafkaProducer[Array[Byte], Array[Byte]](props)</span><span style=''>
-</span>196 <span style=''>  }
-</span>197 <span style=''>
-</span>198 <span style=''>  def consumer(connect: Map[String, String], group: String): Consumer[Array[Byte], Array[Byte]] = {
-</span>199 <span style=''>    import org.apache.kafka.clients.consumer.ConsumerConfig._
-</span>200 <span style=''>    val props = </span><span style='background: #AEF1AE'>new Properties()</span><span style=''>
-</span>201 <span style=''>    </span><span style='background: #AEF1AE'>props.put(GROUP_ID_CONFIG, group)</span><span style=''>
-</span>202 <span style=''>    </span><span style='background: #AEF1AE'>connect.foreach { case (k, v) =&gt; props.put(k, v) }</span><span style=''>
-</span>203 <span style=''>    </span><span style='background: #AEF1AE'>props.put(ENABLE_AUTO_COMMIT_CONFIG, &quot;false&quot;)</span><span style=''>
-</span>204 <span style=''>    </span><span style='background: #AEF1AE'>props.put(AUTO_OFFSET_RESET_CONFIG, &quot;earliest&quot;)</span><span style=''>
-</span>205 <span style=''>    </span><span style='background: #AEF1AE'>props.put(KEY_DESERIALIZER_CLASS_CONFIG, classOf[ByteArrayDeserializer].getName)</span><span style=''>
-</span>206 <span style=''>    </span><span style='background: #AEF1AE'>props.put(VALUE_DESERIALIZER_CLASS_CONFIG, classOf[ByteArrayDeserializer].getName)</span><span style=''>
-</span>207 <span style=''>    </span><span style='background: #AEF1AE'>new KafkaConsumer[Array[Byte], Array[Byte]](props)</span><span style=''>
-</span>208 <span style=''>  }
-</span>209 <span style=''>
-</span>210 <span style=''>  // creates a consumer and sets to the latest offsets
-</span>211 <span style=''>  private [kafka] def consumers(connect: Map[String, String],
-</span>212 <span style=''>                                topic: String,
-</span>213 <span style=''>                                manager: OffsetManager,
-</span>214 <span style=''>                                parallelism: Int,
-</span>215 <span style=''>                                callback: (Int, Long) =&gt; Unit): Seq[Consumer[Array[Byte], Array[Byte]]] = {
-</span>216 <span style=''>    </span><span style='background: #AEF1AE'>require(parallelism &gt; 0, </span><span style='background: #F0ADAD'>&quot;Parallelism must be greater than 0&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
-</span>217 <span style=''>
-</span>218 <span style=''>    val group = </span><span style='background: #AEF1AE'>UUID.randomUUID().toString</span><span style=''>
+</span>156 <span style=''>  @deprecated(&quot;Does not return correct topic if topic is overridden in the feature type - replaced with LambdaDataStore.topic&quot;)
+</span>157 <span style=''>  def topic(ns: String, typeName: String): String = </span><span style='background: #F0ADAD'>s&quot;${ns}_$typeName&quot;.replaceAll(&quot;[^a-zA-Z0-9_\\-]&quot;, &quot;_&quot;)</span><span style=''>
+</span>158 <span style=''>
+</span>159 <span style=''>  def producer(sft: SimpleFeatureType, connect: Map[String, String]): Producer[Array[Byte], Array[Byte]] = {
+</span>160 <span style=''>    import org.apache.kafka.clients.producer.ProducerConfig._
+</span>161 <span style=''>    val props = </span><span style='background: #AEF1AE'>new Properties()</span><span style=''>
+</span>162 <span style=''>    // set some defaults but allow them to be overridden
+</span>163 <span style=''>    </span><span style='background: #AEF1AE'>props.put(ACKS_CONFIG, &quot;1&quot;)</span><span style=''> // mix of reliability and performance
+</span>164 <span style=''>    </span><span style='background: #AEF1AE'>props.put(RETRIES_CONFIG, Int.box(3))</span><span style=''>
+</span>165 <span style=''>    </span><span style='background: #AEF1AE'>props.put(LINGER_MS_CONFIG, Int.box(3))</span><span style=''> // helps improve batching at the expense of slight delays in write
+</span>166 <span style=''>    </span><span style='background: #AEF1AE'>props.put(PARTITIONER_CLASS_CONFIG, classOf[FeatureIdPartitioner].getName)</span><span style=''>
+</span>167 <span style=''>    </span><span style='background: #AEF1AE'>props.put(SimpleFeatureSpecConfig, SimpleFeatureTypes.encodeType(sft, includeUserData = false))</span><span style=''>
+</span>168 <span style=''>    </span><span style='background: #AEF1AE'>connect.foreach { case (k, v) =&gt; props.put(k, v) }</span><span style=''>
+</span>169 <span style=''>    </span><span style='background: #AEF1AE'>props.put(KEY_SERIALIZER_CLASS_CONFIG, classOf[ByteArraySerializer].getName)</span><span style=''>
+</span>170 <span style=''>    </span><span style='background: #AEF1AE'>props.put(VALUE_SERIALIZER_CLASS_CONFIG, classOf[ByteArraySerializer].getName)</span><span style=''>
+</span>171 <span style=''>    </span><span style='background: #AEF1AE'>new KafkaProducer[Array[Byte], Array[Byte]](props)</span><span style=''>
+</span>172 <span style=''>  }
+</span>173 <span style=''>
+</span>174 <span style=''>  def consumer(connect: Map[String, String], group: String): Consumer[Array[Byte], Array[Byte]] = {
+</span>175 <span style=''>    import org.apache.kafka.clients.consumer.ConsumerConfig._
+</span>176 <span style=''>    val props = </span><span style='background: #AEF1AE'>new Properties()</span><span style=''>
+</span>177 <span style=''>    </span><span style='background: #AEF1AE'>props.put(GROUP_ID_CONFIG, group)</span><span style=''>
+</span>178 <span style=''>    </span><span style='background: #AEF1AE'>connect.foreach { case (k, v) =&gt; props.put(k, v) }</span><span style=''>
+</span>179 <span style=''>    </span><span style='background: #AEF1AE'>props.put(ENABLE_AUTO_COMMIT_CONFIG, &quot;false&quot;)</span><span style=''>
+</span>180 <span style=''>    </span><span style='background: #AEF1AE'>props.put(AUTO_OFFSET_RESET_CONFIG, &quot;earliest&quot;)</span><span style=''>
+</span>181 <span style=''>    </span><span style='background: #AEF1AE'>props.put(KEY_DESERIALIZER_CLASS_CONFIG, classOf[ByteArrayDeserializer].getName)</span><span style=''>
+</span>182 <span style=''>    </span><span style='background: #AEF1AE'>props.put(VALUE_DESERIALIZER_CLASS_CONFIG, classOf[ByteArrayDeserializer].getName)</span><span style=''>
+</span>183 <span style=''>    </span><span style='background: #AEF1AE'>new KafkaConsumer[Array[Byte], Array[Byte]](props)</span><span style=''>
+</span>184 <span style=''>  }
+</span>185 <span style=''>
+</span>186 <span style=''>  // creates a consumer and sets to the latest offsets
+</span>187 <span style=''>  private [kafka] def consumers(connect: Map[String, String],
+</span>188 <span style=''>                                topic: String,
+</span>189 <span style=''>                                manager: OffsetManager,
+</span>190 <span style=''>                                parallelism: Int,
+</span>191 <span style=''>                                callback: (Int, Long) =&gt; Unit): Seq[Consumer[Array[Byte], Array[Byte]]] = {
+</span>192 <span style=''>    </span><span style='background: #AEF1AE'>require(parallelism &gt; 0, </span><span style='background: #F0ADAD'>&quot;Parallelism must be greater than 0&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>193 <span style=''>
+</span>194 <span style=''>    val group = </span><span style='background: #AEF1AE'>UUID.randomUUID().toString</span><span style=''>
+</span>195 <span style=''>
+</span>196 <span style=''>    </span><span style='background: #AEF1AE'>Seq.fill(parallelism) {
+</span>197 <span style=''></span><span style='background: #AEF1AE'>      val consumer = KafkaStore.consumer(connect, group)
+</span>198 <span style=''></span><span style='background: #AEF1AE'>      val listener = new OffsetRebalanceListener(consumer, manager, callback)
+</span>199 <span style=''></span><span style='background: #AEF1AE'>      KafkaConsumerVersions.subscribe(consumer, topic, listener)
+</span>200 <span style=''></span><span style='background: #AEF1AE'>      consumer
+</span>201 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>202 <span style=''>  }
+</span>203 <span style=''>
+</span>204 <span style=''>  private [kafka] def serializeKey(time: Long, action: Byte): Array[Byte] = {
+</span>205 <span style=''>    val result = </span><span style='background: #AEF1AE'>Array.ofDim[Byte](9)</span><span style=''>
+</span>206 <span style=''>
+</span>207 <span style=''>    </span><span style='background: #AEF1AE'>result(0) = ((time &gt;&gt; 56) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
+</span>208 <span style=''>    </span><span style='background: #AEF1AE'>result(1) = ((time &gt;&gt; 48) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
+</span>209 <span style=''>    </span><span style='background: #AEF1AE'>result(2) = ((time &gt;&gt; 40) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
+</span>210 <span style=''>    </span><span style='background: #AEF1AE'>result(3) = ((time &gt;&gt; 32) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
+</span>211 <span style=''>    </span><span style='background: #AEF1AE'>result(4) = ((time &gt;&gt; 24) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
+</span>212 <span style=''>    </span><span style='background: #AEF1AE'>result(5) = ((time &gt;&gt; 16) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
+</span>213 <span style=''>    </span><span style='background: #AEF1AE'>result(6) = ((time &gt;&gt; 8)  &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
+</span>214 <span style=''>    </span><span style='background: #AEF1AE'>result(7) = (time &amp; 0xff        ).asInstanceOf[Byte]</span><span style=''>
+</span>215 <span style=''>    </span><span style='background: #AEF1AE'>result(8) = action</span><span style=''>
+</span>216 <span style=''>
+</span>217 <span style=''>    result
+</span>218 <span style=''>  }
 </span>219 <span style=''>
-</span>220 <span style=''>    </span><span style='background: #AEF1AE'>Seq.fill(parallelism) {
-</span>221 <span style=''></span><span style='background: #AEF1AE'>      val consumer = KafkaStore.consumer(connect, group)
-</span>222 <span style=''></span><span style='background: #AEF1AE'>      val listener = new OffsetRebalanceListener(consumer, manager, callback)
-</span>223 <span style=''></span><span style='background: #AEF1AE'>      KafkaConsumerVersions.subscribe(consumer, topic, listener)
-</span>224 <span style=''></span><span style='background: #AEF1AE'>      consumer
-</span>225 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>226 <span style=''>  }
-</span>227 <span style=''>
-</span>228 <span style=''>  private [kafka] def serializeKey(time: Long, action: Byte): Array[Byte] = {
-</span>229 <span style=''>    val result = </span><span style='background: #AEF1AE'>Array.ofDim[Byte](9)</span><span style=''>
-</span>230 <span style=''>
-</span>231 <span style=''>    </span><span style='background: #AEF1AE'>result(0) = ((time &gt;&gt; 56) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
-</span>232 <span style=''>    </span><span style='background: #AEF1AE'>result(1) = ((time &gt;&gt; 48) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
-</span>233 <span style=''>    </span><span style='background: #AEF1AE'>result(2) = ((time &gt;&gt; 40) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
-</span>234 <span style=''>    </span><span style='background: #AEF1AE'>result(3) = ((time &gt;&gt; 32) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
-</span>235 <span style=''>    </span><span style='background: #AEF1AE'>result(4) = ((time &gt;&gt; 24) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
-</span>236 <span style=''>    </span><span style='background: #AEF1AE'>result(5) = ((time &gt;&gt; 16) &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
-</span>237 <span style=''>    </span><span style='background: #AEF1AE'>result(6) = ((time &gt;&gt; 8)  &amp; 0xff).asInstanceOf[Byte]</span><span style=''>
-</span>238 <span style=''>    </span><span style='background: #AEF1AE'>result(7) = (time &amp; 0xff        ).asInstanceOf[Byte]</span><span style=''>
-</span>239 <span style=''>    </span><span style='background: #AEF1AE'>result(8) = action</span><span style=''>
-</span>240 <span style=''>
-</span>241 <span style=''>    result
-</span>242 <span style=''>  }
-</span>243 <span style=''>
-</span>244 <span style=''>  private [kafka] def deserializeKey(key: Array[Byte]): (Long, Byte) = </span><span style='background: #AEF1AE'>(ByteArrays.readLong(key), key(8))</span><span style=''>
-</span>245 <span style=''>
-</span>246 <span style=''>  private [kafka] class OffsetRebalanceListener(consumer: Consumer[Array[Byte], Array[Byte]],
-</span>247 <span style=''>                                                manager: OffsetManager,
-</span>248 <span style=''>                                                callback: (Int, Long) =&gt; Unit)
-</span>249 <span style=''>      extends ConsumerRebalanceListener with LazyLogging {
-</span>250 <span style=''>
-</span>251 <span style=''>    override def onPartitionsRevoked(topicPartitions: java.util.Collection[TopicPartition]): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
-</span>252 <span style=''>
-</span>253 <span style=''>    override def onPartitionsAssigned(topicPartitions: java.util.Collection[TopicPartition]): Unit = {
-</span>254 <span style=''>      import scala.collection.JavaConverters._
-</span>255 <span style=''>
-</span>256 <span style=''>      // ensure we have queues for each partition
-</span>257 <span style=''>      // read our last committed offsets and seek to them
-</span>258 <span style=''>      </span><span style='background: #AEF1AE'>topicPartitions.asScala.foreach { tp =&gt;
-</span>259 <span style=''></span><span style='background: #AEF1AE'>
-</span>260 <span style=''></span><span style='background: #AEF1AE'>        // seek to earliest existing offset and return the offset
-</span>261 <span style=''></span><span style='background: #AEF1AE'>        def seekToBeginning(): Long = {
-</span>262 <span style=''></span><span style='background: #AEF1AE'>          KafkaConsumerVersions.seekToBeginning(consumer, tp)
-</span>263 <span style=''></span><span style='background: #AEF1AE'>          consumer.position(tp) - 1
-</span>264 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>265 <span style=''></span><span style='background: #AEF1AE'>
-</span>266 <span style=''></span><span style='background: #AEF1AE'>        val lastRead = manager.getOffset(tp.topic(), tp.partition())
-</span>267 <span style=''></span><span style='background: #AEF1AE'>
-</span>268 <span style=''></span><span style='background: #AEF1AE'>        KafkaConsumerVersions.pause(consumer, tp)
-</span>269 <span style=''></span><span style='background: #AEF1AE'>
-</span>270 <span style=''></span><span style='background: #AEF1AE'>        val offset = if (lastRead &lt; 0) { seekToBeginning() } else {
-</span>271 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>try { consumer.seek(tp, lastRead + 1); lastRead } catch {
-</span>272 <span style=''></span><span style='background: #F0ADAD'>            case NonFatal(e) =&gt;
-</span>273 <span style=''></span><span style='background: #F0ADAD'>              logger.warn(s&quot;Error seeking to initial offset: [${tp.topic}:${tp.partition}:$lastRead]&quot; +
-</span>274 <span style=''></span><span style='background: #F0ADAD'>                  s&quot;, seeking to beginning: $e&quot;)
-</span>275 <span style=''></span><span style='background: #F0ADAD'>              seekToBeginning()
-</span>276 <span style=''></span><span style='background: #F0ADAD'>          }</span><span style='background: #AEF1AE'>
-</span>277 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>278 <span style=''></span><span style='background: #AEF1AE'>        callback.apply(tp.partition, offset)
-</span>279 <span style=''></span><span style='background: #AEF1AE'>
-</span>280 <span style=''></span><span style='background: #AEF1AE'>        KafkaConsumerVersions.resume(consumer, tp)
-</span>281 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>282 <span style=''>    }
-</span>283 <span style=''>  }
-</span>284 <span style=''>
-</span>285 <span style=''>  /**
-</span>286 <span style=''>    * Ensures that updates to a given feature go to the same partition, so that they maintain order
-</span>287 <span style=''>    */
-</span>288 <span style=''>  class FeatureIdPartitioner extends Partitioner {
-</span>289 <span style=''>
-</span>290 <span style=''>    private var serializer: KryoFeatureSerializer = _
-</span>291 <span style=''>
-</span>292 <span style=''>    private val features = </span><span style='background: #AEF1AE'>new</span><span style=''> ThreadLocal[KryoBufferSimpleFeature]() {
-</span>293 <span style=''>      override def initialValue(): KryoBufferSimpleFeature = </span><span style='background: #AEF1AE'>serializer.getReusableFeature</span><span style=''>
+</span>220 <span style=''>  private [kafka] def deserializeKey(key: Array[Byte]): (Long, Byte) = </span><span style='background: #AEF1AE'>(ByteArrays.readLong(key), key(8))</span><span style=''>
+</span>221 <span style=''>
+</span>222 <span style=''>  private [kafka] class OffsetRebalanceListener(consumer: Consumer[Array[Byte], Array[Byte]],
+</span>223 <span style=''>                                                manager: OffsetManager,
+</span>224 <span style=''>                                                callback: (Int, Long) =&gt; Unit)
+</span>225 <span style=''>      extends ConsumerRebalanceListener with LazyLogging {
+</span>226 <span style=''>
+</span>227 <span style=''>    override def onPartitionsRevoked(topicPartitions: java.util.Collection[TopicPartition]): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
+</span>228 <span style=''>
+</span>229 <span style=''>    override def onPartitionsAssigned(topicPartitions: java.util.Collection[TopicPartition]): Unit = {
+</span>230 <span style=''>      import scala.collection.JavaConverters._
+</span>231 <span style=''>
+</span>232 <span style=''>      // ensure we have queues for each partition
+</span>233 <span style=''>      // read our last committed offsets and seek to them
+</span>234 <span style=''>      </span><span style='background: #AEF1AE'>topicPartitions.asScala.foreach { tp =&gt;
+</span>235 <span style=''></span><span style='background: #AEF1AE'>
+</span>236 <span style=''></span><span style='background: #AEF1AE'>        // seek to earliest existing offset and return the offset
+</span>237 <span style=''></span><span style='background: #AEF1AE'>        def seekToBeginning(): Long = {
+</span>238 <span style=''></span><span style='background: #AEF1AE'>          KafkaConsumerVersions.seekToBeginning(consumer, tp)
+</span>239 <span style=''></span><span style='background: #AEF1AE'>          consumer.position(tp) - 1
+</span>240 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>241 <span style=''></span><span style='background: #AEF1AE'>
+</span>242 <span style=''></span><span style='background: #AEF1AE'>        val lastRead = manager.getOffset(tp.topic(), tp.partition())
+</span>243 <span style=''></span><span style='background: #AEF1AE'>
+</span>244 <span style=''></span><span style='background: #AEF1AE'>        KafkaConsumerVersions.pause(consumer, tp)
+</span>245 <span style=''></span><span style='background: #AEF1AE'>
+</span>246 <span style=''></span><span style='background: #AEF1AE'>        val offset = if (lastRead &lt; 0) { seekToBeginning() } else {
+</span>247 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>try { consumer.seek(tp, lastRead + 1); lastRead } catch {
+</span>248 <span style=''></span><span style='background: #F0ADAD'>            case NonFatal(e) =&gt;
+</span>249 <span style=''></span><span style='background: #F0ADAD'>              logger.warn(s&quot;Error seeking to initial offset: [${tp.topic}:${tp.partition}:$lastRead]&quot; +
+</span>250 <span style=''></span><span style='background: #F0ADAD'>                  s&quot;, seeking to beginning: $e&quot;)
+</span>251 <span style=''></span><span style='background: #F0ADAD'>              seekToBeginning()
+</span>252 <span style=''></span><span style='background: #F0ADAD'>          }</span><span style='background: #AEF1AE'>
+</span>253 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>254 <span style=''></span><span style='background: #AEF1AE'>        callback.apply(tp.partition, offset)
+</span>255 <span style=''></span><span style='background: #AEF1AE'>
+</span>256 <span style=''></span><span style='background: #AEF1AE'>        KafkaConsumerVersions.resume(consumer, tp)
+</span>257 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>258 <span style=''>    }
+</span>259 <span style=''>  }
+</span>260 <span style=''>
+</span>261 <span style=''>  /**
+</span>262 <span style=''>    * Ensures that updates to a given feature go to the same partition, so that they maintain order
+</span>263 <span style=''>    */
+</span>264 <span style=''>  class FeatureIdPartitioner extends Partitioner {
+</span>265 <span style=''>
+</span>266 <span style=''>    private var serializer: KryoFeatureSerializer = _
+</span>267 <span style=''>
+</span>268 <span style=''>    private val features = </span><span style='background: #AEF1AE'>new</span><span style=''> ThreadLocal[KryoBufferSimpleFeature]() {
+</span>269 <span style=''>      override def initialValue(): KryoBufferSimpleFeature = </span><span style='background: #AEF1AE'>serializer.getReusableFeature</span><span style=''>
+</span>270 <span style=''>    }
+</span>271 <span style=''>
+</span>272 <span style=''>    override def partition(
+</span>273 <span style=''>        topic: String,
+</span>274 <span style=''>        key: scala.Any,
+</span>275 <span style=''>        keyBytes: Array[Byte],
+</span>276 <span style=''>        value: scala.Any,
+</span>277 <span style=''>        valueBytes: Array[Byte],
+</span>278 <span style=''>        cluster: Cluster): Int = {
+</span>279 <span style=''>      val numPartitions = </span><span style='background: #AEF1AE'>cluster.partitionsForTopic(topic).size</span><span style=''>
+</span>280 <span style=''>      if (</span><span style='background: #AEF1AE'>numPartitions &lt; 2</span><span style=''>) { </span><span style='background: #AEF1AE'>0</span><span style=''> } else </span><span style='background: #AEF1AE'>{
+</span>281 <span style=''></span><span style='background: #AEF1AE'>        val feature = features.get
+</span>282 <span style=''></span><span style='background: #AEF1AE'>        feature.setBuffer(valueBytes)
+</span>283 <span style=''></span><span style='background: #AEF1AE'>        Math.abs(MurmurHash3.stringHash(feature.getID)) % numPartitions
+</span>284 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>285 <span style=''>    }
+</span>286 <span style=''>
+</span>287 <span style=''>    override def configure(configs: java.util.Map[String, _]): Unit = {
+</span>288 <span style=''>      val spec = </span><span style='background: #AEF1AE'>configs.get(SimpleFeatureSpecConfig)</span><span style=''> match {
+</span>289 <span style=''>        case s: String =&gt; </span><span style='background: #AEF1AE'>s</span><span style=''>
+</span>290 <span style=''>        case s =&gt; </span><span style='background: #F0ADAD'>throw new IllegalStateException(s&quot;Invalid spec config for $SimpleFeatureSpecConfig: $s&quot;)</span><span style=''>
+</span>291 <span style=''>      }
+</span>292 <span style=''>      val options = </span><span style='background: #AEF1AE'>SerializationOptions.builder.immutable.`lazy`.build</span><span style=''>
+</span>293 <span style=''>      </span><span style='background: #AEF1AE'>serializer = KryoFeatureSerializer(SimpleFeatureTypes.createType(&quot;&quot;, spec), options)</span><span style=''>
 </span>294 <span style=''>    }
 </span>295 <span style=''>
-</span>296 <span style=''>    override def partition(
-</span>297 <span style=''>        topic: String,
-</span>298 <span style=''>        key: scala.Any,
-</span>299 <span style=''>        keyBytes: Array[Byte],
-</span>300 <span style=''>        value: scala.Any,
-</span>301 <span style=''>        valueBytes: Array[Byte],
-</span>302 <span style=''>        cluster: Cluster): Int = {
-</span>303 <span style=''>      val numPartitions = </span><span style='background: #AEF1AE'>cluster.partitionsForTopic(topic).size</span><span style=''>
-</span>304 <span style=''>      if (</span><span style='background: #AEF1AE'>numPartitions &lt; 2</span><span style=''>) { </span><span style='background: #AEF1AE'>0</span><span style=''> } else </span><span style='background: #AEF1AE'>{
-</span>305 <span style=''></span><span style='background: #AEF1AE'>        val feature = features.get
-</span>306 <span style=''></span><span style='background: #AEF1AE'>        feature.setBuffer(valueBytes)
-</span>307 <span style=''></span><span style='background: #AEF1AE'>        Math.abs(MurmurHash3.stringHash(feature.getID)) % numPartitions
-</span>308 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>309 <span style=''>    }
-</span>310 <span style=''>
-</span>311 <span style=''>    override def configure(configs: java.util.Map[String, _]): Unit = {
-</span>312 <span style=''>      val spec = </span><span style='background: #AEF1AE'>configs.get(SimpleFeatureSpecConfig)</span><span style=''> match {
-</span>313 <span style=''>        case s: String =&gt; </span><span style='background: #AEF1AE'>s</span><span style=''>
-</span>314 <span style=''>        case s =&gt; </span><span style='background: #F0ADAD'>throw new IllegalStateException(s&quot;Invalid spec config for $SimpleFeatureSpecConfig: $s&quot;)</span><span style=''>
-</span>315 <span style=''>      }
-</span>316 <span style=''>      val options = </span><span style='background: #AEF1AE'>SerializationOptions.builder.immutable.`lazy`.build</span><span style=''>
-</span>317 <span style=''>      </span><span style='background: #AEF1AE'>serializer = KryoFeatureSerializer(SimpleFeatureTypes.createType(&quot;&quot;, spec), options)</span><span style=''>
-</span>318 <span style=''>    }
-</span>319 <span style=''>
-</span>320 <span style=''>    override def close(): Unit = </span><span style='background: #F0ADAD'>{}</span><span style=''>
-</span>321 <span style=''>  }
-</span>322 <span style=''>}
+</span>296 <span style=''>    override def close(): Unit = </span><span style='background: #F0ADAD'>{}</span><span style=''>
+</span>297 <span style=''>  }
+</span>298 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -361,156 +337,12 @@
           53
         </td>
         <td>
-          97453
+          98667
         </td>
         <td>
-          2747
+          2754
           -
-          2767
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.data.LambdaDataStore.LambdaConfig.offsetManager
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.config.offsetManager
-        </td>
-      </tr><tr>
-        <td>
-          55
-        </td>
-        <td>
-          97455
-        </td>
-        <td>
-          2819
-          -
-          2840
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.data.LambdaDataStore.LambdaConfig.producerConfig
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.config.producerConfig
-        </td>
-      </tr><tr>
-        <td>
-          55
-        </td>
-        <td>
-          97454
-        </td>
-        <td>
-          2814
-          -
-          2817
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.sft
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.sft
-        </td>
-      </tr><tr>
-        <td>
-          55
-        </td>
-        <td>
-          97456
-        </td>
-        <td>
-          2794
-          -
-          2841
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.producer
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.producer(KafkaStore.this.sft, KafkaStore.this.config.producerConfig)
-        </td>
-      </tr><tr>
-        <td>
-          57
-        </td>
-        <td>
-          97457
-        </td>
-        <td>
-          2887
-          -
-          2890
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.sft
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.sft
-        </td>
-      </tr><tr>
-        <td>
-          57
-        </td>
-        <td>
-          97459
-        </td>
-        <td>
-          2865
-          -
-          2911
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.data.LambdaDataStore.topic
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.lambda.data.LambdaDataStore.topic(KafkaStore.this.sft, KafkaStore.this.config.zkNamespace)
-        </td>
-      </tr><tr>
-        <td>
-          57
-        </td>
-        <td>
-          97458
-        </td>
-        <td>
-          2892
-          -
-          2910
+          2772
         </td>
         <td>
           Select
@@ -526,39 +358,183 @@
         </td>
       </tr><tr>
         <td>
-          59
+          53
         </td>
         <td>
-          97461
+          98666
         </td>
         <td>
-          2935
+          2749
           -
-          2963
+          2752
         </td>
         <td>
-          Apply
+          Select
         </td>
         <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.&lt;init&gt;
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.sft
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          new KafkaFeatureCache(KafkaStore.this.topic)
+          KafkaStore.this.sft
         </td>
       </tr><tr>
         <td>
-          59
+          53
         </td>
         <td>
-          97460
+          98668
         </td>
         <td>
-          2957
+          2727
           -
-          2962
+          2773
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.data.LambdaDataStore.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.lambda.data.LambdaDataStore.topic(KafkaStore.this.sft, KafkaStore.this.config.zkNamespace)
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          98669
+        </td>
+        <td>
+          2820
+          -
+          2823
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          98671
+        </td>
+        <td>
+          2800
+          -
+          2847
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.producer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.producer(KafkaStore.this.sft, KafkaStore.this.config.producerConfig)
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          98670
+        </td>
+        <td>
+          2825
+          -
+          2846
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.data.LambdaDataStore.LambdaConfig.producerConfig
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.config.producerConfig
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          98673
+        </td>
+        <td>
+          2897
+          -
+          2900
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          98672
+        </td>
+        <td>
+          2893
+          -
+          2895
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          98675
+        </td>
+        <td>
+          2917
+          -
+          2922
         </td>
         <td>
           Select
@@ -574,10 +550,130 @@
         </td>
       </tr><tr>
         <td>
-          64
+          57
         </td>
         <td>
-          97462
+          98674
+        </td>
+        <td>
+          2902
+          -
+          2915
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.offsetManager
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.offsetManager
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          98677
+        </td>
+        <td>
+          2939
+          -
+          2962
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.data.LambdaDataStore.LambdaConfig.persistBatchSize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.config.persistBatchSize
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          98676
+        </td>
+        <td>
+          2924
+          -
+          2937
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.data.LambdaDataStore.LambdaConfig.expiry
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.config.expiry
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          98679
+        </td>
+        <td>
+          2871
+          -
+          2963
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new KafkaFeatureCache(KafkaStore.this.ds, KafkaStore.this.sft, KafkaStore.this.offsetManager, KafkaStore.this.topic, KafkaStore.this.config.expiry, KafkaStore.this.config.persistBatchSize)(KafkaStore.this.clock)
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          98678
+        </td>
+        <td>
+          2871
+          -
+          2871
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.clock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.clock
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          98680
         </td>
         <td>
           3225
@@ -598,10 +694,10 @@
         </td>
       </tr><tr>
         <td>
-          65
+          63
         </td>
         <td>
-          97463
+          98681
         </td>
         <td>
           3332
@@ -622,10 +718,10 @@
         </td>
       </tr><tr>
         <td>
-          65
+          63
         </td>
         <td>
-          97464
+          98682
         </td>
         <td>
           3310
@@ -646,10 +742,10 @@
         </td>
       </tr><tr>
         <td>
-          68
+          66
         </td>
         <td>
-          97465
+          98683
         </td>
         <td>
           3404
@@ -670,10 +766,10 @@
         </td>
       </tr><tr>
         <td>
-          68
+          66
         </td>
         <td>
-          97466
+          98684
         </td>
         <td>
           3380
@@ -694,10 +790,10 @@
         </td>
       </tr><tr>
         <td>
-          70
+          68
         </td>
         <td>
-          97467
+          98685
         </td>
         <td>
           3458
@@ -718,10 +814,10 @@
         </td>
       </tr><tr>
         <td>
-          70
+          68
         </td>
         <td>
-          97469
+          98687
         </td>
         <td>
           3479
@@ -742,10 +838,10 @@
         </td>
       </tr><tr>
         <td>
-          70
+          68
         </td>
         <td>
-          97468
+          98686
         </td>
         <td>
           3465
@@ -766,10 +862,10 @@
         </td>
       </tr><tr>
         <td>
-          70
+          68
         </td>
         <td>
-          97470
+          98688
         </td>
         <td>
           3437
@@ -790,10 +886,10 @@
         </td>
       </tr><tr>
         <td>
-          73
+          71
         </td>
         <td>
-          97471
+          98689
         </td>
         <td>
           3560
@@ -814,10 +910,10 @@
         </td>
       </tr><tr>
         <td>
-          73
+          71
         </td>
         <td>
-          97473
+          98691
         </td>
         <td>
           3590
@@ -838,10 +934,10 @@
         </td>
       </tr><tr>
         <td>
-          73
+          71
         </td>
         <td>
-          97472
+          98690
         </td>
         <td>
           3583
@@ -862,10 +958,10 @@
         </td>
       </tr><tr>
         <td>
-          73
+          71
         </td>
         <td>
-          97475
+          98693
         </td>
         <td>
           3623
@@ -886,10 +982,10 @@
         </td>
       </tr><tr>
         <td>
-          73
+          71
         </td>
         <td>
-          97474
+          98692
         </td>
         <td>
           3605
@@ -910,10 +1006,10 @@
         </td>
       </tr><tr>
         <td>
-          73
+          71
         </td>
         <td>
-          97476
+          98694
         </td>
         <td>
           3539
@@ -936,10 +1032,10 @@
         </td>
       </tr><tr>
         <td>
-          74
+          72
         </td>
         <td>
-          97477
+          98695
         </td>
         <td>
           3668
@@ -960,34 +1056,34 @@
         </td>
       </tr><tr>
         <td>
-          75
+          73
         </td>
         <td>
-          97479
+          98697
         </td>
         <td>
           3778
           -
-          3788
+          3805
         </td>
         <td>
           Select
         </td>
         <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.serializer
+          org.locationtech.geomesa.lambda.data.LambdaDataStore.LambdaConfig.offsetCommitInterval
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          KafkaStore.this.serializer
+          KafkaStore.this.config.offsetCommitInterval
         </td>
       </tr><tr>
         <td>
-          75
+          73
         </td>
         <td>
-          97478
+          98696
         </td>
         <td>
           3760
@@ -1008,15 +1104,63 @@
         </td>
       </tr><tr>
         <td>
-          75
+          73
         </td>
         <td>
-          97481
+          98699
+        </td>
+        <td>
+          3819
+          -
+          3824
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.cache
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.cache
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          98698
+        </td>
+        <td>
+          3807
+          -
+          3817
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.serializer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.serializer
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          98700
         </td>
         <td>
           3728
           -
-          3796
+          3825
         </td>
         <td>
           Apply
@@ -1028,475 +1172,19 @@
           
         </td>
         <td style="background: #AEF1AE">
-          new KafkaCacheLoader(consumers, KafkaStore.this.topic, frequency, KafkaStore.this.serializer, KafkaStore.this.cache)
+          new KafkaCacheLoader(consumers, KafkaStore.this.topic, frequency, KafkaStore.this.config.offsetCommitInterval, KafkaStore.this.serializer, KafkaStore.this.cache)
         </td>
       </tr><tr>
         <td>
-          75
+          77
         </td>
         <td>
-          97480
+          98701
         </td>
         <td>
-          3790
+          3887
           -
-          3795
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.cache
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.cache
-        </td>
-      </tr><tr>
-        <td>
-          78
-        </td>
-        <td>
-          97483
-        </td>
-        <td>
-          3834
-          -
-          3863
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.lang.Object.==
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.config.expiry.==(scala.concurrent.duration.Duration.Inf)
-        </td>
-      </tr><tr>
-        <td>
-          78
-        </td>
-        <td>
-          97482
-        </td>
-        <td>
-          3851
-          -
-          3863
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.concurrent.duration.Duration.Inf
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          scala.concurrent.duration.Duration.Inf
-        </td>
-      </tr><tr>
-        <td>
-          78
-        </td>
-        <td>
-          97485
-        </td>
-        <td>
-          3867
-          -
-          3871
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          scala.None
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          scala.None
-        </td>
-      </tr><tr>
-        <td>
-          78
-        </td>
-        <td>
-          97484
-        </td>
-        <td>
-          3867
-          -
-          3871
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.None
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          scala.None
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97487
-        </td>
-        <td>
-          3919
-          -
-          3922
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.sft
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.sft
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97486
-        </td>
-        <td>
-          3915
-          -
-          3917
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.ds
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.ds
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97489
-        </td>
-        <td>
-          3939
-          -
-          3944
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.cache
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.cache
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97488
-        </td>
-        <td>
-          3924
-          -
-          3937
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.offsetManager
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.offsetManager
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97491
-        </td>
-        <td>
-          3953
-          -
-          3975
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.concurrent.duration.Duration.toMillis
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.config.expiry.toMillis
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97490
-        </td>
-        <td>
-          3946
-          -
-          3951
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.topic
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.topic
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97493
-        </td>
-        <td>
-          3890
-          -
-          3890
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.clock
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.clock
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97492
-        </td>
-        <td>
-          3977
-          -
-          3991
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.data.LambdaDataStore.LambdaConfig.persist
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.config.persist
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97495
-        </td>
-        <td>
-          3885
-          -
-          3993
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Some.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          scala.Some.apply[org.locationtech.geomesa.lambda.stream.kafka.DataStorePersistence](new DataStorePersistence(KafkaStore.this.ds, KafkaStore.this.sft, KafkaStore.this.offsetManager, KafkaStore.this.cache, KafkaStore.this.topic, KafkaStore.this.config.expiry.toMillis, KafkaStore.this.config.persist)(KafkaStore.this.clock))
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97494
-        </td>
-        <td>
-          3890
-          -
-          3992
-        </td>
-        <td>
-          ApplyToImplicitArgs
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.DataStorePersistence.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new DataStorePersistence(KafkaStore.this.ds, KafkaStore.this.sft, KafkaStore.this.offsetManager, KafkaStore.this.cache, KafkaStore.this.topic, KafkaStore.this.config.expiry.toMillis, KafkaStore.this.config.persist)(KafkaStore.this.clock)
-        </td>
-      </tr><tr>
-        <td>
-          79
-        </td>
-        <td>
-          97496
-        </td>
-        <td>
-          3885
-          -
-          3993
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          scala.Some.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          scala.Some.apply[org.locationtech.geomesa.lambda.stream.kafka.DataStorePersistence](new DataStorePersistence(KafkaStore.this.ds, KafkaStore.this.sft, KafkaStore.this.offsetManager, KafkaStore.this.cache, KafkaStore.this.topic, KafkaStore.this.config.expiry.toMillis, KafkaStore.this.config.persist)(KafkaStore.this.clock))
-        </td>
-      </tr><tr>
-        <td>
-          83
-        </td>
-        <td>
-          97497
-        </td>
-        <td>
-          4080
-          -
-          4085
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.topic
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.topic
-        </td>
-      </tr><tr>
-        <td>
-          83
-        </td>
-        <td>
-          97499
-        </td>
-        <td>
-          4048
-          -
-          4093
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.OffsetManager.addOffsetListener
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.offsetManager.addOffsetListener(KafkaStore.this.topic, KafkaStore.this.cache)
-        </td>
-      </tr><tr>
-        <td>
-          83
-        </td>
-        <td>
-          97498
-        </td>
-        <td>
-          4087
-          -
-          4092
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.cache
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.cache
-        </td>
-      </tr><tr>
-        <td>
-          86
-        </td>
-        <td>
-          97500
-        </td>
-        <td>
-          4151
-          -
-          4167
+          3903
         </td>
         <td>
           Apply
@@ -1512,15 +1200,39 @@
         </td>
       </tr><tr>
         <td>
-          87
+          78
         </td>
         <td>
-          97501
+          98703
         </td>
         <td>
-          4219
+          3955
           -
-          4234
+          3970
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.Properties.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          props.put(k, v)
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          98702
+        </td>
+        <td>
+          3955
+          -
+          3970
         </td>
         <td>
           Apply
@@ -1536,15 +1248,15 @@
         </td>
       </tr><tr>
         <td>
-          87
+          78
         </td>
         <td>
-          97503
+          98704
         </td>
         <td>
-          4172
+          3908
           -
-          4236
+          3972
         </td>
         <td>
           Apply
@@ -1562,39 +1274,15 @@
         </td>
       </tr><tr>
         <td>
-          87
+          80
         </td>
         <td>
-          97502
+          98705
         </td>
         <td>
-          4219
+          3988
           -
-          4234
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          java.util.Properties.put
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          props.put(k, v)
-        </td>
-      </tr><tr>
-        <td>
-          89
-        </td>
-        <td>
-          97504
-        </td>
-        <td>
-          4252
-          -
-          4277
+          4013
         </td>
         <td>
           Apply
@@ -1610,63 +1298,15 @@
         </td>
       </tr><tr>
         <td>
-          89
+          80
         </td>
         <td>
-          97515
+          98717
         </td>
         <td>
-          4279
+          3978
           -
-          4279
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          io.this.IsCloseable.closeableIsCloseable
-        </td>
-      </tr><tr>
-        <td>
-          89
-        </td>
-        <td>
-          97517
-        </td>
-        <td>
-          4279
-          -
-          4279
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          89
-        </td>
-        <td>
-          97516
-        </td>
-        <td>
-          4242
-          -
-          4720
+          4456
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1692,39 +1332,63 @@ else
         </td>
       </tr><tr>
         <td>
-          90
+          80
         </td>
         <td>
-          97505
+          98716
         </td>
         <td>
-          4340
+          4015
           -
-          4345
+          4015
         </td>
         <td>
           Select
         </td>
         <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.topic
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
         </td>
         <td>
           
         </td>
         <td style="background: #F0ADAD">
-          KafkaStore.this.topic
+          io.this.IsCloseable.closeableIsCloseable
         </td>
       </tr><tr>
         <td>
-          90
+          80
         </td>
         <td>
-          97506
+          98718
         </td>
         <td>
-          4300
+          4015
           -
-          4346
+          4015
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          98707
+        </td>
+        <td>
+          4036
+          -
+          4082
         </td>
         <td>
           Apply
@@ -1740,15 +1404,39 @@ else
         </td>
       </tr><tr>
         <td>
-          91
+          81
         </td>
         <td>
-          97507
+          98706
         </td>
         <td>
-          4358
+          4076
           -
-          4431
+          4081
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaStore.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          98708
+        </td>
+        <td>
+          4094
+          -
+          4167
         </td>
         <td>
           Typed
@@ -1767,15 +1455,15 @@ else
         </td>
       </tr><tr>
         <td>
-          92
+          83
         </td>
         <td>
-          97514
+          98715
         </td>
         <td>
-          4445
+          4181
           -
-          4714
+          4450
         </td>
         <td>
           Block
@@ -1795,15 +1483,15 @@ else
         </td>
       </tr><tr>
         <td>
-          93
+          84
         </td>
         <td>
-          97508
+          98709
         </td>
         <td>
-          4473
+          4209
           -
-          4549
+          4285
         </td>
         <td>
           Apply
@@ -1819,63 +1507,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          85
         </td>
         <td>
-          97509
+          98711
         </td>
         <td>
-          4586
+          4329
           -
-          4591
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.topic
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          KafkaStore.this.topic
-        </td>
-      </tr><tr>
-        <td>
-          94
-        </td>
-        <td>
-          97511
-        </td>
-        <td>
-          4612
-          -
-          4631
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.Int.toShort
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          replication.toShort
-        </td>
-      </tr><tr>
-        <td>
-          94
-        </td>
-        <td>
-          97510
-        </td>
-        <td>
-          4593
-          -
-          4610
+          4346
         </td>
         <td>
           Select
@@ -1891,87 +1531,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          85
         </td>
         <td>
-          97512
+          98710
         </td>
         <td>
-          4573
+          4322
           -
-          4632
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.admin.NewTopic.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          new org.apache.kafka.clients.admin.NewTopic(KafkaStore.this.topic, KafkaStore.this.config.partitions, replication.toShort)
-        </td>
-      </tr><tr>
-        <td>
-          95
-        </td>
-        <td>
-          97513
-        </td>
-        <td>
-          4641
-          -
-          4706
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.common.KafkaFuture.get
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          admin.createTopics(java.util.Collections.singletonList[org.apache.kafka.clients.admin.NewTopic](newTopic)).all().get()
-        </td>
-      </tr><tr>
-        <td>
-          101
-        </td>
-        <td>
-          97519
-        </td>
-        <td>
-          4770
-          -
-          4804
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.OffsetManager.deleteOffsets
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          KafkaStore.this.offsetManager.deleteOffsets(KafkaStore.this.topic)
-        </td>
-      </tr><tr>
-        <td>
-          101
-        </td>
-        <td>
-          97518
-        </td>
-        <td>
-          4798
-          -
-          4803
+          4327
         </td>
         <td>
           Select
@@ -1987,15 +1555,135 @@ else
         </td>
       </tr><tr>
         <td>
-          102
+          85
         </td>
         <td>
-          97520
+          98713
         </td>
         <td>
-          4821
+          4309
           -
-          4837
+          4368
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.admin.NewTopic.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.kafka.clients.admin.NewTopic(KafkaStore.this.topic, KafkaStore.this.config.partitions, replication.toShort)
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          98712
+        </td>
+        <td>
+          4348
+          -
+          4367
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Int.toShort
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          replication.toShort
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          98714
+        </td>
+        <td>
+          4377
+          -
+          4442
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.common.KafkaFuture.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          admin.createTopics(java.util.Collections.singletonList[org.apache.kafka.clients.admin.NewTopic](newTopic)).all().get()
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          98719
+        </td>
+        <td>
+          4534
+          -
+          4539
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaStore.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          98720
+        </td>
+        <td>
+          4506
+          -
+          4540
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.OffsetManager.deleteOffsets
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaStore.this.offsetManager.deleteOffsets(KafkaStore.this.topic)
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          98721
+        </td>
+        <td>
+          4557
+          -
+          4573
         </td>
         <td>
           Apply
@@ -2011,15 +1699,39 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          94
         </td>
         <td>
-          97521
+          98723
         </td>
         <td>
-          4889
+          4625
           -
-          4904
+          4640
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.Properties.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          props.put(k, v)
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          98722
+        </td>
+        <td>
+          4625
+          -
+          4640
         </td>
         <td>
           Apply
@@ -2035,15 +1747,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          94
         </td>
         <td>
-          97523
+          98724
         </td>
         <td>
-          4842
+          4578
           -
-          4906
+          4642
         </td>
         <td>
           Apply
@@ -2061,39 +1773,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          96
         </td>
         <td>
-          97522
+          98725
         </td>
         <td>
-          4889
+          4658
           -
-          4904
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          java.util.Properties.put
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          props.put(k, v)
-        </td>
-      </tr><tr>
-        <td>
-          105
-        </td>
-        <td>
-          97524
-        </td>
-        <td>
-          4922
-          -
-          4947
+          4683
         </td>
         <td>
           Apply
@@ -2109,15 +1797,63 @@ else
         </td>
       </tr><tr>
         <td>
-          105
+          96
         </td>
         <td>
-          97531
+          98731
         </td>
         <td>
-          4912
+          4685
           -
-          5190
+          4685
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          98733
+        </td>
+        <td>
+          4685
+          -
+          4685
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          98732
+        </td>
+        <td>
+          4648
+          -
+          4926
         </td>
         <td>
           ApplyToImplicitArgs
@@ -2139,87 +1875,15 @@ else
         </td>
       </tr><tr>
         <td>
-          105
+          97
         </td>
         <td>
-          97530
+          98727
         </td>
         <td>
-          4949
+          4706
           -
-          4949
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          io.this.IsCloseable.closeableIsCloseable
-        </td>
-      </tr><tr>
-        <td>
-          105
-        </td>
-        <td>
-          97532
-        </td>
-        <td>
-          4949
-          -
-          4949
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          106
-        </td>
-        <td>
-          97525
-        </td>
-        <td>
-          5010
-          -
-          5015
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.topic
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          KafkaStore.this.topic
-        </td>
-      </tr><tr>
-        <td>
-          106
-        </td>
-        <td>
-          97526
-        </td>
-        <td>
-          4970
-          -
-          5016
+          4752
         </td>
         <td>
           Apply
@@ -2235,39 +1899,39 @@ else
         </td>
       </tr><tr>
         <td>
-          107
+          97
         </td>
         <td>
-          97527
+          98726
         </td>
         <td>
-          5028
+          4746
           -
-          5090
+          4751
         </td>
         <td>
-          Apply
+          Select
         </td>
         <td>
-          org.apache.kafka.common.KafkaFuture.get
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.topic
         </td>
         <td>
           
         </td>
         <td style="background: #F0ADAD">
-          admin.deleteTopics(java.util.Collections.singletonList[String](KafkaStore.this.topic)).all().get()
+          KafkaStore.this.topic
         </td>
       </tr><tr>
         <td>
-          107
+          98
         </td>
         <td>
-          97528
+          98729
         </td>
         <td>
-          5028
+          4764
           -
-          5090
+          4826
         </td>
         <td>
           Block
@@ -2283,15 +1947,39 @@ else
         </td>
       </tr><tr>
         <td>
-          109
+          98
         </td>
         <td>
-          97529
+          98728
         </td>
         <td>
-          5114
+          4764
           -
-          5176
+          4826
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.common.KafkaFuture.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          admin.deleteTopics(java.util.Collections.singletonList[String](KafkaStore.this.topic)).all().get()
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          98730
+        </td>
+        <td>
+          4850
+          -
+          4912
         </td>
         <td>
           Typed
@@ -2310,15 +1998,15 @@ else
         </td>
       </tr><tr>
         <td>
-          119
+          110
         </td>
         <td>
-          97533
+          98734
         </td>
         <td>
-          5417
+          5153
           -
-          5428
+          5164
         </td>
         <td>
           Apply
@@ -2334,15 +2022,39 @@ else
         </td>
       </tr><tr>
         <td>
-          120
+          111
         </td>
         <td>
-          97535
+          98735
         </td>
         <td>
-          5433
+          5184
           -
-          5464
+          5199
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.Query.setFilter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          query.setFilter(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          98736
+        </td>
+        <td>
+          5169
+          -
+          5200
         </td>
         <td>
           Apply
@@ -2360,63 +2072,15 @@ else
         </td>
       </tr><tr>
         <td>
-          120
+          112
         </td>
         <td>
-          97534
+          98737
         </td>
         <td>
-          5448
+          5224
           -
-          5463
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.geotools.api.data.Query.setFilter
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          query.setFilter(x$1)
-        </td>
-      </tr><tr>
-        <td>
-          121
-        </td>
-        <td>
-          97537
-        </td>
-        <td>
-          5469
-          -
-          5518
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Option.foreach
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          transforms.foreach[Unit](((x$2: Array[String]) =&gt; query.setPropertyNames((x$2: _*))))
-        </td>
-      </tr><tr>
-        <td>
-          121
-        </td>
-        <td>
-          97536
-        </td>
-        <td>
-          5488
-          -
-          5517
+          5253
         </td>
         <td>
           Apply
@@ -2432,15 +2096,63 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          112
         </td>
         <td>
-          97539
+          98738
         </td>
         <td>
-          5523
+          5205
           -
-          5552
+          5254
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          transforms.foreach[Unit](((x$2: Array[String]) =&gt; query.setPropertyNames((x$2: _*))))
+        </td>
+      </tr><tr>
+        <td>
+          113
+        </td>
+        <td>
+          98739
+        </td>
+        <td>
+          5273
+          -
+          5287
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.Query.setHints
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          query.setHints(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          113
+        </td>
+        <td>
+          98740
+        </td>
+        <td>
+          5259
+          -
+          5288
         </td>
         <td>
           Apply
@@ -2458,63 +2170,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          114
         </td>
         <td>
-          97538
+          98741
         </td>
         <td>
-          5537
+          5314
           -
-          5551
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.geotools.api.data.Query.setHints
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          query.setHints(x$1)
-        </td>
-      </tr><tr>
-        <td>
-          123
-        </td>
-        <td>
-          97541
-        </td>
-        <td>
-          5557
-          -
-          5598
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.index.planning.LocalQueryRunner.runQuery
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.queryRunner.runQuery(KafkaStore.this.sft, query, explain)
-        </td>
-      </tr><tr>
-        <td>
-          123
-        </td>
-        <td>
-          97540
-        </td>
-        <td>
-          5578
-          -
-          5581
+          5317
         </td>
         <td>
           Select
@@ -2530,15 +2194,39 @@ else
         </td>
       </tr><tr>
         <td>
-          127
+          114
         </td>
         <td>
-          97542
+          98742
         </td>
         <td>
-          5678
+          5293
           -
-          5723
+          5334
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.planning.LocalQueryRunner.runQuery
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.queryRunner.runQuery(KafkaStore.this.sft, query, explain)
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          98743
+        </td>
+        <td>
+          5414
+          -
+          5459
         </td>
         <td>
           Apply
@@ -2554,15 +2242,39 @@ else
         </td>
       </tr><tr>
         <td>
-          128
+          119
         </td>
         <td>
-          97543
+          98745
         </td>
         <td>
-          5762
+          5514
           -
-          5776
+          5532
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.MessageTypes.Write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.MessageTypes.Write
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          98744
+        </td>
+        <td>
+          5498
+          -
+          5512
         </td>
         <td>
           Apply
@@ -2578,15 +2290,15 @@ else
         </td>
       </tr><tr>
         <td>
-          128
+          119
         </td>
         <td>
-          97545
+          98746
         </td>
         <td>
-          5738
+          5474
           -
-          5797
+          5533
         </td>
         <td>
           Apply
@@ -2602,63 +2314,15 @@ else
         </td>
       </tr><tr>
         <td>
-          128
+          120
         </td>
         <td>
-          97544
+          98747
         </td>
         <td>
-          5778
+          5571
           -
-          5796
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.MessageTypes.Write
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.MessageTypes.Write
-        </td>
-      </tr><tr>
-        <td>
-          129
-        </td>
-        <td>
-          97547
-        </td>
-        <td>
-          5847
-          -
-          5876
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.features.kryo.impl.KryoFeatureSerialization.serialize
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.serializer.serialize(feature)
-        </td>
-      </tr><tr>
-        <td>
-          129
-        </td>
-        <td>
-          97546
-        </td>
-        <td>
-          5835
-          -
-          5840
+          5576
         </td>
         <td>
           Select
@@ -2674,39 +2338,15 @@ else
         </td>
       </tr><tr>
         <td>
-          129
+          120
         </td>
         <td>
-          97549
+          98749
         </td>
         <td>
-          5802
+          5552
           -
-          5878
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.producer.Producer.send
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.producer.send(new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](KafkaStore.this.topic, key, KafkaStore.this.serializer.serialize(feature)))
-        </td>
-      </tr><tr>
-        <td>
-          129
-        </td>
-        <td>
-          97548
-        </td>
-        <td>
-          5816
-          -
-          5877
+          5613
         </td>
         <td>
           Apply
@@ -2722,15 +2362,63 @@ else
         </td>
       </tr><tr>
         <td>
-          136
+          120
         </td>
         <td>
-          97550
+          98748
         </td>
         <td>
-          6120
+          5583
           -
-          6165
+          5612
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.kryo.impl.KryoFeatureSerialization.serialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.serializer.serialize(feature)
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          98750
+        </td>
+        <td>
+          5538
+          -
+          5614
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.send
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.producer.send(new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](KafkaStore.this.topic, key, KafkaStore.this.serializer.serialize(feature)))
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          98751
+        </td>
+        <td>
+          5810
+          -
+          5855
         </td>
         <td>
           Apply
@@ -2746,15 +2434,39 @@ else
         </td>
       </tr><tr>
         <td>
-          137
+          127
         </td>
         <td>
-          97551
+          98753
         </td>
         <td>
-          6204
+          5910
           -
-          6218
+          5929
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.MessageTypes.Delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.MessageTypes.Delete
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          98752
+        </td>
+        <td>
+          5894
+          -
+          5908
         </td>
         <td>
           Apply
@@ -2770,15 +2482,15 @@ else
         </td>
       </tr><tr>
         <td>
-          137
+          127
         </td>
         <td>
-          97553
+          98754
         </td>
         <td>
-          6180
+          5870
           -
-          6240
+          5930
         </td>
         <td>
           Apply
@@ -2794,63 +2506,15 @@ else
         </td>
       </tr><tr>
         <td>
-          137
+          128
         </td>
         <td>
-          97552
+          98755
         </td>
         <td>
-          6220
+          5968
           -
-          6239
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.MessageTypes.Delete
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.MessageTypes.Delete
-        </td>
-      </tr><tr>
-        <td>
-          138
-        </td>
-        <td>
-          97555
-        </td>
-        <td>
-          6290
-          -
-          6319
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.features.kryo.impl.KryoFeatureSerialization.serialize
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.serializer.serialize(feature)
-        </td>
-      </tr><tr>
-        <td>
-          138
-        </td>
-        <td>
-          97554
-        </td>
-        <td>
-          6278
-          -
-          6283
+          5973
         </td>
         <td>
           Select
@@ -2866,39 +2530,15 @@ else
         </td>
       </tr><tr>
         <td>
-          138
+          128
         </td>
         <td>
-          97557
+          98757
         </td>
         <td>
-          6245
+          5949
           -
-          6321
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.producer.Producer.send
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.producer.send(new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](KafkaStore.this.topic, key, KafkaStore.this.serializer.serialize(feature)))
-        </td>
-      </tr><tr>
-        <td>
-          138
-        </td>
-        <td>
-          97556
-        </td>
-        <td>
-          6259
-          -
-          6320
+          6010
         </td>
         <td>
           Apply
@@ -2914,39 +2554,39 @@ else
         </td>
       </tr><tr>
         <td>
-          140
+          128
         </td>
         <td>
-          97558
+          98756
         </td>
         <td>
-          6371
+          5980
           -
-          6385
+          6009
         </td>
         <td>
-          Select
+          Apply
         </td>
         <td>
-          org.locationtech.geomesa.lambda.data.LambdaDataStore.LambdaConfig.persist
+          org.locationtech.geomesa.features.kryo.impl.KryoFeatureSerialization.serialize
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          KafkaStore.this.config.persist
+          KafkaStore.this.serializer.serialize(feature)
         </td>
       </tr><tr>
         <td>
-          140
+          128
         </td>
         <td>
-          97575
+          98759
         </td>
         <td>
-          6367
+          5948
           -
-          6367
+          5948
         </td>
         <td>
           Literal
@@ -2957,23 +2597,47 @@ else
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
+        <td style="background: #AEF1AE">
           ()
         </td>
       </tr><tr>
         <td>
-          140
+          128
         </td>
         <td>
-          97574
+          98758
         </td>
         <td>
-          6387
+          5935
           -
-          6648
+          6011
         </td>
         <td>
-          Block
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.send
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaStore.this.producer.send(new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](KafkaStore.this.topic, key, KafkaStore.this.serializer.serialize(feature)))
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          98761
+        </td>
+        <td>
+          6063
+          -
+          6063
+        </td>
+        <td>
+          Literal
         </td>
         <td>
           &lt;nosymbol&gt;
@@ -2982,236 +2646,115 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          {
-  val filter: org.geotools.api.filter.Id = org.locationtech.geomesa.filter.`package`.ff.id(org.locationtech.geomesa.filter.`package`.ff.featureId(feature.getID()));
-  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature], Unit](KafkaStore.this.ds.getFeatureWriter(KafkaStore.this.sft.getTypeName(), filter, org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature]) =&gt; while$1(){
-    if (writer.hasNext())
-      {
-        {
-          writer.next();
-          writer.remove()
-        };
-        while$1()
-      }
-    else
-      ()
-  }))(io.this.IsCloseable.closeableIsCloseable)
-}
-        </td>
-      </tr><tr>
-        <td>
-          140
-        </td>
-        <td>
-          97576
-        </td>
-        <td>
-          6367
-          -
-          6367
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
           ()
         </td>
       </tr><tr>
         <td>
-          141
+          131
         </td>
         <td>
-          97559
+          98760
         </td>
         <td>
-          6427
+          6050
           -
-          6440
+          6065
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.geotools.api.feature.simple.SimpleFeature.getID
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.persist
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          feature.getID()
+          KafkaStore.this.cache.persist()
         </td>
       </tr><tr>
         <td>
-          141
+          133
         </td>
         <td>
-          97561
+          98762
         </td>
         <td>
-          6408
+          6098
           -
-          6442
+          6114
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.geotools.api.filter.FilterFactory.id
+          org.apache.kafka.clients.producer.Producer.flush
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.filter.`package`.ff.id(org.locationtech.geomesa.filter.`package`.ff.featureId(feature.getID()))
+          KafkaStore.this.producer.flush()
         </td>
       </tr><tr>
         <td>
-          141
+          136
         </td>
         <td>
-          97560
+          98763
         </td>
         <td>
-          6414
+          6170
           -
-          6441
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.geotools.api.filter.FilterFactory.featureId
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.filter.`package`.ff.featureId(feature.getID())
-        </td>
-      </tr><tr>
-        <td>
-          142
-        </td>
-        <td>
-          97563
-        </td>
-        <td>
-          6504
-          -
-          6527
+          6176
         </td>
         <td>
           Select
         </td>
         <td>
-          org.geotools.api.data.Transaction.AUTO_COMMIT
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.loader
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          org.geotools.api.data.Transaction.AUTO_COMMIT
+          KafkaStore.this.loader
         </td>
       </tr><tr>
         <td>
-          142
+          136
         </td>
         <td>
-          97562
+          98765
         </td>
         <td>
-          6479
+          6153
           -
-          6494
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.sft.getTypeName()
-        </td>
-      </tr><tr>
-        <td>
-          142
-        </td>
-        <td>
-          97564
-        </td>
-        <td>
-          6459
-          -
-          6528
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.geotools.api.data.DataStore.getFeatureWriter
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.ds.getFeatureWriter(KafkaStore.this.sft.getTypeName(), filter, org.geotools.api.data.Transaction.AUTO_COMMIT)
-        </td>
-      </tr><tr>
-        <td>
-          142
-        </td>
-        <td>
-          97573
-        </td>
-        <td>
-          6449
-          -
-          6642
+          6177
         </td>
         <td>
           ApplyToImplicitArgs
         </td>
         <td>
-          org.locationtech.geomesa.utils.io.WithClose.apply
+          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature], Unit](KafkaStore.this.ds.getFeatureWriter(KafkaStore.this.sft.getTypeName(), filter, org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature]) =&gt; while$1(){
-  if (writer.hasNext())
-    {
-      {
-        writer.next();
-        writer.remove()
-      };
-      while$1()
-    }
-  else
-    ()
-}))(io.this.IsCloseable.closeableIsCloseable)
+          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[org.locationtech.geomesa.lambda.stream.kafka.KafkaCacheLoader](KafkaStore.this.loader)(io.this.IsCloseable.closeableIsCloseable)
         </td>
       </tr><tr>
         <td>
-          142
+          136
         </td>
         <td>
-          97572
+          98764
         </td>
         <td>
-          6530
+          6169
           -
-          6530
+          6169
         </td>
         <td>
           Select
@@ -3227,117 +2770,159 @@ else
         </td>
       </tr><tr>
         <td>
-          143
+          137
         </td>
         <td>
-          97565
+          98767
         </td>
         <td>
-          6557
+          6198
           -
-          6571
+          6198
         </td>
         <td>
-          Apply
+          Select
         </td>
         <td>
-          org.geotools.api.data.FeatureWriter.hasNext
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          writer.hasNext()
+          io.this.IsCloseable.closeableIsCloseable
         </td>
       </tr><tr>
         <td>
-          143
+          137
         </td>
         <td>
-          97569
+          98766
         </td>
         <td>
-          6573
+          6199
           -
-          6634
+          6211
         </td>
         <td>
-          Block
+          Select
         </td>
         <td>
-          &lt;nosymbol&gt;
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.interceptors
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          {
-  {
-    writer.next();
-    writer.remove()
-  };
-  while$1()
-}
+          KafkaStore.this.interceptors
         </td>
       </tr><tr>
         <td>
-          143
+          137
         </td>
         <td>
-          97568
+          98768
         </td>
         <td>
-          6573
+          6182
           -
-          6573
+          6212
         </td>
         <td>
-          Apply
+          ApplyToImplicitArgs
         </td>
         <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.while$1
+          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          while$1()
+          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[org.locationtech.geomesa.index.planning.QueryInterceptor.QueryInterceptorFactory](KafkaStore.this.interceptors)(io.this.IsCloseable.closeableIsCloseable)
         </td>
       </tr><tr>
         <td>
-          143
+          138
         </td>
         <td>
-          97571
+          98769
         </td>
         <td>
-          6550
+          6234
           -
-          6550
+          6239
         </td>
         <td>
-          Block
+          Select
         </td>
         <td>
-          &lt;nosymbol&gt;
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.cache
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          ()
+          KafkaStore.this.cache
         </td>
       </tr><tr>
         <td>
-          143
+          138
         </td>
         <td>
-          97570
+          98771
         </td>
         <td>
-          6550
+          6217
           -
-          6550
+          6240
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache](KafkaStore.this.cache)(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          138
+        </td>
+        <td>
+          98770
+        </td>
+        <td>
+          6233
+          -
+          6233
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          138
+        </td>
+        <td>
+          98772
+        </td>
+        <td>
+          6233
+          -
+          6233
         </td>
         <td>
           Literal
@@ -3356,492 +2941,12 @@ else
           144
         </td>
         <td>
-          97566
+          98773
         </td>
         <td>
-          6585
+          6301
           -
-          6598
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.geotools.api.data.FeatureWriter.next
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          writer.next()
-        </td>
-      </tr><tr>
-        <td>
-          145
-        </td>
-        <td>
-          97567
-        </td>
-        <td>
-          6609
-          -
-          6624
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.geotools.api.data.FeatureWriter.remove
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          writer.remove()
-        </td>
-      </tr><tr>
-        <td>
-          151
-        </td>
-        <td>
-          97577
-        </td>
-        <td>
-          6687
-          -
-          6698
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.persistence
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.persistence
-        </td>
-      </tr><tr>
-        <td>
-          152
-        </td>
-        <td>
-          97579
-        </td>
-        <td>
-          6727
-          -
-          6734
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.DataStorePersistence.run
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          p.run()
-        </td>
-      </tr><tr>
-        <td>
-          152
-        </td>
-        <td>
-          97578
-        </td>
-        <td>
-          6727
-          -
-          6734
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.DataStorePersistence.run
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          p.run()
-        </td>
-      </tr><tr>
-        <td>
-          153
-        </td>
-        <td>
-          97581
-        </td>
-        <td>
-          6752
-          -
-          6822
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          throw new java.lang.IllegalStateException(&quot;Persistence disabled for this store&quot;)
-        </td>
-      </tr><tr>
-        <td>
-          153
-        </td>
-        <td>
-          97580
-        </td>
-        <td>
-          6752
-          -
-          6822
-        </td>
-        <td>
-          Throw
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          throw new java.lang.IllegalStateException(&quot;Persistence disabled for this store&quot;)
-        </td>
-      </tr><tr>
-        <td>
-          156
-        </td>
-        <td>
-          97582
-        </td>
-        <td>
-          6859
-          -
-          6875
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.producer.Producer.flush
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.producer.flush()
-        </td>
-      </tr><tr>
-        <td>
-          159
-        </td>
-        <td>
-          97583
-        </td>
-        <td>
-          6931
-          -
-          6937
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.loader
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.loader
-        </td>
-      </tr><tr>
-        <td>
-          159
-        </td>
-        <td>
-          97585
-        </td>
-        <td>
-          6914
-          -
-          6938
-        </td>
-        <td>
-          ApplyToImplicitArgs
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[org.locationtech.geomesa.lambda.stream.kafka.KafkaCacheLoader](KafkaStore.this.loader)(io.this.IsCloseable.closeableIsCloseable)
-        </td>
-      </tr><tr>
-        <td>
-          159
-        </td>
-        <td>
-          97584
-        </td>
-        <td>
-          6930
-          -
-          6930
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          io.this.IsCloseable.closeableIsCloseable
-        </td>
-      </tr><tr>
-        <td>
-          160
-        </td>
-        <td>
-          97587
-        </td>
-        <td>
-          6959
-          -
-          6959
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          io.this.IsCloseable.closeableIsCloseable
-        </td>
-      </tr><tr>
-        <td>
-          160
-        </td>
-        <td>
-          97586
-        </td>
-        <td>
-          6960
-          -
-          6972
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.interceptors
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.interceptors
-        </td>
-      </tr><tr>
-        <td>
-          160
-        </td>
-        <td>
-          97588
-        </td>
-        <td>
-          6943
-          -
-          6973
-        </td>
-        <td>
-          ApplyToImplicitArgs
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[org.locationtech.geomesa.index.planning.QueryInterceptor.QueryInterceptorFactory](KafkaStore.this.interceptors)(io.this.IsCloseable.closeableIsCloseable)
-        </td>
-      </tr><tr>
-        <td>
-          161
-        </td>
-        <td>
-          97589
-        </td>
-        <td>
-          6995
-          -
-          7006
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.persistence
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.persistence
-        </td>
-      </tr><tr>
-        <td>
-          161
-        </td>
-        <td>
-          97591
-        </td>
-        <td>
-          6978
-          -
-          7007
-        </td>
-        <td>
-          ApplyToImplicitArgs
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[Option[org.locationtech.geomesa.lambda.stream.kafka.DataStorePersistence]](KafkaStore.this.persistence)(io.this.IsCloseable.optionIsCloseable)
-        </td>
-      </tr><tr>
-        <td>
-          161
-        </td>
-        <td>
-          97590
-        </td>
-        <td>
-          6994
-          -
-          6994
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.io.IsCloseableImplicits.optionIsCloseable
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          io.this.IsCloseable.optionIsCloseable
-        </td>
-      </tr><tr>
-        <td>
-          162
-        </td>
-        <td>
-          97593
-        </td>
-        <td>
-          7054
-          -
-          7059
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.cache
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.cache
-        </td>
-      </tr><tr>
-        <td>
-          162
-        </td>
-        <td>
-          97592
-        </td>
-        <td>
-          7047
-          -
-          7052
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.topic
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.topic
-        </td>
-      </tr><tr>
-        <td>
-          162
-        </td>
-        <td>
-          97594
-        </td>
-        <td>
-          7012
-          -
-          7060
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.OffsetManager.removeOffsetListener
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaStore.this.offsetManager.removeOffsetListener(KafkaStore.this.topic, KafkaStore.this.cache)
-        </td>
-      </tr><tr>
-        <td>
-          168
-        </td>
-        <td>
-          97595
-        </td>
-        <td>
-          7121
-          -
-          7139
+          6319
         </td>
         <td>
           Literal
@@ -3857,15 +2962,15 @@ else
         </td>
       </tr><tr>
         <td>
-          170
+          146
         </td>
         <td>
-          97596
+          98774
         </td>
         <td>
-          7186
+          6366
           -
-          7241
+          6421
         </td>
         <td>
           Apply
@@ -3881,15 +2986,15 @@ else
         </td>
       </tr><tr>
         <td>
-          173
+          149
         </td>
         <td>
-          97597
+          98775
         </td>
         <td>
-          7290
+          6470
           -
-          7291
+          6471
         </td>
         <td>
           Literal
@@ -3905,15 +3010,15 @@ else
         </td>
       </tr><tr>
         <td>
-          174
+          150
         </td>
         <td>
-          97598
+          98776
         </td>
         <td>
-          7315
+          6495
           -
-          7316
+          6496
         </td>
         <td>
           Literal
@@ -3929,15 +3034,15 @@ else
         </td>
       </tr><tr>
         <td>
-          178
+          154
         </td>
         <td>
-          97599
+          98777
         </td>
         <td>
-          7433
+          6613
           -
-          7463
+          6643
         </td>
         <td>
           Apply
@@ -3953,15 +3058,15 @@ else
         </td>
       </tr><tr>
         <td>
-          181
+          157
         </td>
         <td>
-          97600
+          98778
         </td>
         <td>
-          7645
+          6825
           -
-          7699
+          6879
         </td>
         <td>
           Apply
@@ -3977,15 +3082,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          161
         </td>
         <td>
-          97601
+          98779
         </td>
         <td>
-          7888
+          7068
           -
-          7904
+          7084
         </td>
         <td>
           Apply
@@ -4001,15 +3106,15 @@ else
         </td>
       </tr><tr>
         <td>
-          187
+          163
         </td>
         <td>
-          97602
+          98780
         </td>
         <td>
-          7966
+          7146
           -
-          7993
+          7173
         </td>
         <td>
           Apply
@@ -4025,15 +3130,15 @@ else
         </td>
       </tr><tr>
         <td>
-          188
+          164
         </td>
         <td>
-          97603
+          98781
         </td>
         <td>
-          8046
+          7226
           -
-          8060
+          7240
         </td>
         <td>
           Literal
@@ -4049,15 +3154,15 @@ else
         </td>
       </tr><tr>
         <td>
-          188
+          164
         </td>
         <td>
-          97605
+          98783
         </td>
         <td>
-          8036
+          7216
           -
-          8073
+          7253
         </td>
         <td>
           Apply
@@ -4073,15 +3178,15 @@ else
         </td>
       </tr><tr>
         <td>
-          188
+          164
         </td>
         <td>
-          97604
+          98782
         </td>
         <td>
-          8062
+          7242
           -
-          8072
+          7252
         </td>
         <td>
           Apply
@@ -4097,15 +3202,15 @@ else
         </td>
       </tr><tr>
         <td>
-          189
+          165
         </td>
         <td>
-          97607
+          98785
         </td>
         <td>
-          8106
+          7286
           -
-          8116
+          7296
         </td>
         <td>
           Apply
@@ -4121,15 +3226,15 @@ else
         </td>
       </tr><tr>
         <td>
-          189
+          165
         </td>
         <td>
-          97606
+          98784
         </td>
         <td>
-          8088
+          7268
           -
-          8104
+          7284
         </td>
         <td>
           Literal
@@ -4145,15 +3250,15 @@ else
         </td>
       </tr><tr>
         <td>
-          189
+          165
         </td>
         <td>
-          97608
+          98786
         </td>
         <td>
-          8078
+          7258
           -
-          8117
+          7297
         </td>
         <td>
           Apply
@@ -4169,15 +3274,15 @@ else
         </td>
       </tr><tr>
         <td>
-          190
+          166
         </td>
         <td>
-          97609
+          98787
         </td>
         <td>
-          8199
+          7379
           -
-          8223
+          7403
         </td>
         <td>
           Literal
@@ -4193,15 +3298,15 @@ else
         </td>
       </tr><tr>
         <td>
-          190
+          166
         </td>
         <td>
-          97611
+          98789
         </td>
         <td>
-          8189
+          7369
           -
-          8263
+          7443
         </td>
         <td>
           Apply
@@ -4217,15 +3322,15 @@ else
         </td>
       </tr><tr>
         <td>
-          190
+          166
         </td>
         <td>
-          97610
+          98788
         </td>
         <td>
-          8225
+          7405
           -
-          8262
+          7442
         </td>
         <td>
           Apply
@@ -4241,15 +3346,15 @@ else
         </td>
       </tr><tr>
         <td>
-          191
+          167
         </td>
         <td>
-          97613
+          98791
         </td>
         <td>
-          8303
+          7483
           -
-          8362
+          7542
         </td>
         <td>
           Apply
@@ -4265,15 +3370,15 @@ else
         </td>
       </tr><tr>
         <td>
-          191
+          167
         </td>
         <td>
-          97612
+          98790
         </td>
         <td>
-          8278
+          7458
           -
-          8301
+          7481
         </td>
         <td>
           Select
@@ -4289,15 +3394,15 @@ else
         </td>
       </tr><tr>
         <td>
-          191
+          167
         </td>
         <td>
-          97614
+          98792
         </td>
         <td>
-          8268
+          7448
           -
-          8363
+          7543
         </td>
         <td>
           Apply
@@ -4313,15 +3418,15 @@ else
         </td>
       </tr><tr>
         <td>
-          192
+          168
         </td>
         <td>
-          97615
+          98793
         </td>
         <td>
-          8401
+          7581
           -
-          8416
+          7596
         </td>
         <td>
           Apply
@@ -4337,15 +3442,15 @@ else
         </td>
       </tr><tr>
         <td>
-          192
+          168
         </td>
         <td>
-          97617
+          98795
         </td>
         <td>
-          8368
+          7548
           -
-          8418
+          7598
         </td>
         <td>
           Apply
@@ -4363,15 +3468,15 @@ else
         </td>
       </tr><tr>
         <td>
-          192
+          168
         </td>
         <td>
-          97616
+          98794
         </td>
         <td>
-          8401
+          7581
           -
-          8416
+          7596
         </td>
         <td>
           Block
@@ -4387,15 +3492,15 @@ else
         </td>
       </tr><tr>
         <td>
-          193
+          169
         </td>
         <td>
-          97619
+          98797
         </td>
         <td>
-          8462
+          7642
           -
-          8498
+          7678
         </td>
         <td>
           Apply
@@ -4411,15 +3516,15 @@ else
         </td>
       </tr><tr>
         <td>
-          193
+          169
         </td>
         <td>
-          97618
+          98796
         </td>
         <td>
-          8433
+          7613
           -
-          8460
+          7640
         </td>
         <td>
           Literal
@@ -4435,15 +3540,15 @@ else
         </td>
       </tr><tr>
         <td>
-          193
+          169
         </td>
         <td>
-          97620
+          98798
         </td>
         <td>
-          8423
+          7603
           -
-          8499
+          7679
         </td>
         <td>
           Apply
@@ -4459,15 +3564,15 @@ else
         </td>
       </tr><tr>
         <td>
-          194
+          170
         </td>
         <td>
-          97621
+          98799
         </td>
         <td>
-          8514
+          7694
           -
-          8543
+          7723
         </td>
         <td>
           Literal
@@ -4483,15 +3588,15 @@ else
         </td>
       </tr><tr>
         <td>
-          194
+          170
         </td>
         <td>
-          97623
+          98801
         </td>
         <td>
-          8504
+          7684
           -
-          8582
+          7762
         </td>
         <td>
           Apply
@@ -4507,15 +3612,15 @@ else
         </td>
       </tr><tr>
         <td>
-          194
+          170
         </td>
         <td>
-          97622
+          98800
         </td>
         <td>
-          8545
+          7725
           -
-          8581
+          7761
         </td>
         <td>
           Apply
@@ -4531,15 +3636,15 @@ else
         </td>
       </tr><tr>
         <td>
-          195
+          171
         </td>
         <td>
-          97624
+          98802
         </td>
         <td>
-          8587
+          7767
           -
-          8637
+          7817
         </td>
         <td>
           Apply
@@ -4555,15 +3660,15 @@ else
         </td>
       </tr><tr>
         <td>
-          200
+          176
         </td>
         <td>
-          97625
+          98803
         </td>
         <td>
-          8821
+          8001
           -
-          8837
+          8017
         </td>
         <td>
           Apply
@@ -4579,15 +3684,15 @@ else
         </td>
       </tr><tr>
         <td>
-          201
+          177
         </td>
         <td>
-          97626
+          98804
         </td>
         <td>
-          8842
+          8022
           -
-          8875
+          8055
         </td>
         <td>
           Apply
@@ -4603,15 +3708,15 @@ else
         </td>
       </tr><tr>
         <td>
-          202
+          178
         </td>
         <td>
-          97627
+          98805
         </td>
         <td>
-          8913
+          8093
           -
-          8928
+          8108
         </td>
         <td>
           Apply
@@ -4627,15 +3732,15 @@ else
         </td>
       </tr><tr>
         <td>
-          202
+          178
         </td>
         <td>
-          97629
+          98807
         </td>
         <td>
-          8880
+          8060
           -
-          8930
+          8110
         </td>
         <td>
           Apply
@@ -4653,15 +3758,15 @@ else
         </td>
       </tr><tr>
         <td>
-          202
+          178
         </td>
         <td>
-          97628
+          98806
         </td>
         <td>
-          8913
+          8093
           -
-          8928
+          8108
         </td>
         <td>
           Block
@@ -4677,15 +3782,15 @@ else
         </td>
       </tr><tr>
         <td>
-          203
+          179
         </td>
         <td>
-          97630
+          98808
         </td>
         <td>
-          8935
+          8115
           -
-          8980
+          8160
         </td>
         <td>
           Apply
@@ -4701,15 +3806,15 @@ else
         </td>
       </tr><tr>
         <td>
-          204
+          180
         </td>
         <td>
-          97631
+          98809
         </td>
         <td>
-          8985
+          8165
           -
-          9032
+          8212
         </td>
         <td>
           Apply
@@ -4725,15 +3830,15 @@ else
         </td>
       </tr><tr>
         <td>
-          205
+          181
         </td>
         <td>
-          97633
+          98811
         </td>
         <td>
-          9078
+          8258
           -
-          9116
+          8296
         </td>
         <td>
           Apply
@@ -4749,15 +3854,15 @@ else
         </td>
       </tr><tr>
         <td>
-          205
+          181
         </td>
         <td>
-          97632
+          98810
         </td>
         <td>
-          9047
+          8227
           -
-          9076
+          8256
         </td>
         <td>
           Literal
@@ -4773,15 +3878,15 @@ else
         </td>
       </tr><tr>
         <td>
-          205
+          181
         </td>
         <td>
-          97634
+          98812
         </td>
         <td>
-          9037
+          8217
           -
-          9117
+          8297
         </td>
         <td>
           Apply
@@ -4797,15 +3902,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          182
         </td>
         <td>
-          97635
+          98813
         </td>
         <td>
-          9132
+          8312
           -
-          9163
+          8343
         </td>
         <td>
           Literal
@@ -4821,15 +3926,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          182
         </td>
         <td>
-          97637
+          98815
         </td>
         <td>
-          9122
+          8302
           -
-          9204
+          8384
         </td>
         <td>
           Apply
@@ -4845,15 +3950,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          182
         </td>
         <td>
-          97636
+          98814
         </td>
         <td>
-          9165
+          8345
           -
-          9203
+          8383
         </td>
         <td>
           Apply
@@ -4869,15 +3974,15 @@ else
         </td>
       </tr><tr>
         <td>
-          207
+          183
         </td>
         <td>
-          97638
+          98816
         </td>
         <td>
-          9209
+          8389
           -
-          9259
+          8439
         </td>
         <td>
           Apply
@@ -4893,15 +3998,15 @@ else
         </td>
       </tr><tr>
         <td>
-          216
+          192
         </td>
         <td>
-          97639
+          98817
         </td>
         <td>
-          9655
+          8835
           -
-          9670
+          8850
         </td>
         <td>
           Apply
@@ -4917,15 +4022,15 @@ else
         </td>
       </tr><tr>
         <td>
-          216
+          192
         </td>
         <td>
-          97641
+          98819
         </td>
         <td>
-          9647
+          8827
           -
-          9709
+          8889
         </td>
         <td>
           Apply
@@ -4941,15 +4046,15 @@ else
         </td>
       </tr><tr>
         <td>
-          216
+          192
         </td>
         <td>
-          97640
+          98818
         </td>
         <td>
-          9672
+          8852
           -
-          9708
+          8888
         </td>
         <td>
           Literal
@@ -4965,15 +4070,15 @@ else
         </td>
       </tr><tr>
         <td>
-          218
+          194
         </td>
         <td>
-          97642
+          98820
         </td>
         <td>
-          9727
+          8907
           -
-          9753
+          8933
         </td>
         <td>
           Apply
@@ -4989,15 +4094,15 @@ else
         </td>
       </tr><tr>
         <td>
-          220
+          196
         </td>
         <td>
-          97646
+          98824
         </td>
         <td>
-          9759
+          8939
           -
-          10003
+          9183
         </td>
         <td>
           Apply
@@ -5018,15 +4123,15 @@ else
         </td>
       </tr><tr>
         <td>
-          221
+          197
         </td>
         <td>
-          97643
+          98821
         </td>
         <td>
-          9804
+          8984
           -
-          9839
+          9019
         </td>
         <td>
           Apply
@@ -5042,15 +4147,15 @@ else
         </td>
       </tr><tr>
         <td>
-          222
+          198
         </td>
         <td>
-          97644
+          98822
         </td>
         <td>
-          9861
+          9041
           -
-          9917
+          9097
         </td>
         <td>
           Apply
@@ -5066,15 +4171,15 @@ else
         </td>
       </tr><tr>
         <td>
-          223
+          199
         </td>
         <td>
-          97645
+          98823
         </td>
         <td>
-          9924
+          9104
           -
-          9982
+          9162
         </td>
         <td>
           Apply
@@ -5090,15 +4195,15 @@ else
         </td>
       </tr><tr>
         <td>
-          229
+          205
         </td>
         <td>
-          97647
+          98825
         </td>
         <td>
-          10122
+          9302
           -
-          10123
+          9303
         </td>
         <td>
           Literal
@@ -5114,15 +4219,15 @@ else
         </td>
       </tr><tr>
         <td>
-          229
+          205
         </td>
         <td>
-          97648
+          98826
         </td>
         <td>
-          10104
+          9284
           -
-          10124
+          9304
         </td>
         <td>
           ApplyToImplicitArgs
@@ -5138,15 +4243,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          207
         </td>
         <td>
-          97649
+          98827
         </td>
         <td>
-          10137
+          9317
           -
-          10138
+          9318
         </td>
         <td>
           Literal
@@ -5162,15 +4267,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          207
         </td>
         <td>
-          97651
+          98829
         </td>
         <td>
-          10158
+          9338
           -
-          10162
+          9342
         </td>
         <td>
           Literal
@@ -5186,15 +4291,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          207
         </td>
         <td>
-          97650
+          98828
         </td>
         <td>
-          10152
+          9332
           -
-          10154
+          9334
         </td>
         <td>
           Literal
@@ -5210,15 +4315,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          207
         </td>
         <td>
-          97653
+          98831
         </td>
         <td>
-          10130
+          9310
           -
-          10182
+          9362
         </td>
         <td>
           Apply
@@ -5234,15 +4339,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          207
         </td>
         <td>
-          97652
+          98830
         </td>
         <td>
-          10142
+          9322
           -
-          10182
+          9362
         </td>
         <td>
           TypeApply
@@ -5258,15 +4363,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          208
         </td>
         <td>
-          97655
+          98833
         </td>
         <td>
-          10209
+          9389
           -
-          10211
+          9391
         </td>
         <td>
           Literal
@@ -5282,15 +4387,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          208
         </td>
         <td>
-          97654
+          98832
         </td>
         <td>
-          10194
+          9374
           -
-          10195
+          9375
         </td>
         <td>
           Literal
@@ -5306,15 +4411,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          208
         </td>
         <td>
-          97657
+          98835
         </td>
         <td>
-          10199
+          9379
           -
-          10239
+          9419
         </td>
         <td>
           TypeApply
@@ -5330,15 +4435,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          208
         </td>
         <td>
-          97656
+          98834
         </td>
         <td>
-          10215
+          9395
           -
-          10219
+          9399
         </td>
         <td>
           Literal
@@ -5354,15 +4459,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          208
         </td>
         <td>
-          97658
+          98836
         </td>
         <td>
-          10187
+          9367
           -
-          10239
+          9419
         </td>
         <td>
           Apply
@@ -5378,15 +4483,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          209
         </td>
         <td>
-          97659
+          98837
         </td>
         <td>
-          10251
+          9431
           -
-          10252
+          9432
         </td>
         <td>
           Literal
@@ -5402,15 +4507,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          209
         </td>
         <td>
-          97661
+          98839
         </td>
         <td>
-          10272
+          9452
           -
-          10276
+          9456
         </td>
         <td>
           Literal
@@ -5426,15 +4531,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          209
         </td>
         <td>
-          97660
+          98838
         </td>
         <td>
-          10266
+          9446
           -
-          10268
+          9448
         </td>
         <td>
           Literal
@@ -5450,15 +4555,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          209
         </td>
         <td>
-          97663
+          98841
         </td>
         <td>
-          10244
+          9424
           -
-          10296
+          9476
         </td>
         <td>
           Apply
@@ -5474,15 +4579,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          209
         </td>
         <td>
-          97662
+          98840
         </td>
         <td>
-          10256
+          9436
           -
-          10296
+          9476
         </td>
         <td>
           TypeApply
@@ -5498,15 +4603,15 @@ else
         </td>
       </tr><tr>
         <td>
-          234
+          210
         </td>
         <td>
-          97665
+          98843
         </td>
         <td>
-          10323
+          9503
           -
-          10325
+          9505
         </td>
         <td>
           Literal
@@ -5522,15 +4627,15 @@ else
         </td>
       </tr><tr>
         <td>
-          234
+          210
         </td>
         <td>
-          97664
+          98842
         </td>
         <td>
-          10308
+          9488
           -
-          10309
+          9489
         </td>
         <td>
           Literal
@@ -5546,15 +4651,15 @@ else
         </td>
       </tr><tr>
         <td>
-          234
+          210
         </td>
         <td>
-          97667
+          98845
         </td>
         <td>
-          10313
+          9493
           -
-          10353
+          9533
         </td>
         <td>
           TypeApply
@@ -5570,15 +4675,15 @@ else
         </td>
       </tr><tr>
         <td>
-          234
+          210
         </td>
         <td>
-          97666
+          98844
         </td>
         <td>
-          10329
+          9509
           -
-          10333
+          9513
         </td>
         <td>
           Literal
@@ -5594,15 +4699,15 @@ else
         </td>
       </tr><tr>
         <td>
-          234
+          210
         </td>
         <td>
-          97668
+          98846
         </td>
         <td>
-          10301
+          9481
           -
-          10353
+          9533
         </td>
         <td>
           Apply
@@ -5618,15 +4723,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          211
         </td>
         <td>
-          97669
+          98847
         </td>
         <td>
-          10365
+          9545
           -
-          10366
+          9546
         </td>
         <td>
           Literal
@@ -5642,15 +4747,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          211
         </td>
         <td>
-          97671
+          98849
         </td>
         <td>
-          10386
+          9566
           -
-          10390
+          9570
         </td>
         <td>
           Literal
@@ -5666,15 +4771,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          211
         </td>
         <td>
-          97670
+          98848
         </td>
         <td>
-          10380
+          9560
           -
-          10382
+          9562
         </td>
         <td>
           Literal
@@ -5690,15 +4795,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          211
         </td>
         <td>
-          97673
+          98851
         </td>
         <td>
-          10358
+          9538
           -
-          10410
+          9590
         </td>
         <td>
           Apply
@@ -5714,15 +4819,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          211
         </td>
         <td>
-          97672
+          98850
         </td>
         <td>
-          10370
+          9550
           -
-          10410
+          9590
         </td>
         <td>
           TypeApply
@@ -5738,15 +4843,15 @@ else
         </td>
       </tr><tr>
         <td>
-          236
+          212
         </td>
         <td>
-          97675
+          98853
         </td>
         <td>
-          10437
+          9617
           -
-          10439
+          9619
         </td>
         <td>
           Literal
@@ -5762,15 +4867,15 @@ else
         </td>
       </tr><tr>
         <td>
-          236
+          212
         </td>
         <td>
-          97674
+          98852
         </td>
         <td>
-          10422
+          9602
           -
-          10423
+          9603
         </td>
         <td>
           Literal
@@ -5786,15 +4891,15 @@ else
         </td>
       </tr><tr>
         <td>
-          236
+          212
         </td>
         <td>
-          97677
+          98855
         </td>
         <td>
-          10427
+          9607
           -
-          10467
+          9647
         </td>
         <td>
           TypeApply
@@ -5810,15 +4915,15 @@ else
         </td>
       </tr><tr>
         <td>
-          236
+          212
         </td>
         <td>
-          97676
+          98854
         </td>
         <td>
-          10443
+          9623
           -
-          10447
+          9627
         </td>
         <td>
           Literal
@@ -5834,15 +4939,15 @@ else
         </td>
       </tr><tr>
         <td>
-          236
+          212
         </td>
         <td>
-          97678
+          98856
         </td>
         <td>
-          10415
+          9595
           -
-          10467
+          9647
         </td>
         <td>
           Apply
@@ -5858,15 +4963,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          213
         </td>
         <td>
-          97679
+          98857
         </td>
         <td>
-          10479
+          9659
           -
-          10480
+          9660
         </td>
         <td>
           Literal
@@ -5882,15 +4987,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          213
         </td>
         <td>
-          97681
+          98859
         </td>
         <td>
-          10500
+          9680
           -
-          10504
+          9684
         </td>
         <td>
           Literal
@@ -5906,15 +5011,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          213
         </td>
         <td>
-          97680
+          98858
         </td>
         <td>
-          10494
+          9674
           -
-          10495
+          9675
         </td>
         <td>
           Literal
@@ -5930,15 +5035,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          213
         </td>
         <td>
-          97683
+          98861
         </td>
         <td>
-          10472
+          9652
           -
-          10524
+          9704
         </td>
         <td>
           Apply
@@ -5954,15 +5059,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          213
         </td>
         <td>
-          97682
+          98860
         </td>
         <td>
-          10484
+          9664
           -
-          10524
+          9704
         </td>
         <td>
           TypeApply
@@ -5978,15 +5083,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          214
         </td>
         <td>
-          97685
+          98863
         </td>
         <td>
-          10549
+          9729
           -
-          10553
+          9733
         </td>
         <td>
           Literal
@@ -6002,15 +5107,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          214
         </td>
         <td>
-          97684
+          98862
         </td>
         <td>
-          10536
+          9716
           -
-          10537
+          9717
         </td>
         <td>
           Literal
@@ -6026,15 +5131,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          214
         </td>
         <td>
-          97687
+          98865
         </td>
         <td>
-          10529
+          9709
           -
-          10581
+          9761
         </td>
         <td>
           Apply
@@ -6050,15 +5155,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          214
         </td>
         <td>
-          97686
+          98864
         </td>
         <td>
-          10541
+          9721
           -
-          10581
+          9761
         </td>
         <td>
           TypeApply
@@ -6074,15 +5179,15 @@ else
         </td>
       </tr><tr>
         <td>
-          239
+          215
         </td>
         <td>
-          97688
+          98866
         </td>
         <td>
-          10586
+          9766
           -
-          10604
+          9784
         </td>
         <td>
           Apply
@@ -6098,15 +5203,15 @@ else
         </td>
       </tr><tr>
         <td>
-          244
+          220
         </td>
         <td>
-          97689
+          98867
         </td>
         <td>
-          10694
+          9874
           -
-          10718
+          9898
         </td>
         <td>
           Apply
@@ -6122,15 +5227,15 @@ else
         </td>
       </tr><tr>
         <td>
-          244
+          220
         </td>
         <td>
-          97691
+          98869
         </td>
         <td>
-          10693
+          9873
           -
-          10727
+          9907
         </td>
         <td>
           Apply
@@ -6146,15 +5251,15 @@ else
         </td>
       </tr><tr>
         <td>
-          244
+          220
         </td>
         <td>
-          97690
+          98868
         </td>
         <td>
-          10720
+          9900
           -
-          10726
+          9906
         </td>
         <td>
           Apply
@@ -6170,15 +5275,15 @@ else
         </td>
       </tr><tr>
         <td>
-          251
+          227
         </td>
         <td>
-          97692
+          98870
         </td>
         <td>
-          11134
+          10314
           -
-          11136
+          10316
         </td>
         <td>
           Literal
@@ -6194,15 +5299,15 @@ else
         </td>
       </tr><tr>
         <td>
-          258
+          234
         </td>
         <td>
-          97714
+          98892
         </td>
         <td>
-          11403
+          10583
           -
-          12259
+          11439
         </td>
         <td>
           Apply
@@ -6242,15 +5347,15 @@ else
         </td>
       </tr><tr>
         <td>
-          262
+          238
         </td>
         <td>
-          97693
+          98871
         </td>
         <td>
-          11598
+          10778
           -
-          11606
+          10786
         </td>
         <td>
           Select
@@ -6266,15 +5371,15 @@ else
         </td>
       </tr><tr>
         <td>
-          262
+          238
         </td>
         <td>
-          97694
+          98872
         </td>
         <td>
-          11560
+          10740
           -
-          11611
+          10791
         </td>
         <td>
           Apply
@@ -6290,15 +5395,15 @@ else
         </td>
       </tr><tr>
         <td>
-          263
+          239
         </td>
         <td>
-          97695
+          98873
         </td>
         <td>
-          11622
+          10802
           -
-          11647
+          10827
         </td>
         <td>
           Apply
@@ -6314,15 +5419,15 @@ else
         </td>
       </tr><tr>
         <td>
-          266
+          242
         </td>
         <td>
-          97697
+          98875
         </td>
         <td>
-          11712
+          10892
           -
-          11726
+          10906
         </td>
         <td>
           Apply
@@ -6338,15 +5443,15 @@ else
         </td>
       </tr><tr>
         <td>
-          266
+          242
         </td>
         <td>
-          97696
+          98874
         </td>
         <td>
-          11700
+          10880
           -
-          11710
+          10890
         </td>
         <td>
           Apply
@@ -6362,15 +5467,15 @@ else
         </td>
       </tr><tr>
         <td>
-          266
+          242
         </td>
         <td>
-          97698
+          98876
         </td>
         <td>
-          11682
+          10862
           -
-          11727
+          10907
         </td>
         <td>
           Apply
@@ -6386,15 +5491,15 @@ else
         </td>
       </tr><tr>
         <td>
-          268
+          244
         </td>
         <td>
-          97699
+          98877
         </td>
         <td>
-          11765
+          10945
           -
-          11773
+          10953
         </td>
         <td>
           Select
@@ -6410,15 +5515,15 @@ else
         </td>
       </tr><tr>
         <td>
-          268
+          244
         </td>
         <td>
-          97700
+          98878
         </td>
         <td>
-          11737
+          10917
           -
-          11778
+          10958
         </td>
         <td>
           Apply
@@ -6434,15 +5539,15 @@ else
         </td>
       </tr><tr>
         <td>
-          270
+          246
         </td>
         <td>
-          97701
+          98879
         </td>
         <td>
-          11805
+          10985
           -
-          11817
+          10997
         </td>
         <td>
           Apply
@@ -6458,15 +5563,15 @@ else
         </td>
       </tr><tr>
         <td>
-          270
+          246
         </td>
         <td>
-          97703
+          98881
         </td>
         <td>
-          11821
+          11001
           -
-          11838
+          11018
         </td>
         <td>
           Block
@@ -6482,15 +5587,15 @@ else
         </td>
       </tr><tr>
         <td>
-          270
+          246
         </td>
         <td>
-          97702
+          98880
         </td>
         <td>
-          11821
+          11001
           -
-          11838
+          11018
         </td>
         <td>
           Apply
@@ -6506,15 +5611,15 @@ else
         </td>
       </tr><tr>
         <td>
-          271
+          247
         </td>
         <td>
-          97705
+          98883
         </td>
         <td>
-          11864
+          11044
           -
-          11895
+          11075
         </td>
         <td>
           Apply
@@ -6530,15 +5635,15 @@ else
         </td>
       </tr><tr>
         <td>
-          271
+          247
         </td>
         <td>
-          97704
+          98882
         </td>
         <td>
-          11882
+          11062
           -
-          11894
+          11074
         </td>
         <td>
           Apply
@@ -6554,15 +5659,15 @@ else
         </td>
       </tr><tr>
         <td>
-          271
+          247
         </td>
         <td>
-          97706
+          98884
         </td>
         <td>
-          11864
+          11044
           -
-          11905
+          11085
         </td>
         <td>
           Block
@@ -6581,15 +5686,15 @@ else
         </td>
       </tr><tr>
         <td>
-          271
+          247
         </td>
         <td>
-          97709
+          98887
         </td>
         <td>
-          11858
+          11038
           -
-          12144
+          11324
         </td>
         <td>
           Try
@@ -6616,15 +5721,15 @@ else
         </td>
       </tr><tr>
         <td>
-          272
+          248
         </td>
         <td>
-          97708
+          98886
         </td>
         <td>
-          11945
+          11125
           -
-          12132
+          11312
         </td>
         <td>
           Block
@@ -6646,15 +5751,15 @@ else
         </td>
       </tr><tr>
         <td>
-          275
+          251
         </td>
         <td>
-          97707
+          98885
         </td>
         <td>
-          12115
+          11295
           -
-          12132
+          11312
         </td>
         <td>
           Apply
@@ -6670,15 +5775,15 @@ else
         </td>
       </tr><tr>
         <td>
-          278
+          254
         </td>
         <td>
-          97711
+          98889
         </td>
         <td>
-          12163
+          11343
           -
-          12199
+          11379
         </td>
         <td>
           Apply
@@ -6694,15 +5799,15 @@ else
         </td>
       </tr><tr>
         <td>
-          278
+          254
         </td>
         <td>
-          97710
+          98888
         </td>
         <td>
-          12178
+          11358
           -
-          12190
+          11370
         </td>
         <td>
           Apply
@@ -6718,15 +5823,15 @@ else
         </td>
       </tr><tr>
         <td>
-          280
+          256
         </td>
         <td>
-          97713
+          98891
         </td>
         <td>
-          12209
+          11389
           -
-          12251
+          11431
         </td>
         <td>
           Apply
@@ -6742,15 +5847,15 @@ else
         </td>
       </tr><tr>
         <td>
-          280
+          256
         </td>
         <td>
-          97712
+          98890
         </td>
         <td>
-          12238
+          11418
           -
-          12246
+          11426
         </td>
         <td>
           Select
@@ -6766,15 +5871,15 @@ else
         </td>
       </tr><tr>
         <td>
-          292
+          268
         </td>
         <td>
-          97716
+          98894
         </td>
         <td>
-          12518
+          11698
           -
-          12521
+          11701
         </td>
         <td>
           Apply
@@ -6790,15 +5895,15 @@ else
         </td>
       </tr><tr>
         <td>
-          293
+          269
         </td>
         <td>
-          97715
+          98893
         </td>
         <td>
-          12624
+          11804
           -
-          12653
+          11833
         </td>
         <td>
           Select
@@ -6814,15 +5919,15 @@ else
         </td>
       </tr><tr>
         <td>
-          303
+          279
         </td>
         <td>
-          97717
+          98895
         </td>
         <td>
-          12887
+          12067
           -
-          12925
+          12105
         </td>
         <td>
           Apply
@@ -6838,15 +5943,15 @@ else
         </td>
       </tr><tr>
         <td>
-          304
+          280
         </td>
         <td>
-          97719
+          98897
         </td>
         <td>
-          12957
+          12137
           -
-          12958
+          12138
         </td>
         <td>
           Literal
@@ -6862,15 +5967,15 @@ else
         </td>
       </tr><tr>
         <td>
-          304
+          280
         </td>
         <td>
-          97718
+          98896
         </td>
         <td>
-          12936
+          12116
           -
-          12953
+          12133
         </td>
         <td>
           Apply
@@ -6886,15 +5991,15 @@ else
         </td>
       </tr><tr>
         <td>
-          304
+          280
         </td>
         <td>
-          97720
+          98898
         </td>
         <td>
-          12957
+          12137
           -
-          12958
+          12138
         </td>
         <td>
           Block
@@ -6910,15 +6015,15 @@ else
         </td>
       </tr><tr>
         <td>
-          304
+          280
         </td>
         <td>
-          97724
+          98902
         </td>
         <td>
-          12966
+          12146
           -
-          13120
+          12300
         </td>
         <td>
           Block
@@ -6938,15 +6043,15 @@ else
         </td>
       </tr><tr>
         <td>
-          305
+          281
         </td>
         <td>
-          97721
+          98899
         </td>
         <td>
-          12990
+          12170
           -
-          13002
+          12182
         </td>
         <td>
           Apply
@@ -6962,15 +6067,15 @@ else
         </td>
       </tr><tr>
         <td>
-          306
+          282
         </td>
         <td>
-          97722
+          98900
         </td>
         <td>
-          13011
+          12191
           -
-          13040
+          12220
         </td>
         <td>
           Apply
@@ -6986,15 +6091,15 @@ else
         </td>
       </tr><tr>
         <td>
-          307
+          283
         </td>
         <td>
-          97723
+          98901
         </td>
         <td>
-          13049
+          12229
           -
-          13112
+          12292
         </td>
         <td>
           Apply
@@ -7010,15 +6115,15 @@ else
         </td>
       </tr><tr>
         <td>
-          312
+          288
         </td>
         <td>
-          97725
+          98903
         </td>
         <td>
-          13229
+          12409
           -
-          13252
+          12432
         </td>
         <td>
           Select
@@ -7034,15 +6139,15 @@ else
         </td>
       </tr><tr>
         <td>
-          312
+          288
         </td>
         <td>
-          97726
+          98904
         </td>
         <td>
-          13217
+          12397
           -
-          13253
+          12433
         </td>
         <td>
           Apply
@@ -7058,15 +6163,15 @@ else
         </td>
       </tr><tr>
         <td>
-          313
+          289
         </td>
         <td>
-          97727
+          98905
         </td>
         <td>
-          13288
+          12468
           -
-          13289
+          12469
         </td>
         <td>
           Ident
@@ -7082,15 +6187,15 @@ else
         </td>
       </tr><tr>
         <td>
-          314
+          290
         </td>
         <td>
-          97729
+          98907
         </td>
         <td>
-          13308
+          12488
           -
-          13396
+          12576
         </td>
         <td>
           Block
@@ -7106,15 +6211,15 @@ else
         </td>
       </tr><tr>
         <td>
-          314
+          290
         </td>
         <td>
-          97728
+          98906
         </td>
         <td>
-          13308
+          12488
           -
-          13396
+          12576
         </td>
         <td>
           Throw
@@ -7130,15 +6235,15 @@ else
         </td>
       </tr><tr>
         <td>
-          316
+          292
         </td>
         <td>
-          97730
+          98908
         </td>
         <td>
-          13425
+          12605
           -
-          13476
+          12656
         </td>
         <td>
           Select
@@ -7154,15 +6259,15 @@ else
         </td>
       </tr><tr>
         <td>
-          317
+          293
         </td>
         <td>
-          97731
+          98909
         </td>
         <td>
-          13518
+          12698
           -
-          13557
+          12737
         </td>
         <td>
           Apply
@@ -7178,15 +6283,15 @@ else
         </td>
       </tr><tr>
         <td>
-          317
+          293
         </td>
         <td>
-          97733
+          98911
         </td>
         <td>
-          13483
+          12663
           -
-          13567
+          12747
         </td>
         <td>
           Apply
@@ -7202,15 +6307,15 @@ else
         </td>
       </tr><tr>
         <td>
-          317
+          293
         </td>
         <td>
-          97732
+          98910
         </td>
         <td>
-          13496
+          12676
           -
-          13567
+          12747
         </td>
         <td>
           Apply
@@ -7226,15 +6331,15 @@ else
         </td>
       </tr><tr>
         <td>
-          320
+          296
         </td>
         <td>
-          97734
+          98912
         </td>
         <td>
-          13608
+          12788
           -
-          13610
+          12790
         </td>
         <td>
           Literal
