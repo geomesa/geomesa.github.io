@@ -39,229 +39,231 @@
 </span>15 <span style=''>import org.geotools.data._
 </span>16 <span style=''>import org.locationtech.geomesa.convert.EvaluationContext
 </span>17 <span style=''>import org.locationtech.geomesa.convert2.SimpleFeatureConverter
-</span>18 <span style=''>import org.locationtech.geomesa.jobs.JobResult.{JobFailure, JobSuccess}
-</span>19 <span style=''>import org.locationtech.geomesa.jobs._
-</span>20 <span style=''>import org.locationtech.geomesa.tools.Command
-</span>21 <span style=''>import org.locationtech.geomesa.tools.ingest.IngestCommand.{IngestCounters, Inputs}
-</span>22 <span style=''>import org.locationtech.geomesa.tools.ingest.LocalConverterIngest.DataStoreWriter
-</span>23 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
-</span>24 <span style=''>import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
-</span>25 <span style=''>import org.locationtech.geomesa.utils.geotools.FeatureUtils
-</span>26 <span style=''>import org.locationtech.geomesa.utils.io.fs.FileSystemDelegate.FileHandle
-</span>27 <span style=''>import org.locationtech.geomesa.utils.io.{CloseQuietly, CloseWithLogging, CloseablePool, WithClose}
-</span>28 <span style=''>import org.locationtech.geomesa.utils.text.TextTools
-</span>29 <span style=''>
-</span>30 <span style=''>import java.io.Flushable
-</span>31 <span style=''>import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
-</span>32 <span style=''>import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Executors}
-</span>33 <span style=''>import scala.util.control.NonFatal
-</span>34 <span style=''>
-</span>35 <span style=''>/**
-</span>36 <span style=''> * Ingestion that uses geomesa converters to process input files
-</span>37 <span style=''> *
-</span>38 <span style=''> * @param ds data store
-</span>39 <span style=''> * @param sft simple feature type
-</span>40 <span style=''> * @param converterConfig converter definition
-</span>41 <span style=''> * @param inputs paths to ingest
-</span>42 <span style=''> * @param numThreads how many threads to use
-</span>43 <span style=''> */
-</span>44 <span style=''>class LocalConverterIngest(
-</span>45 <span style=''>    ds: DataStore,
-</span>46 <span style=''>    dsParams: java.util.Map[String, _],
-</span>47 <span style=''>    sft: SimpleFeatureType,
-</span>48 <span style=''>    converterConfig: Config,
-</span>49 <span style=''>    inputs: Inputs,
-</span>50 <span style=''>    numThreads: Int
-</span>51 <span style=''>  ) extends Awaitable with LazyLogging {
-</span>52 <span style=''>
-</span>53 <span style=''>  private val files = inputs.handles
-</span>54 <span style=''>  private val latch = </span><span style='background: #AEF1AE'>new CountDownLatch(files.length)</span><span style=''>
-</span>55 <span style=''>
-</span>56 <span style=''>  private val threads = if (</span><span style='background: #AEF1AE'>numThreads &lt;= files.length</span><span style=''>) { </span><span style='background: #AEF1AE'>numThreads</span><span style=''> } else </span><span style='background: #F0ADAD'>{
-</span>57 <span style=''></span><span style='background: #F0ADAD'>    Command.user.warn(&quot;Can't use more threads than there are input files - reducing thread count&quot;)
-</span>58 <span style=''></span><span style='background: #F0ADAD'>    files.length
-</span>59 <span style=''></span><span style='background: #F0ADAD'>  }</span><span style=''>
-</span>60 <span style=''>
-</span>61 <span style=''>  private val batch = </span><span style='background: #AEF1AE'>IngestCommand.LocalBatchSize.toInt.getOrElse {
-</span>62 <span style=''></span><span style='background: #AEF1AE'>    </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(
-</span>63 <span style=''></span><span style='background: #F0ADAD'>      s&quot;Invalid batch size for property ${IngestCommand.LocalBatchSize.property}: &quot; +
-</span>64 <span style=''></span><span style='background: #F0ADAD'>          IngestCommand.LocalBatchSize.get)</span><span style='background: #AEF1AE'>
-</span>65 <span style=''></span><span style='background: #AEF1AE'>  }</span><span style=''>
-</span>66 <span style=''>
-</span>67 <span style=''>  private val es = </span><span style='background: #AEF1AE'>Executors.newFixedThreadPool(threads)</span><span style=''>
-</span>68 <span style=''>
-</span>69 <span style=''>  // global counts shared among threads
-</span>70 <span style=''>  private val written = </span><span style='background: #AEF1AE'>new AtomicLong(0)</span><span style=''>
-</span>71 <span style=''>  private val failed = </span><span style='background: #AEF1AE'>new AtomicLong(0)</span><span style=''>
-</span>72 <span style=''>  private val errors = </span><span style='background: #AEF1AE'>new AtomicInteger(0)</span><span style=''>
-</span>73 <span style=''>
-</span>74 <span style=''>  private val bytesRead = </span><span style='background: #AEF1AE'>new AtomicLong(0L)</span><span style=''>
-</span>75 <span style=''>
-</span>76 <span style=''>  private val batches = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[FeatureWriter[SimpleFeatureType, SimpleFeature], AtomicInteger](threads)</span><span style=''>
-</span>77 <span style=''>
-</span>78 <span style=''>  // keep track of failure at a global level, keep line counts and success local
-</span>79 <span style=''>  private val globalFailures = </span><span style='background: #AEF1AE'>new</span><span style=''> com.codahale.metrics.Counter {
-</span>80 <span style=''>    override def inc(): Unit = </span><span style='background: #AEF1AE'>failed.incrementAndGet()</span><span style=''>
-</span>81 <span style=''>    override def inc(n: Long): Unit = </span><span style='background: #F0ADAD'>failed.addAndGet(n)</span><span style=''>
-</span>82 <span style=''>    override def dec(): Unit = </span><span style='background: #F0ADAD'>failed.decrementAndGet()</span><span style=''>
-</span>83 <span style=''>    override def dec(n: Long): Unit = </span><span style='background: #F0ADAD'>failed.addAndGet(-1 * n)</span><span style=''>
-</span>84 <span style=''>    override def getCount: Long = </span><span style='background: #F0ADAD'>failed.get()</span><span style=''>
-</span>85 <span style=''>  }
-</span>86 <span style=''>
-</span>87 <span style=''>  private val progress: () =&gt; Float =
-</span>88 <span style=''>    if (</span><span style='background: #AEF1AE'>inputs.stdin</span><span style=''>) {
-</span>89 <span style=''>      </span><span style='background: #AEF1AE'>() =&gt; .99f</span><span style=''> // we don't know how many bytes are actually available
-</span>90 <span style=''>    } else </span><span style='background: #AEF1AE'>{
-</span>91 <span style=''></span><span style='background: #AEF1AE'>      val length = files.map(_.length).sum.toFloat // only evaluate once
-</span>92 <span style=''></span><span style='background: #AEF1AE'>      () =&gt; bytesRead.get / length
-</span>93 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>94 <span style=''>
-</span>95 <span style=''>  Command.user.info(s&quot;Ingesting ${if (inputs.stdin) { &quot;from stdin&quot; } else { TextTools.getPlural(files.length, &quot;file&quot;) }} &quot; +
-</span>96 <span style=''>      s&quot;with ${TextTools.getPlural(threads, &quot;thread&quot;)}&quot;)
-</span>97 <span style=''>
-</span>98 <span style=''>  private val converters = </span><span style='background: #AEF1AE'>CloseablePool(SimpleFeatureConverter(sft, converterConfig), threads)</span><span style=''>
-</span>99 <span style=''>  private val writers = {
-</span>100 <span style=''>    def factory: FeatureWriter[SimpleFeatureType, SimpleFeature] =
-</span>101 <span style=''>      if (</span><span style='background: #AEF1AE'>threads &gt; 1 &amp;&amp; </span><span style='background: #F0ADAD'>ds.getClass.getSimpleName.equals(&quot;JDBCDataStore&quot;)</span><span style=''>) {
-</span>102 <span style=''>        // creates a new data store for each writer to avoid synchronized blocks in JDBCDataStore.
-</span>103 <span style=''>        // the synchronization is to allow for generated fids from the database.
-</span>104 <span style=''>        // generally, this shouldn't be an issue since we use provided fids,
-</span>105 <span style=''>        // but running with 1 thread  would restore the old behavior
-</span>106 <span style=''>        </span><span style='background: #F0ADAD'>new DataStoreWriter(dsParams, sft.getTypeName)</span><span style=''>
-</span>107 <span style=''>      } else {
-</span>108 <span style=''>        </span><span style='background: #AEF1AE'>ds.getFeatureWriterAppend(sft.getTypeName, Transaction.AUTO_COMMIT)</span><span style=''>
-</span>109 <span style=''>      }
-</span>110 <span style=''>    </span><span style='background: #AEF1AE'>CloseablePool(factory, threads)</span><span style=''>
-</span>111 <span style=''>  }
-</span>112 <span style=''>
-</span>113 <span style=''>  private val closer = </span><span style='background: #AEF1AE'>new</span><span style=''> Runnable() {
-</span>114 <span style=''>    override def run(): Unit = {
-</span>115 <span style=''>      </span><span style='background: #AEF1AE'>latch.await()</span><span style=''>
-</span>116 <span style=''>      </span><span style='background: #AEF1AE'>CloseWithLogging(converters)</span><span style=''>
-</span>117 <span style=''>      </span><span style='background: #AEF1AE'>CloseWithLogging(writers).foreach(_ =&gt; </span><span style='background: #F0ADAD'>errors.incrementAndGet()</span><span style='background: #AEF1AE'>)</span><span style=''>
-</span>118 <span style=''>    }
-</span>119 <span style=''>  }
-</span>120 <span style=''>
-</span>121 <span style=''>  private val futures = </span><span style='background: #AEF1AE'>files.map(f =&gt; es.submit(new LocalIngestWorker(f))) :+ CachedThreadPool.submit(closer)</span><span style=''>
-</span>122 <span style=''>
-</span>123 <span style=''>  </span><span style='background: #AEF1AE'>es.shutdown()</span><span style=''>
-</span>124 <span style=''>
-</span>125 <span style=''>  override def await(reporter: StatusCallback): JobResult = {
-</span>126 <span style=''>    while (</span><span style='background: #AEF1AE'>!es.isTerminated</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>127 <span style=''></span><span style='background: #AEF1AE'>      Thread.sleep(500)
-</span>128 <span style=''></span><span style='background: #AEF1AE'>      reporter(&quot;&quot;, progress(), counters, done = false)
-</span>129 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>130 <span style=''>    </span><span style='background: #AEF1AE'>reporter(&quot;&quot;, progress(), counters, done = true)</span><span style=''>
-</span>131 <span style=''>
-</span>132 <span style=''>    // Get all futures so that we can propagate the logging up to the top level for handling
-</span>133 <span style=''>    // in org.locationtech.geomesa.tools.Runner to catch missing dependencies
-</span>134 <span style=''>    </span><span style='background: #AEF1AE'>futures.foreach(_.get)</span><span style=''>
-</span>135 <span style=''>
-</span>136 <span style=''>    if (</span><span style='background: #AEF1AE'>errors.get &gt; 0</span><span style=''>) {
-</span>137 <span style=''>      </span><span style='background: #AEF1AE'>JobFailure(&quot;Some files caused errors, check logs for details&quot;)</span><span style=''>
-</span>138 <span style=''>    } else </span><span style='background: #AEF1AE'>{
-</span>139 <span style=''></span><span style='background: #AEF1AE'>      val message =
-</span>140 <span style=''></span><span style='background: #AEF1AE'>        if (inputs.stdin) { &quot;from stdin&quot; } else if (files.lengthCompare(1) == 0) { s&quot;for file ${files.head.path}&quot; } else { </span><span style='background: #F0ADAD'>&quot;&quot;</span><span style='background: #AEF1AE'> }
-</span>141 <span style=''></span><span style='background: #AEF1AE'>      JobSuccess(message, counters.toMap)
-</span>142 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>143 <span style=''>  }
-</span>144 <span style=''>
-</span>145 <span style=''>  /**
-</span>146 <span style=''>   * Hook to allow modification of the feature returned by the converter
-</span>147 <span style=''>   *
-</span>148 <span style=''>   * @param iter features
-</span>149 <span style=''>   * @return
-</span>150 <span style=''>   */
-</span>151 <span style=''>  protected def features(iter: CloseableIterator[SimpleFeature]): CloseableIterator[SimpleFeature] = iter
-</span>152 <span style=''>
-</span>153 <span style=''>  private def counters: Seq[(String, Long)] =
-</span>154 <span style=''>    </span><span style='background: #AEF1AE'>Seq((IngestCounters.Ingested, written.get()), (IngestCounters.Failed, failed.get()))</span><span style=''>
-</span>155 <span style=''>
-</span>156 <span style=''>  class LocalIngestWorker(file: FileHandle) extends Runnable {
-</span>157 <span style=''>    override def run(): Unit = {
-</span>158 <span style=''>      try {
-</span>159 <span style=''>        </span><span style='background: #AEF1AE'>converters.borrow { converter =&gt;
-</span>160 <span style=''></span><span style='background: #AEF1AE'>          WithClose(file.open) { streams =&gt;
-</span>161 <span style=''></span><span style='background: #AEF1AE'>            streams.foreach { case (name, is) =&gt;
-</span>162 <span style=''></span><span style='background: #AEF1AE'>              val params = EvaluationContext.inputFileParam(name.getOrElse(file.path))
-</span>163 <span style=''></span><span style='background: #AEF1AE'>              val success = converter.createEvaluationContext().success
-</span>164 <span style=''></span><span style='background: #AEF1AE'>              val ec = converter.createEvaluationContext(params, success, globalFailures)
-</span>165 <span style=''></span><span style='background: #AEF1AE'>              WithClose(LocalConverterIngest.this.features(converter.process(is, ec))) { features =&gt;
-</span>166 <span style=''></span><span style='background: #AEF1AE'>                writers.borrow { writer =&gt;
-</span>167 <span style=''></span><span style='background: #AEF1AE'>                  var count = batches.get(writer)
-</span>168 <span style=''></span><span style='background: #AEF1AE'>                  if (count == null) {
-</span>169 <span style=''></span><span style='background: #AEF1AE'>                    count = new AtomicInteger(0)
-</span>170 <span style=''></span><span style='background: #AEF1AE'>                    batches.put(writer, count)
-</span>171 <span style=''></span><span style='background: #AEF1AE'>                  }
-</span>172 <span style=''></span><span style='background: #AEF1AE'>                  features.foreach { sf =&gt;
-</span>173 <span style=''></span><span style='background: #AEF1AE'>                    try {
-</span>174 <span style=''></span><span style='background: #AEF1AE'>                      FeatureUtils.write(writer, sf)
-</span>175 <span style=''></span><span style='background: #AEF1AE'>                      written.incrementAndGet()
-</span>176 <span style=''></span><span style='background: #AEF1AE'>                      count.incrementAndGet()
-</span>177 <span style=''></span><span style='background: #AEF1AE'>                    } catch {
-</span>178 <span style=''></span><span style='background: #AEF1AE'>                      case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt;
-</span>179 <span style=''></span><span style='background: #F0ADAD'>                        logger.error(s&quot;Failed to write '${DataUtilities.encodeFeature(sf)}'&quot;, e)
-</span>180 <span style=''></span><span style='background: #F0ADAD'>                        failed.incrementAndGet()</span><span style='background: #AEF1AE'>
-</span>181 <span style=''></span><span style='background: #AEF1AE'>                    }
-</span>182 <span style=''></span><span style='background: #AEF1AE'>                    if (count.get % batch == 0) </span><span style='background: #F0ADAD'>{
-</span>183 <span style=''></span><span style='background: #F0ADAD'>                      count.set(0)
-</span>184 <span style=''></span><span style='background: #F0ADAD'>                      writer match {
-</span>185 <span style=''></span><span style='background: #F0ADAD'>                        case f: Flushable =&gt; f.flush()
-</span>186 <span style=''></span><span style='background: #F0ADAD'>                        case _ =&gt; // no-op
-</span>187 <span style=''></span><span style='background: #F0ADAD'>                      }
-</span>188 <span style=''></span><span style='background: #F0ADAD'>                    }</span><span style='background: #AEF1AE'>
-</span>189 <span style=''></span><span style='background: #AEF1AE'>                  }
-</span>190 <span style=''></span><span style='background: #AEF1AE'>                }
-</span>191 <span style=''></span><span style='background: #AEF1AE'>              }
-</span>192 <span style=''></span><span style='background: #AEF1AE'>            }
-</span>193 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>194 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
-</span>195 <span style=''>      } catch {
-</span>196 <span style=''>        case e @ (_: ClassNotFoundException | _: NoClassDefFoundError) =&gt;
-</span>197 <span style=''>          // Rethrow exception so it can be caught by getting the future of this runnable in the main thread
-</span>198 <span style=''>          // which will in turn cause the exception to be handled by org.locationtech.geomesa.tools.Runner
-</span>199 <span style=''>          // Likely all threads will fail if a dependency is missing so it will terminate quickly
-</span>200 <span style=''>          </span><span style='background: #F0ADAD'>throw e</span><span style=''>
-</span>201 <span style=''>
-</span>202 <span style=''>        case NonFatal(e) </span><span style='background: #AEF1AE'>=&gt;
-</span>203 <span style=''></span><span style='background: #AEF1AE'>          // Don't kill the entire program b/c this thread was bad! use outer try/catch
-</span>204 <span style=''></span><span style='background: #AEF1AE'>          val msg = s&quot;Fatal error running local ingest worker on ${file.path}&quot;
-</span>205 <span style=''></span><span style='background: #AEF1AE'>          Command.user.error(msg)
-</span>206 <span style=''></span><span style='background: #AEF1AE'>          logger.error(msg, e)
-</span>207 <span style=''></span><span style='background: #AEF1AE'>          errors.incrementAndGet()</span><span style=''>
-</span>208 <span style=''>      } finally </span><span style='background: #AEF1AE'>{
-</span>209 <span style=''></span><span style='background: #AEF1AE'>        latch.countDown()
-</span>210 <span style=''></span><span style='background: #AEF1AE'>        bytesRead.addAndGet(file.length)
-</span>211 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>212 <span style=''>    }
-</span>213 <span style=''>  }
-</span>214 <span style=''>}
-</span>215 <span style=''>
-</span>216 <span style=''>object LocalConverterIngest {
+</span>18 <span style=''>import org.locationtech.geomesa.index.utils.FeatureWriterHelper
+</span>19 <span style=''>import org.locationtech.geomesa.jobs.JobResult.{JobFailure, JobSuccess}
+</span>20 <span style=''>import org.locationtech.geomesa.jobs._
+</span>21 <span style=''>import org.locationtech.geomesa.tools.Command
+</span>22 <span style=''>import org.locationtech.geomesa.tools.ingest.IngestCommand.{IngestCounters, Inputs}
+</span>23 <span style=''>import org.locationtech.geomesa.tools.ingest.LocalConverterIngest.DataStoreWriter
+</span>24 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
+</span>25 <span style=''>import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+</span>26 <span style=''>import org.locationtech.geomesa.utils.geotools.FeatureUtils
+</span>27 <span style=''>import org.locationtech.geomesa.utils.io.fs.FileSystemDelegate.FileHandle
+</span>28 <span style=''>import org.locationtech.geomesa.utils.io.{CloseQuietly, CloseWithLogging, CloseablePool, WithClose}
+</span>29 <span style=''>import org.locationtech.geomesa.utils.text.TextTools
+</span>30 <span style=''>
+</span>31 <span style=''>import java.io.Flushable
+</span>32 <span style=''>import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
+</span>33 <span style=''>import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Executors}
+</span>34 <span style=''>import scala.util.control.NonFatal
+</span>35 <span style=''>
+</span>36 <span style=''>/**
+</span>37 <span style=''> * Ingestion that uses geomesa converters to process input files
+</span>38 <span style=''> *
+</span>39 <span style=''> * @param ds data store
+</span>40 <span style=''> * @param sft simple feature type
+</span>41 <span style=''> * @param converterConfig converter definition
+</span>42 <span style=''> * @param inputs paths to ingest
+</span>43 <span style=''> * @param numThreads how many threads to use
+</span>44 <span style=''> */
+</span>45 <span style=''>class LocalConverterIngest(
+</span>46 <span style=''>    ds: DataStore,
+</span>47 <span style=''>    dsParams: java.util.Map[String, _],
+</span>48 <span style=''>    sft: SimpleFeatureType,
+</span>49 <span style=''>    converterConfig: Config,
+</span>50 <span style=''>    inputs: Inputs,
+</span>51 <span style=''>    numThreads: Int
+</span>52 <span style=''>  ) extends Awaitable with LazyLogging {
+</span>53 <span style=''>
+</span>54 <span style=''>  private val files = inputs.handles
+</span>55 <span style=''>  private val latch = </span><span style='background: #AEF1AE'>new CountDownLatch(files.length)</span><span style=''>
+</span>56 <span style=''>
+</span>57 <span style=''>  private val threads = if (</span><span style='background: #AEF1AE'>numThreads &lt;= files.length</span><span style=''>) { </span><span style='background: #AEF1AE'>numThreads</span><span style=''> } else </span><span style='background: #F0ADAD'>{
+</span>58 <span style=''></span><span style='background: #F0ADAD'>    Command.user.warn(&quot;Can't use more threads than there are input files - reducing thread count&quot;)
+</span>59 <span style=''></span><span style='background: #F0ADAD'>    files.length
+</span>60 <span style=''></span><span style='background: #F0ADAD'>  }</span><span style=''>
+</span>61 <span style=''>
+</span>62 <span style=''>  private val batch = </span><span style='background: #AEF1AE'>IngestCommand.LocalBatchSize.toInt.getOrElse {
+</span>63 <span style=''></span><span style='background: #AEF1AE'>    </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(
+</span>64 <span style=''></span><span style='background: #F0ADAD'>      s&quot;Invalid batch size for property ${IngestCommand.LocalBatchSize.property}: &quot; +
+</span>65 <span style=''></span><span style='background: #F0ADAD'>          IngestCommand.LocalBatchSize.get)</span><span style='background: #AEF1AE'>
+</span>66 <span style=''></span><span style='background: #AEF1AE'>  }</span><span style=''>
+</span>67 <span style=''>
+</span>68 <span style=''>  private val es = </span><span style='background: #AEF1AE'>Executors.newFixedThreadPool(threads)</span><span style=''>
+</span>69 <span style=''>
+</span>70 <span style=''>  // global counts shared among threads
+</span>71 <span style=''>  private val written = </span><span style='background: #AEF1AE'>new AtomicLong(0)</span><span style=''>
+</span>72 <span style=''>  private val failed = </span><span style='background: #AEF1AE'>new AtomicLong(0)</span><span style=''>
+</span>73 <span style=''>  private val errors = </span><span style='background: #AEF1AE'>new AtomicInteger(0)</span><span style=''>
+</span>74 <span style=''>
+</span>75 <span style=''>  private val bytesRead = </span><span style='background: #AEF1AE'>new AtomicLong(0L)</span><span style=''>
+</span>76 <span style=''>
+</span>77 <span style=''>  private val batches = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[FeatureWriter[SimpleFeatureType, SimpleFeature], AtomicInteger](threads)</span><span style=''>
+</span>78 <span style=''>
+</span>79 <span style=''>  // keep track of failure at a global level, keep line counts and success local
+</span>80 <span style=''>  private val globalFailures = </span><span style='background: #AEF1AE'>new</span><span style=''> com.codahale.metrics.Counter {
+</span>81 <span style=''>    override def inc(): Unit = </span><span style='background: #AEF1AE'>failed.incrementAndGet()</span><span style=''>
+</span>82 <span style=''>    override def inc(n: Long): Unit = </span><span style='background: #F0ADAD'>failed.addAndGet(n)</span><span style=''>
+</span>83 <span style=''>    override def dec(): Unit = </span><span style='background: #F0ADAD'>failed.decrementAndGet()</span><span style=''>
+</span>84 <span style=''>    override def dec(n: Long): Unit = </span><span style='background: #F0ADAD'>failed.addAndGet(-1 * n)</span><span style=''>
+</span>85 <span style=''>    override def getCount: Long = </span><span style='background: #F0ADAD'>failed.get()</span><span style=''>
+</span>86 <span style=''>  }
+</span>87 <span style=''>
+</span>88 <span style=''>  private val progress: () =&gt; Float =
+</span>89 <span style=''>    if (</span><span style='background: #AEF1AE'>inputs.stdin</span><span style=''>) {
+</span>90 <span style=''>      </span><span style='background: #AEF1AE'>() =&gt; .99f</span><span style=''> // we don't know how many bytes are actually available
+</span>91 <span style=''>    } else </span><span style='background: #AEF1AE'>{
+</span>92 <span style=''></span><span style='background: #AEF1AE'>      val length = files.map(_.length).sum.toFloat // only evaluate once
+</span>93 <span style=''></span><span style='background: #AEF1AE'>      () =&gt; bytesRead.get / length
+</span>94 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>95 <span style=''>
+</span>96 <span style=''>  Command.user.info(s&quot;Ingesting ${if (inputs.stdin) { &quot;from stdin&quot; } else { TextTools.getPlural(files.length, &quot;file&quot;) }} &quot; +
+</span>97 <span style=''>      s&quot;with ${TextTools.getPlural(threads, &quot;thread&quot;)}&quot;)
+</span>98 <span style=''>
+</span>99 <span style=''>  private val converters = </span><span style='background: #AEF1AE'>CloseablePool(SimpleFeatureConverter(sft, converterConfig), threads)</span><span style=''>
+</span>100 <span style=''>  private val writers = {
+</span>101 <span style=''>    def factory: FeatureWriter[SimpleFeatureType, SimpleFeature] =
+</span>102 <span style=''>      if (</span><span style='background: #AEF1AE'>threads &gt; 1 &amp;&amp; </span><span style='background: #F0ADAD'>ds.getClass.getSimpleName.equals(&quot;JDBCDataStore&quot;)</span><span style=''>) {
+</span>103 <span style=''>        // creates a new data store for each writer to avoid synchronized blocks in JDBCDataStore.
+</span>104 <span style=''>        // the synchronization is to allow for generated fids from the database.
+</span>105 <span style=''>        // generally, this shouldn't be an issue since we use provided fids,
+</span>106 <span style=''>        // but running with 1 thread  would restore the old behavior
+</span>107 <span style=''>        </span><span style='background: #F0ADAD'>new DataStoreWriter(dsParams, sft.getTypeName)</span><span style=''>
+</span>108 <span style=''>      } else {
+</span>109 <span style=''>        </span><span style='background: #AEF1AE'>ds.getFeatureWriterAppend(sft.getTypeName, Transaction.AUTO_COMMIT)</span><span style=''>
+</span>110 <span style=''>      }
+</span>111 <span style=''>    </span><span style='background: #AEF1AE'>CloseablePool(factory, threads)</span><span style=''>
+</span>112 <span style=''>  }
+</span>113 <span style=''>
+</span>114 <span style=''>  private val closer = </span><span style='background: #AEF1AE'>new</span><span style=''> Runnable() {
+</span>115 <span style=''>    override def run(): Unit = {
+</span>116 <span style=''>      </span><span style='background: #AEF1AE'>latch.await()</span><span style=''>
+</span>117 <span style=''>      </span><span style='background: #AEF1AE'>CloseWithLogging(converters)</span><span style=''>
+</span>118 <span style=''>      </span><span style='background: #AEF1AE'>CloseWithLogging(writers).foreach(_ =&gt; </span><span style='background: #F0ADAD'>errors.incrementAndGet()</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>119 <span style=''>    }
+</span>120 <span style=''>  }
+</span>121 <span style=''>
+</span>122 <span style=''>  private val futures = </span><span style='background: #AEF1AE'>files.map(f =&gt; es.submit(new LocalIngestWorker(f))) :+ CachedThreadPool.submit(closer)</span><span style=''>
+</span>123 <span style=''>
+</span>124 <span style=''>  </span><span style='background: #AEF1AE'>es.shutdown()</span><span style=''>
+</span>125 <span style=''>
+</span>126 <span style=''>  override def await(reporter: StatusCallback): JobResult = {
+</span>127 <span style=''>    while (</span><span style='background: #AEF1AE'>!es.isTerminated</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>128 <span style=''></span><span style='background: #AEF1AE'>      Thread.sleep(500)
+</span>129 <span style=''></span><span style='background: #AEF1AE'>      reporter(&quot;&quot;, progress(), counters, done = false)
+</span>130 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>131 <span style=''>    </span><span style='background: #AEF1AE'>reporter(&quot;&quot;, progress(), counters, done = true)</span><span style=''>
+</span>132 <span style=''>
+</span>133 <span style=''>    // Get all futures so that we can propagate the logging up to the top level for handling
+</span>134 <span style=''>    // in org.locationtech.geomesa.tools.Runner to catch missing dependencies
+</span>135 <span style=''>    </span><span style='background: #AEF1AE'>futures.foreach(_.get)</span><span style=''>
+</span>136 <span style=''>
+</span>137 <span style=''>    if (</span><span style='background: #AEF1AE'>errors.get &gt; 0</span><span style=''>) {
+</span>138 <span style=''>      </span><span style='background: #AEF1AE'>JobFailure(&quot;Some files caused errors, check logs for details&quot;)</span><span style=''>
+</span>139 <span style=''>    } else </span><span style='background: #AEF1AE'>{
+</span>140 <span style=''></span><span style='background: #AEF1AE'>      val message =
+</span>141 <span style=''></span><span style='background: #AEF1AE'>        if (inputs.stdin) { &quot;from stdin&quot; } else if (files.lengthCompare(1) == 0) { s&quot;for file ${files.head.path}&quot; } else { </span><span style='background: #F0ADAD'>&quot;&quot;</span><span style='background: #AEF1AE'> }
+</span>142 <span style=''></span><span style='background: #AEF1AE'>      JobSuccess(message, counters.toMap)
+</span>143 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>144 <span style=''>  }
+</span>145 <span style=''>
+</span>146 <span style=''>  /**
+</span>147 <span style=''>   * Hook to allow modification of the feature returned by the converter
+</span>148 <span style=''>   *
+</span>149 <span style=''>   * @param iter features
+</span>150 <span style=''>   * @return
+</span>151 <span style=''>   */
+</span>152 <span style=''>  protected def features(iter: CloseableIterator[SimpleFeature]): CloseableIterator[SimpleFeature] = iter
+</span>153 <span style=''>
+</span>154 <span style=''>  private def counters: Seq[(String, Long)] =
+</span>155 <span style=''>    </span><span style='background: #AEF1AE'>Seq((IngestCounters.Ingested, written.get()), (IngestCounters.Failed, failed.get()))</span><span style=''>
+</span>156 <span style=''>
+</span>157 <span style=''>  class LocalIngestWorker(file: FileHandle) extends Runnable {
+</span>158 <span style=''>    override def run(): Unit = {
+</span>159 <span style=''>      try {
+</span>160 <span style=''>        </span><span style='background: #AEF1AE'>converters.borrow { converter =&gt;
+</span>161 <span style=''></span><span style='background: #AEF1AE'>          WithClose(file.open) { streams =&gt;
+</span>162 <span style=''></span><span style='background: #AEF1AE'>            streams.foreach { case (name, is) =&gt;
+</span>163 <span style=''></span><span style='background: #AEF1AE'>              val params = EvaluationContext.inputFileParam(name.getOrElse(file.path))
+</span>164 <span style=''></span><span style='background: #AEF1AE'>              val success = converter.createEvaluationContext().success
+</span>165 <span style=''></span><span style='background: #AEF1AE'>              val ec = converter.createEvaluationContext(params, success, globalFailures)
+</span>166 <span style=''></span><span style='background: #AEF1AE'>              WithClose(LocalConverterIngest.this.features(converter.process(is, ec))) { features =&gt;
+</span>167 <span style=''></span><span style='background: #AEF1AE'>                writers.borrow { writer =&gt;
+</span>168 <span style=''></span><span style='background: #AEF1AE'>                  var count = batches.get(writer)
+</span>169 <span style=''></span><span style='background: #AEF1AE'>                  if (count == null) {
+</span>170 <span style=''></span><span style='background: #AEF1AE'>                    count = new AtomicInteger(0)
+</span>171 <span style=''></span><span style='background: #AEF1AE'>                    batches.put(writer, count)
+</span>172 <span style=''></span><span style='background: #AEF1AE'>                  }
+</span>173 <span style=''></span><span style='background: #AEF1AE'>                  val helper = FeatureWriterHelper(writer)
+</span>174 <span style=''></span><span style='background: #AEF1AE'>                  features.foreach { sf =&gt;
+</span>175 <span style=''></span><span style='background: #AEF1AE'>                    try {
+</span>176 <span style=''></span><span style='background: #AEF1AE'>                      helper.write(sf)
+</span>177 <span style=''></span><span style='background: #AEF1AE'>                      written.incrementAndGet()
+</span>178 <span style=''></span><span style='background: #AEF1AE'>                      count.incrementAndGet()
+</span>179 <span style=''></span><span style='background: #AEF1AE'>                    } catch {
+</span>180 <span style=''></span><span style='background: #AEF1AE'>                      case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt;
+</span>181 <span style=''></span><span style='background: #F0ADAD'>                        logger.error(s&quot;Failed to write '${DataUtilities.encodeFeature(sf)}'&quot;, e)
+</span>182 <span style=''></span><span style='background: #F0ADAD'>                        failed.incrementAndGet()</span><span style='background: #AEF1AE'>
+</span>183 <span style=''></span><span style='background: #AEF1AE'>                    }
+</span>184 <span style=''></span><span style='background: #AEF1AE'>                    if (count.get % batch == 0) </span><span style='background: #F0ADAD'>{
+</span>185 <span style=''></span><span style='background: #F0ADAD'>                      count.set(0)
+</span>186 <span style=''></span><span style='background: #F0ADAD'>                      writer match {
+</span>187 <span style=''></span><span style='background: #F0ADAD'>                        case f: Flushable =&gt; f.flush()
+</span>188 <span style=''></span><span style='background: #F0ADAD'>                        case _ =&gt; // no-op
+</span>189 <span style=''></span><span style='background: #F0ADAD'>                      }
+</span>190 <span style=''></span><span style='background: #F0ADAD'>                    }</span><span style='background: #AEF1AE'>
+</span>191 <span style=''></span><span style='background: #AEF1AE'>                  }
+</span>192 <span style=''></span><span style='background: #AEF1AE'>                }
+</span>193 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>194 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>195 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>196 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>197 <span style=''>      } catch {
+</span>198 <span style=''>        case e @ (_: ClassNotFoundException | _: NoClassDefFoundError) =&gt;
+</span>199 <span style=''>          // Rethrow exception so it can be caught by getting the future of this runnable in the main thread
+</span>200 <span style=''>          // which will in turn cause the exception to be handled by org.locationtech.geomesa.tools.Runner
+</span>201 <span style=''>          // Likely all threads will fail if a dependency is missing so it will terminate quickly
+</span>202 <span style=''>          </span><span style='background: #F0ADAD'>throw e</span><span style=''>
+</span>203 <span style=''>
+</span>204 <span style=''>        case NonFatal(e) </span><span style='background: #AEF1AE'>=&gt;
+</span>205 <span style=''></span><span style='background: #AEF1AE'>          // Don't kill the entire program b/c this thread was bad! use outer try/catch
+</span>206 <span style=''></span><span style='background: #AEF1AE'>          val msg = s&quot;Fatal error running local ingest worker on ${file.path}&quot;
+</span>207 <span style=''></span><span style='background: #AEF1AE'>          Command.user.error(msg)
+</span>208 <span style=''></span><span style='background: #AEF1AE'>          logger.error(msg, e)
+</span>209 <span style=''></span><span style='background: #AEF1AE'>          errors.incrementAndGet()</span><span style=''>
+</span>210 <span style=''>      } finally </span><span style='background: #AEF1AE'>{
+</span>211 <span style=''></span><span style='background: #AEF1AE'>        latch.countDown()
+</span>212 <span style=''></span><span style='background: #AEF1AE'>        bytesRead.addAndGet(file.length)
+</span>213 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>214 <span style=''>    }
+</span>215 <span style=''>  }
+</span>216 <span style=''>}
 </span>217 <span style=''>
-</span>218 <span style=''>  class DataStoreWriter(connection: java.util.Map[String, _], typeName: String)
-</span>219 <span style=''>      extends FeatureWriter[SimpleFeatureType, SimpleFeature] {
-</span>220 <span style=''>
-</span>221 <span style=''>    private val ds = </span><span style='background: #F0ADAD'>DataStoreFinder.getDataStore(connection)</span><span style=''>
-</span>222 <span style=''>    private val writer = </span><span style='background: #F0ADAD'>ds.getFeatureWriterAppend(typeName, Transaction.AUTO_COMMIT)</span><span style=''>
-</span>223 <span style=''>
-</span>224 <span style=''>    override def getFeatureType: SimpleFeatureType = </span><span style='background: #F0ADAD'>writer.getFeatureType</span><span style=''>
-</span>225 <span style=''>    override def next(): SimpleFeature = </span><span style='background: #F0ADAD'>writer.next()</span><span style=''>
-</span>226 <span style=''>    override def remove(): Unit = </span><span style='background: #F0ADAD'>writer.remove()</span><span style=''>
-</span>227 <span style=''>    override def write(): Unit = </span><span style='background: #F0ADAD'>writer.write()</span><span style=''>
-</span>228 <span style=''>    override def hasNext: Boolean = </span><span style='background: #F0ADAD'>writer.hasNext</span><span style=''>
-</span>229 <span style=''>    override def close(): Unit = {
-</span>230 <span style=''>      var err: Throwable = </span><span style='background: #F0ADAD'>null</span><span style=''>
-</span>231 <span style=''>      </span><span style='background: #F0ADAD'>CloseQuietly(writer).foreach(err = _)</span><span style=''>
-</span>232 <span style=''>      </span><span style='background: #F0ADAD'>CloseQuietly(ds).foreach { e =&gt;
-</span>233 <span style=''></span><span style='background: #F0ADAD'>        if (err == null) { err = e } else { err.addSuppressed(e) }
-</span>234 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
-</span>235 <span style=''>      if (</span><span style='background: #F0ADAD'>err != null</span><span style=''>) {
-</span>236 <span style=''>        </span><span style='background: #F0ADAD'>throw err</span><span style=''>
-</span>237 <span style=''>      }
-</span>238 <span style=''>    }
-</span>239 <span style=''>  }
-</span>240 <span style=''>}
+</span>218 <span style=''>object LocalConverterIngest {
+</span>219 <span style=''>
+</span>220 <span style=''>  class DataStoreWriter(connection: java.util.Map[String, _], typeName: String)
+</span>221 <span style=''>      extends FeatureWriter[SimpleFeatureType, SimpleFeature] {
+</span>222 <span style=''>
+</span>223 <span style=''>    private val ds = </span><span style='background: #F0ADAD'>DataStoreFinder.getDataStore(connection)</span><span style=''>
+</span>224 <span style=''>    private val writer = </span><span style='background: #F0ADAD'>ds.getFeatureWriterAppend(typeName, Transaction.AUTO_COMMIT)</span><span style=''>
+</span>225 <span style=''>
+</span>226 <span style=''>    override def getFeatureType: SimpleFeatureType = </span><span style='background: #F0ADAD'>writer.getFeatureType</span><span style=''>
+</span>227 <span style=''>    override def next(): SimpleFeature = </span><span style='background: #F0ADAD'>writer.next()</span><span style=''>
+</span>228 <span style=''>    override def remove(): Unit = </span><span style='background: #F0ADAD'>writer.remove()</span><span style=''>
+</span>229 <span style=''>    override def write(): Unit = </span><span style='background: #F0ADAD'>writer.write()</span><span style=''>
+</span>230 <span style=''>    override def hasNext: Boolean = </span><span style='background: #F0ADAD'>writer.hasNext</span><span style=''>
+</span>231 <span style=''>    override def close(): Unit = {
+</span>232 <span style=''>      var err: Throwable = </span><span style='background: #F0ADAD'>null</span><span style=''>
+</span>233 <span style=''>      </span><span style='background: #F0ADAD'>CloseQuietly(writer).foreach(err = _)</span><span style=''>
+</span>234 <span style=''>      </span><span style='background: #F0ADAD'>CloseQuietly(ds).foreach { e =&gt;
+</span>235 <span style=''></span><span style='background: #F0ADAD'>        if (err == null) { err = e } else { err.addSuppressed(e) }
+</span>236 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
+</span>237 <span style=''>      if (</span><span style='background: #F0ADAD'>err != null</span><span style=''>) {
+</span>238 <span style=''>        </span><span style='background: #F0ADAD'>throw err</span><span style=''>
+</span>239 <span style=''>      }
+</span>240 <span style=''>    }
+</span>241 <span style=''>  }
+</span>242 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -276,15 +278,15 @@
         <th>Code</th>
       </tr><tr>
         <td>
-          54
+          55
         </td>
         <td>
           2440
         </td>
         <td>
-          2360
+          2424
           -
-          2372
+          2436
         </td>
         <td>
           Select
@@ -300,15 +302,15 @@
         </td>
       </tr><tr>
         <td>
-          54
+          55
         </td>
         <td>
           2441
         </td>
         <td>
-          2341
+          2405
           -
-          2373
+          2437
         </td>
         <td>
           Apply
@@ -324,15 +326,15 @@
         </td>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
           2442
         </td>
         <td>
-          2417
+          2481
           -
-          2429
+          2493
         </td>
         <td>
           Select
@@ -348,15 +350,15 @@
         </td>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
           2443
         </td>
         <td>
-          2403
+          2467
           -
-          2429
+          2493
         </td>
         <td>
           Apply
@@ -372,15 +374,15 @@
         </td>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
           2444
         </td>
         <td>
-          2433
+          2497
           -
-          2443
+          2507
         </td>
         <td>
           Select
@@ -396,15 +398,15 @@
         </td>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
           2445
         </td>
         <td>
-          2433
+          2497
           -
-          2443
+          2507
         </td>
         <td>
           Block
@@ -420,15 +422,15 @@
         </td>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
           2447
         </td>
         <td>
-          2451
+          2515
           -
-          2572
+          2636
         </td>
         <td>
           Block
@@ -450,15 +452,15 @@
         </td>
       </tr><tr>
         <td>
-          58
+          59
         </td>
         <td>
           2446
         </td>
         <td>
-          2556
+          2620
           -
-          2568
+          2632
         </td>
         <td>
           Select
@@ -474,15 +476,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           2449
         </td>
         <td>
-          2596
+          2660
           -
-          2816
+          2880
         </td>
         <td>
           Apply
@@ -498,15 +500,15 @@
         </td>
       </tr><tr>
         <td>
-          62
+          63
         </td>
         <td>
           2448
         </td>
         <td>
-          2647
+          2711
           -
-          2812
+          2876
         </td>
         <td>
           Throw
@@ -522,15 +524,15 @@
         </td>
       </tr><tr>
         <td>
-          67
+          68
         </td>
         <td>
           2450
         </td>
         <td>
-          2866
+          2930
           -
-          2873
+          2937
         </td>
         <td>
           Select
@@ -546,15 +548,15 @@
         </td>
       </tr><tr>
         <td>
-          67
+          68
         </td>
         <td>
           2451
         </td>
         <td>
-          2837
+          2901
           -
-          2874
+          2938
         </td>
         <td>
           Apply
@@ -570,39 +572,15 @@
         </td>
       </tr><tr>
         <td>
-          70
+          71
         </td>
         <td>
           2452
         </td>
         <td>
-          2940
+          3004
           -
-          2957
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.concurrent.atomic.AtomicLong.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new java.util.concurrent.atomic.AtomicLong(0L)
-        </td>
-      </tr><tr>
-        <td>
-          71
-        </td>
-        <td>
-          2453
-        </td>
-        <td>
-          2981
-          -
-          2998
+          3021
         </td>
         <td>
           Apply
@@ -621,36 +599,12 @@
           72
         </td>
         <td>
-          2454
+          2453
         </td>
         <td>
-          3022
+          3045
           -
-          3042
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.concurrent.atomic.AtomicInteger.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new java.util.concurrent.atomic.AtomicInteger(0)
-        </td>
-      </tr><tr>
-        <td>
-          74
-        </td>
-        <td>
-          2455
-        </td>
-        <td>
-          3070
-          -
-          3088
+          3062
         </td>
         <td>
           Apply
@@ -666,15 +620,63 @@
         </td>
       </tr><tr>
         <td>
-          76
+          73
+        </td>
+        <td>
+          2454
+        </td>
+        <td>
+          3086
+          -
+          3106
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicInteger.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicInteger(0)
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          2455
+        </td>
+        <td>
+          3134
+          -
+          3152
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicLong(0L)
+        </td>
+      </tr><tr>
+        <td>
+          77
         </td>
         <td>
           2456
         </td>
         <td>
-          3200
+          3264
           -
-          3207
+          3271
         </td>
         <td>
           Select
@@ -690,15 +692,15 @@
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
           2457
         </td>
         <td>
-          3114
+          3178
           -
-          3208
+          3272
         </td>
         <td>
           Apply
@@ -714,15 +716,15 @@
         </td>
       </tr><tr>
         <td>
-          79
+          80
         </td>
         <td>
           2468
         </td>
         <td>
-          3322
+          3386
           -
-          3325
+          3389
         </td>
         <td>
           Apply
@@ -738,15 +740,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          81
         </td>
         <td>
           2458
         </td>
         <td>
-          3388
+          3452
           -
-          3412
+          3476
         </td>
         <td>
           Apply
@@ -762,15 +764,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          81
         </td>
         <td>
           2459
         </td>
         <td>
-          3410
+          3474
           -
-          3410
+          3474
         </td>
         <td>
           Literal
@@ -786,15 +788,15 @@
         </td>
       </tr><tr>
         <td>
-          81
+          82
         </td>
         <td>
           2460
         </td>
         <td>
-          3451
+          3515
           -
-          3470
+          3534
         </td>
         <td>
           Apply
@@ -810,15 +812,15 @@
         </td>
       </tr><tr>
         <td>
-          81
+          82
         </td>
         <td>
           2461
         </td>
         <td>
-          3467
+          3531
           -
-          3467
+          3531
         </td>
         <td>
           Literal
@@ -834,15 +836,15 @@
         </td>
       </tr><tr>
         <td>
-          82
+          83
         </td>
         <td>
           2462
         </td>
         <td>
-          3502
+          3566
           -
-          3526
+          3590
         </td>
         <td>
           Apply
@@ -858,87 +860,15 @@
         </td>
       </tr><tr>
         <td>
-          82
+          83
         </td>
         <td>
           2463
         </td>
         <td>
-          3524
-          -
-          3524
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          83
-        </td>
-        <td>
-          2464
-        </td>
-        <td>
-          3582
+          3588
           -
           3588
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Int.*
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          -1.*(n)
-        </td>
-      </tr><tr>
-        <td>
-          83
-        </td>
-        <td>
-          2465
-        </td>
-        <td>
-          3565
-          -
-          3589
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.concurrent.atomic.AtomicLong.addAndGet
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          LocalConverterIngest.this.failed.addAndGet(-1.*(n))
-        </td>
-      </tr><tr>
-        <td>
-          83
-        </td>
-        <td>
-          2466
-        </td>
-        <td>
-          3581
-          -
-          3581
         </td>
         <td>
           Literal
@@ -957,12 +887,84 @@
           84
         </td>
         <td>
+          2464
+        </td>
+        <td>
+          3646
+          -
+          3652
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.*
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          -1.*(n)
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          2465
+        </td>
+        <td>
+          3629
+          -
+          3653
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.addAndGet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          LocalConverterIngest.this.failed.addAndGet(-1.*(n))
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          2466
+        </td>
+        <td>
+          3645
+          -
+          3645
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
           2467
         </td>
         <td>
-          3624
+          3688
           -
-          3636
+          3700
         </td>
         <td>
           Apply
@@ -978,15 +980,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          89
         </td>
         <td>
           2469
         </td>
         <td>
-          3688
+          3752
           -
-          3700
+          3764
         </td>
         <td>
           Select
@@ -1002,15 +1004,15 @@
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           2470
         </td>
         <td>
-          3716
+          3780
           -
-          3720
+          3784
         </td>
         <td>
           Literal
@@ -1026,15 +1028,15 @@
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           2471
         </td>
         <td>
-          3710
+          3774
           -
-          3720
+          3784
         </td>
         <td>
           Function
@@ -1050,15 +1052,15 @@
         </td>
       </tr><tr>
         <td>
-          90
+          91
         </td>
         <td>
           2477
         </td>
         <td>
-          3787
+          3851
           -
-          3902
+          3966
         </td>
         <td>
           Block
@@ -1077,15 +1079,15 @@
         </td>
       </tr><tr>
         <td>
-          91
+          92
         </td>
         <td>
           2472
         </td>
         <td>
-          3818
+          3882
           -
-          3826
+          3890
         </td>
         <td>
           Select
@@ -1101,15 +1103,15 @@
         </td>
       </tr><tr>
         <td>
-          91
+          92
         </td>
         <td>
           2473
         </td>
         <td>
-          3817
+          3881
           -
-          3817
+          3881
         </td>
         <td>
           TypeApply
@@ -1125,15 +1127,15 @@
         </td>
       </tr><tr>
         <td>
-          91
+          92
         </td>
         <td>
           2474
         </td>
         <td>
-          3828
+          3892
           -
-          3828
+          3892
         </td>
         <td>
           Select
@@ -1149,15 +1151,15 @@
         </td>
       </tr><tr>
         <td>
-          91
+          92
         </td>
         <td>
           2475
         </td>
         <td>
-          3808
+          3872
           -
-          3839
+          3903
         </td>
         <td>
           Select
@@ -1173,15 +1175,15 @@
         </td>
       </tr><tr>
         <td>
-          92
+          93
         </td>
         <td>
           2476
         </td>
         <td>
-          3874
+          3938
           -
-          3896
+          3960
         </td>
         <td>
           Apply
@@ -1197,15 +1199,15 @@
         </td>
       </tr><tr>
         <td>
-          98
+          99
         </td>
         <td>
           2478
         </td>
         <td>
-          4151
+          4215
           -
-          4154
+          4218
         </td>
         <td>
           Select
@@ -1221,15 +1223,15 @@
         </td>
       </tr><tr>
         <td>
-          98
+          99
         </td>
         <td>
           2479
         </td>
         <td>
-          4156
+          4220
           -
-          4171
+          4235
         </td>
         <td>
           Select
@@ -1245,15 +1247,15 @@
         </td>
       </tr><tr>
         <td>
-          98
+          99
         </td>
         <td>
           2480
         </td>
         <td>
-          4128
+          4192
           -
-          4172
+          4236
         </td>
         <td>
           Apply
@@ -1269,15 +1271,15 @@
         </td>
       </tr><tr>
         <td>
-          98
+          99
         </td>
         <td>
           2481
         </td>
         <td>
-          4174
+          4238
           -
-          4181
+          4245
         </td>
         <td>
           Select
@@ -1293,15 +1295,15 @@
         </td>
       </tr><tr>
         <td>
-          98
+          99
         </td>
         <td>
           2482
         </td>
         <td>
-          4114
+          4178
           -
-          4182
+          4246
         </td>
         <td>
           Apply
@@ -1317,15 +1319,15 @@
         </td>
       </tr><tr>
         <td>
-          101
+          102
         </td>
         <td>
           2483
         </td>
         <td>
-          4296
+          4360
           -
-          4297
+          4361
         </td>
         <td>
           Literal
@@ -1341,15 +1343,15 @@
         </td>
       </tr><tr>
         <td>
-          101
+          102
         </td>
         <td>
           2484
         </td>
         <td>
-          4301
+          4365
           -
-          4350
+          4414
         </td>
         <td>
           Apply
@@ -1365,15 +1367,15 @@
         </td>
       </tr><tr>
         <td>
-          101
+          102
         </td>
         <td>
           2485
         </td>
         <td>
-          4286
-          -
           4350
+          -
+          4414
         </td>
         <td>
           Apply
@@ -1389,15 +1391,15 @@
         </td>
       </tr><tr>
         <td>
-          106
+          107
         </td>
         <td>
           2486
         </td>
         <td>
-          4708
+          4772
           -
-          4716
+          4780
         </td>
         <td>
           Select
@@ -1413,15 +1415,15 @@
         </td>
       </tr><tr>
         <td>
-          106
+          107
         </td>
         <td>
           2487
         </td>
         <td>
-          4718
+          4782
           -
-          4733
+          4797
         </td>
         <td>
           Apply
@@ -1437,15 +1439,15 @@
         </td>
       </tr><tr>
         <td>
-          106
+          107
         </td>
         <td>
           2488
         </td>
         <td>
-          4688
+          4752
           -
-          4734
+          4798
         </td>
         <td>
           Apply
@@ -1461,15 +1463,15 @@
         </td>
       </tr><tr>
         <td>
-          106
+          107
         </td>
         <td>
           2489
         </td>
         <td>
-          4688
+          4752
           -
-          4734
+          4798
         </td>
         <td>
           Block
@@ -1485,15 +1487,15 @@
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           2490
         </td>
         <td>
-          4784
+          4848
           -
-          4799
+          4863
         </td>
         <td>
           Apply
@@ -1509,15 +1511,15 @@
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           2491
         </td>
         <td>
-          4801
+          4865
           -
-          4824
+          4888
         </td>
         <td>
           Select
@@ -1533,15 +1535,15 @@
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           2492
         </td>
         <td>
-          4758
+          4822
           -
-          4825
+          4889
         </td>
         <td>
           Apply
@@ -1557,15 +1559,15 @@
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           2493
         </td>
         <td>
-          4758
+          4822
           -
-          4825
+          4889
         </td>
         <td>
           Block
@@ -1581,15 +1583,15 @@
         </td>
       </tr><tr>
         <td>
-          110
+          111
         </td>
         <td>
           2494
         </td>
         <td>
-          4861
+          4925
           -
-          4868
+          4932
         </td>
         <td>
           Select
@@ -1605,15 +1607,15 @@
         </td>
       </tr><tr>
         <td>
-          110
+          111
         </td>
         <td>
           2495
         </td>
         <td>
-          4838
+          4902
           -
-          4869
+          4933
         </td>
         <td>
           Apply
@@ -1629,15 +1631,15 @@
         </td>
       </tr><tr>
         <td>
-          113
+          114
         </td>
         <td>
           2504
         </td>
         <td>
-          4898
+          4962
           -
-          4901
+          4965
         </td>
         <td>
           Apply
@@ -1653,15 +1655,15 @@
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
           2496
         </td>
         <td>
-          4954
+          5018
           -
-          4967
+          5031
         </td>
         <td>
           Apply
@@ -1677,15 +1679,15 @@
         </td>
       </tr><tr>
         <td>
-          116
+          117
         </td>
         <td>
           2497
         </td>
         <td>
-          4991
+          5055
           -
-          5001
+          5065
         </td>
         <td>
           Select
@@ -1701,15 +1703,15 @@
         </td>
       </tr><tr>
         <td>
-          116
+          117
         </td>
         <td>
           2498
         </td>
         <td>
-          4990
+          5054
           -
-          4990
+          5054
         </td>
         <td>
           Select
@@ -1725,15 +1727,15 @@
         </td>
       </tr><tr>
         <td>
-          116
+          117
         </td>
         <td>
           2499
         </td>
         <td>
-          4974
+          5038
           -
-          5002
+          5066
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1749,15 +1751,15 @@
         </td>
       </tr><tr>
         <td>
-          117
+          118
         </td>
         <td>
           2500
         </td>
         <td>
-          5026
+          5090
           -
-          5033
+          5097
         </td>
         <td>
           Select
@@ -1773,15 +1775,15 @@
         </td>
       </tr><tr>
         <td>
-          117
+          118
         </td>
         <td>
           2501
         </td>
         <td>
-          5025
+          5089
           -
-          5025
+          5089
         </td>
         <td>
           Select
@@ -1797,15 +1799,15 @@
         </td>
       </tr><tr>
         <td>
-          117
+          118
         </td>
         <td>
           2502
         </td>
         <td>
-          5048
+          5112
           -
-          5072
+          5136
         </td>
         <td>
           Apply
@@ -1821,15 +1823,15 @@
         </td>
       </tr><tr>
         <td>
-          117
+          118
         </td>
         <td>
           2503
         </td>
         <td>
-          5009
-          -
           5073
+          -
+          5137
         </td>
         <td>
           Apply
@@ -1845,15 +1847,15 @@
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
           2505
         </td>
         <td>
-          5134
+          5198
           -
-          5158
+          5222
         </td>
         <td>
           Apply
@@ -1869,15 +1871,15 @@
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
           2506
         </td>
         <td>
-          5124
+          5188
           -
-          5159
+          5223
         </td>
         <td>
           Apply
@@ -1893,15 +1895,15 @@
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
           2507
         </td>
         <td>
-          5118
+          5182
           -
-          5118
+          5182
         </td>
         <td>
           TypeApply
@@ -1917,15 +1919,15 @@
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
           2508
         </td>
         <td>
-          5188
+          5252
           -
-          5194
+          5258
         </td>
         <td>
           Select
@@ -1941,15 +1943,15 @@
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
           2509
         </td>
         <td>
-          5164
+          5228
           -
-          5195
+          5259
         </td>
         <td>
           Apply
@@ -1965,15 +1967,15 @@
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
           2510
         </td>
         <td>
-          5161
+          5225
           -
-          5161
+          5225
         </td>
         <td>
           TypeApply
@@ -1989,15 +1991,15 @@
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
           2511
         </td>
         <td>
-          5109
+          5173
           -
-          5195
+          5259
         </td>
         <td>
           ApplyToImplicitArgs
@@ -2013,15 +2015,15 @@
         </td>
       </tr><tr>
         <td>
-          123
+          124
         </td>
         <td>
           2512
         </td>
         <td>
-          5199
+          5263
           -
-          5212
+          5276
         </td>
         <td>
           Apply
@@ -2037,15 +2039,15 @@
         </td>
       </tr><tr>
         <td>
-          126
+          127
         </td>
         <td>
           2513
         </td>
         <td>
-          5287
+          5351
           -
-          5303
+          5367
         </td>
         <td>
           Select
@@ -2061,15 +2063,15 @@
         </td>
       </tr><tr>
         <td>
-          126
+          127
         </td>
         <td>
           2520
         </td>
         <td>
-          5305
+          5369
           -
-          5305
+          5369
         </td>
         <td>
           Apply
@@ -2085,15 +2087,15 @@
         </td>
       </tr><tr>
         <td>
-          126
+          127
         </td>
         <td>
           2521
         </td>
         <td>
-          5305
+          5369
           -
-          5391
+          5455
         </td>
         <td>
           Block
@@ -2115,42 +2117,18 @@
         </td>
       </tr><tr>
         <td>
-          126
+          127
         </td>
         <td>
           2522
         </td>
         <td>
-          5280
+          5344
           -
-          5280
+          5344
         </td>
         <td>
           Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          126
-        </td>
-        <td>
-          2523
-        </td>
-        <td>
-          5280
-          -
-          5280
-        </td>
-        <td>
-          Block
         </td>
         <td>
           &lt;nosymbol&gt;
@@ -2166,12 +2144,36 @@
           127
         </td>
         <td>
+          2523
+        </td>
+        <td>
+          5344
+          -
+          5344
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
           2514
         </td>
         <td>
-          5313
+          5377
           -
-          5330
+          5394
         </td>
         <td>
           Apply
@@ -2187,15 +2189,15 @@
         </td>
       </tr><tr>
         <td>
-          128
+          129
         </td>
         <td>
           2515
         </td>
         <td>
-          5346
+          5410
           -
-          5348
+          5412
         </td>
         <td>
           Literal
@@ -2211,15 +2213,15 @@
         </td>
       </tr><tr>
         <td>
-          128
+          129
         </td>
         <td>
           2516
         </td>
         <td>
-          5350
+          5414
           -
-          5360
+          5424
         </td>
         <td>
           Apply
@@ -2235,15 +2237,15 @@
         </td>
       </tr><tr>
         <td>
-          128
+          129
         </td>
         <td>
           2517
         </td>
         <td>
-          5362
+          5426
           -
-          5370
+          5434
         </td>
         <td>
           Select
@@ -2259,15 +2261,15 @@
         </td>
       </tr><tr>
         <td>
-          128
+          129
         </td>
         <td>
           2518
         </td>
         <td>
-          5379
+          5443
           -
-          5384
+          5448
         </td>
         <td>
           Literal
@@ -2283,15 +2285,15 @@
         </td>
       </tr><tr>
         <td>
-          128
+          129
         </td>
         <td>
           2519
         </td>
         <td>
-          5337
+          5401
           -
-          5385
+          5449
         </td>
         <td>
           Apply
@@ -2307,15 +2309,15 @@
         </td>
       </tr><tr>
         <td>
-          130
+          131
         </td>
         <td>
           2524
         </td>
         <td>
-          5405
+          5469
           -
-          5407
+          5471
         </td>
         <td>
           Literal
@@ -2331,15 +2333,15 @@
         </td>
       </tr><tr>
         <td>
-          130
+          131
         </td>
         <td>
           2525
         </td>
         <td>
-          5409
+          5473
           -
-          5419
+          5483
         </td>
         <td>
           Apply
@@ -2355,15 +2357,15 @@
         </td>
       </tr><tr>
         <td>
-          130
+          131
         </td>
         <td>
           2526
         </td>
         <td>
-          5421
+          5485
           -
-          5429
+          5493
         </td>
         <td>
           Select
@@ -2379,15 +2381,15 @@
         </td>
       </tr><tr>
         <td>
-          130
+          131
         </td>
         <td>
           2527
         </td>
         <td>
-          5438
+          5502
           -
-          5442
+          5506
         </td>
         <td>
           Literal
@@ -2403,15 +2405,15 @@
         </td>
       </tr><tr>
         <td>
-          130
+          131
         </td>
         <td>
           2528
         </td>
         <td>
-          5396
+          5460
           -
-          5443
+          5507
         </td>
         <td>
           Apply
@@ -2427,15 +2429,15 @@
         </td>
       </tr><tr>
         <td>
-          134
+          135
         </td>
         <td>
           2529
         </td>
         <td>
-          5636
+          5700
           -
-          5641
+          5705
         </td>
         <td>
           Apply
@@ -2451,15 +2453,15 @@
         </td>
       </tr><tr>
         <td>
-          134
+          135
         </td>
         <td>
           2530
         </td>
         <td>
-          5620
+          5684
           -
-          5642
+          5706
         </td>
         <td>
           Apply
@@ -2475,15 +2477,15 @@
         </td>
       </tr><tr>
         <td>
-          136
+          137
         </td>
         <td>
           2531
         </td>
         <td>
-          5652
+          5716
           -
-          5666
+          5730
         </td>
         <td>
           Apply
@@ -2499,15 +2501,15 @@
         </td>
       </tr><tr>
         <td>
-          137
+          138
         </td>
         <td>
           2532
         </td>
         <td>
-          5676
+          5740
           -
-          5738
+          5802
         </td>
         <td>
           Apply
@@ -2523,15 +2525,15 @@
         </td>
       </tr><tr>
         <td>
-          137
+          138
         </td>
         <td>
           2533
         </td>
         <td>
-          5676
+          5740
           -
-          5738
+          5802
         </td>
         <td>
           Block
@@ -2547,15 +2549,15 @@
         </td>
       </tr><tr>
         <td>
-          138
+          139
         </td>
         <td>
           2549
         </td>
         <td>
-          5750
+          5814
           -
-          5947
+          6011
         </td>
         <td>
           Block
@@ -2580,15 +2582,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2534
         </td>
         <td>
-          5784
+          5848
           -
-          5796
+          5860
         </td>
         <td>
           Select
@@ -2604,15 +2606,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2535
         </td>
         <td>
-          5800
+          5864
           -
-          5812
+          5876
         </td>
         <td>
           Literal
@@ -2628,15 +2630,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2536
         </td>
         <td>
-          5800
+          5864
           -
-          5812
+          5876
         </td>
         <td>
           Block
@@ -2652,15 +2654,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2537
         </td>
         <td>
-          5824
+          5888
           -
-          5851
+          5915
         </td>
         <td>
           Apply
@@ -2676,15 +2678,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2538
         </td>
         <td>
-          5857
+          5921
           -
-          5867
+          5931
         </td>
         <td>
           Literal
@@ -2700,15 +2702,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2539
         </td>
         <td>
-          5884
+          5948
           -
-          5885
+          5949
         </td>
         <td>
           Literal
@@ -2724,15 +2726,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2540
         </td>
         <td>
-          5868
+          5932
           -
-          5883
+          5947
         </td>
         <td>
           Select
@@ -2748,15 +2750,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2541
         </td>
         <td>
-          5855
+          5919
           -
-          5885
+          5949
         </td>
         <td>
           Apply
@@ -2772,15 +2774,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2542
         </td>
         <td>
-          5855
+          5919
           -
-          5885
+          5949
         </td>
         <td>
           Block
@@ -2796,15 +2798,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2543
         </td>
         <td>
-          5895
+          5959
           -
-          5897
+          5961
         </td>
         <td>
           Literal
@@ -2820,15 +2822,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2544
         </td>
         <td>
-          5895
+          5959
           -
-          5897
+          5961
         </td>
         <td>
           Block
@@ -2844,15 +2846,15 @@
         </td>
       </tr><tr>
         <td>
-          140
+          141
         </td>
         <td>
           2545
         </td>
         <td>
-          5820
+          5884
           -
-          5899
+          5963
         </td>
         <td>
           If
@@ -2871,15 +2873,15 @@ else
         </td>
       </tr><tr>
         <td>
-          141
+          142
         </td>
         <td>
           2546
         </td>
         <td>
-          5935
+          5999
           -
-          5935
+          5999
         </td>
         <td>
           TypeApply
@@ -2895,15 +2897,15 @@ else
         </td>
       </tr><tr>
         <td>
-          141
+          142
         </td>
         <td>
           2547
         </td>
         <td>
-          5926
+          5990
           -
-          5940
+          6004
         </td>
         <td>
           ApplyToImplicitArgs
@@ -2919,15 +2921,15 @@ else
         </td>
       </tr><tr>
         <td>
-          141
+          142
         </td>
         <td>
           2548
         </td>
         <td>
-          5906
+          5970
           -
-          5941
+          6005
         </td>
         <td>
           Apply
@@ -2943,15 +2945,15 @@ else
         </td>
       </tr><tr>
         <td>
-          154
+          155
         </td>
         <td>
           2550
         </td>
         <td>
-          6244
+          6308
           -
-          6267
+          6331
         </td>
         <td>
           Select
@@ -2967,15 +2969,15 @@ else
         </td>
       </tr><tr>
         <td>
-          154
+          155
         </td>
         <td>
           2551
         </td>
         <td>
-          6269
+          6333
           -
-          6282
+          6346
         </td>
         <td>
           Apply
@@ -2991,15 +2993,15 @@ else
         </td>
       </tr><tr>
         <td>
-          154
+          155
         </td>
         <td>
           2552
         </td>
         <td>
-          6243
+          6307
           -
-          6283
+          6347
         </td>
         <td>
           Apply
@@ -3015,15 +3017,15 @@ else
         </td>
       </tr><tr>
         <td>
-          154
+          155
         </td>
         <td>
           2553
         </td>
         <td>
-          6286
+          6350
           -
-          6307
+          6371
         </td>
         <td>
           Select
@@ -3039,15 +3041,15 @@ else
         </td>
       </tr><tr>
         <td>
-          154
+          155
         </td>
         <td>
           2554
         </td>
         <td>
-          6309
+          6373
           -
-          6321
+          6385
         </td>
         <td>
           Apply
@@ -3063,15 +3065,15 @@ else
         </td>
       </tr><tr>
         <td>
-          154
+          155
         </td>
         <td>
           2555
         </td>
         <td>
-          6285
+          6349
           -
-          6322
+          6386
         </td>
         <td>
           Apply
@@ -3087,15 +3089,15 @@ else
         </td>
       </tr><tr>
         <td>
-          154
+          155
         </td>
         <td>
           2556
         </td>
         <td>
-          6239
+          6303
           -
-          6323
+          6387
         </td>
         <td>
           Apply
@@ -3111,15 +3113,15 @@ else
         </td>
       </tr><tr>
         <td>
-          159
+          160
         </td>
         <td>
-          2597
+          2598
         </td>
         <td>
-          6441
+          6505
           -
-          7976
+          8085
         </td>
         <td>
           Apply
@@ -3145,10 +3147,11 @@ else
         }
       else
         ();
+      val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply$default$2);
       features.foreach[Unit](((sf: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
         try {
           {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3);
+  helper.write(sf);
   LocalConverterIngest.this.written.incrementAndGet();
   count.incrementAndGet()
 }.toLong
@@ -3178,15 +3181,15 @@ else
         </td>
       </tr><tr>
         <td>
-          159
+          160
         </td>
         <td>
-          2598
+          2599
         </td>
         <td>
-          6441
+          6505
           -
-          7976
+          8085
         </td>
         <td>
           Block
@@ -3212,10 +3215,11 @@ else
         }
       else
         ();
+      val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply$default$2);
       features.foreach[Unit](((sf: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
         try {
           {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3);
+  helper.write(sf);
   LocalConverterIngest.this.written.incrementAndGet();
   count.incrementAndGet()
 }.toLong
@@ -3245,15 +3249,15 @@ else
         </td>
       </tr><tr>
         <td>
-          160
+          161
         </td>
         <td>
           2557
         </td>
         <td>
-          6494
+          6558
           -
-          6503
+          6567
         </td>
         <td>
           Select
@@ -3269,15 +3273,15 @@ else
         </td>
       </tr><tr>
         <td>
-          160
+          161
         </td>
         <td>
-          2595
+          2596
         </td>
         <td>
-          6505
+          6569
           -
-          6505
+          6569
         </td>
         <td>
           Select
@@ -3293,15 +3297,15 @@ else
         </td>
       </tr><tr>
         <td>
-          160
+          161
         </td>
         <td>
-          2596
+          2597
         </td>
         <td>
-          6484
+          6548
           -
-          7966
+          8075
         </td>
         <td>
           ApplyToImplicitArgs
@@ -3327,10 +3331,11 @@ else
         }
       else
         ();
+      val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply$default$2);
       features.foreach[Unit](((sf: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
         try {
           {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3);
+  helper.write(sf);
   LocalConverterIngest.this.written.incrementAndGet();
   count.incrementAndGet()
 }.toLong
@@ -3360,15 +3365,15 @@ else
         </td>
       </tr><tr>
         <td>
-          161
+          162
         </td>
         <td>
-          2593
+          2594
         </td>
         <td>
-          6564
+          6628
           -
-          7940
+          8049
         </td>
         <td>
           Block
@@ -3393,10 +3398,11 @@ else
       }
     else
       ();
+    val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply$default$2);
     features.foreach[Unit](((sf: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
       try {
         {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3);
+  helper.write(sf);
   LocalConverterIngest.this.written.incrementAndGet();
   count.incrementAndGet()
 }.toLong
@@ -3425,15 +3431,15 @@ else
         </td>
       </tr><tr>
         <td>
-          161
+          162
         </td>
         <td>
-          2594
+          2595
         </td>
         <td>
-          6530
+          6594
           -
-          7954
+          8063
         </td>
         <td>
           Apply
@@ -3459,10 +3465,11 @@ else
         }
       else
         ();
+      val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply$default$2);
       features.foreach[Unit](((sf: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
         try {
           {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3);
+  helper.write(sf);
   LocalConverterIngest.this.written.incrementAndGet();
   count.incrementAndGet()
 }.toLong
@@ -3492,15 +3499,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          163
         </td>
         <td>
           2558
         </td>
         <td>
-          6642
+          6706
           -
-          6651
+          6715
         </td>
         <td>
           Select
@@ -3516,15 +3523,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          163
         </td>
         <td>
           2559
         </td>
         <td>
-          6627
+          6691
           -
-          6652
+          6716
         </td>
         <td>
           Apply
@@ -3540,15 +3547,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          163
         </td>
         <td>
           2560
         </td>
         <td>
-          6594
+          6658
           -
-          6653
+          6717
         </td>
         <td>
           Apply
@@ -3564,15 +3571,15 @@ else
         </td>
       </tr><tr>
         <td>
-          163
+          164
         </td>
         <td>
           2561
         </td>
         <td>
-          6682
+          6746
           -
-          6725
+          6789
         </td>
         <td>
           Select
@@ -3588,15 +3595,15 @@ else
         </td>
       </tr><tr>
         <td>
-          164
+          165
         </td>
         <td>
           2562
         </td>
         <td>
-          6800
+          6864
           -
-          6814
+          6878
         </td>
         <td>
           Select
@@ -3612,15 +3619,15 @@ else
         </td>
       </tr><tr>
         <td>
-          164
+          165
         </td>
         <td>
           2563
         </td>
         <td>
-          6749
+          6813
           -
-          6815
+          6879
         </td>
         <td>
           Apply
@@ -3636,15 +3643,15 @@ else
         </td>
       </tr><tr>
         <td>
-          165
+          166
         </td>
         <td>
           2564
         </td>
         <td>
-          6875
+          6939
           -
-          6900
+          6964
         </td>
         <td>
           Apply
@@ -3660,15 +3667,15 @@ else
         </td>
       </tr><tr>
         <td>
-          165
+          166
         </td>
         <td>
           2565
         </td>
         <td>
-          6840
+          6904
           -
-          6901
+          6965
         </td>
         <td>
           Apply
@@ -3684,15 +3691,15 @@ else
         </td>
       </tr><tr>
         <td>
-          165
+          166
         </td>
         <td>
-          2591
+          2592
         </td>
         <td>
-          6903
+          6967
           -
-          6903
+          6967
         </td>
         <td>
           Select
@@ -3708,15 +3715,15 @@ else
         </td>
       </tr><tr>
         <td>
-          165
+          166
         </td>
         <td>
-          2592
+          2593
         </td>
         <td>
-          6830
+          6894
           -
-          7940
+          8049
         </td>
         <td>
           ApplyToImplicitArgs
@@ -3737,10 +3744,11 @@ else
     }
   else
     ();
+  val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply$default$2);
   features.foreach[Unit](((sf: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
     try {
       {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3);
+  helper.write(sf);
   LocalConverterIngest.this.written.incrementAndGet();
   count.incrementAndGet()
 }.toLong
@@ -3768,15 +3776,15 @@ else
         </td>
       </tr><tr>
         <td>
-          166
+          167
         </td>
         <td>
-          2590
+          2591
         </td>
         <td>
-          6933
+          6997
           -
-          7924
+          8033
         </td>
         <td>
           Apply
@@ -3797,10 +3805,11 @@ else
     }
   else
     ();
+  val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply$default$2);
   features.foreach[Unit](((sf: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
     try {
       {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3);
+  helper.write(sf);
   LocalConverterIngest.this.written.incrementAndGet();
   count.incrementAndGet()
 }.toLong
@@ -3828,15 +3837,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          168
         </td>
         <td>
           2566
         </td>
         <td>
-          6990
+          7054
           -
-          7009
+          7073
         </td>
         <td>
           Apply
@@ -3852,15 +3861,15 @@ else
         </td>
       </tr><tr>
         <td>
-          168
+          169
         </td>
         <td>
           2567
         </td>
         <td>
-          7032
+          7096
           -
-          7045
+          7109
         </td>
         <td>
           Apply
@@ -3876,15 +3885,15 @@ else
         </td>
       </tr><tr>
         <td>
-          168
+          169
         </td>
         <td>
           2570
         </td>
         <td>
-          7047
+          7111
           -
-          7164
+          7228
         </td>
         <td>
           Block
@@ -3903,15 +3912,15 @@ else
         </td>
       </tr><tr>
         <td>
-          168
+          169
         </td>
         <td>
           2571
         </td>
         <td>
-          7028
+          7092
           -
-          7028
+          7092
         </td>
         <td>
           Literal
@@ -3927,15 +3936,15 @@ else
         </td>
       </tr><tr>
         <td>
-          168
+          169
         </td>
         <td>
           2572
         </td>
         <td>
-          7028
+          7092
           -
-          7028
+          7092
         </td>
         <td>
           Block
@@ -3951,15 +3960,15 @@ else
         </td>
       </tr><tr>
         <td>
-          169
+          170
         </td>
         <td>
           2568
         </td>
         <td>
-          7077
+          7141
           -
-          7097
+          7161
         </td>
         <td>
           Apply
@@ -3975,15 +3984,15 @@ else
         </td>
       </tr><tr>
         <td>
-          170
+          171
         </td>
         <td>
           2569
         </td>
         <td>
-          7118
+          7182
           -
-          7144
+          7208
         </td>
         <td>
           Apply
@@ -3999,15 +4008,39 @@ else
         </td>
       </tr><tr>
         <td>
-          172
+          173
         </td>
         <td>
-          2589
+          2573
         </td>
         <td>
-          7183
+          7260
           -
-          7906
+          7287
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply$default$2)
+        </td>
+      </tr><tr>
+        <td>
+          174
+        </td>
+        <td>
+          2590
+        </td>
+        <td>
+          7306
+          -
+          8015
         </td>
         <td>
           Apply
@@ -4022,7 +4055,7 @@ else
           features.foreach[Unit](((sf: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
   try {
     {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3);
+  helper.write(sf);
   LocalConverterIngest.this.written.incrementAndGet();
   count.incrementAndGet()
 }.toLong
@@ -4049,15 +4082,15 @@ else
         </td>
       </tr><tr>
         <td>
-          173
+          175
         </td>
         <td>
-          2576
+          2577
         </td>
         <td>
-          7256
+          7379
           -
-          7380
+          7489
         </td>
         <td>
           Select
@@ -4070,22 +4103,22 @@ else
         </td>
         <td style="background: #AEF1AE">
           {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3);
+  helper.write(sf);
   LocalConverterIngest.this.written.incrementAndGet();
   count.incrementAndGet()
 }.toLong
         </td>
       </tr><tr>
         <td>
-          173
+          175
         </td>
         <td>
-          2577
+          2578
         </td>
         <td>
-          7256
+          7379
           -
-          7380
+          7489
         </td>
         <td>
           Block
@@ -4098,46 +4131,46 @@ else
         </td>
         <td style="background: #AEF1AE">
           {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3);
+  helper.write(sf);
   LocalConverterIngest.this.written.incrementAndGet();
   count.incrementAndGet()
 }.toLong
         </td>
       </tr><tr>
         <td>
-          174
-        </td>
-        <td>
-          2573
-        </td>
-        <td>
-          7256
-          -
-          7286
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.geotools.FeatureUtils.write
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, sf, org.locationtech.geomesa.utils.geotools.FeatureUtils.write$default$3)
-        </td>
-      </tr><tr>
-        <td>
-          175
+          176
         </td>
         <td>
           2574
         </td>
         <td>
-          7309
+          7379
           -
-          7334
+          7395
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.FeatureWriterHelper.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          helper.write(sf)
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          2575
+        </td>
+        <td>
+          7418
+          -
+          7443
         </td>
         <td>
           Apply
@@ -4153,15 +4186,15 @@ else
         </td>
       </tr><tr>
         <td>
-          176
+          178
         </td>
         <td>
-          2575
+          2576
         </td>
         <td>
-          7357
+          7466
           -
-          7380
+          7489
         </td>
         <td>
           Apply
@@ -4177,15 +4210,15 @@ else
         </td>
       </tr><tr>
         <td>
-          178
+          180
         </td>
         <td>
-          2579
+          2580
         </td>
         <td>
-          7450
+          7559
           -
-          7598
+          7707
         </td>
         <td>
           Block
@@ -4207,15 +4240,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          182
         </td>
         <td>
-          2578
+          2579
         </td>
         <td>
-          7574
+          7683
           -
-          7598
+          7707
         </td>
         <td>
           Apply
@@ -4231,15 +4264,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          184
         </td>
         <td>
-          2580
+          2581
         </td>
         <td>
-          7645
+          7754
           -
-          7667
+          7776
         </td>
         <td>
           Apply
@@ -4255,15 +4288,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          184
         </td>
         <td>
-          2586
+          2587
         </td>
         <td>
-          7669
+          7778
           -
-          7886
+          7995
         </td>
         <td>
           Block
@@ -4285,15 +4318,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          184
         </td>
         <td>
-          2587
+          2588
         </td>
         <td>
-          7641
+          7750
           -
-          7641
+          7750
         </td>
         <td>
           Literal
@@ -4309,15 +4342,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          184
         </td>
         <td>
-          2588
+          2589
         </td>
         <td>
-          7641
+          7750
           -
-          7641
+          7750
         </td>
         <td>
           Block
@@ -4333,15 +4366,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          185
         </td>
         <td>
-          2581
+          2582
         </td>
         <td>
-          7693
+          7802
           -
-          7705
+          7814
         </td>
         <td>
           Apply
@@ -4357,15 +4390,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          187
         </td>
         <td>
-          2582
+          2583
         </td>
         <td>
-          7788
+          7897
           -
-          7797
+          7906
         </td>
         <td>
           Apply
@@ -4381,15 +4414,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          187
         </td>
         <td>
-          2583
+          2584
         </td>
         <td>
-          7788
+          7897
           -
-          7797
+          7906
         </td>
         <td>
           Block
@@ -4405,15 +4438,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          188
         </td>
         <td>
-          2584
+          2585
         </td>
         <td>
-          7829
+          7938
           -
-          7831
+          7940
         </td>
         <td>
           Literal
@@ -4429,15 +4462,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          188
         </td>
         <td>
-          2585
+          2586
         </td>
         <td>
-          7829
+          7938
           -
-          7831
+          7940
         </td>
         <td>
           Block
@@ -4453,15 +4486,15 @@ else
         </td>
       </tr><tr>
         <td>
-          200
+          202
         </td>
         <td>
-          2599
+          2600
         </td>
         <td>
-          8391
+          8500
           -
-          8398
+          8507
         </td>
         <td>
           Throw
@@ -4477,15 +4510,15 @@ else
         </td>
       </tr><tr>
         <td>
-          200
+          202
         </td>
         <td>
-          2600
+          2601
         </td>
         <td>
-          8391
+          8500
           -
-          8398
+          8507
         </td>
         <td>
           Block
@@ -4501,15 +4534,15 @@ else
         </td>
       </tr><tr>
         <td>
-          202
+          204
         </td>
         <td>
-          2607
+          2608
         </td>
         <td>
-          8425
+          8534
           -
-          8694
+          8803
         </td>
         <td>
           Block
@@ -4539,15 +4572,15 @@ else
         </td>
       </tr><tr>
         <td>
-          204
+          206
         </td>
         <td>
-          2601
+          2602
         </td>
         <td>
-          8538
+          8647
           -
-          8582
+          8691
         </td>
         <td>
           Literal
@@ -4563,15 +4596,15 @@ else
         </td>
       </tr><tr>
         <td>
-          204
+          206
         </td>
         <td>
-          2602
+          2603
         </td>
         <td>
-          8593
+          8702
           -
-          8594
+          8703
         </td>
         <td>
           Literal
@@ -4587,15 +4620,15 @@ else
         </td>
       </tr><tr>
         <td>
-          204
+          206
         </td>
         <td>
-          2603
+          2604
         </td>
         <td>
-          8583
+          8692
           -
-          8592
+          8701
         </td>
         <td>
           Select
@@ -4611,15 +4644,15 @@ else
         </td>
       </tr><tr>
         <td>
-          204
+          206
         </td>
         <td>
-          2604
+          2605
         </td>
         <td>
-          8536
+          8645
           -
-          8594
+          8703
         </td>
         <td>
           Apply
@@ -4635,15 +4668,15 @@ else
         </td>
       </tr><tr>
         <td>
-          207
+          209
         </td>
         <td>
-          2605
+          2606
         </td>
         <td>
-          8670
+          8779
           -
-          8694
+          8803
         </td>
         <td>
           Apply
@@ -4659,15 +4692,15 @@ else
         </td>
       </tr><tr>
         <td>
-          207
+          209
         </td>
         <td>
-          2606
+          2607
         </td>
         <td>
-          8692
+          8801
           -
-          8692
+          8801
         </td>
         <td>
           Literal
@@ -4683,15 +4716,15 @@ else
         </td>
       </tr><tr>
         <td>
-          208
+          210
         </td>
         <td>
-          2612
+          2613
         </td>
         <td>
-          8711
+          8820
           -
-          8787
+          8896
         </td>
         <td>
           Block
@@ -4713,15 +4746,15 @@ else
         </td>
       </tr><tr>
         <td>
-          209
+          211
         </td>
         <td>
-          2608
+          2609
         </td>
         <td>
-          8721
+          8830
           -
-          8738
+          8847
         </td>
         <td>
           Apply
@@ -4737,15 +4770,15 @@ else
         </td>
       </tr><tr>
         <td>
-          210
+          212
         </td>
         <td>
-          2609
+          2610
         </td>
         <td>
-          8767
+          8876
           -
-          8778
+          8887
         </td>
         <td>
           Select
@@ -4761,15 +4794,15 @@ else
         </td>
       </tr><tr>
         <td>
-          210
+          212
         </td>
         <td>
-          2610
+          2611
         </td>
         <td>
-          8747
+          8856
           -
-          8779
+          8888
         </td>
         <td>
           Apply
@@ -4785,15 +4818,15 @@ else
         </td>
       </tr><tr>
         <td>
-          210
+          212
         </td>
         <td>
-          2611
+          2612
         </td>
         <td>
-          8766
+          8875
           -
-          8766
+          8875
         </td>
         <td>
           Literal
@@ -4809,15 +4842,15 @@ else
         </td>
       </tr><tr>
         <td>
-          221
+          223
         </td>
         <td>
-          2613
+          2614
         </td>
         <td>
-          9027
+          9136
           -
-          9037
+          9146
         </td>
         <td>
           Select
@@ -4833,15 +4866,15 @@ else
         </td>
       </tr><tr>
         <td>
-          221
+          223
         </td>
         <td>
-          2614
+          2615
         </td>
         <td>
-          8998
+          9107
           -
-          9038
+          9147
         </td>
         <td>
           Apply
@@ -4857,15 +4890,15 @@ else
         </td>
       </tr><tr>
         <td>
-          222
+          224
         </td>
         <td>
-          2615
+          2616
         </td>
         <td>
-          9090
+          9199
           -
-          9098
+          9207
         </td>
         <td>
           Select
@@ -4881,15 +4914,15 @@ else
         </td>
       </tr><tr>
         <td>
-          222
+          224
         </td>
         <td>
-          2616
+          2617
         </td>
         <td>
-          9100
+          9209
           -
-          9123
+          9232
         </td>
         <td>
           Select
@@ -4905,15 +4938,15 @@ else
         </td>
       </tr><tr>
         <td>
-          222
+          224
         </td>
         <td>
-          2617
+          2618
         </td>
         <td>
-          9064
+          9173
           -
-          9124
+          9233
         </td>
         <td>
           Apply
@@ -4929,15 +4962,15 @@ else
         </td>
       </tr><tr>
         <td>
-          224
+          226
         </td>
         <td>
-          2618
+          2619
         </td>
         <td>
-          9179
+          9288
           -
-          9200
+          9309
         </td>
         <td>
           Apply
@@ -4953,15 +4986,15 @@ else
         </td>
       </tr><tr>
         <td>
-          225
+          227
         </td>
         <td>
-          2619
+          2620
         </td>
         <td>
-          9242
+          9351
           -
-          9255
+          9364
         </td>
         <td>
           Apply
@@ -4977,15 +5010,15 @@ else
         </td>
       </tr><tr>
         <td>
-          226
+          228
         </td>
         <td>
-          2620
+          2621
         </td>
         <td>
-          9290
+          9399
           -
-          9305
+          9414
         </td>
         <td>
           Apply
@@ -5001,15 +5034,15 @@ else
         </td>
       </tr><tr>
         <td>
-          227
+          229
         </td>
         <td>
-          2621
+          2622
         </td>
         <td>
-          9339
+          9448
           -
-          9353
+          9462
         </td>
         <td>
           Apply
@@ -5025,15 +5058,15 @@ else
         </td>
       </tr><tr>
         <td>
-          228
+          230
         </td>
         <td>
-          2622
+          2623
         </td>
         <td>
-          9390
+          9499
           -
-          9404
+          9513
         </td>
         <td>
           Apply
@@ -5049,15 +5082,15 @@ else
         </td>
       </tr><tr>
         <td>
-          230
+          232
         </td>
         <td>
-          2623
+          2624
         </td>
         <td>
-          9467
+          9576
           -
-          9471
+          9580
         </td>
         <td>
           Literal
@@ -5073,15 +5106,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          233
         </td>
         <td>
-          2624
+          2625
         </td>
         <td>
-          9491
+          9600
           -
-          9497
+          9606
         </td>
         <td>
           Select
@@ -5097,15 +5130,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          233
         </td>
         <td>
-          2625
+          2626
         </td>
         <td>
-          9490
+          9599
           -
-          9490
+          9599
         </td>
         <td>
           Select
@@ -5121,15 +5154,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          233
         </td>
         <td>
-          2626
+          2627
         </td>
         <td>
-          9478
+          9587
           -
-          9515
+          9624
         </td>
         <td>
           Apply
@@ -5145,15 +5178,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          234
         </td>
         <td>
-          2627
+          2628
         </td>
         <td>
-          9535
+          9644
           -
-          9537
+          9646
         </td>
         <td>
           Select
@@ -5169,15 +5202,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          234
         </td>
         <td>
-          2628
+          2629
         </td>
         <td>
-          9534
+          9643
           -
-          9534
+          9643
         </td>
         <td>
           Select
@@ -5193,15 +5226,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          234
         </td>
         <td>
-          2633
+          2634
         </td>
         <td>
-          9522
+          9631
           -
-          9628
+          9737
         </td>
         <td>
           Apply
@@ -5220,15 +5253,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          235
         </td>
         <td>
-          2629
+          2630
         </td>
         <td>
-          9566
+          9675
           -
-          9577
+          9686
         </td>
         <td>
           Apply
@@ -5244,15 +5277,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          235
         </td>
         <td>
-          2630
+          2631
         </td>
         <td>
-          9581
+          9690
           -
-          9588
+          9697
         </td>
         <td>
           Assign
@@ -5268,15 +5301,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          235
         </td>
         <td>
-          2631
+          2632
         </td>
         <td>
-          9598
+          9707
           -
-          9618
+          9727
         </td>
         <td>
           Apply
@@ -5292,15 +5325,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          235
         </td>
         <td>
-          2632
+          2633
         </td>
         <td>
-          9598
+          9707
           -
-          9618
+          9727
         </td>
         <td>
           Block
@@ -5316,15 +5349,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          237
         </td>
         <td>
-          2634
+          2635
         </td>
         <td>
-          9639
+          9748
           -
-          9650
+          9759
         </td>
         <td>
           Apply
@@ -5340,15 +5373,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          237
         </td>
         <td>
-          2637
+          2638
         </td>
         <td>
-          9635
+          9744
           -
-          9635
+          9744
         </td>
         <td>
           Literal
@@ -5364,15 +5397,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          237
         </td>
         <td>
-          2638
+          2639
         </td>
         <td>
-          9635
+          9744
           -
-          9635
+          9744
         </td>
         <td>
           Block
@@ -5388,15 +5421,15 @@ else
         </td>
       </tr><tr>
         <td>
-          236
+          238
         </td>
         <td>
-          2635
+          2636
         </td>
         <td>
-          9662
+          9771
           -
-          9671
+          9780
         </td>
         <td>
           Throw
@@ -5412,15 +5445,15 @@ else
         </td>
       </tr><tr>
         <td>
-          236
+          238
         </td>
         <td>
-          2636
+          2637
         </td>
         <td>
-          9662
+          9771
           -
-          9671
+          9780
         </td>
         <td>
           Block

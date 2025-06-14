@@ -35,435 +35,437 @@
 </span>11 <span style=''>import com.typesafe.scalalogging.StrictLogging
 </span>12 <span style=''>import org.geotools.api.data.{DataStore, Transaction}
 </span>13 <span style=''>import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
-</span>14 <span style=''>import org.locationtech.geomesa.lambda.stream.OffsetManager
-</span>15 <span style=''>import org.locationtech.geomesa.lambda.stream.OffsetManager.OffsetListener
-</span>16 <span style=''>import org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache._
-</span>17 <span style=''>import org.locationtech.geomesa.utils.concurrent.ExitingExecutor
-</span>18 <span style=''>import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
-</span>19 <span style=''>import org.locationtech.geomesa.utils.geotools.FeatureUtils
-</span>20 <span style=''>import org.locationtech.geomesa.utils.io.{CloseWithLogging, WithClose}
-</span>21 <span style=''>import org.locationtech.geomesa.utils.stats.MethodProfiling
-</span>22 <span style=''>
-</span>23 <span style=''>import java.io.Closeable
-</span>24 <span style=''>import java.time.{Clock, Instant, ZoneOffset, ZonedDateTime}
-</span>25 <span style=''>import java.util.concurrent.atomic.AtomicLong
-</span>26 <span style=''>import java.util.concurrent.{ConcurrentHashMap, ScheduledThreadPoolExecutor, TimeUnit}
-</span>27 <span style=''>import scala.annotation.tailrec
-</span>28 <span style=''>import scala.collection.mutable.ArrayBuffer
-</span>29 <span style=''>import scala.concurrent.duration.FiniteDuration
-</span>30 <span style=''>import scala.util.Random
-</span>31 <span style=''>import scala.util.control.NonFatal
-</span>32 <span style=''>
-</span>33 <span style=''>/**
-</span>34 <span style=''>  * Locally cached features
-</span>35 <span style=''>  */
-</span>36 <span style=''>class KafkaFeatureCache(
-</span>37 <span style=''>    ds: DataStore,
-</span>38 <span style=''>    sft: SimpleFeatureType,
-</span>39 <span style=''>    offsetManager: OffsetManager,
-</span>40 <span style=''>    topic: String,
-</span>41 <span style=''>    expiry: Option[FiniteDuration],
-</span>42 <span style=''>    batchSize: Option[Int])
-</span>43 <span style=''>   (implicit clock: Clock = Clock.systemUTC())
-</span>44 <span style=''>  extends WritableFeatureCache with ReadableFeatureCache with OffsetListener
-</span>45 <span style=''>    with Closeable with MethodProfiling with StrictLogging {
-</span>46 <span style=''>
-</span>47 <span style=''>  import org.locationtech.geomesa.filter.ff
-</span>48 <span style=''>
-</span>49 <span style=''>  import scala.collection.JavaConverters._
-</span>50 <span style=''>
-</span>51 <span style=''>  </span><span style='background: #AEF1AE'>require(batchSize.forall(</span><span style='background: #F0ADAD'>_ &gt; 0</span><span style='background: #AEF1AE'>), </span><span style='background: #F0ADAD'>s&quot;Invalid persistence batch size: ${batchSize.orNull}&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
-</span>52 <span style=''>
-</span>53 <span style=''>  // map of feature id -&gt; current feature
-</span>54 <span style=''>  private val features = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[String, FeatureReference]</span><span style=''>
-</span>55 <span style=''>
-</span>56 <span style=''>  // technically we should synchronize all access to the following array, since we expand it if needed;
-</span>57 <span style=''>  // however, in normal use it will be created up front and then only read.
-</span>58 <span style=''>  // if partitions are added at runtime, we may have synchronization issues...
-</span>59 <span style=''>  private val offsets = </span><span style='background: #AEF1AE'>ArrayBuffer.empty[AtomicLong]</span><span style=''>
-</span>60 <span style=''>
-</span>61 <span style=''>  private val lockTimeout = </span><span style='background: #AEF1AE'>KafkaFeatureCache.LockTimeout.toMillis.get</span><span style=''>
-</span>62 <span style=''>
-</span>63 <span style=''>  private val persistence = </span><span style='background: #AEF1AE'>expiry.map(e =&gt; new Persistence(e.toMillis))</span><span style=''>
-</span>64 <span style=''>
-</span>65 <span style=''>  </span><span style='background: #AEF1AE'>offsetManager.addOffsetListener(topic, this)</span><span style=''>
-</span>66 <span style=''>
-</span>67 <span style=''>  override def partitionAssigned(partition: Int, offset: Long): Unit = {
-</span>68 <span style=''>    logger.debug(s&quot;Partition assigned: [$topic:$partition:$offset]&quot;)
-</span>69 <span style=''>    </span><span style='background: #AEF1AE'>ensurePartition(partition, offset)</span><span style=''>
-</span>70 <span style=''>  }
-</span>71 <span style=''>
-</span>72 <span style=''>  override def get(id: String): SimpleFeature = {
-</span>73 <span style=''>    val result = </span><span style='background: #AEF1AE'>features.get(id)</span><span style=''>
-</span>74 <span style=''>    if (</span><span style='background: #AEF1AE'>result == null</span><span style=''>) { </span><span style='background: #F0ADAD'>null</span><span style=''> } else { </span><span style='background: #AEF1AE'>result.feature</span><span style=''> }
-</span>75 <span style=''>  }
-</span>76 <span style=''>
-</span>77 <span style=''>  override def all(): Iterator[SimpleFeature] = </span><span style='background: #AEF1AE'>features.values.iterator.asScala.map(_.feature)</span><span style=''>
-</span>78 <span style=''>
-</span>79 <span style=''>  override def add(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit = {
-</span>80 <span style=''>    if (</span><span style='background: #AEF1AE'>offsets(partition).get &lt; offset</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>81 <span style=''></span><span style='background: #AEF1AE'>      logger.trace(s&quot;Adding [$partition:$offset] $feature created at &quot; +
-</span>82 <span style=''></span><span style='background: #AEF1AE'>          s&quot;${ZonedDateTime.ofInstant(Instant.ofEpochMilli(created), ZoneOffset.UTC)}&quot;)
-</span>83 <span style=''></span><span style='background: #AEF1AE'>      features.put(feature.getID, new FeatureReference(feature, partition, offset, created))
-</span>84 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''> else {
-</span>85 <span style=''>      </span><span style='background: #F0ADAD'>logger.trace(s&quot;Ignoring [$partition:$offset] $feature created at &quot; +
-</span>86 <span style=''></span><span style='background: #F0ADAD'>          s&quot;${ZonedDateTime.ofInstant(Instant.ofEpochMilli(created), ZoneOffset.UTC)}&quot;)</span><span style=''>
-</span>87 <span style=''>    }
-</span>88 <span style=''>  }
-</span>89 <span style=''>
-</span>90 <span style=''>  override def delete(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit = {
-</span>91 <span style=''>    logger.trace(s&quot;Deleting [$partition:$offset] $feature created at &quot; +
-</span>92 <span style=''>        s&quot;${ZonedDateTime.ofInstant(Instant.ofEpochMilli(created), ZoneOffset.UTC)}&quot;)
-</span>93 <span style=''>    </span><span style='background: #AEF1AE'>features.remove(feature.getID)</span><span style=''>
-</span>94 <span style=''>    </span><span style='background: #AEF1AE'>persistence.foreach { p =&gt;
-</span>95 <span style=''></span><span style='background: #AEF1AE'>      try {
-</span>96 <span style=''></span><span style='background: #AEF1AE'>        if (p.delete(feature.getID)) {
-</span>97 <span style=''></span><span style='background: #AEF1AE'>          logger.trace(s&quot;Persistent store delete [$topic:$partition:$offset] $feature&quot;)
-</span>98 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>99 <span style=''></span><span style='background: #AEF1AE'>      } catch {
-</span>100 <span style=''></span><span style='background: #AEF1AE'>        case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.error(s&quot;Error deleting feature in persistent store: $feature&quot;, e)</span><span style='background: #AEF1AE'>
-</span>101 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>102 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>103 <span style=''>  }
-</span>104 <span style=''>
-</span>105 <span style=''>  override def offsetChanged(partition: Int, offset: Long): Unit = {
-</span>106 <span style=''>    if (</span><span style='background: #AEF1AE'>offsets.length &lt;= partition</span><span style=''>) </span><span style='background: #F0ADAD'>{
-</span>107 <span style=''></span><span style='background: #F0ADAD'>      logger.debug(s&quot;Offsets changed for [$topic:$partition]: (unassigned) -&gt; $offset&quot;)
-</span>108 <span style=''></span><span style='background: #F0ADAD'>      ensurePartition(partition, offset)
-</span>109 <span style=''></span><span style='background: #F0ADAD'>      return
-</span>110 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
-</span>111 <span style=''>
-</span>112 <span style=''>    // update the valid offset
-</span>113 <span style=''>    var last = </span><span style='background: #AEF1AE'>offsets(partition).get</span><span style=''>
-</span>114 <span style=''>    logger.debug(s&quot;Offsets changed for [$topic:$partition]: $last -&gt; $offset&quot;)
-</span>115 <span style=''>    while (</span><span style='background: #AEF1AE'>last &lt; offset &amp;&amp; !offsets(partition).compareAndSet(last, offset)</span><span style=''>) {
-</span>116 <span style=''>      </span><span style='background: #F0ADAD'>last = offsets(partition).get</span><span style=''>
-</span>117 <span style=''>    }
-</span>118 <span style=''>
-</span>119 <span style=''>    def onCompleted(count: Int, time: Long): Unit =
-</span>120 <span style=''>      logger.debug(f&quot;Size of cached state for [$topic]: ${features.size}%d (removed $count%d entries in ${time}ms)&quot;)
-</span>121 <span style=''>
-</span>122 <span style=''>    </span><span style='background: #AEF1AE'>profile(onCompleted _) {
-</span>123 <span style=''></span><span style='background: #AEF1AE'>      var removed = 0
-</span>124 <span style=''></span><span style='background: #AEF1AE'>      val iter = features.values().iterator()
-</span>125 <span style=''></span><span style='background: #AEF1AE'>      while (iter.hasNext) {
-</span>126 <span style=''></span><span style='background: #AEF1AE'>        val next = iter.next()
-</span>127 <span style=''></span><span style='background: #AEF1AE'>        if (next.partition == partition &amp;&amp; next.offset &lt;= offset) {
-</span>128 <span style=''></span><span style='background: #AEF1AE'>          iter.remove()
-</span>129 <span style=''></span><span style='background: #AEF1AE'>          removed += 1
-</span>130 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>131 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>132 <span style=''></span><span style='background: #AEF1AE'>      removed
-</span>133 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>134 <span style=''>  }
-</span>135 <span style=''>
-</span>136 <span style=''>  /**
-</span>137 <span style=''>   * Persist any expired features
-</span>138 <span style=''>   *
-</span>139 <span style=''>   * @return list of last persisted offsets per partition
-</span>140 <span style=''>   */
-</span>141 <span style=''>  def persist(): Seq[PartitionOffset] =
-</span>142 <span style=''>    </span><span style='background: #AEF1AE'>persistence.getOrElse(throw new IllegalStateException(&quot;Persistence is disabled for this store&quot;)).persist()</span><span style=''>
-</span>143 <span style=''>
-</span>144 <span style=''>  override def close(): Unit = {
-</span>145 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(persistence)</span><span style=''>
-</span>146 <span style=''>    </span><span style='background: #AEF1AE'>offsetManager.removeOffsetListener(topic, this)</span><span style=''>
-</span>147 <span style=''>  }
-</span>148 <span style=''>
-</span>149 <span style=''>  /**
-</span>150 <span style=''>   * Create an offset holder for the partition if it doesn't already exist
-</span>151 <span style=''>   *
-</span>152 <span style=''>   * @param partition partition
-</span>153 <span style=''>   * @param offset offset
-</span>154 <span style=''>   */
-</span>155 <span style=''>  private def ensurePartition(partition: Int, offset: Long): Unit = </span><span style='background: #AEF1AE'>synchronized {
-</span>156 <span style=''></span><span style='background: #AEF1AE'>    while (offsets.length &lt;= partition) {
-</span>157 <span style=''></span><span style='background: #AEF1AE'>      offsets += new AtomicLong(-1L)
-</span>158 <span style=''></span><span style='background: #AEF1AE'>    }
-</span>159 <span style=''></span><span style='background: #AEF1AE'>    offsets(partition).set(offset)
-</span>160 <span style=''></span><span style='background: #AEF1AE'>  }</span><span style=''>
-</span>161 <span style=''>
-</span>162 <span style=''>  /**
-</span>163 <span style=''>   * Wrapper for managing scheduled persistence runs
-</span>164 <span style=''>   */
-</span>165 <span style=''>  private class Persistence(expiryMillis: Long) extends Closeable {
-</span>166 <span style=''>
-</span>167 <span style=''>    private val frequency = </span><span style='background: #AEF1AE'>KafkaFeatureCache.PersistInterval.toMillis.get</span><span style=''>
-</span>168 <span style=''>    private val executor = </span><span style='background: #AEF1AE'>ExitingExecutor(new ScheduledThreadPoolExecutor(1))</span><span style=''>
-</span>169 <span style=''>    private val schedule = </span><span style='background: #AEF1AE'>executor.scheduleWithFixedDelay(() =&gt; </span><span style='background: #F0ADAD'>persist()</span><span style='background: #AEF1AE'>, frequency, frequency, TimeUnit.MILLISECONDS)</span><span style=''>
-</span>170 <span style=''>
-</span>171 <span style=''>    /**
-</span>172 <span style=''>     * Persist any expired features
-</span>173 <span style=''>     *
-</span>174 <span style=''>     * @return list of last persisted offsets per partition
-</span>175 <span style=''>     */
-</span>176 <span style=''>    def persist(): Seq[PartitionOffset] = {
-</span>177 <span style=''>      logger.debug(s&quot;Running persistence for [$topic]&quot;)
-</span>178 <span style=''>      // lock per-partition to allow for multiple write threads
-</span>179 <span style=''>      // randomly access the partitions to avoid contention if multiple data stores are all on the same schedule
-</span>180 <span style=''>      </span><span style='background: #AEF1AE'>Random.shuffle(Range(0, offsets.length).toList).flatMap { partition =&gt;
-</span>181 <span style=''></span><span style='background: #AEF1AE'>        // if we don't get the lock just try again next run
-</span>182 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(s&quot;Acquiring lock for [$topic:$partition]&quot;)
-</span>183 <span style=''></span><span style='background: #AEF1AE'>        offsetManager.acquireLock(topic, partition, lockTimeout) match {
-</span>184 <span style=''></span><span style='background: #AEF1AE'>          case None </span><span style='background: #F0ADAD'>=&gt;
-</span>185 <span style=''></span><span style='background: #F0ADAD'>            logger.trace(s&quot;Could not acquire lock for [$topic:$partition] within ${lockTimeout}ms&quot;)
-</span>186 <span style=''></span><span style='background: #F0ADAD'>            None</span><span style='background: #AEF1AE'>
-</span>187 <span style=''></span><span style='background: #AEF1AE'>          case Some(lock) =&gt;
-</span>188 <span style=''></span><span style='background: #AEF1AE'>            try {
-</span>189 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Acquired lock for [$topic:$partition]&quot;)
-</span>190 <span style=''></span><span style='background: #AEF1AE'>              persist(partition).map(PartitionOffset(partition, _))
-</span>191 <span style=''></span><span style='background: #AEF1AE'>            } finally {
-</span>192 <span style=''></span><span style='background: #AEF1AE'>              lock.close()
-</span>193 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Released lock for [$topic:$partition]&quot;)
-</span>194 <span style=''></span><span style='background: #AEF1AE'>            }
-</span>195 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>196 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>197 <span style=''>    }
-</span>198 <span style=''>
-</span>199 <span style=''>    /**
-</span>200 <span style=''>     * Delete a feature
-</span>201 <span style=''>     *
-</span>202 <span style=''>     * @param id feature id
-</span>203 <span style=''>     * @return true if feature was deleted
-</span>204 <span style=''>     */
-</span>205 <span style=''>    def delete(id: String): Boolean = {
-</span>206 <span style=''>      </span><span style='background: #AEF1AE'>WithClose(ds.getFeatureWriter(sft.getTypeName, ff.id(ff.featureId(id)), Transaction.AUTO_COMMIT)) { writer =&gt;
-</span>207 <span style=''></span><span style='background: #AEF1AE'>        if (writer.hasNext) {
-</span>208 <span style=''></span><span style='background: #AEF1AE'>          writer.next()
-</span>209 <span style=''></span><span style='background: #AEF1AE'>          writer.remove()
-</span>210 <span style=''></span><span style='background: #AEF1AE'>          true
-</span>211 <span style=''></span><span style='background: #AEF1AE'>        } else {
-</span>212 <span style=''></span><span style='background: #AEF1AE'>          false
-</span>213 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>214 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>215 <span style=''>    }
-</span>216 <span style=''>
-</span>217 <span style=''>    /**
-</span>218 <span style=''>     * Persist any expired features that haven't yet been persisted
-</span>219 <span style=''>     *
-</span>220 <span style=''>     * @param partition partition to persist
-</span>221 <span style=''>     * @param lastPersistedOffset result from previous recursive run, if any
-</span>222 <span style=''>     * @return offset of latest persisted feature
-</span>223 <span style=''>     */
-</span>224 <span style=''>    @tailrec
-</span>225 <span style=''>    private def persist(partition: Int, lastPersistedOffset: Option[Long] = None): Option[Long] = {
-</span>226 <span style=''>      val expiry = </span><span style='background: #AEF1AE'>clock.millis() - expiryMillis</span><span style=''>
-</span>227 <span style=''>
-</span>228 <span style=''>      val lastOffset = </span><span style='background: #AEF1AE'>offsetManager.getOffset(topic, partition)</span><span style=''>
-</span>229 <span style=''>      logger.debug(s&quot;Last persisted offsets for [$topic:$partition]: $lastOffset&quot;)
-</span>230 <span style=''>
-</span>231 <span style=''>      var nextOffset = </span><span style='background: #AEF1AE'>-1L</span><span style=''>
-</span>232 <span style=''>      // note: copy to a new collection so that any updates don't affect our persistence here
-</span>233 <span style=''>      val expired = {
-</span>234 <span style=''>        val builder = </span><span style='background: #AEF1AE'>Map.newBuilder[String, FeatureReference]</span><span style=''>
-</span>235 <span style=''>        </span><span style='background: #AEF1AE'>features.asScala.foreach { case (id, f) =&gt;
-</span>236 <span style=''></span><span style='background: #AEF1AE'>          // note: offset &gt; lastOffset ensures we don't operate on features that have already been processed
-</span>237 <span style=''></span><span style='background: #AEF1AE'>          if (f.partition == partition &amp;&amp; f.created &lt;= expiry &amp;&amp; f.offset &gt; lastOffset) {
-</span>238 <span style=''></span><span style='background: #AEF1AE'>            nextOffset = math.max(nextOffset, f.offset)
-</span>239 <span style=''></span><span style='background: #AEF1AE'>            builder += id -&gt; f
-</span>240 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>241 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
-</span>242 <span style=''>        </span><span style='background: #AEF1AE'>builder.result()</span><span style=''>
-</span>243 <span style=''>      }
-</span>244 <span style=''>      logger.debug(s&quot;Found ${expired.size} expired entries for [$topic:$partition]&quot;)
-</span>245 <span style=''>
-</span>246 <span style=''>      if (</span><span style='background: #AEF1AE'>expired.isEmpty</span><span style=''>) {
-</span>247 <span style=''>        </span><span style='background: #AEF1AE'>lastPersistedOffset</span><span style=''>
-</span>248 <span style=''>      } else </span><span style='background: #AEF1AE'>{
-</span>249 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(expired.values.map(e =&gt; s&quot;offset ${e.offset}: ${e.feature}&quot;).mkString(&quot;Expired entries:\n\t&quot;, &quot;\n\t&quot;, &quot;&quot;))
-</span>250 <span style=''></span><span style='background: #AEF1AE'>        val batch = batchSize match {
-</span>251 <span style=''></span><span style='background: #AEF1AE'>          case Some(max) if </span><span style='background: #F0ADAD'>expired.size &gt; max</span><span style='background: #AEF1AE'> </span><span style='background: #F0ADAD'>=&gt;
-</span>252 <span style=''></span><span style='background: #F0ADAD'>            logger.trace(s&quot;Skipping persistence for ${expired.size - max} features based on batch size of $max&quot;)
-</span>253 <span style=''></span><span style='background: #F0ADAD'>            // sort by offset since we track persistence based on offset
-</span>254 <span style=''></span><span style='background: #F0ADAD'>            val sorted = expired.toList.sortBy(_._2.offset).take(max)
-</span>255 <span style=''></span><span style='background: #F0ADAD'>            nextOffset = sorted.last._2.offset
-</span>256 <span style=''></span><span style='background: #F0ADAD'>            sorted.toMap</span><span style='background: #AEF1AE'>
-</span>257 <span style=''></span><span style='background: #AEF1AE'>          case _ =&gt;
-</span>258 <span style=''></span><span style='background: #AEF1AE'>            expired
-</span>259 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>260 <span style=''></span><span style='background: #AEF1AE'>        persist(partition, batch)
-</span>261 <span style=''></span><span style='background: #AEF1AE'>
-</span>262 <span style=''></span><span style='background: #AEF1AE'>        logger.debug(s&quot;Committing offset [$topic:$partition:$nextOffset]&quot;)
-</span>263 <span style=''></span><span style='background: #AEF1AE'>        // this will trigger our listener and cause the feature to be removed from the cache
-</span>264 <span style=''></span><span style='background: #AEF1AE'>        offsetManager.setOffset(topic, partition, nextOffset)
-</span>265 <span style=''></span><span style='background: #AEF1AE'>        if (batch.size &lt; expired.size) {
-</span>266 <span style=''></span><span style='background: #AEF1AE'>          // we skipped some expired features, so run again immediately
-</span>267 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>persist(partition, Some(nextOffset))</span><span style='background: #AEF1AE'>
-</span>268 <span style=''></span><span style='background: #AEF1AE'>        } else {
-</span>269 <span style=''></span><span style='background: #AEF1AE'>          Some(nextOffset)
-</span>270 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>271 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>272 <span style=''>    }
-</span>273 <span style=''>
-</span>274 <span style=''>    /**
-</span>275 <span style=''>     * Persist expired features
-</span>276 <span style=''>     *
-</span>277 <span style=''>     * @param partition partition
-</span>278 <span style=''>     * @param batch expired features
-</span>279 <span style=''>     */
-</span>280 <span style=''>    private def persist(partition: Int, batch: Map[String, FeatureReference]): Unit = {
-</span>281 <span style=''>      // do an update query first
-</span>282 <span style=''>      val remaining = </span><span style='background: #AEF1AE'>persistUpdates(partition, batch)</span><span style=''>
-</span>283 <span style=''>      // if any weren't updates, add them as inserts
-</span>284 <span style=''>      if (</span><span style='background: #AEF1AE'>remaining.nonEmpty</span><span style=''>) {
-</span>285 <span style=''>        </span><span style='background: #AEF1AE'>persistAppends(partition, remaining)</span><span style=''>
-</span>286 <span style=''>      }
-</span>287 <span style=''>    }
-</span>288 <span style=''>
-</span>289 <span style=''>    /**
-</span>290 <span style=''>     * Attempt to persist expired features through modifying writes
-</span>291 <span style=''>     *
-</span>292 <span style=''>     * @param partition partition being persisted
-</span>293 <span style=''>     * @param batch expired feature
-</span>294 <span style=''>     * @return any features that were not persisted
-</span>295 <span style=''>     */
-</span>296 <span style=''>    private def persistUpdates(partition: Int, batch: Map[String, FeatureReference]): Iterable[FeatureReference] = {
-</span>297 <span style=''>      logger.debug(s&quot;Attempting persistent updates on ${batch.size} features&quot;)
-</span>298 <span style=''>      val persistedKeys = </span><span style='background: #AEF1AE'>scala.collection.mutable.Set.empty[String]</span><span style=''>
-</span>299 <span style=''>      </span><span style='background: #AEF1AE'>profile((c: Int, time: Long) =&gt; logger.debug(s&quot;Wrote $c updated feature(s) to persistent storage in ${time}ms&quot;)) {
-</span>300 <span style=''></span><span style='background: #AEF1AE'>        val filter = ff.id(batch.keys.map(ff.featureId).toSeq: _*)
-</span>301 <span style=''></span><span style='background: #AEF1AE'>        WithClose(ds.getFeatureWriter(sft.getTypeName, filter, Transaction.AUTO_COMMIT)) { writer =&gt;
-</span>302 <span style=''></span><span style='background: #AEF1AE'>          var count = 0
-</span>303 <span style=''></span><span style='background: #AEF1AE'>          while (writer.hasNext) {
-</span>304 <span style=''></span><span style='background: #AEF1AE'>            val next = writer.next()
-</span>305 <span style=''></span><span style='background: #AEF1AE'>            batch.get(next.getID).foreach { p =&gt;
-</span>306 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Persistent store modify [$topic:$partition:${p.offset}] ${p.feature}&quot;)
-</span>307 <span style=''></span><span style='background: #AEF1AE'>              persistedKeys += next.getID
-</span>308 <span style=''></span><span style='background: #AEF1AE'>              FeatureUtils.copyToFeature(next, p.feature, useProvidedFid = true)
-</span>309 <span style=''></span><span style='background: #AEF1AE'>              try {
-</span>310 <span style=''></span><span style='background: #AEF1AE'>                writer.write()
-</span>311 <span style=''></span><span style='background: #AEF1AE'>                count += 1
-</span>312 <span style=''></span><span style='background: #AEF1AE'>              } catch {
-</span>313 <span style=''></span><span style='background: #AEF1AE'>                case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.error(s&quot;Error persisting feature: ${p.feature}&quot;, e)</span><span style='background: #AEF1AE'>
-</span>314 <span style=''></span><span style='background: #AEF1AE'>              }
-</span>315 <span style=''></span><span style='background: #AEF1AE'>            }
-</span>316 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>317 <span style=''></span><span style='background: #AEF1AE'>          count
-</span>318 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>319 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>320 <span style=''>      </span><span style='background: #AEF1AE'>batch.collect { case (k, v) if !persistedKeys.contains(k) =&gt; v }</span><span style=''>
-</span>321 <span style=''>    }
-</span>322 <span style=''>
-</span>323 <span style=''>    /**
-</span>324 <span style=''>     * Attempt to persist expired features through appending writes
-</span>325 <span style=''>     *
-</span>326 <span style=''>     * @param partition partition being persisted
-</span>327 <span style=''>     * @param batch expired feature
-</span>328 <span style=''>     */
-</span>329 <span style=''>    private def persistAppends(partition: Int, batch: Iterable[FeatureReference]): Unit = {
-</span>330 <span style=''>      logger.debug(s&quot;Attempting persistent appends on ${batch.size} features&quot;)
-</span>331 <span style=''>      </span><span style='background: #AEF1AE'>profile((c: Int, time: Long) =&gt; logger.debug(s&quot;Wrote $c new feature(s) to persistent storage in ${time}ms&quot;)) {
-</span>332 <span style=''></span><span style='background: #AEF1AE'>        WithClose(ds.getFeatureWriterAppend(sft.getTypeName, Transaction.AUTO_COMMIT)) { writer =&gt;
-</span>333 <span style=''></span><span style='background: #AEF1AE'>          var count = 0
-</span>334 <span style=''></span><span style='background: #AEF1AE'>          batch.foreach { p =&gt;
-</span>335 <span style=''></span><span style='background: #AEF1AE'>            logger.trace(s&quot;Persistent store append [$topic:$partition:${p.offset}] ${p.feature}&quot;)
-</span>336 <span style=''></span><span style='background: #AEF1AE'>            try {
-</span>337 <span style=''></span><span style='background: #AEF1AE'>              FeatureUtils.write(writer, p.feature, useProvidedFid = true)
-</span>338 <span style=''></span><span style='background: #AEF1AE'>              count += 1
-</span>339 <span style=''></span><span style='background: #AEF1AE'>            } catch {
-</span>340 <span style=''></span><span style='background: #AEF1AE'>              case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.error(s&quot;Error persisting feature: ${p.feature}&quot;, e)</span><span style='background: #AEF1AE'>
-</span>341 <span style=''></span><span style='background: #AEF1AE'>            }
-</span>342 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>343 <span style=''></span><span style='background: #AEF1AE'>          count
-</span>344 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>345 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>346 <span style=''>    }
-</span>347 <span style=''>
-</span>348 <span style=''>    override def close(): Unit = {
-</span>349 <span style=''>      </span><span style='background: #AEF1AE'>schedule.cancel(true)</span><span style=''>
-</span>350 <span style=''>      </span><span style='background: #AEF1AE'>executor.shutdownNow()</span><span style=''>
-</span>351 <span style=''>      </span><span style='background: #AEF1AE'>executor.awaitTermination(1, TimeUnit.SECONDS)</span><span style=''>
-</span>352 <span style=''>    }
-</span>353 <span style=''>  }
-</span>354 <span style=''>}
-</span>355 <span style=''>
-</span>356 <span style=''>object KafkaFeatureCache {
+</span>14 <span style=''>import org.locationtech.geomesa.index.utils.FeatureWriterHelper
+</span>15 <span style=''>import org.locationtech.geomesa.lambda.stream.OffsetManager
+</span>16 <span style=''>import org.locationtech.geomesa.lambda.stream.OffsetManager.OffsetListener
+</span>17 <span style=''>import org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache._
+</span>18 <span style=''>import org.locationtech.geomesa.utils.concurrent.ExitingExecutor
+</span>19 <span style=''>import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
+</span>20 <span style=''>import org.locationtech.geomesa.utils.geotools.FeatureUtils
+</span>21 <span style=''>import org.locationtech.geomesa.utils.io.{CloseWithLogging, WithClose}
+</span>22 <span style=''>import org.locationtech.geomesa.utils.stats.MethodProfiling
+</span>23 <span style=''>
+</span>24 <span style=''>import java.io.Closeable
+</span>25 <span style=''>import java.time.{Clock, Instant, ZoneOffset, ZonedDateTime}
+</span>26 <span style=''>import java.util.concurrent.atomic.AtomicLong
+</span>27 <span style=''>import java.util.concurrent.{ConcurrentHashMap, ScheduledThreadPoolExecutor, TimeUnit}
+</span>28 <span style=''>import scala.annotation.tailrec
+</span>29 <span style=''>import scala.collection.mutable.ArrayBuffer
+</span>30 <span style=''>import scala.concurrent.duration.FiniteDuration
+</span>31 <span style=''>import scala.util.Random
+</span>32 <span style=''>import scala.util.control.NonFatal
+</span>33 <span style=''>
+</span>34 <span style=''>/**
+</span>35 <span style=''>  * Locally cached features
+</span>36 <span style=''>  */
+</span>37 <span style=''>class KafkaFeatureCache(
+</span>38 <span style=''>    ds: DataStore,
+</span>39 <span style=''>    sft: SimpleFeatureType,
+</span>40 <span style=''>    offsetManager: OffsetManager,
+</span>41 <span style=''>    topic: String,
+</span>42 <span style=''>    expiry: Option[FiniteDuration],
+</span>43 <span style=''>    batchSize: Option[Int])
+</span>44 <span style=''>   (implicit clock: Clock = Clock.systemUTC())
+</span>45 <span style=''>  extends WritableFeatureCache with ReadableFeatureCache with OffsetListener
+</span>46 <span style=''>    with Closeable with MethodProfiling with StrictLogging {
+</span>47 <span style=''>
+</span>48 <span style=''>  import org.locationtech.geomesa.filter.ff
+</span>49 <span style=''>
+</span>50 <span style=''>  import scala.collection.JavaConverters._
+</span>51 <span style=''>
+</span>52 <span style=''>  </span><span style='background: #AEF1AE'>require(batchSize.forall(</span><span style='background: #F0ADAD'>_ &gt; 0</span><span style='background: #AEF1AE'>), </span><span style='background: #F0ADAD'>s&quot;Invalid persistence batch size: ${batchSize.orNull}&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>53 <span style=''>
+</span>54 <span style=''>  // map of feature id -&gt; current feature
+</span>55 <span style=''>  private val features = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[String, FeatureReference]</span><span style=''>
+</span>56 <span style=''>
+</span>57 <span style=''>  // technically we should synchronize all access to the following array, since we expand it if needed;
+</span>58 <span style=''>  // however, in normal use it will be created up front and then only read.
+</span>59 <span style=''>  // if partitions are added at runtime, we may have synchronization issues...
+</span>60 <span style=''>  private val offsets = </span><span style='background: #AEF1AE'>ArrayBuffer.empty[AtomicLong]</span><span style=''>
+</span>61 <span style=''>
+</span>62 <span style=''>  private val lockTimeout = </span><span style='background: #AEF1AE'>KafkaFeatureCache.LockTimeout.toMillis.get</span><span style=''>
+</span>63 <span style=''>
+</span>64 <span style=''>  private val persistence = </span><span style='background: #AEF1AE'>expiry.map(e =&gt; new Persistence(e.toMillis))</span><span style=''>
+</span>65 <span style=''>
+</span>66 <span style=''>  </span><span style='background: #AEF1AE'>offsetManager.addOffsetListener(topic, this)</span><span style=''>
+</span>67 <span style=''>
+</span>68 <span style=''>  override def partitionAssigned(partition: Int, offset: Long): Unit = {
+</span>69 <span style=''>    logger.debug(s&quot;Partition assigned: [$topic:$partition:$offset]&quot;)
+</span>70 <span style=''>    </span><span style='background: #AEF1AE'>ensurePartition(partition, offset)</span><span style=''>
+</span>71 <span style=''>  }
+</span>72 <span style=''>
+</span>73 <span style=''>  override def get(id: String): SimpleFeature = {
+</span>74 <span style=''>    val result = </span><span style='background: #AEF1AE'>features.get(id)</span><span style=''>
+</span>75 <span style=''>    if (</span><span style='background: #AEF1AE'>result == null</span><span style=''>) { </span><span style='background: #F0ADAD'>null</span><span style=''> } else { </span><span style='background: #AEF1AE'>result.feature</span><span style=''> }
+</span>76 <span style=''>  }
+</span>77 <span style=''>
+</span>78 <span style=''>  override def all(): Iterator[SimpleFeature] = </span><span style='background: #AEF1AE'>features.values.iterator.asScala.map(_.feature)</span><span style=''>
+</span>79 <span style=''>
+</span>80 <span style=''>  override def add(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit = {
+</span>81 <span style=''>    if (</span><span style='background: #AEF1AE'>offsets(partition).get &lt; offset</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>82 <span style=''></span><span style='background: #AEF1AE'>      logger.trace(s&quot;Adding [$partition:$offset] $feature created at &quot; +
+</span>83 <span style=''></span><span style='background: #AEF1AE'>          s&quot;${ZonedDateTime.ofInstant(Instant.ofEpochMilli(created), ZoneOffset.UTC)}&quot;)
+</span>84 <span style=''></span><span style='background: #AEF1AE'>      features.put(feature.getID, new FeatureReference(feature, partition, offset, created))
+</span>85 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''> else {
+</span>86 <span style=''>      </span><span style='background: #F0ADAD'>logger.trace(s&quot;Ignoring [$partition:$offset] $feature created at &quot; +
+</span>87 <span style=''></span><span style='background: #F0ADAD'>          s&quot;${ZonedDateTime.ofInstant(Instant.ofEpochMilli(created), ZoneOffset.UTC)}&quot;)</span><span style=''>
+</span>88 <span style=''>    }
+</span>89 <span style=''>  }
+</span>90 <span style=''>
+</span>91 <span style=''>  override def delete(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit = {
+</span>92 <span style=''>    logger.trace(s&quot;Deleting [$partition:$offset] $feature created at &quot; +
+</span>93 <span style=''>        s&quot;${ZonedDateTime.ofInstant(Instant.ofEpochMilli(created), ZoneOffset.UTC)}&quot;)
+</span>94 <span style=''>    </span><span style='background: #AEF1AE'>features.remove(feature.getID)</span><span style=''>
+</span>95 <span style=''>    </span><span style='background: #AEF1AE'>persistence.foreach { p =&gt;
+</span>96 <span style=''></span><span style='background: #AEF1AE'>      try {
+</span>97 <span style=''></span><span style='background: #AEF1AE'>        if (p.delete(feature.getID)) {
+</span>98 <span style=''></span><span style='background: #AEF1AE'>          logger.trace(s&quot;Persistent store delete [$topic:$partition:$offset] $feature&quot;)
+</span>99 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>100 <span style=''></span><span style='background: #AEF1AE'>      } catch {
+</span>101 <span style=''></span><span style='background: #AEF1AE'>        case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.error(s&quot;Error deleting feature in persistent store: $feature&quot;, e)</span><span style='background: #AEF1AE'>
+</span>102 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>103 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>104 <span style=''>  }
+</span>105 <span style=''>
+</span>106 <span style=''>  override def offsetChanged(partition: Int, offset: Long): Unit = {
+</span>107 <span style=''>    if (</span><span style='background: #AEF1AE'>offsets.length &lt;= partition</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>108 <span style=''></span><span style='background: #F0ADAD'>      logger.debug(s&quot;Offsets changed for [$topic:$partition]: (unassigned) -&gt; $offset&quot;)
+</span>109 <span style=''></span><span style='background: #F0ADAD'>      ensurePartition(partition, offset)
+</span>110 <span style=''></span><span style='background: #F0ADAD'>      return
+</span>111 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>112 <span style=''>
+</span>113 <span style=''>    // update the valid offset
+</span>114 <span style=''>    var last = </span><span style='background: #AEF1AE'>offsets(partition).get</span><span style=''>
+</span>115 <span style=''>    logger.debug(s&quot;Offsets changed for [$topic:$partition]: $last -&gt; $offset&quot;)
+</span>116 <span style=''>    while (</span><span style='background: #AEF1AE'>last &lt; offset &amp;&amp; !offsets(partition).compareAndSet(last, offset)</span><span style=''>) {
+</span>117 <span style=''>      </span><span style='background: #F0ADAD'>last = offsets(partition).get</span><span style=''>
+</span>118 <span style=''>    }
+</span>119 <span style=''>
+</span>120 <span style=''>    def onCompleted(count: Int, time: Long): Unit =
+</span>121 <span style=''>      logger.debug(f&quot;Size of cached state for [$topic]: ${features.size}%d (removed $count%d entries in ${time}ms)&quot;)
+</span>122 <span style=''>
+</span>123 <span style=''>    </span><span style='background: #AEF1AE'>profile(onCompleted _) {
+</span>124 <span style=''></span><span style='background: #AEF1AE'>      var removed = 0
+</span>125 <span style=''></span><span style='background: #AEF1AE'>      val iter = features.values().iterator()
+</span>126 <span style=''></span><span style='background: #AEF1AE'>      while (iter.hasNext) {
+</span>127 <span style=''></span><span style='background: #AEF1AE'>        val next = iter.next()
+</span>128 <span style=''></span><span style='background: #AEF1AE'>        if (next.partition == partition &amp;&amp; next.offset &lt;= offset) {
+</span>129 <span style=''></span><span style='background: #AEF1AE'>          iter.remove()
+</span>130 <span style=''></span><span style='background: #AEF1AE'>          removed += 1
+</span>131 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>132 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>133 <span style=''></span><span style='background: #AEF1AE'>      removed
+</span>134 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>135 <span style=''>  }
+</span>136 <span style=''>
+</span>137 <span style=''>  /**
+</span>138 <span style=''>   * Persist any expired features
+</span>139 <span style=''>   *
+</span>140 <span style=''>   * @return list of last persisted offsets per partition
+</span>141 <span style=''>   */
+</span>142 <span style=''>  def persist(): Seq[PartitionOffset] =
+</span>143 <span style=''>    </span><span style='background: #AEF1AE'>persistence.getOrElse(throw new IllegalStateException(&quot;Persistence is disabled for this store&quot;)).persist()</span><span style=''>
+</span>144 <span style=''>
+</span>145 <span style=''>  override def close(): Unit = {
+</span>146 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(persistence)</span><span style=''>
+</span>147 <span style=''>    </span><span style='background: #AEF1AE'>offsetManager.removeOffsetListener(topic, this)</span><span style=''>
+</span>148 <span style=''>  }
+</span>149 <span style=''>
+</span>150 <span style=''>  /**
+</span>151 <span style=''>   * Create an offset holder for the partition if it doesn't already exist
+</span>152 <span style=''>   *
+</span>153 <span style=''>   * @param partition partition
+</span>154 <span style=''>   * @param offset offset
+</span>155 <span style=''>   */
+</span>156 <span style=''>  private def ensurePartition(partition: Int, offset: Long): Unit = </span><span style='background: #AEF1AE'>synchronized {
+</span>157 <span style=''></span><span style='background: #AEF1AE'>    while (offsets.length &lt;= partition) {
+</span>158 <span style=''></span><span style='background: #AEF1AE'>      offsets += new AtomicLong(-1L)
+</span>159 <span style=''></span><span style='background: #AEF1AE'>    }
+</span>160 <span style=''></span><span style='background: #AEF1AE'>    offsets(partition).set(offset)
+</span>161 <span style=''></span><span style='background: #AEF1AE'>  }</span><span style=''>
+</span>162 <span style=''>
+</span>163 <span style=''>  /**
+</span>164 <span style=''>   * Wrapper for managing scheduled persistence runs
+</span>165 <span style=''>   */
+</span>166 <span style=''>  private class Persistence(expiryMillis: Long) extends Closeable {
+</span>167 <span style=''>
+</span>168 <span style=''>    private val frequency = </span><span style='background: #AEF1AE'>KafkaFeatureCache.PersistInterval.toMillis.get</span><span style=''>
+</span>169 <span style=''>    private val executor = </span><span style='background: #AEF1AE'>ExitingExecutor(new ScheduledThreadPoolExecutor(1))</span><span style=''>
+</span>170 <span style=''>    private val schedule = </span><span style='background: #AEF1AE'>executor.scheduleWithFixedDelay(() =&gt; </span><span style='background: #F0ADAD'>persist()</span><span style='background: #AEF1AE'>, frequency, frequency, TimeUnit.MILLISECONDS)</span><span style=''>
+</span>171 <span style=''>
+</span>172 <span style=''>    /**
+</span>173 <span style=''>     * Persist any expired features
+</span>174 <span style=''>     *
+</span>175 <span style=''>     * @return list of last persisted offsets per partition
+</span>176 <span style=''>     */
+</span>177 <span style=''>    def persist(): Seq[PartitionOffset] = {
+</span>178 <span style=''>      logger.debug(s&quot;Running persistence for [$topic]&quot;)
+</span>179 <span style=''>      // lock per-partition to allow for multiple write threads
+</span>180 <span style=''>      // randomly access the partitions to avoid contention if multiple data stores are all on the same schedule
+</span>181 <span style=''>      </span><span style='background: #AEF1AE'>Random.shuffle(Range(0, offsets.length).toList).flatMap { partition =&gt;
+</span>182 <span style=''></span><span style='background: #AEF1AE'>        // if we don't get the lock just try again next run
+</span>183 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(s&quot;Acquiring lock for [$topic:$partition]&quot;)
+</span>184 <span style=''></span><span style='background: #AEF1AE'>        offsetManager.acquireLock(topic, partition, lockTimeout) match {
+</span>185 <span style=''></span><span style='background: #AEF1AE'>          case None </span><span style='background: #F0ADAD'>=&gt;
+</span>186 <span style=''></span><span style='background: #F0ADAD'>            logger.trace(s&quot;Could not acquire lock for [$topic:$partition] within ${lockTimeout}ms&quot;)
+</span>187 <span style=''></span><span style='background: #F0ADAD'>            None</span><span style='background: #AEF1AE'>
+</span>188 <span style=''></span><span style='background: #AEF1AE'>          case Some(lock) =&gt;
+</span>189 <span style=''></span><span style='background: #AEF1AE'>            try {
+</span>190 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Acquired lock for [$topic:$partition]&quot;)
+</span>191 <span style=''></span><span style='background: #AEF1AE'>              persist(partition).map(PartitionOffset(partition, _))
+</span>192 <span style=''></span><span style='background: #AEF1AE'>            } finally {
+</span>193 <span style=''></span><span style='background: #AEF1AE'>              lock.close()
+</span>194 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Released lock for [$topic:$partition]&quot;)
+</span>195 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>196 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>197 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>198 <span style=''>    }
+</span>199 <span style=''>
+</span>200 <span style=''>    /**
+</span>201 <span style=''>     * Delete a feature
+</span>202 <span style=''>     *
+</span>203 <span style=''>     * @param id feature id
+</span>204 <span style=''>     * @return true if feature was deleted
+</span>205 <span style=''>     */
+</span>206 <span style=''>    def delete(id: String): Boolean = {
+</span>207 <span style=''>      </span><span style='background: #AEF1AE'>WithClose(ds.getFeatureWriter(sft.getTypeName, ff.id(ff.featureId(id)), Transaction.AUTO_COMMIT)) { writer =&gt;
+</span>208 <span style=''></span><span style='background: #AEF1AE'>        if (writer.hasNext) {
+</span>209 <span style=''></span><span style='background: #AEF1AE'>          writer.next()
+</span>210 <span style=''></span><span style='background: #AEF1AE'>          writer.remove()
+</span>211 <span style=''></span><span style='background: #AEF1AE'>          true
+</span>212 <span style=''></span><span style='background: #AEF1AE'>        } else {
+</span>213 <span style=''></span><span style='background: #AEF1AE'>          false
+</span>214 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>215 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>216 <span style=''>    }
+</span>217 <span style=''>
+</span>218 <span style=''>    /**
+</span>219 <span style=''>     * Persist any expired features that haven't yet been persisted
+</span>220 <span style=''>     *
+</span>221 <span style=''>     * @param partition partition to persist
+</span>222 <span style=''>     * @param lastPersistedOffset result from previous recursive run, if any
+</span>223 <span style=''>     * @return offset of latest persisted feature
+</span>224 <span style=''>     */
+</span>225 <span style=''>    @tailrec
+</span>226 <span style=''>    private def persist(partition: Int, lastPersistedOffset: Option[Long] = None): Option[Long] = {
+</span>227 <span style=''>      val expiry = </span><span style='background: #AEF1AE'>clock.millis() - expiryMillis</span><span style=''>
+</span>228 <span style=''>
+</span>229 <span style=''>      val lastOffset = </span><span style='background: #AEF1AE'>offsetManager.getOffset(topic, partition)</span><span style=''>
+</span>230 <span style=''>      logger.debug(s&quot;Last persisted offsets for [$topic:$partition]: $lastOffset&quot;)
+</span>231 <span style=''>
+</span>232 <span style=''>      var nextOffset = </span><span style='background: #AEF1AE'>-1L</span><span style=''>
+</span>233 <span style=''>      // note: copy to a new collection so that any updates don't affect our persistence here
+</span>234 <span style=''>      val expired = {
+</span>235 <span style=''>        val builder = </span><span style='background: #AEF1AE'>Map.newBuilder[String, FeatureReference]</span><span style=''>
+</span>236 <span style=''>        </span><span style='background: #AEF1AE'>features.asScala.foreach { case (id, f) =&gt;
+</span>237 <span style=''></span><span style='background: #AEF1AE'>          // note: offset &gt; lastOffset ensures we don't operate on features that have already been processed
+</span>238 <span style=''></span><span style='background: #AEF1AE'>          if (f.partition == partition &amp;&amp; f.created &lt;= expiry &amp;&amp; f.offset &gt; lastOffset) {
+</span>239 <span style=''></span><span style='background: #AEF1AE'>            nextOffset = math.max(nextOffset, f.offset)
+</span>240 <span style=''></span><span style='background: #AEF1AE'>            builder += id -&gt; f
+</span>241 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>242 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>243 <span style=''>        </span><span style='background: #AEF1AE'>builder.result()</span><span style=''>
+</span>244 <span style=''>      }
+</span>245 <span style=''>      logger.debug(s&quot;Found ${expired.size} expired entries for [$topic:$partition]&quot;)
+</span>246 <span style=''>
+</span>247 <span style=''>      if (</span><span style='background: #AEF1AE'>expired.isEmpty</span><span style=''>) {
+</span>248 <span style=''>        </span><span style='background: #AEF1AE'>lastPersistedOffset</span><span style=''>
+</span>249 <span style=''>      } else </span><span style='background: #AEF1AE'>{
+</span>250 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(expired.values.map(e =&gt; s&quot;offset ${e.offset}: ${e.feature}&quot;).mkString(&quot;Expired entries:\n\t&quot;, &quot;\n\t&quot;, &quot;&quot;))
+</span>251 <span style=''></span><span style='background: #AEF1AE'>        val batch = batchSize match {
+</span>252 <span style=''></span><span style='background: #AEF1AE'>          case Some(max) if </span><span style='background: #F0ADAD'>expired.size &gt; max</span><span style='background: #AEF1AE'> </span><span style='background: #F0ADAD'>=&gt;
+</span>253 <span style=''></span><span style='background: #F0ADAD'>            logger.trace(s&quot;Skipping persistence for ${expired.size - max} features based on batch size of $max&quot;)
+</span>254 <span style=''></span><span style='background: #F0ADAD'>            // sort by offset since we track persistence based on offset
+</span>255 <span style=''></span><span style='background: #F0ADAD'>            val sorted = expired.toList.sortBy(_._2.offset).take(max)
+</span>256 <span style=''></span><span style='background: #F0ADAD'>            nextOffset = sorted.last._2.offset
+</span>257 <span style=''></span><span style='background: #F0ADAD'>            sorted.toMap</span><span style='background: #AEF1AE'>
+</span>258 <span style=''></span><span style='background: #AEF1AE'>          case _ =&gt;
+</span>259 <span style=''></span><span style='background: #AEF1AE'>            expired
+</span>260 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>261 <span style=''></span><span style='background: #AEF1AE'>        persist(partition, batch)
+</span>262 <span style=''></span><span style='background: #AEF1AE'>
+</span>263 <span style=''></span><span style='background: #AEF1AE'>        logger.debug(s&quot;Committing offset [$topic:$partition:$nextOffset]&quot;)
+</span>264 <span style=''></span><span style='background: #AEF1AE'>        // this will trigger our listener and cause the feature to be removed from the cache
+</span>265 <span style=''></span><span style='background: #AEF1AE'>        offsetManager.setOffset(topic, partition, nextOffset)
+</span>266 <span style=''></span><span style='background: #AEF1AE'>        if (batch.size &lt; expired.size) {
+</span>267 <span style=''></span><span style='background: #AEF1AE'>          // we skipped some expired features, so run again immediately
+</span>268 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>persist(partition, Some(nextOffset))</span><span style='background: #AEF1AE'>
+</span>269 <span style=''></span><span style='background: #AEF1AE'>        } else {
+</span>270 <span style=''></span><span style='background: #AEF1AE'>          Some(nextOffset)
+</span>271 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>272 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>273 <span style=''>    }
+</span>274 <span style=''>
+</span>275 <span style=''>    /**
+</span>276 <span style=''>     * Persist expired features
+</span>277 <span style=''>     *
+</span>278 <span style=''>     * @param partition partition
+</span>279 <span style=''>     * @param batch expired features
+</span>280 <span style=''>     */
+</span>281 <span style=''>    private def persist(partition: Int, batch: Map[String, FeatureReference]): Unit = {
+</span>282 <span style=''>      // do an update query first
+</span>283 <span style=''>      val remaining = </span><span style='background: #AEF1AE'>persistUpdates(partition, batch)</span><span style=''>
+</span>284 <span style=''>      // if any weren't updates, add them as inserts
+</span>285 <span style=''>      if (</span><span style='background: #AEF1AE'>remaining.nonEmpty</span><span style=''>) {
+</span>286 <span style=''>        </span><span style='background: #AEF1AE'>persistAppends(partition, remaining)</span><span style=''>
+</span>287 <span style=''>      }
+</span>288 <span style=''>    }
+</span>289 <span style=''>
+</span>290 <span style=''>    /**
+</span>291 <span style=''>     * Attempt to persist expired features through modifying writes
+</span>292 <span style=''>     *
+</span>293 <span style=''>     * @param partition partition being persisted
+</span>294 <span style=''>     * @param batch expired feature
+</span>295 <span style=''>     * @return any features that were not persisted
+</span>296 <span style=''>     */
+</span>297 <span style=''>    private def persistUpdates(partition: Int, batch: Map[String, FeatureReference]): Iterable[FeatureReference] = {
+</span>298 <span style=''>      logger.debug(s&quot;Attempting persistent updates on ${batch.size} features&quot;)
+</span>299 <span style=''>      val persistedKeys = </span><span style='background: #AEF1AE'>scala.collection.mutable.Set.empty[String]</span><span style=''>
+</span>300 <span style=''>      </span><span style='background: #AEF1AE'>profile((c: Int, time: Long) =&gt; logger.debug(s&quot;Wrote $c updated feature(s) to persistent storage in ${time}ms&quot;)) {
+</span>301 <span style=''></span><span style='background: #AEF1AE'>        val filter = ff.id(batch.keys.map(ff.featureId).toSeq: _*)
+</span>302 <span style=''></span><span style='background: #AEF1AE'>        WithClose(ds.getFeatureWriter(sft.getTypeName, filter, Transaction.AUTO_COMMIT)) { writer =&gt;
+</span>303 <span style=''></span><span style='background: #AEF1AE'>          var count = 0
+</span>304 <span style=''></span><span style='background: #AEF1AE'>          while (writer.hasNext) {
+</span>305 <span style=''></span><span style='background: #AEF1AE'>            val next = writer.next()
+</span>306 <span style=''></span><span style='background: #AEF1AE'>            batch.get(next.getID).foreach { p =&gt;
+</span>307 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Persistent store modify [$topic:$partition:${p.offset}] ${p.feature}&quot;)
+</span>308 <span style=''></span><span style='background: #AEF1AE'>              persistedKeys += next.getID
+</span>309 <span style=''></span><span style='background: #AEF1AE'>              FeatureUtils.copyToFeature(next, p.feature, useProvidedFid = true)
+</span>310 <span style=''></span><span style='background: #AEF1AE'>              try {
+</span>311 <span style=''></span><span style='background: #AEF1AE'>                writer.write()
+</span>312 <span style=''></span><span style='background: #AEF1AE'>                count += 1
+</span>313 <span style=''></span><span style='background: #AEF1AE'>              } catch {
+</span>314 <span style=''></span><span style='background: #AEF1AE'>                case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.error(s&quot;Error persisting feature: ${p.feature}&quot;, e)</span><span style='background: #AEF1AE'>
+</span>315 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>316 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>317 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>318 <span style=''></span><span style='background: #AEF1AE'>          count
+</span>319 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>320 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>321 <span style=''>      </span><span style='background: #AEF1AE'>batch.collect { case (k, v) if !persistedKeys.contains(k) =&gt; v }</span><span style=''>
+</span>322 <span style=''>    }
+</span>323 <span style=''>
+</span>324 <span style=''>    /**
+</span>325 <span style=''>     * Attempt to persist expired features through appending writes
+</span>326 <span style=''>     *
+</span>327 <span style=''>     * @param partition partition being persisted
+</span>328 <span style=''>     * @param batch expired feature
+</span>329 <span style=''>     */
+</span>330 <span style=''>    private def persistAppends(partition: Int, batch: Iterable[FeatureReference]): Unit = {
+</span>331 <span style=''>      logger.debug(s&quot;Attempting persistent appends on ${batch.size} features&quot;)
+</span>332 <span style=''>      </span><span style='background: #AEF1AE'>profile((c: Int, time: Long) =&gt; logger.debug(s&quot;Wrote $c new feature(s) to persistent storage in ${time}ms&quot;)) {
+</span>333 <span style=''></span><span style='background: #AEF1AE'>        WithClose(ds.getFeatureWriterAppend(sft.getTypeName, Transaction.AUTO_COMMIT)) { writer =&gt;
+</span>334 <span style=''></span><span style='background: #AEF1AE'>          var count = 0
+</span>335 <span style=''></span><span style='background: #AEF1AE'>          val helper = FeatureWriterHelper(writer, useProvidedFids = true)
+</span>336 <span style=''></span><span style='background: #AEF1AE'>          batch.foreach { p =&gt;
+</span>337 <span style=''></span><span style='background: #AEF1AE'>            logger.trace(s&quot;Persistent store append [$topic:$partition:${p.offset}] ${p.feature}&quot;)
+</span>338 <span style=''></span><span style='background: #AEF1AE'>            try {
+</span>339 <span style=''></span><span style='background: #AEF1AE'>              helper.write(p.feature)
+</span>340 <span style=''></span><span style='background: #AEF1AE'>              count += 1
+</span>341 <span style=''></span><span style='background: #AEF1AE'>            } catch {
+</span>342 <span style=''></span><span style='background: #AEF1AE'>              case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.error(s&quot;Error persisting feature: ${p.feature}&quot;, e)</span><span style='background: #AEF1AE'>
+</span>343 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>344 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>345 <span style=''></span><span style='background: #AEF1AE'>          count
+</span>346 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>347 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>348 <span style=''>    }
+</span>349 <span style=''>
+</span>350 <span style=''>    override def close(): Unit = {
+</span>351 <span style=''>      </span><span style='background: #AEF1AE'>schedule.cancel(true)</span><span style=''>
+</span>352 <span style=''>      </span><span style='background: #AEF1AE'>executor.shutdownNow()</span><span style=''>
+</span>353 <span style=''>      </span><span style='background: #AEF1AE'>executor.awaitTermination(1, TimeUnit.SECONDS)</span><span style=''>
+</span>354 <span style=''>    }
+</span>355 <span style=''>  }
+</span>356 <span style=''>}
 </span>357 <span style=''>
-</span>358 <span style=''>  val PersistInterval: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.lambda.persist.interval&quot;, &quot;1 minute&quot;)</span><span style=''>
-</span>359 <span style=''>  val LockTimeout: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.lambda.persist.lock.timeout&quot;, &quot;1 second&quot;)</span><span style=''>
-</span>360 <span style=''>
-</span>361 <span style=''>  trait ReadableFeatureCache {
+</span>358 <span style=''>object KafkaFeatureCache {
+</span>359 <span style=''>
+</span>360 <span style=''>  val PersistInterval: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.lambda.persist.interval&quot;, &quot;1 minute&quot;)</span><span style=''>
+</span>361 <span style=''>  val LockTimeout: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.lambda.persist.lock.timeout&quot;, &quot;1 second&quot;)</span><span style=''>
 </span>362 <span style=''>
-</span>363 <span style=''>    /**
-</span>364 <span style=''>      * Returns most recent versions of all features currently in this cache
-</span>365 <span style=''>      *
-</span>366 <span style=''>      * @return
-</span>367 <span style=''>      */
-</span>368 <span style=''>    def all(): Iterator[SimpleFeature]
-</span>369 <span style=''>
-</span>370 <span style=''>    /**
-</span>371 <span style=''>      * Returns the most recent version of a feature in this cache, by feature ID
-</span>372 <span style=''>      *
-</span>373 <span style=''>      * @param id feature id
-</span>374 <span style=''>      * @return
-</span>375 <span style=''>      */
-</span>376 <span style=''>    def get(id: String): SimpleFeature
-</span>377 <span style=''>  }
-</span>378 <span style=''>
-</span>379 <span style=''>  trait WritableFeatureCache {
+</span>363 <span style=''>  trait ReadableFeatureCache {
+</span>364 <span style=''>
+</span>365 <span style=''>    /**
+</span>366 <span style=''>      * Returns most recent versions of all features currently in this cache
+</span>367 <span style=''>      *
+</span>368 <span style=''>      * @return
+</span>369 <span style=''>      */
+</span>370 <span style=''>    def all(): Iterator[SimpleFeature]
+</span>371 <span style=''>
+</span>372 <span style=''>    /**
+</span>373 <span style=''>      * Returns the most recent version of a feature in this cache, by feature ID
+</span>374 <span style=''>      *
+</span>375 <span style=''>      * @param id feature id
+</span>376 <span style=''>      * @return
+</span>377 <span style=''>      */
+</span>378 <span style=''>    def get(id: String): SimpleFeature
+</span>379 <span style=''>  }
 </span>380 <span style=''>
-</span>381 <span style=''>    /**
-</span>382 <span style=''>      * Initialize this cached state for a given partition and offset
-</span>383 <span style=''>      *
-</span>384 <span style=''>      * @param partition partition
-</span>385 <span style=''>      * @param offset offset
-</span>386 <span style=''>      */
-</span>387 <span style=''>    def partitionAssigned(partition: Int, offset: Long): Unit
-</span>388 <span style=''>
-</span>389 <span style=''>    /**
-</span>390 <span style=''>      * Add a feature to the cached state
-</span>391 <span style=''>      *
-</span>392 <span style=''>      * @param feature feature
-</span>393 <span style=''>      * @param partition partition corresponding to the add message
-</span>394 <span style=''>      * @param offset offset corresponding to the add message
-</span>395 <span style=''>      * @param created time feature was created
-</span>396 <span style=''>      */
-</span>397 <span style=''>    def add(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit
-</span>398 <span style=''>
-</span>399 <span style=''>    /**
-</span>400 <span style=''>      * Deletes a feature from the cached state
-</span>401 <span style=''>      *
-</span>402 <span style=''>      * @param feature feature
-</span>403 <span style=''>      * @param partition partition corresponding to the delete message
-</span>404 <span style=''>      * @param offset offset corresponding to the delete message
-</span>405 <span style=''>      * @param created time feature was deleted
-</span>406 <span style=''>      */
-</span>407 <span style=''>    def delete(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit
-</span>408 <span style=''>  }
-</span>409 <span style=''>
-</span>410 <span style=''>  /**
-</span>411 <span style=''>   * Partition and offset holder
-</span>412 <span style=''>   *
-</span>413 <span style=''>   * @param partition partition
-</span>414 <span style=''>   * @param offset offset
-</span>415 <span style=''>   */
-</span>416 <span style=''>  case class PartitionOffset(partition: Int, offset: Long)
-</span>417 <span style=''>
-</span>418 <span style=''>  /**
-</span>419 <span style=''>   * Feature holder used to track the latest feature in our state. Comparison is only based on the
-</span>420 <span style=''>   * partition and offset (which are unique) so that we don't have to hold onto expired features
-</span>421 <span style=''>   * in memory
-</span>422 <span style=''>   *
-</span>423 <span style=''>   * @param feature simple feature
-</span>424 <span style=''>   * @param partition kafka partition
-</span>425 <span style=''>   * @param offset kafka offset
-</span>426 <span style=''>   * @param created create time
-</span>427 <span style=''>   */
-</span>428 <span style=''>  private class FeatureReference(
-</span>429 <span style=''>      val feature: SimpleFeature,
-</span>430 <span style=''>      val partition: Int,
-</span>431 <span style=''>      val offset: Long,
-</span>432 <span style=''>      val created: Long) {
-</span>433 <span style=''>    override def equals(other: Any): Boolean = other match {
-</span>434 <span style=''>      case that: FeatureReference =&gt; </span><span style='background: #F0ADAD'>partition == that.partition &amp;&amp; offset == that.offset</span><span style=''>
-</span>435 <span style=''>      case _ =&gt; </span><span style='background: #F0ADAD'>false</span><span style=''>
-</span>436 <span style=''>    }
-</span>437 <span style=''>    override def hashCode(): Int = {
-</span>438 <span style=''>      val state = </span><span style='background: #F0ADAD'>Seq(partition, offset)</span><span style=''>
-</span>439 <span style=''>      </span><span style='background: #F0ADAD'>state.map(_.hashCode()).foldLeft(0)((a, b) =&gt; 31 * a + b)</span><span style=''>
-</span>440 <span style=''>    }
-</span>441 <span style=''>  }
-</span>442 <span style=''>}
+</span>381 <span style=''>  trait WritableFeatureCache {
+</span>382 <span style=''>
+</span>383 <span style=''>    /**
+</span>384 <span style=''>      * Initialize this cached state for a given partition and offset
+</span>385 <span style=''>      *
+</span>386 <span style=''>      * @param partition partition
+</span>387 <span style=''>      * @param offset offset
+</span>388 <span style=''>      */
+</span>389 <span style=''>    def partitionAssigned(partition: Int, offset: Long): Unit
+</span>390 <span style=''>
+</span>391 <span style=''>    /**
+</span>392 <span style=''>      * Add a feature to the cached state
+</span>393 <span style=''>      *
+</span>394 <span style=''>      * @param feature feature
+</span>395 <span style=''>      * @param partition partition corresponding to the add message
+</span>396 <span style=''>      * @param offset offset corresponding to the add message
+</span>397 <span style=''>      * @param created time feature was created
+</span>398 <span style=''>      */
+</span>399 <span style=''>    def add(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit
+</span>400 <span style=''>
+</span>401 <span style=''>    /**
+</span>402 <span style=''>      * Deletes a feature from the cached state
+</span>403 <span style=''>      *
+</span>404 <span style=''>      * @param feature feature
+</span>405 <span style=''>      * @param partition partition corresponding to the delete message
+</span>406 <span style=''>      * @param offset offset corresponding to the delete message
+</span>407 <span style=''>      * @param created time feature was deleted
+</span>408 <span style=''>      */
+</span>409 <span style=''>    def delete(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit
+</span>410 <span style=''>  }
+</span>411 <span style=''>
+</span>412 <span style=''>  /**
+</span>413 <span style=''>   * Partition and offset holder
+</span>414 <span style=''>   *
+</span>415 <span style=''>   * @param partition partition
+</span>416 <span style=''>   * @param offset offset
+</span>417 <span style=''>   */
+</span>418 <span style=''>  case class PartitionOffset(partition: Int, offset: Long)
+</span>419 <span style=''>
+</span>420 <span style=''>  /**
+</span>421 <span style=''>   * Feature holder used to track the latest feature in our state. Comparison is only based on the
+</span>422 <span style=''>   * partition and offset (which are unique) so that we don't have to hold onto expired features
+</span>423 <span style=''>   * in memory
+</span>424 <span style=''>   *
+</span>425 <span style=''>   * @param feature simple feature
+</span>426 <span style=''>   * @param partition kafka partition
+</span>427 <span style=''>   * @param offset kafka offset
+</span>428 <span style=''>   * @param created create time
+</span>429 <span style=''>   */
+</span>430 <span style=''>  private class FeatureReference(
+</span>431 <span style=''>      val feature: SimpleFeature,
+</span>432 <span style=''>      val partition: Int,
+</span>433 <span style=''>      val offset: Long,
+</span>434 <span style=''>      val created: Long) {
+</span>435 <span style=''>    override def equals(other: Any): Boolean = other match {
+</span>436 <span style=''>      case that: FeatureReference =&gt; </span><span style='background: #F0ADAD'>partition == that.partition &amp;&amp; offset == that.offset</span><span style=''>
+</span>437 <span style=''>      case _ =&gt; </span><span style='background: #F0ADAD'>false</span><span style=''>
+</span>438 <span style=''>    }
+</span>439 <span style=''>    override def hashCode(): Int = {
+</span>440 <span style=''>      val state = </span><span style='background: #F0ADAD'>Seq(partition, offset)</span><span style=''>
+</span>441 <span style=''>      </span><span style='background: #F0ADAD'>state.map(_.hashCode()).foldLeft(0)((a, b) =&gt; 31 * a + b)</span><span style=''>
+</span>442 <span style=''>    }
+</span>443 <span style=''>  }
+</span>444 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -478,15 +480,15 @@
         <th>Code</th>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
-          696
+          697
         </td>
         <td>
-          2181
+          2245
           -
-          2186
+          2250
         </td>
         <td>
           Apply
@@ -502,15 +504,15 @@
         </td>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
-          697
+          698
         </td>
         <td>
-          2164
+          2228
           -
-          2187
+          2251
         </td>
         <td>
           Apply
@@ -526,15 +528,15 @@
         </td>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
-          698
+          699
         </td>
         <td>
-          2191
+          2255
           -
-          2224
+          2288
         </td>
         <td>
           Literal
@@ -550,15 +552,15 @@
         </td>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
-          699
+          700
         </td>
         <td>
-          2242
+          2306
           -
-          2243
+          2307
         </td>
         <td>
           Literal
@@ -574,15 +576,15 @@
         </td>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
-          700
+          701
         </td>
         <td>
-          2235
+          2299
           -
-          2235
+          2299
         </td>
         <td>
           TypeApply
@@ -598,15 +600,15 @@
         </td>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
-          701
+          702
         </td>
         <td>
-          2225
+          2289
           -
-          2241
+          2305
         </td>
         <td>
           ApplyToImplicitArgs
@@ -622,15 +624,15 @@
         </td>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
-          702
+          703
         </td>
         <td>
-          2189
+          2253
           -
-          2243
+          2307
         </td>
         <td>
           Apply
@@ -646,15 +648,15 @@
         </td>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
-          703
+          704
         </td>
         <td>
-          2156
+          2220
           -
-          2244
+          2308
         </td>
         <td>
           Apply
@@ -670,15 +672,15 @@
         </td>
       </tr><tr>
         <td>
-          54
+          55
         </td>
         <td>
-          704
+          705
         </td>
         <td>
-          2313
+          2377
           -
-          2360
+          2424
         </td>
         <td>
           Apply
@@ -694,15 +696,15 @@
         </td>
       </tr><tr>
         <td>
-          59
+          60
         </td>
         <td>
-          705
+          706
         </td>
         <td>
-          2645
+          2709
           -
-          2674
+          2738
         </td>
         <td>
           TypeApply
@@ -718,15 +720,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
-          706
+          707
         </td>
         <td>
-          2704
+          2768
           -
-          2746
+          2810
         </td>
         <td>
           Select
@@ -742,15 +744,15 @@
         </td>
       </tr><tr>
         <td>
-          63
+          64
         </td>
         <td>
-          707
+          708
         </td>
         <td>
-          2808
+          2872
           -
-          2818
+          2882
         </td>
         <td>
           Select
@@ -766,15 +768,15 @@
         </td>
       </tr><tr>
         <td>
-          63
+          64
         </td>
         <td>
-          708
+          709
         </td>
         <td>
-          2792
+          2856
           -
-          2819
+          2883
         </td>
         <td>
           Apply
@@ -790,15 +792,15 @@
         </td>
       </tr><tr>
         <td>
-          63
+          64
         </td>
         <td>
-          709
+          710
         </td>
         <td>
-          2776
+          2840
           -
-          2820
+          2884
         </td>
         <td>
           Apply
@@ -814,15 +816,15 @@
         </td>
       </tr><tr>
         <td>
-          65
+          66
         </td>
         <td>
-          710
+          711
         </td>
         <td>
-          2856
+          2920
           -
-          2861
+          2925
         </td>
         <td>
           Select
@@ -838,15 +840,15 @@
         </td>
       </tr><tr>
         <td>
-          65
+          66
         </td>
         <td>
-          711
+          712
         </td>
         <td>
-          2824
+          2888
           -
-          2868
+          2932
         </td>
         <td>
           Apply
@@ -862,15 +864,15 @@
         </td>
       </tr><tr>
         <td>
-          69
+          70
         </td>
         <td>
-          712
+          713
         </td>
         <td>
-          3016
+          3080
           -
-          3050
+          3114
         </td>
         <td>
           Apply
@@ -886,15 +888,15 @@
         </td>
       </tr><tr>
         <td>
-          73
+          74
         </td>
         <td>
-          713
+          714
         </td>
         <td>
-          3123
+          3187
           -
-          3139
+          3203
         </td>
         <td>
           Apply
@@ -910,15 +912,15 @@
         </td>
       </tr><tr>
         <td>
-          74
+          75
         </td>
         <td>
-          714
+          715
         </td>
         <td>
-          3148
+          3212
           -
-          3162
+          3226
         </td>
         <td>
           Apply
@@ -934,15 +936,15 @@
         </td>
       </tr><tr>
         <td>
-          74
+          75
         </td>
         <td>
-          715
+          716
         </td>
         <td>
-          3166
+          3230
           -
-          3170
+          3234
         </td>
         <td>
           Literal
@@ -958,15 +960,15 @@
         </td>
       </tr><tr>
         <td>
-          74
+          75
         </td>
         <td>
-          716
+          717
         </td>
         <td>
-          3166
+          3230
           -
-          3170
+          3234
         </td>
         <td>
           Block
@@ -982,15 +984,15 @@
         </td>
       </tr><tr>
         <td>
-          74
+          75
         </td>
         <td>
-          717
+          718
         </td>
         <td>
-          3180
+          3244
           -
-          3194
+          3258
         </td>
         <td>
           Select
@@ -1006,15 +1008,15 @@
         </td>
       </tr><tr>
         <td>
-          74
+          75
         </td>
         <td>
-          718
+          719
         </td>
         <td>
-          3180
+          3244
           -
-          3194
+          3258
         </td>
         <td>
           Block
@@ -1030,15 +1032,15 @@
         </td>
       </tr><tr>
         <td>
-          77
+          78
         </td>
         <td>
-          719
+          720
         </td>
         <td>
-          3250
+          3314
           -
-          3274
+          3338
         </td>
         <td>
           Apply
@@ -1054,15 +1056,15 @@
         </td>
       </tr><tr>
         <td>
-          77
+          78
         </td>
         <td>
-          720
+          721
         </td>
         <td>
-          3287
+          3351
           -
-          3296
+          3360
         </td>
         <td>
           Select
@@ -1078,15 +1080,15 @@
         </td>
       </tr><tr>
         <td>
-          77
+          78
         </td>
         <td>
-          721
+          722
         </td>
         <td>
-          3250
+          3314
           -
-          3297
+          3361
         </td>
         <td>
           Apply
@@ -1102,15 +1104,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          81
         </td>
         <td>
-          722
+          723
         </td>
         <td>
-          3405
+          3469
           -
-          3436
+          3500
         </td>
         <td>
           Apply
@@ -1126,15 +1128,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          81
         </td>
         <td>
-          727
+          728
         </td>
         <td>
-          3438
+          3502
           -
-          3699
+          3763
         </td>
         <td>
           Block
@@ -1159,15 +1161,15 @@
         </td>
       </tr><tr>
         <td>
-          83
+          84
         </td>
         <td>
-          723
+          724
         </td>
         <td>
-          3620
+          3684
           -
-          3633
+          3697
         </td>
         <td>
           Apply
@@ -1183,15 +1185,15 @@
         </td>
       </tr><tr>
         <td>
-          83
+          84
         </td>
         <td>
-          724
+          725
         </td>
         <td>
-          3635
+          3699
           -
-          3692
+          3756
         </td>
         <td>
           Apply
@@ -1207,15 +1209,15 @@
         </td>
       </tr><tr>
         <td>
-          83
+          84
         </td>
         <td>
-          725
+          726
         </td>
         <td>
-          3607
+          3671
           -
-          3693
+          3757
         </td>
         <td>
           Apply
@@ -1231,15 +1233,15 @@
         </td>
       </tr><tr>
         <td>
-          83
+          84
         </td>
         <td>
-          726
+          727
         </td>
         <td>
-          3619
+          3683
           -
-          3619
+          3683
         </td>
         <td>
           Literal
@@ -1255,15 +1257,15 @@
         </td>
       </tr><tr>
         <td>
-          85
+          86
         </td>
         <td>
-          728
+          729
         </td>
         <td>
-          3713
+          3777
           -
-          3869
+          3933
         </td>
         <td>
           Typed
@@ -1282,15 +1284,15 @@ else
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
-          729
+          730
         </td>
         <td>
-          4161
+          4225
           -
-          4174
+          4238
         </td>
         <td>
           Apply
@@ -1306,15 +1308,15 @@ else
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
-          730
+          731
         </td>
         <td>
-          4145
+          4209
           -
-          4175
+          4239
         </td>
         <td>
           Apply
@@ -1330,15 +1332,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
-          738
+          739
         </td>
         <td>
-          4180
+          4244
           -
-          4486
+          4550
         </td>
         <td>
           Apply
@@ -1367,15 +1369,15 @@ else
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          731
+          732
         </td>
         <td>
-          4240
+          4304
           -
-          4253
+          4317
         </td>
         <td>
           Apply
@@ -1391,15 +1393,15 @@ else
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          732
+          733
         </td>
         <td>
-          4231
+          4295
           -
-          4254
+          4318
         </td>
         <td>
           Apply
@@ -1415,15 +1417,15 @@ else
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          734
+          735
         </td>
         <td>
-          4227
+          4291
           -
-          4227
+          4291
         </td>
         <td>
           Literal
@@ -1439,15 +1441,15 @@ else
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          735
+          736
         </td>
         <td>
-          4227
+          4291
           -
-          4227
+          4291
         </td>
         <td>
           Block
@@ -1463,15 +1465,15 @@ else
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          736
+          737
         </td>
         <td>
-          4227
+          4291
           -
-          4355
+          4419
         </td>
         <td>
           If
@@ -1493,15 +1495,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          98
         </td>
         <td>
-          733
+          734
         </td>
         <td>
-          4268
+          4332
           -
-          4345
+          4409
         </td>
         <td>
           Typed
@@ -1520,15 +1522,15 @@ else
         </td>
       </tr><tr>
         <td>
-          100
+          101
         </td>
         <td>
-          737
+          738
         </td>
         <td>
-          4400
+          4464
           -
-          4472
+          4536
         </td>
         <td>
           Typed
@@ -1547,15 +1549,15 @@ else
         </td>
       </tr><tr>
         <td>
-          106
+          107
         </td>
         <td>
-          739
+          740
         </td>
         <td>
-          4569
+          4633
           -
-          4596
+          4660
         </td>
         <td>
           Apply
@@ -1571,15 +1573,15 @@ else
         </td>
       </tr><tr>
         <td>
-          106
+          107
         </td>
         <td>
-          742
+          743
         </td>
         <td>
-          4598
+          4662
           -
-          4747
+          4811
         </td>
         <td>
           Block
@@ -1602,15 +1604,15 @@ else
         </td>
       </tr><tr>
         <td>
-          106
+          107
         </td>
         <td>
-          743
+          744
         </td>
         <td>
-          4565
+          4629
           -
-          4565
+          4629
         </td>
         <td>
           Literal
@@ -1626,15 +1628,15 @@ else
         </td>
       </tr><tr>
         <td>
-          106
+          107
         </td>
         <td>
-          744
+          745
         </td>
         <td>
-          4565
+          4629
           -
-          4565
+          4629
         </td>
         <td>
           Block
@@ -1650,15 +1652,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
-          740
+          741
         </td>
         <td>
-          4694
+          4758
           -
-          4728
+          4792
         </td>
         <td>
           Apply
@@ -1674,15 +1676,15 @@ else
         </td>
       </tr><tr>
         <td>
-          109
+          110
         </td>
         <td>
-          741
+          742
         </td>
         <td>
-          4735
+          4799
           -
-          4741
+          4805
         </td>
         <td>
           Literal
@@ -1698,15 +1700,15 @@ else
         </td>
       </tr><tr>
         <td>
-          113
+          114
         </td>
         <td>
-          745
+          746
         </td>
         <td>
-          4795
+          4859
           -
-          4817
+          4881
         </td>
         <td>
           Apply
@@ -1722,15 +1724,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
-          746
+          747
         </td>
         <td>
-          4925
+          4989
           -
-          4972
+          5036
         </td>
         <td>
           Select
@@ -1746,15 +1748,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
-          747
+          748
         </td>
         <td>
-          4908
-          -
           4972
+          -
+          5036
         </td>
         <td>
           Apply
@@ -1770,15 +1772,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
-          750
+          751
         </td>
         <td>
-          4982
+          5046
           -
-          5011
+          5075
         </td>
         <td>
           Block
@@ -1797,15 +1799,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
-          751
+          752
         </td>
         <td>
-          4901
+          4965
           -
-          4901
+          4965
         </td>
         <td>
           Literal
@@ -1821,15 +1823,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
-          752
+          753
         </td>
         <td>
-          4901
+          4965
           -
-          4901
+          4965
         </td>
         <td>
           Block
@@ -1845,15 +1847,15 @@ else
         </td>
       </tr><tr>
         <td>
-          116
+          117
         </td>
         <td>
-          748
+          749
         </td>
         <td>
-          4989
+          5053
           -
-          5011
+          5075
         </td>
         <td>
           Apply
@@ -1869,15 +1871,15 @@ else
         </td>
       </tr><tr>
         <td>
-          116
+          117
         </td>
         <td>
-          749
+          750
         </td>
         <td>
-          4987
+          5051
           -
-          4987
+          5051
         </td>
         <td>
           Apply
@@ -1893,15 +1895,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          123
         </td>
         <td>
-          753
+          754
         </td>
         <td>
-          5201
+          5265
           -
-          5212
+          5276
         </td>
         <td>
           Apply
@@ -1917,15 +1919,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          123
         </td>
         <td>
-          769
+          770
         </td>
         <td>
-          5193
+          5257
           -
-          5498
+          5562
         </td>
         <td>
           Apply
@@ -1965,15 +1967,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          123
         </td>
         <td>
-          770
+          771
         </td>
         <td>
-          5216
+          5280
           -
-          5216
+          5280
         </td>
         <td>
           Literal
@@ -1989,15 +1991,15 @@ else
         </td>
       </tr><tr>
         <td>
-          123
+          124
         </td>
         <td>
-          754
+          755
         </td>
         <td>
-          5238
+          5302
           -
-          5239
+          5303
         </td>
         <td>
           Literal
@@ -2013,15 +2015,15 @@ else
         </td>
       </tr><tr>
         <td>
-          124
+          125
         </td>
         <td>
-          755
+          756
         </td>
         <td>
-          5257
+          5321
           -
-          5285
+          5349
         </td>
         <td>
           Apply
@@ -2037,15 +2039,15 @@ else
         </td>
       </tr><tr>
         <td>
-          125
+          126
         </td>
         <td>
-          756
+          757
         </td>
         <td>
-          5299
+          5363
           -
-          5311
+          5375
         </td>
         <td>
           Apply
@@ -2061,15 +2063,15 @@ else
         </td>
       </tr><tr>
         <td>
-          125
+          126
         </td>
         <td>
-          765
+          766
         </td>
         <td>
-          5313
+          5377
           -
-          5313
+          5377
         </td>
         <td>
           Apply
@@ -2085,15 +2087,15 @@ else
         </td>
       </tr><tr>
         <td>
-          125
+          126
         </td>
         <td>
-          766
+          767
         </td>
         <td>
-          5313
+          5377
           -
-          5478
+          5542
         </td>
         <td>
           Block
@@ -2121,15 +2123,15 @@ else
         </td>
       </tr><tr>
         <td>
-          125
+          126
         </td>
         <td>
-          767
+          768
         </td>
         <td>
-          5292
+          5356
           -
-          5292
+          5356
         </td>
         <td>
           Literal
@@ -2145,15 +2147,15 @@ else
         </td>
       </tr><tr>
         <td>
-          125
+          126
         </td>
         <td>
-          768
+          769
         </td>
         <td>
-          5292
+          5356
           -
-          5292
+          5356
         </td>
         <td>
           Block
@@ -2169,15 +2171,15 @@ else
         </td>
       </tr><tr>
         <td>
-          126
+          127
         </td>
         <td>
-          757
+          758
         </td>
         <td>
-          5334
+          5398
           -
-          5345
+          5409
         </td>
         <td>
           Apply
@@ -2193,15 +2195,15 @@ else
         </td>
       </tr><tr>
         <td>
-          127
+          128
         </td>
         <td>
-          758
+          759
         </td>
         <td>
-          5389
+          5453
           -
-          5410
+          5474
         </td>
         <td>
           Apply
@@ -2217,15 +2219,15 @@ else
         </td>
       </tr><tr>
         <td>
-          127
+          128
         </td>
         <td>
-          759
+          760
         </td>
         <td>
-          5358
+          5422
           -
-          5410
+          5474
         </td>
         <td>
           Apply
@@ -2241,15 +2243,15 @@ else
         </td>
       </tr><tr>
         <td>
-          127
+          128
         </td>
         <td>
-          762
+          763
         </td>
         <td>
-          5412
+          5476
           -
-          5470
+          5534
         </td>
         <td>
           Block
@@ -2268,15 +2270,15 @@ else
         </td>
       </tr><tr>
         <td>
-          127
+          128
         </td>
         <td>
-          763
+          764
         </td>
         <td>
-          5354
+          5418
           -
-          5354
+          5418
         </td>
         <td>
           Literal
@@ -2292,15 +2294,15 @@ else
         </td>
       </tr><tr>
         <td>
-          127
+          128
         </td>
         <td>
-          764
+          765
         </td>
         <td>
-          5354
+          5418
           -
-          5354
+          5418
         </td>
         <td>
           Block
@@ -2316,15 +2318,15 @@ else
         </td>
       </tr><tr>
         <td>
-          128
+          129
         </td>
         <td>
-          760
+          761
         </td>
         <td>
-          5424
+          5488
           -
-          5437
+          5501
         </td>
         <td>
           Apply
@@ -2340,15 +2342,15 @@ else
         </td>
       </tr><tr>
         <td>
-          129
+          130
         </td>
         <td>
-          761
+          762
         </td>
         <td>
-          5448
+          5512
           -
-          5460
+          5524
         </td>
         <td>
           Apply
@@ -2364,15 +2366,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
-          771
+          772
         </td>
         <td>
-          5657
+          5721
           -
-          5763
+          5827
         </td>
         <td>
           Apply
@@ -2388,15 +2390,15 @@ else
         </td>
       </tr><tr>
         <td>
-          145
+          146
         </td>
         <td>
-          772
+          773
         </td>
         <td>
-          5819
+          5883
           -
-          5830
+          5894
         </td>
         <td>
           Select
@@ -2412,15 +2414,15 @@ else
         </td>
       </tr><tr>
         <td>
-          145
+          146
         </td>
         <td>
-          773
+          774
         </td>
         <td>
-          5818
+          5882
           -
-          5818
+          5882
         </td>
         <td>
           Select
@@ -2436,15 +2438,15 @@ else
         </td>
       </tr><tr>
         <td>
-          145
+          146
         </td>
         <td>
-          774
+          775
         </td>
         <td>
-          5802
+          5866
           -
-          5831
+          5895
         </td>
         <td>
           ApplyToImplicitArgs
@@ -2460,15 +2462,15 @@ else
         </td>
       </tr><tr>
         <td>
-          146
+          147
         </td>
         <td>
-          775
+          776
         </td>
         <td>
-          5871
+          5935
           -
-          5876
+          5940
         </td>
         <td>
           Select
@@ -2484,15 +2486,15 @@ else
         </td>
       </tr><tr>
         <td>
-          146
+          147
         </td>
         <td>
-          776
+          777
         </td>
         <td>
-          5836
+          5900
           -
-          5883
+          5947
         </td>
         <td>
           Apply
@@ -2508,15 +2510,15 @@ else
         </td>
       </tr><tr>
         <td>
-          155
+          156
         </td>
         <td>
-          785
+          786
         </td>
         <td>
-          6107
+          6171
           -
-          6245
+          6309
         </td>
         <td>
           Apply
@@ -2543,15 +2545,15 @@ else
         </td>
       </tr><tr>
         <td>
-          156
+          157
         </td>
         <td>
-          777
+          778
         </td>
         <td>
-          6133
+          6197
           -
-          6160
+          6224
         </td>
         <td>
           Apply
@@ -2567,15 +2569,15 @@ else
         </td>
       </tr><tr>
         <td>
-          156
+          157
         </td>
         <td>
-          781
+          782
         </td>
         <td>
-          6170
+          6234
           -
-          6200
+          6264
         </td>
         <td>
           Block
@@ -2594,15 +2596,15 @@ else
         </td>
       </tr><tr>
         <td>
-          156
+          157
         </td>
         <td>
-          782
+          783
         </td>
         <td>
-          6126
+          6190
           -
-          6126
+          6190
         </td>
         <td>
           Literal
@@ -2618,15 +2620,15 @@ else
         </td>
       </tr><tr>
         <td>
-          156
+          157
         </td>
         <td>
-          783
+          784
         </td>
         <td>
-          6126
+          6190
           -
-          6126
+          6190
         </td>
         <td>
           Block
@@ -2642,15 +2644,15 @@ else
         </td>
       </tr><tr>
         <td>
-          157
+          158
         </td>
         <td>
-          778
+          779
         </td>
         <td>
-          6181
+          6245
           -
-          6200
+          6264
         </td>
         <td>
           Apply
@@ -2666,15 +2668,15 @@ else
         </td>
       </tr><tr>
         <td>
-          157
+          158
         </td>
         <td>
-          779
+          780
         </td>
         <td>
-          6170
+          6234
           -
-          6200
+          6264
         </td>
         <td>
           Apply
@@ -2690,15 +2692,15 @@ else
         </td>
       </tr><tr>
         <td>
-          157
+          158
         </td>
         <td>
-          780
+          781
         </td>
         <td>
-          6178
+          6242
           -
-          6178
+          6242
         </td>
         <td>
           Apply
@@ -2714,15 +2716,15 @@ else
         </td>
       </tr><tr>
         <td>
-          159
+          160
         </td>
         <td>
-          784
+          785
         </td>
         <td>
-          6211
+          6275
           -
-          6241
+          6305
         </td>
         <td>
           Apply
@@ -2738,15 +2740,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          168
         </td>
         <td>
-          786
+          787
         </td>
         <td>
-          6409
+          6473
           -
-          6455
+          6519
         </td>
         <td>
           Select
@@ -2762,15 +2764,15 @@ else
         </td>
       </tr><tr>
         <td>
-          168
+          169
         </td>
         <td>
-          787
+          788
         </td>
         <td>
-          6499
+          6563
           -
-          6533
+          6597
         </td>
         <td>
           Apply
@@ -2786,15 +2788,15 @@ else
         </td>
       </tr><tr>
         <td>
-          168
+          169
         </td>
         <td>
-          788
+          789
         </td>
         <td>
-          6483
+          6547
           -
-          6483
+          6547
         </td>
         <td>
           TypeApply
@@ -2810,15 +2812,15 @@ else
         </td>
       </tr><tr>
         <td>
-          168
+          169
         </td>
         <td>
-          789
+          790
         </td>
         <td>
-          6483
+          6547
           -
-          6534
+          6598
         </td>
         <td>
           Apply
@@ -2834,15 +2836,15 @@ else
         </td>
       </tr><tr>
         <td>
-          169
+          170
         </td>
         <td>
-          790
+          791
         </td>
         <td>
-          6600
+          6664
           -
-          6609
+          6673
         </td>
         <td>
           Apply
@@ -2858,15 +2860,15 @@ else
         </td>
       </tr><tr>
         <td>
-          169
+          170
         </td>
         <td>
-          791
+          792
         </td>
         <td>
-          6607
+          6671
           -
-          6607
+          6671
         </td>
         <td>
           Literal
@@ -2882,39 +2884,15 @@ else
         </td>
       </tr><tr>
         <td>
-          169
-        </td>
-        <td>
-          792
-        </td>
-        <td>
-          6611
-          -
-          6620
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.frequency
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          Persistence.this.frequency
-        </td>
-      </tr><tr>
-        <td>
-          169
+          170
         </td>
         <td>
           793
         </td>
         <td>
-          6622
+          6675
           -
-          6631
+          6684
         </td>
         <td>
           Select
@@ -2930,15 +2908,39 @@ else
         </td>
       </tr><tr>
         <td>
-          169
+          170
         </td>
         <td>
           794
         </td>
         <td>
-          6633
+          6686
           -
-          6654
+          6695
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.frequency
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.frequency
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          795
+        </td>
+        <td>
+          6697
+          -
+          6718
         </td>
         <td>
           Literal
@@ -2954,15 +2956,15 @@ else
         </td>
       </tr><tr>
         <td>
-          169
+          170
         </td>
         <td>
-          795
+          796
         </td>
         <td>
-          6562
+          6626
           -
-          6655
+          6719
         </td>
         <td>
           Apply
@@ -2981,15 +2983,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          181
         </td>
         <td>
-          796
+          797
         </td>
         <td>
-          7080
+          7144
           -
-          7081
+          7145
         </td>
         <td>
           Literal
@@ -3005,15 +3007,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          181
         </td>
         <td>
-          797
+          798
         </td>
         <td>
-          7083
+          7147
           -
-          7097
+          7161
         </td>
         <td>
           Select
@@ -3029,15 +3031,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          181
         </td>
         <td>
-          798
+          799
         </td>
         <td>
-          7074
+          7138
           -
-          7105
+          7169
         </td>
         <td>
           Select
@@ -3053,15 +3055,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          181
         </td>
         <td>
-          799
+          800
         </td>
         <td>
-          7073
+          7137
           -
-          7073
+          7137
         </td>
         <td>
           TypeApply
@@ -3077,15 +3079,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          181
         </td>
         <td>
-          813
+          814
         </td>
         <td>
-          7115
+          7179
           -
-          7115
+          7179
         </td>
         <td>
           TypeApply
@@ -3101,15 +3103,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          181
         </td>
         <td>
-          814
+          815
         </td>
         <td>
-          7059
+          7123
           -
-          7802
+          7866
         </td>
         <td>
           ApplyToImplicitArgs
@@ -3152,15 +3154,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          184
         </td>
         <td>
-          800
+          801
         </td>
         <td>
-          7288
+          7352
           -
-          7293
+          7357
         </td>
         <td>
           Select
@@ -3176,15 +3178,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          184
         </td>
         <td>
-          801
+          802
         </td>
         <td>
-          7306
+          7370
           -
-          7317
+          7381
         </td>
         <td>
           Select
@@ -3200,15 +3202,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          184
         </td>
         <td>
-          802
+          803
         </td>
         <td>
-          7262
+          7326
           -
-          7318
+          7382
         </td>
         <td>
           Apply
@@ -3224,15 +3226,15 @@ else
         </td>
       </tr><tr>
         <td>
-          184
+          185
         </td>
         <td>
-          805
+          806
         </td>
         <td>
-          7347
+          7411
           -
-          7466
+          7530
         </td>
         <td>
           Block
@@ -3254,15 +3256,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          187
         </td>
         <td>
-          803
+          804
         </td>
         <td>
-          7462
+          7526
           -
-          7466
+          7530
         </td>
         <td>
           Select
@@ -3278,15 +3280,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          187
         </td>
         <td>
-          804
+          805
         </td>
         <td>
-          7462
+          7526
           -
-          7466
+          7530
         </td>
         <td>
           ApplyImplicitView
@@ -3302,15 +3304,15 @@ else
         </td>
       </tr><tr>
         <td>
-          188
+          189
         </td>
         <td>
-          809
+          810
         </td>
         <td>
-          7528
+          7592
           -
-          7650
+          7714
         </td>
         <td>
           Block
@@ -3332,15 +3334,15 @@ else
         </td>
       </tr><tr>
         <td>
-          188
+          189
         </td>
         <td>
-          812
+          813
         </td>
         <td>
-          7508
+          7572
           -
-          7784
+          7848
         </td>
         <td>
           Try
@@ -3368,15 +3370,15 @@ else
         </td>
       </tr><tr>
         <td>
-          190
+          191
         </td>
         <td>
-          806
+          807
         </td>
         <td>
-          7620
+          7684
           -
-          7649
+          7713
         </td>
         <td>
           Apply
@@ -3392,15 +3394,15 @@ else
         </td>
       </tr><tr>
         <td>
-          190
+          191
         </td>
         <td>
-          807
+          808
         </td>
         <td>
-          7597
+          7661
           -
-          7650
+          7714
         </td>
         <td>
           Apply
@@ -3416,15 +3418,15 @@ else
         </td>
       </tr><tr>
         <td>
-          190
+          191
         </td>
         <td>
-          808
+          809
         </td>
         <td>
-          7597
+          7661
           -
-          7650
+          7714
         </td>
         <td>
           ApplyImplicitView
@@ -3440,15 +3442,15 @@ else
         </td>
       </tr><tr>
         <td>
-          191
+          192
         </td>
         <td>
-          811
+          812
         </td>
         <td>
-          7673
+          7737
           -
-          7784
+          7848
         </td>
         <td>
           Block
@@ -3470,15 +3472,15 @@ else
         </td>
       </tr><tr>
         <td>
-          192
+          193
         </td>
         <td>
-          810
+          811
         </td>
         <td>
-          7689
+          7753
           -
-          7701
+          7765
         </td>
         <td>
           Apply
@@ -3494,15 +3496,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          207
         </td>
         <td>
-          815
+          816
         </td>
         <td>
-          8004
+          8068
           -
-          8019
+          8083
         </td>
         <td>
           Apply
@@ -3518,15 +3520,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          207
         </td>
         <td>
-          816
+          817
         </td>
         <td>
-          8027
+          8091
           -
-          8043
+          8107
         </td>
         <td>
           Apply
@@ -3542,15 +3544,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          207
         </td>
         <td>
-          817
+          818
         </td>
         <td>
-          8021
+          8085
           -
-          8044
+          8108
         </td>
         <td>
           Apply
@@ -3566,15 +3568,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          207
         </td>
         <td>
-          818
+          819
         </td>
         <td>
-          8046
+          8110
           -
-          8069
+          8133
         </td>
         <td>
           Select
@@ -3590,15 +3592,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          207
         </td>
         <td>
-          819
+          820
         </td>
         <td>
-          7984
+          8048
           -
-          8070
+          8134
         </td>
         <td>
           Apply
@@ -3614,15 +3616,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          207
         </td>
         <td>
-          827
+          828
         </td>
         <td>
-          8072
+          8136
           -
-          8072
+          8136
         </td>
         <td>
           Select
@@ -3638,15 +3640,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          207
         </td>
         <td>
-          828
+          829
         </td>
         <td>
-          7974
+          8038
           -
-          8229
+          8293
         </td>
         <td>
           ApplyToImplicitArgs
@@ -3669,15 +3671,15 @@ else
         </td>
       </tr><tr>
         <td>
-          207
+          208
         </td>
         <td>
-          820
+          821
         </td>
         <td>
-          8096
+          8160
           -
-          8110
+          8174
         </td>
         <td>
           Apply
@@ -3693,15 +3695,15 @@ else
         </td>
       </tr><tr>
         <td>
-          207
+          208
         </td>
         <td>
-          824
+          825
         </td>
         <td>
-          8112
+          8176
           -
-          8188
+          8252
         </td>
         <td>
           Block
@@ -3721,15 +3723,15 @@ else
         </td>
       </tr><tr>
         <td>
-          208
+          209
         </td>
         <td>
-          821
+          822
         </td>
         <td>
-          8124
+          8188
           -
-          8137
+          8201
         </td>
         <td>
           Apply
@@ -3745,15 +3747,15 @@ else
         </td>
       </tr><tr>
         <td>
-          209
+          210
         </td>
         <td>
-          822
+          823
         </td>
         <td>
-          8148
+          8212
           -
-          8163
+          8227
         </td>
         <td>
           Apply
@@ -3769,15 +3771,15 @@ else
         </td>
       </tr><tr>
         <td>
-          210
+          211
         </td>
         <td>
-          823
+          824
         </td>
         <td>
-          8174
+          8238
           -
-          8178
+          8242
         </td>
         <td>
           Literal
@@ -3793,15 +3795,15 @@ else
         </td>
       </tr><tr>
         <td>
-          212
+          213
         </td>
         <td>
-          825
+          826
         </td>
         <td>
-          8206
+          8270
           -
-          8211
+          8275
         </td>
         <td>
           Literal
@@ -3817,15 +3819,15 @@ else
         </td>
       </tr><tr>
         <td>
-          212
+          213
         </td>
         <td>
-          826
+          827
         </td>
         <td>
-          8206
+          8270
           -
-          8211
+          8275
         </td>
         <td>
           Block
@@ -3841,15 +3843,15 @@ else
         </td>
       </tr><tr>
         <td>
-          226
+          227
         </td>
         <td>
-          829
+          830
         </td>
         <td>
-          8649
+          8713
           -
-          8661
+          8725
         </td>
         <td>
           Select
@@ -3865,15 +3867,15 @@ else
         </td>
       </tr><tr>
         <td>
-          226
+          227
         </td>
         <td>
-          830
+          831
         </td>
         <td>
-          8632
+          8696
           -
-          8661
+          8725
         </td>
         <td>
           Apply
@@ -3889,15 +3891,15 @@ else
         </td>
       </tr><tr>
         <td>
-          228
+          229
         </td>
         <td>
-          831
+          832
         </td>
         <td>
-          8710
+          8774
           -
-          8715
+          8779
         </td>
         <td>
           Select
@@ -3913,15 +3915,15 @@ else
         </td>
       </tr><tr>
         <td>
-          228
+          229
         </td>
         <td>
-          832
+          833
         </td>
         <td>
-          8686
+          8750
           -
-          8727
+          8791
         </td>
         <td>
           Apply
@@ -3937,15 +3939,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          232
         </td>
         <td>
-          833
+          834
         </td>
         <td>
-          8835
+          8899
           -
-          8838
+          8902
         </td>
         <td>
           Literal
@@ -3961,15 +3963,15 @@ else
         </td>
       </tr><tr>
         <td>
-          234
+          235
         </td>
         <td>
-          834
+          835
         </td>
         <td>
-          8977
+          9041
           -
-          9017
+          9081
         </td>
         <td>
           TypeApply
@@ -3985,15 +3987,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          236
         </td>
         <td>
-          835
+          836
         </td>
         <td>
-          9026
+          9090
           -
-          9034
+          9098
         </td>
         <td>
           Select
@@ -4009,15 +4011,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          236
         </td>
         <td>
-          847
+          848
         </td>
         <td>
-          9026
+          9090
           -
-          9376
+          9440
         </td>
         <td>
           Apply
@@ -4041,15 +4043,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          238
         </td>
         <td>
-          836
+          837
         </td>
         <td>
-          9220
+          9284
           -
-          9239
+          9303
         </td>
         <td>
           Apply
@@ -4065,15 +4067,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          238
         </td>
         <td>
-          837
+          838
         </td>
         <td>
-          9243
+          9307
           -
-          9264
+          9328
         </td>
         <td>
           Apply
@@ -4089,15 +4091,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          238
         </td>
         <td>
-          838
+          839
         </td>
         <td>
-          9192
+          9256
           -
-          9264
+          9328
         </td>
         <td>
           Apply
@@ -4113,15 +4115,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          238
         </td>
         <td>
-          843
+          844
         </td>
         <td>
-          9266
+          9330
           -
-          9366
+          9430
         </td>
         <td>
           Block
@@ -4140,15 +4142,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          238
         </td>
         <td>
-          844
+          845
         </td>
         <td>
-          9188
+          9252
           -
-          9188
+          9252
         </td>
         <td>
           Literal
@@ -4164,15 +4166,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          238
         </td>
         <td>
-          845
+          846
         </td>
         <td>
-          9188
+          9252
           -
-          9188
+          9252
         </td>
         <td>
           Block
@@ -4188,15 +4190,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          238
         </td>
         <td>
-          846
+          847
         </td>
         <td>
-          9188
+          9252
           -
-          9366
+          9430
         </td>
         <td>
           If
@@ -4218,15 +4220,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
-          839
+          840
         </td>
         <td>
-          9314
+          9378
           -
-          9322
+          9386
         </td>
         <td>
           Select
@@ -4242,15 +4244,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
-          840
+          841
         </td>
         <td>
-          9293
+          9357
           -
-          9323
+          9387
         </td>
         <td>
           Apply
@@ -4266,15 +4268,15 @@ else
         </td>
       </tr><tr>
         <td>
-          239
+          240
         </td>
         <td>
-          841
+          842
         </td>
         <td>
-          9347
+          9411
           -
-          9354
+          9418
         </td>
         <td>
           Apply
@@ -4290,15 +4292,15 @@ else
         </td>
       </tr><tr>
         <td>
-          239
+          240
         </td>
         <td>
-          842
+          843
         </td>
         <td>
-          9336
+          9400
           -
-          9354
+          9418
         </td>
         <td>
           Apply
@@ -4314,15 +4316,15 @@ else
         </td>
       </tr><tr>
         <td>
-          242
+          243
         </td>
         <td>
-          848
+          849
         </td>
         <td>
-          9385
+          9449
           -
-          9401
+          9465
         </td>
         <td>
           Apply
@@ -4338,15 +4340,15 @@ else
         </td>
       </tr><tr>
         <td>
-          246
+          247
         </td>
         <td>
-          849
+          850
         </td>
         <td>
-          9506
+          9570
           -
-          9521
+          9585
         </td>
         <td>
           Select
@@ -4362,15 +4364,15 @@ else
         </td>
       </tr><tr>
         <td>
-          247
+          248
         </td>
         <td>
-          850
+          851
         </td>
         <td>
-          9533
+          9597
           -
-          9552
+          9616
         </td>
         <td>
           Ident
@@ -4386,15 +4388,15 @@ else
         </td>
       </tr><tr>
         <td>
-          248
+          249
         </td>
         <td>
-          869
+          870
         </td>
         <td>
-          9566
+          9630
           -
-          10648
+          10712
         </td>
         <td>
           Block
@@ -4437,15 +4439,15 @@ else
         </td>
       </tr><tr>
         <td>
-          250
+          251
         </td>
         <td>
-          851
+          852
         </td>
         <td>
-          9716
+          9780
           -
-          9725
+          9789
         </td>
         <td>
           Select
@@ -4461,15 +4463,15 @@ else
         </td>
       </tr><tr>
         <td>
-          251
+          252
         </td>
         <td>
-          852
+          853
         </td>
         <td>
-          9762
+          9826
           -
-          9780
+          9844
         </td>
         <td>
           Apply
@@ -4485,15 +4487,15 @@ else
         </td>
       </tr><tr>
         <td>
-          251
+          252
         </td>
         <td>
-          857
+          858
         </td>
         <td>
-          9781
+          9845
           -
-          10111
+          10175
         </td>
         <td>
           Block
@@ -4517,15 +4519,15 @@ else
         </td>
       </tr><tr>
         <td>
-          254
+          255
         </td>
         <td>
-          853
+          854
         </td>
         <td>
-          9995
+          10059
           -
-          10039
+          10103
         </td>
         <td>
           Apply
@@ -4541,15 +4543,15 @@ else
         </td>
       </tr><tr>
         <td>
-          255
+          256
         </td>
         <td>
-          854
+          855
         </td>
         <td>
-          10065
+          10129
           -
-          10086
+          10150
         </td>
         <td>
           Select
@@ -4565,15 +4567,15 @@ else
         </td>
       </tr><tr>
         <td>
-          256
+          257
         </td>
         <td>
-          855
+          856
         </td>
         <td>
-          10106
+          10170
           -
-          10106
+          10170
         </td>
         <td>
           TypeApply
@@ -4589,15 +4591,15 @@ else
         </td>
       </tr><tr>
         <td>
-          256
+          257
         </td>
         <td>
-          856
+          857
         </td>
         <td>
-          10099
+          10163
           -
-          10111
+          10175
         </td>
         <td>
           ApplyToImplicitArgs
@@ -4613,15 +4615,15 @@ else
         </td>
       </tr><tr>
         <td>
-          258
+          259
         </td>
         <td>
-          858
+          859
         </td>
         <td>
-          10144
+          10208
           -
-          10151
+          10215
         </td>
         <td>
           Ident
@@ -4637,15 +4639,15 @@ else
         </td>
       </tr><tr>
         <td>
-          260
+          261
         </td>
         <td>
-          859
+          860
         </td>
         <td>
-          10170
+          10234
           -
-          10195
+          10259
         </td>
         <td>
           Apply
@@ -4661,15 +4663,15 @@ else
         </td>
       </tr><tr>
         <td>
-          264
+          265
         </td>
         <td>
-          860
+          861
         </td>
         <td>
-          10397
+          10461
           -
-          10402
+          10466
         </td>
         <td>
           Select
@@ -4685,15 +4687,15 @@ else
         </td>
       </tr><tr>
         <td>
-          264
+          265
         </td>
         <td>
-          861
+          862
         </td>
         <td>
-          10373
+          10437
           -
-          10426
+          10490
         </td>
         <td>
           Apply
@@ -4709,15 +4711,15 @@ else
         </td>
       </tr><tr>
         <td>
-          265
+          266
         </td>
         <td>
-          862
+          863
         </td>
         <td>
-          10452
+          10516
           -
-          10464
+          10528
         </td>
         <td>
           Select
@@ -4733,15 +4735,15 @@ else
         </td>
       </tr><tr>
         <td>
-          265
+          266
         </td>
         <td>
-          863
+          864
         </td>
         <td>
-          10439
+          10503
           -
-          10464
+          10528
         </td>
         <td>
           Apply
@@ -4757,15 +4759,15 @@ else
         </td>
       </tr><tr>
         <td>
-          267
+          268
         </td>
         <td>
-          864
+          865
         </td>
         <td>
-          10569
+          10633
           -
-          10585
+          10649
         </td>
         <td>
           Apply
@@ -4781,15 +4783,15 @@ else
         </td>
       </tr><tr>
         <td>
-          267
+          268
         </td>
         <td>
-          865
+          866
         </td>
         <td>
-          10550
+          10614
           -
-          10586
+          10650
         </td>
         <td>
           Apply
@@ -4805,31 +4807,7 @@ else
         </td>
       </tr><tr>
         <td>
-          267
-        </td>
-        <td>
-          866
-        </td>
-        <td>
-          10550
-          -
-          10586
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.persist
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          Persistence.this.persist(partition, scala.Some.apply[Long](nextOffset))
-        </td>
-      </tr><tr>
-        <td>
-          269
+          268
         </td>
         <td>
           867
@@ -4837,7 +4815,31 @@ else
         <td>
           10614
           -
-          10630
+          10650
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.persist
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Persistence.this.persist(partition, scala.Some.apply[Long](nextOffset))
+        </td>
+      </tr><tr>
+        <td>
+          270
+        </td>
+        <td>
+          868
+        </td>
+        <td>
+          10678
+          -
+          10694
         </td>
         <td>
           Apply
@@ -4853,15 +4855,15 @@ else
         </td>
       </tr><tr>
         <td>
-          269
+          270
         </td>
         <td>
-          868
+          869
         </td>
         <td>
-          10614
+          10678
           -
-          10630
+          10694
         </td>
         <td>
           Block
@@ -4877,15 +4879,15 @@ else
         </td>
       </tr><tr>
         <td>
-          282
+          283
         </td>
         <td>
-          870
+          871
         </td>
         <td>
-          10926
+          10990
           -
-          10958
+          11022
         </td>
         <td>
           Apply
@@ -4901,15 +4903,15 @@ else
         </td>
       </tr><tr>
         <td>
-          284
+          285
         </td>
         <td>
-          871
+          872
         </td>
         <td>
-          11022
+          11086
           -
-          11040
+          11104
         </td>
         <td>
           Select
@@ -4925,15 +4927,15 @@ else
         </td>
       </tr><tr>
         <td>
-          284
+          285
         </td>
         <td>
-          874
+          875
         </td>
         <td>
-          11018
+          11082
           -
-          11018
+          11082
         </td>
         <td>
           Literal
@@ -4949,15 +4951,15 @@ else
         </td>
       </tr><tr>
         <td>
-          284
+          285
         </td>
         <td>
-          875
+          876
         </td>
         <td>
-          11018
+          11082
           -
-          11018
+          11082
         </td>
         <td>
           Block
@@ -4973,15 +4975,15 @@ else
         </td>
       </tr><tr>
         <td>
-          285
+          286
         </td>
         <td>
-          872
+          873
         </td>
         <td>
-          11052
+          11116
           -
-          11088
+          11152
         </td>
         <td>
           Apply
@@ -4997,15 +4999,15 @@ else
         </td>
       </tr><tr>
         <td>
-          285
+          286
         </td>
         <td>
-          873
+          874
         </td>
         <td>
-          11052
+          11116
           -
-          11088
+          11152
         </td>
         <td>
           Block
@@ -5021,15 +5023,15 @@ else
         </td>
       </tr><tr>
         <td>
-          298
+          299
         </td>
         <td>
-          876
+          877
         </td>
         <td>
-          11555
+          11619
           -
-          11597
+          11661
         </td>
         <td>
           TypeApply
@@ -5045,15 +5047,15 @@ else
         </td>
       </tr><tr>
         <td>
-          299
+          300
         </td>
         <td>
-          904
+          905
         </td>
         <td>
-          11604
+          11668
           -
-          12527
+          12591
         </td>
         <td>
           Apply
@@ -5108,15 +5110,15 @@ else
         </td>
       </tr><tr>
         <td>
-          300
+          301
         </td>
         <td>
-          877
+          878
         </td>
         <td>
-          11761
+          11825
           -
-          11773
+          11837
         </td>
         <td>
           Apply
@@ -5132,15 +5134,15 @@ else
         </td>
       </tr><tr>
         <td>
-          300
+          301
         </td>
         <td>
-          878
+          879
         </td>
         <td>
-          11760
+          11824
           -
-          11760
+          11824
         </td>
         <td>
           TypeApply
@@ -5156,15 +5158,15 @@ else
         </td>
       </tr><tr>
         <td>
-          300
+          301
         </td>
         <td>
-          879
+          880
         </td>
         <td>
-          11746
+          11810
           -
-          11780
+          11844
         </td>
         <td>
           Select
@@ -5182,15 +5184,15 @@ else
         </td>
       </tr><tr>
         <td>
-          300
+          301
         </td>
         <td>
-          880
+          881
         </td>
         <td>
-          11740
+          11804
           -
-          11785
+          11849
         </td>
         <td>
           Apply
@@ -5208,15 +5210,15 @@ else
         </td>
       </tr><tr>
         <td>
-          301
+          302
         </td>
         <td>
-          881
+          882
         </td>
         <td>
-          11824
+          11888
           -
-          11839
+          11903
         </td>
         <td>
           Apply
@@ -5232,15 +5234,15 @@ else
         </td>
       </tr><tr>
         <td>
-          301
+          302
         </td>
         <td>
-          882
+          883
         </td>
         <td>
-          11849
+          11913
           -
-          11872
+          11936
         </td>
         <td>
           Select
@@ -5256,15 +5258,15 @@ else
         </td>
       </tr><tr>
         <td>
-          301
+          302
         </td>
         <td>
-          883
+          884
         </td>
         <td>
-          11804
+          11868
           -
-          11873
+          11937
         </td>
         <td>
           Apply
@@ -5280,15 +5282,15 @@ else
         </td>
       </tr><tr>
         <td>
-          301
+          302
         </td>
         <td>
-          902
+          903
         </td>
         <td>
-          11875
+          11939
           -
-          11875
+          11939
         </td>
         <td>
           Select
@@ -5304,15 +5306,15 @@ else
         </td>
       </tr><tr>
         <td>
-          301
+          302
         </td>
         <td>
-          903
+          904
         </td>
         <td>
-          11794
+          11858
           -
-          12519
+          12583
         </td>
         <td>
           ApplyToImplicitArgs
@@ -5359,15 +5361,15 @@ else
         </td>
       </tr><tr>
         <td>
-          302
+          303
         </td>
         <td>
-          884
+          885
         </td>
         <td>
-          11909
+          11973
           -
-          11910
+          11974
         </td>
         <td>
           Literal
@@ -5383,15 +5385,15 @@ else
         </td>
       </tr><tr>
         <td>
-          303
+          304
         </td>
         <td>
-          885
+          886
         </td>
         <td>
-          11928
+          11992
           -
-          11942
+          12006
         </td>
         <td>
           Apply
@@ -5407,15 +5409,15 @@ else
         </td>
       </tr><tr>
         <td>
-          303
+          304
         </td>
         <td>
-          898
+          899
         </td>
         <td>
-          11944
+          12008
           -
-          11944
+          12008
         </td>
         <td>
           Apply
@@ -5431,15 +5433,15 @@ else
         </td>
       </tr><tr>
         <td>
-          303
+          304
         </td>
         <td>
-          899
+          900
         </td>
         <td>
-          11944
+          12008
           -
-          12493
+          12557
         </td>
         <td>
           Block
@@ -5477,15 +5479,15 @@ else
         </td>
       </tr><tr>
         <td>
-          303
+          304
         </td>
         <td>
-          900
+          901
         </td>
         <td>
-          11921
+          11985
           -
-          11921
+          11985
         </td>
         <td>
           Literal
@@ -5501,15 +5503,15 @@ else
         </td>
       </tr><tr>
         <td>
-          303
+          304
         </td>
         <td>
-          901
+          902
         </td>
         <td>
-          11921
+          11985
           -
-          11921
+          11985
         </td>
         <td>
           Block
@@ -5525,15 +5527,15 @@ else
         </td>
       </tr><tr>
         <td>
-          304
+          305
         </td>
         <td>
-          886
+          887
         </td>
         <td>
-          11969
+          12033
           -
-          11982
+          12046
         </td>
         <td>
           Apply
@@ -5549,15 +5551,15 @@ else
         </td>
       </tr><tr>
         <td>
-          305
+          306
         </td>
         <td>
-          887
+          888
         </td>
         <td>
-          12005
+          12069
           -
-          12015
+          12079
         </td>
         <td>
           Apply
@@ -5573,15 +5575,15 @@ else
         </td>
       </tr><tr>
         <td>
-          305
+          306
         </td>
         <td>
-          897
+          898
         </td>
         <td>
-          11995
+          12059
           -
-          12481
+          12545
         </td>
         <td>
           Apply
@@ -5613,15 +5615,15 @@ else
         </td>
       </tr><tr>
         <td>
-          307
+          308
         </td>
         <td>
-          888
+          889
         </td>
         <td>
-          12163
+          12227
           -
-          12173
+          12237
         </td>
         <td>
           Apply
@@ -5637,15 +5639,15 @@ else
         </td>
       </tr><tr>
         <td>
-          307
+          308
         </td>
         <td>
-          889
+          890
         </td>
         <td>
-          12146
+          12210
           -
-          12173
+          12237
         </td>
         <td>
           Apply
@@ -5661,15 +5663,15 @@ else
         </td>
       </tr><tr>
         <td>
-          308
+          309
         </td>
         <td>
-          890
+          891
         </td>
         <td>
-          12221
+          12285
           -
-          12230
+          12294
         </td>
         <td>
           Select
@@ -5685,15 +5687,15 @@ else
         </td>
       </tr><tr>
         <td>
-          308
+          309
         </td>
         <td>
-          891
+          892
         </td>
         <td>
-          12249
+          12313
           -
-          12253
+          12317
         </td>
         <td>
           Literal
@@ -5709,15 +5711,15 @@ else
         </td>
       </tr><tr>
         <td>
-          308
+          309
         </td>
         <td>
-          892
+          893
         </td>
         <td>
-          12188
+          12252
           -
-          12254
+          12318
         </td>
         <td>
           Apply
@@ -5733,15 +5735,15 @@ else
         </td>
       </tr><tr>
         <td>
-          309
+          310
         </td>
         <td>
-          895
+          896
         </td>
         <td>
-          12291
+          12355
           -
-          12332
+          12396
         </td>
         <td>
           Block
@@ -5760,15 +5762,15 @@ else
         </td>
       </tr><tr>
         <td>
-          310
+          311
         </td>
         <td>
-          893
+          894
         </td>
         <td>
-          12291
+          12355
           -
-          12305
+          12369
         </td>
         <td>
           Apply
@@ -5784,15 +5786,15 @@ else
         </td>
       </tr><tr>
         <td>
-          311
+          312
         </td>
         <td>
-          894
+          895
         </td>
         <td>
-          12322
+          12386
           -
-          12332
+          12396
         </td>
         <td>
           Apply
@@ -5808,15 +5810,15 @@ else
         </td>
       </tr><tr>
         <td>
-          313
+          314
         </td>
         <td>
-          896
+          897
         </td>
         <td>
-          12393
+          12457
           -
-          12451
+          12515
         </td>
         <td>
           Typed
@@ -5835,15 +5837,15 @@ else
         </td>
       </tr><tr>
         <td>
-          320
+          321
         </td>
         <td>
-          905
+          906
         </td>
         <td>
-          12565
+          12629
           -
-          12591
+          12655
         </td>
         <td>
           Select
@@ -5859,15 +5861,15 @@ else
         </td>
       </tr><tr>
         <td>
-          320
+          321
         </td>
         <td>
-          906
+          907
         </td>
         <td>
-          12595
+          12659
           -
-          12596
+          12660
         </td>
         <td>
           Ident
@@ -5883,15 +5885,15 @@ else
         </td>
       </tr><tr>
         <td>
-          320
+          321
         </td>
         <td>
-          907
+          908
         </td>
         <td>
-          12548
+          12612
           -
-          12548
+          12612
         </td>
         <td>
           Apply
@@ -5907,15 +5909,15 @@ else
         </td>
       </tr><tr>
         <td>
-          320
+          321
         </td>
         <td>
-          908
+          909
         </td>
         <td>
-          12548
+          12612
           -
-          12548
+          12612
         </td>
         <td>
           TypeApply
@@ -5931,15 +5933,15 @@ else
         </td>
       </tr><tr>
         <td>
-          320
+          321
         </td>
         <td>
-          909
+          910
         </td>
         <td>
-          12534
-          -
           12598
+          -
+          12662
         </td>
         <td>
           ApplyToImplicitArgs
@@ -5971,15 +5973,15 @@ else
         </td>
       </tr><tr>
         <td>
-          331
+          332
         </td>
         <td>
-          923
+          924
         </td>
         <td>
-          12960
+          13024
           -
-          13615
+          13717
         </td>
         <td>
           Apply
@@ -5996,13 +5998,14 @@ else
 else
   (): Unit)))(org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature], Int](KafkaFeatureCache.this.ds.getFeatureWriterAppend(KafkaFeatureCache.this.sft.getTypeName(), org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
   var count: Int = 0;
+  val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, true);
   batch.foreach[Unit](((p: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; {
     (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
       KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store append [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], p.offset.asInstanceOf[AnyRef], (p.feature: AnyRef))
     else
       (): Unit);
     try {
-      org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, p.feature, true);
+      helper.write(p.feature);
       count = count.+(1)
     } catch {
       case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
@@ -6016,15 +6019,15 @@ else
         </td>
       </tr><tr>
         <td>
-          331
+          332
         </td>
         <td>
-          924
+          925
         </td>
         <td>
-          13069
+          13133
           -
-          13069
+          13133
         </td>
         <td>
           Literal
@@ -6040,15 +6043,15 @@ else
         </td>
       </tr><tr>
         <td>
-          332
+          333
         </td>
         <td>
-          910
+          911
         </td>
         <td>
-          13115
+          13179
           -
-          13130
+          13194
         </td>
         <td>
           Apply
@@ -6064,15 +6067,15 @@ else
         </td>
       </tr><tr>
         <td>
-          332
+          333
         </td>
         <td>
-          911
+          912
         </td>
         <td>
-          13132
+          13196
           -
-          13155
+          13219
         </td>
         <td>
           Select
@@ -6088,15 +6091,15 @@ else
         </td>
       </tr><tr>
         <td>
-          332
+          333
         </td>
         <td>
-          912
+          913
         </td>
         <td>
-          13089
+          13153
           -
-          13156
+          13220
         </td>
         <td>
           Apply
@@ -6112,15 +6115,15 @@ else
         </td>
       </tr><tr>
         <td>
-          332
+          333
         </td>
         <td>
-          921
+          922
         </td>
         <td>
-          13158
+          13222
           -
-          13158
+          13222
         </td>
         <td>
           Select
@@ -6136,15 +6139,15 @@ else
         </td>
       </tr><tr>
         <td>
-          332
+          333
         </td>
         <td>
-          922
+          923
         </td>
         <td>
-          13079
+          13143
           -
-          13607
+          13709
         </td>
         <td>
           ApplyToImplicitArgs
@@ -6158,13 +6161,14 @@ else
         <td style="background: #AEF1AE">
           org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature], Int](KafkaFeatureCache.this.ds.getFeatureWriterAppend(KafkaFeatureCache.this.sft.getTypeName(), org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
   var count: Int = 0;
+  val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, true);
   batch.foreach[Unit](((p: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; {
     (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
       KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store append [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], p.offset.asInstanceOf[AnyRef], (p.feature: AnyRef))
     else
       (): Unit);
     try {
-      org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, p.feature, true);
+      helper.write(p.feature);
       count = count.+(1)
     } catch {
       case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
@@ -6178,15 +6182,15 @@ else
         </td>
       </tr><tr>
         <td>
-          333
+          334
         </td>
         <td>
-          913
+          914
         </td>
         <td>
-          13192
+          13256
           -
-          13193
+          13257
         </td>
         <td>
           Literal
@@ -6202,15 +6206,39 @@ else
         </td>
       </tr><tr>
         <td>
-          334
+          335
         </td>
         <td>
-          920
+          915
         </td>
         <td>
-          13204
+          13281
           -
-          13581
+          13332
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, true)
+        </td>
+      </tr><tr>
+        <td>
+          336
+        </td>
+        <td>
+          921
+        </td>
+        <td>
+          13343
+          -
+          13683
         </td>
         <td>
           Apply
@@ -6228,7 +6256,7 @@ else
   else
     (): Unit);
   try {
-    org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, p.feature, true);
+    helper.write(p.feature);
     count = count.+(1)
   } catch {
     case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
@@ -6240,15 +6268,15 @@ else
         </td>
       </tr><tr>
         <td>
-          336
+          338
         </td>
         <td>
-          918
+          919
         </td>
         <td>
-          13355
+          13494
           -
-          13440
+          13542
         </td>
         <td>
           Block
@@ -6261,21 +6289,21 @@ else
         </td>
         <td style="background: #AEF1AE">
           {
-  org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, p.feature, true);
+  helper.write(p.feature);
   count = count.+(1)
 }
         </td>
       </tr><tr>
         <td>
-          337
+          339
         </td>
         <td>
-          914
+          916
         </td>
         <td>
-          13382
+          13507
           -
-          13391
+          13516
         </td>
         <td>
           Select
@@ -6291,63 +6319,39 @@ else
         </td>
       </tr><tr>
         <td>
-          337
-        </td>
-        <td>
-          915
-        </td>
-        <td>
-          13410
-          -
-          13414
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          true
-        </td>
-      </tr><tr>
-        <td>
-          337
-        </td>
-        <td>
-          916
-        </td>
-        <td>
-          13355
-          -
-          13415
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.geotools.FeatureUtils.write
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.geotools.FeatureUtils.write(writer, p.feature, true)
-        </td>
-      </tr><tr>
-        <td>
-          338
+          339
         </td>
         <td>
           917
         </td>
         <td>
-          13430
+          13494
           -
-          13440
+          13517
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.FeatureWriterHelper.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          helper.write(p.feature)
+        </td>
+      </tr><tr>
+        <td>
+          340
+        </td>
+        <td>
+          918
+        </td>
+        <td>
+          13532
+          -
+          13542
         </td>
         <td>
           Apply
@@ -6363,15 +6367,15 @@ else
         </td>
       </tr><tr>
         <td>
-          340
+          342
         </td>
         <td>
-          919
+          920
         </td>
         <td>
-          13497
+          13599
           -
-          13555
+          13657
         </td>
         <td>
           Typed
@@ -6390,15 +6394,15 @@ else
         </td>
       </tr><tr>
         <td>
-          349
+          351
         </td>
         <td>
-          925
+          926
         </td>
         <td>
-          13664
+          13766
           -
-          13685
+          13787
         </td>
         <td>
           Apply
@@ -6414,15 +6418,15 @@ else
         </td>
       </tr><tr>
         <td>
-          350
+          352
         </td>
         <td>
-          926
+          927
         </td>
         <td>
-          13692
+          13794
           -
-          13714
+          13816
         </td>
         <td>
           Apply
@@ -6438,15 +6442,15 @@ else
         </td>
       </tr><tr>
         <td>
-          351
+          353
         </td>
         <td>
-          927
+          928
         </td>
         <td>
-          13721
+          13823
           -
-          13767
+          13869
         </td>
         <td>
           Apply
@@ -6462,15 +6466,15 @@ else
         </td>
       </tr><tr>
         <td>
-          351
+          353
         </td>
         <td>
-          928
+          929
         </td>
         <td>
-          13746
+          13848
           -
-          13746
+          13848
         </td>
         <td>
           Literal
@@ -6486,15 +6490,15 @@ else
         </td>
       </tr><tr>
         <td>
-          358
+          360
         </td>
         <td>
-          929
+          930
         </td>
         <td>
-          13849
+          13951
           -
-          13910
+          14012
         </td>
         <td>
           Apply
@@ -6510,15 +6514,15 @@ else
         </td>
       </tr><tr>
         <td>
-          359
+          361
         </td>
         <td>
-          930
+          931
         </td>
         <td>
-          13947
+          14049
           -
-          14012
+          14114
         </td>
         <td>
           Apply
@@ -6534,15 +6538,15 @@ else
         </td>
       </tr><tr>
         <td>
-          434
+          436
         </td>
         <td>
-          931
+          932
         </td>
         <td>
-          16190
+          16292
           -
-          16204
+          16306
         </td>
         <td>
           Select
@@ -6558,15 +6562,15 @@ else
         </td>
       </tr><tr>
         <td>
-          434
+          436
         </td>
         <td>
-          932
+          933
         </td>
         <td>
-          16218
+          16320
           -
-          16229
+          16331
         </td>
         <td>
           Select
@@ -6582,15 +6586,15 @@ else
         </td>
       </tr><tr>
         <td>
-          434
+          436
         </td>
         <td>
-          933
+          934
         </td>
         <td>
-          16208
+          16310
           -
-          16229
+          16331
         </td>
         <td>
           Apply
@@ -6606,15 +6610,15 @@ else
         </td>
       </tr><tr>
         <td>
-          434
+          436
         </td>
         <td>
-          934
+          935
         </td>
         <td>
-          16177
+          16279
           -
-          16229
+          16331
         </td>
         <td>
           Apply
@@ -6630,15 +6634,15 @@ else
         </td>
       </tr><tr>
         <td>
-          434
+          436
         </td>
         <td>
-          935
+          936
         </td>
         <td>
-          16177
+          16279
           -
-          16229
+          16331
         </td>
         <td>
           Block
@@ -6654,15 +6658,15 @@ else
         </td>
       </tr><tr>
         <td>
-          435
+          437
         </td>
         <td>
-          936
+          937
         </td>
         <td>
-          16246
+          16348
           -
-          16251
+          16353
         </td>
         <td>
           Literal
@@ -6678,15 +6682,15 @@ else
         </td>
       </tr><tr>
         <td>
-          435
+          437
         </td>
         <td>
-          937
+          938
         </td>
         <td>
-          16246
+          16348
           -
-          16251
+          16353
         </td>
         <td>
           Block
@@ -6702,15 +6706,15 @@ else
         </td>
       </tr><tr>
         <td>
-          438
+          440
         </td>
         <td>
-          938
+          939
         </td>
         <td>
-          16317
+          16419
           -
-          16326
+          16428
         </td>
         <td>
           Select
@@ -6726,15 +6730,15 @@ else
         </td>
       </tr><tr>
         <td>
-          438
+          440
         </td>
         <td>
-          939
+          940
         </td>
         <td>
-          16328
+          16430
           -
-          16334
+          16436
         </td>
         <td>
           Select
@@ -6750,15 +6754,15 @@ else
         </td>
       </tr><tr>
         <td>
-          438
+          440
         </td>
         <td>
-          940
+          941
         </td>
         <td>
-          16313
+          16415
           -
-          16335
+          16437
         </td>
         <td>
           Apply
@@ -6774,15 +6778,15 @@ else
         </td>
       </tr><tr>
         <td>
-          439
+          441
         </td>
         <td>
-          941
+          942
         </td>
         <td>
-          16352
+          16454
           -
-          16364
+          16466
         </td>
         <td>
           Apply
@@ -6798,15 +6802,15 @@ else
         </td>
       </tr><tr>
         <td>
-          439
+          441
         </td>
         <td>
-          942
+          943
         </td>
         <td>
-          16351
+          16453
           -
-          16351
+          16453
         </td>
         <td>
           TypeApply
@@ -6822,15 +6826,15 @@ else
         </td>
       </tr><tr>
         <td>
-          439
+          441
         </td>
         <td>
-          943
+          944
         </td>
         <td>
-          16375
+          16477
           -
-          16376
+          16478
         </td>
         <td>
           Literal
@@ -6846,15 +6850,15 @@ else
         </td>
       </tr><tr>
         <td>
-          439
+          441
         </td>
         <td>
-          944
+          945
         </td>
         <td>
-          16388
+          16490
           -
-          16398
+          16500
         </td>
         <td>
           Apply
@@ -6870,15 +6874,15 @@ else
         </td>
       </tr><tr>
         <td>
-          439
+          441
         </td>
         <td>
-          945
+          946
         </td>
         <td>
-          16342
+          16444
           -
-          16399
+          16501
         </td>
         <td>
           Apply
