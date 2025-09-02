@@ -1,1 +1,1 @@
-typeSearchIndex = [{"l":"All Classes","url":"allclasses-index.html"},{"p":"org.locationtech.geomesa.convert","l":"ConverterConfigProvider"},{"p":"org.locationtech.geomesa.convert2.interop","l":"SimpleFeatureConverterLoader"}]
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.locationtech.geomesa.convert","l":"ConverterConfigProvider"},{"p":"org.locationtech.geomesa.convert2.interop","l":"SimpleFeatureConverterLoader"}];updateSearchResults();

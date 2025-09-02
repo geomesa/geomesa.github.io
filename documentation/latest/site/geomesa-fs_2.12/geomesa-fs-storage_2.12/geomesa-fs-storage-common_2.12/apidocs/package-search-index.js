@@ -1,1 +1,1 @@
-packageSearchIndex = [{"l":"All Packages","url":"allpackages-index.html"},{"l":"org.locationtech.geomesa.fs.storage.common.interop"}]
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.locationtech.geomesa.fs.storage.common.interop"}];updateSearchResults();

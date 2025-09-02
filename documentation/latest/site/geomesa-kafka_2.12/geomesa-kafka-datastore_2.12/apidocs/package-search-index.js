@@ -1,1 +1,1 @@
-packageSearchIndex = [{"l":"All Packages","url":"allpackages-index.html"},{"l":"org.locationtech.geomesa.kafka.jstreams"},{"l":"org.locationtech.geomesa.kafka.utils.interop"}]
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.locationtech.geomesa.kafka.jstreams"},{"l":"org.locationtech.geomesa.kafka.utils.interop"}];updateSearchResults();

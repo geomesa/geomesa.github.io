@@ -1,1 +1,1 @@
-typeSearchIndex = [{"l":"All Classes","url":"allclasses-index.html"},{"p":"org.locationtech.geomesa.jobs.interop.mapreduce","l":"GeoMesaOutputFormat"}]
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"org.locationtech.geomesa.jobs.interop.mapreduce","l":"GeoMesaOutputFormat"}];updateSearchResults();

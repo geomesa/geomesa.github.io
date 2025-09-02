@@ -1,0 +1,6760 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/lambda/stream/kafka/KafkaFeatureCache.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.lambda.stream.kafka
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.StrictLogging
+</span>12 <span style=''>import org.geotools.api.data.{DataStore, Transaction}
+</span>13 <span style=''>import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+</span>14 <span style=''>import org.locationtech.geomesa.index.utils.FeatureWriterHelper
+</span>15 <span style=''>import org.locationtech.geomesa.lambda.data.LambdaDataStore.PersistenceConfig
+</span>16 <span style=''>import org.locationtech.geomesa.lambda.stream.OffsetManager
+</span>17 <span style=''>import org.locationtech.geomesa.lambda.stream.OffsetManager.OffsetListener
+</span>18 <span style=''>import org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache._
+</span>19 <span style=''>import org.locationtech.geomesa.utils.concurrent.ExitingExecutor
+</span>20 <span style=''>import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
+</span>21 <span style=''>import org.locationtech.geomesa.utils.geotools.FeatureUtils
+</span>22 <span style=''>import org.locationtech.geomesa.utils.io.{CloseWithLogging, WithClose}
+</span>23 <span style=''>import org.locationtech.geomesa.utils.stats.MethodProfiling
+</span>24 <span style=''>
+</span>25 <span style=''>import java.io.Closeable
+</span>26 <span style=''>import java.time.{Clock, Instant, ZoneOffset, ZonedDateTime}
+</span>27 <span style=''>import java.util.concurrent.atomic.AtomicLong
+</span>28 <span style=''>import java.util.concurrent.{ConcurrentHashMap, ScheduledThreadPoolExecutor, TimeUnit}
+</span>29 <span style=''>import scala.annotation.tailrec
+</span>30 <span style=''>import scala.collection.mutable.ArrayBuffer
+</span>31 <span style=''>import scala.concurrent.duration.FiniteDuration
+</span>32 <span style=''>import scala.util.Random
+</span>33 <span style=''>import scala.util.control.NonFatal
+</span>34 <span style=''>
+</span>35 <span style=''>/**
+</span>36 <span style=''>  * Locally cached features
+</span>37 <span style=''>  */
+</span>38 <span style=''>class KafkaFeatureCache(
+</span>39 <span style=''>    ds: DataStore,
+</span>40 <span style=''>    sft: SimpleFeatureType,
+</span>41 <span style=''>    offsetManager: OffsetManager,
+</span>42 <span style=''>    topic: String,
+</span>43 <span style=''>    persist: Option[PersistenceConfig])
+</span>44 <span style=''>   (implicit clock: Clock = Clock.systemUTC())
+</span>45 <span style=''>  extends WritableFeatureCache with ReadableFeatureCache with OffsetListener
+</span>46 <span style=''>    with Closeable with MethodProfiling with StrictLogging {
+</span>47 <span style=''>
+</span>48 <span style=''>  import org.locationtech.geomesa.filter.ff
+</span>49 <span style=''>
+</span>50 <span style=''>  import scala.collection.JavaConverters._
+</span>51 <span style=''>
+</span>52 <span style=''>  // map of feature id -&gt; current feature
+</span>53 <span style=''>  private val features = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[String, FeatureReference]</span><span style=''>
+</span>54 <span style=''>
+</span>55 <span style=''>  // technically we should synchronize all access to the following array, since we expand it if needed;
+</span>56 <span style=''>  // however, in normal use it will be created up front and then only read.
+</span>57 <span style=''>  // if partitions are added at runtime, we may have synchronization issues...
+</span>58 <span style=''>  private val offsets = </span><span style='background: #AEF1AE'>ArrayBuffer.empty[AtomicLong]</span><span style=''>
+</span>59 <span style=''>
+</span>60 <span style=''>  private val lockTimeout = </span><span style='background: #AEF1AE'>KafkaFeatureCache.LockTimeout.toMillis.get</span><span style=''>
+</span>61 <span style=''>
+</span>62 <span style=''>  private val persistence = </span><span style='background: #AEF1AE'>persist.map { case PersistenceConfig(e, batchSize) =&gt; new Persistence(e.toMillis, batchSize) }</span><span style=''>
+</span>63 <span style=''>
+</span>64 <span style=''>  </span><span style='background: #AEF1AE'>offsetManager.addOffsetListener(topic, this)</span><span style=''>
+</span>65 <span style=''>
+</span>66 <span style=''>  override def partitionAssigned(partition: Int, offset: Long): Unit = {
+</span>67 <span style=''>    logger.debug(s&quot;Partition assigned: [$topic:$partition:$offset]&quot;)
+</span>68 <span style=''>    </span><span style='background: #AEF1AE'>ensurePartition(partition, offset)</span><span style=''>
+</span>69 <span style=''>  }
+</span>70 <span style=''>
+</span>71 <span style=''>  override def get(id: String): SimpleFeature = {
+</span>72 <span style=''>    val result = </span><span style='background: #AEF1AE'>features.get(id)</span><span style=''>
+</span>73 <span style=''>    if (</span><span style='background: #AEF1AE'>result == null</span><span style=''>) { </span><span style='background: #F0ADAD'>null</span><span style=''> } else { </span><span style='background: #AEF1AE'>result.feature</span><span style=''> }
+</span>74 <span style=''>  }
+</span>75 <span style=''>
+</span>76 <span style=''>  override def all(): Iterator[SimpleFeature] = </span><span style='background: #AEF1AE'>features.values.iterator.asScala.map(_.feature)</span><span style=''>
+</span>77 <span style=''>
+</span>78 <span style=''>  override def add(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit = {
+</span>79 <span style=''>    if (</span><span style='background: #AEF1AE'>offsets(partition).get &lt; offset</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>80 <span style=''></span><span style='background: #AEF1AE'>      logger.trace(s&quot;Adding [$partition:$offset] $feature created at &quot; +
+</span>81 <span style=''></span><span style='background: #AEF1AE'>          s&quot;${ZonedDateTime.ofInstant(Instant.ofEpochMilli(created), ZoneOffset.UTC)}&quot;)
+</span>82 <span style=''></span><span style='background: #AEF1AE'>      features.put(feature.getID, new FeatureReference(feature, partition, offset, created))
+</span>83 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''> else {
+</span>84 <span style=''>      </span><span style='background: #F0ADAD'>logger.trace(s&quot;Ignoring [$partition:$offset] $feature created at &quot; +
+</span>85 <span style=''></span><span style='background: #F0ADAD'>          s&quot;${ZonedDateTime.ofInstant(Instant.ofEpochMilli(created), ZoneOffset.UTC)}&quot;)</span><span style=''>
+</span>86 <span style=''>    }
+</span>87 <span style=''>  }
+</span>88 <span style=''>
+</span>89 <span style=''>  override def delete(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit = {
+</span>90 <span style=''>    logger.trace(s&quot;Deleting [$partition:$offset] $feature created at &quot; +
+</span>91 <span style=''>        s&quot;${ZonedDateTime.ofInstant(Instant.ofEpochMilli(created), ZoneOffset.UTC)}&quot;)
+</span>92 <span style=''>    </span><span style='background: #AEF1AE'>features.remove(feature.getID)</span><span style=''>
+</span>93 <span style=''>    </span><span style='background: #AEF1AE'>persistence.foreach { p =&gt;
+</span>94 <span style=''></span><span style='background: #AEF1AE'>      try {
+</span>95 <span style=''></span><span style='background: #AEF1AE'>        if (p.delete(feature.getID)) {
+</span>96 <span style=''></span><span style='background: #AEF1AE'>          logger.trace(s&quot;Persistent store delete [$topic:$partition:$offset] $feature&quot;)
+</span>97 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>98 <span style=''></span><span style='background: #AEF1AE'>      } catch {
+</span>99 <span style=''></span><span style='background: #AEF1AE'>        case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.error(s&quot;Error deleting feature in persistent store: $feature&quot;, e)</span><span style='background: #AEF1AE'>
+</span>100 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>101 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>102 <span style=''>  }
+</span>103 <span style=''>
+</span>104 <span style=''>  override def offsetChanged(partition: Int, offset: Long): Unit = {
+</span>105 <span style=''>    if (</span><span style='background: #AEF1AE'>offsets.length &lt;= partition</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>106 <span style=''></span><span style='background: #F0ADAD'>      logger.debug(s&quot;Offsets changed for [$topic:$partition]: (unassigned) -&gt; $offset&quot;)
+</span>107 <span style=''></span><span style='background: #F0ADAD'>      ensurePartition(partition, offset)
+</span>108 <span style=''></span><span style='background: #F0ADAD'>      return
+</span>109 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>110 <span style=''>
+</span>111 <span style=''>    // update the valid offset
+</span>112 <span style=''>    var last = </span><span style='background: #AEF1AE'>offsets(partition).get</span><span style=''>
+</span>113 <span style=''>    logger.debug(s&quot;Offsets changed for [$topic:$partition]: $last -&gt; $offset&quot;)
+</span>114 <span style=''>    while (</span><span style='background: #AEF1AE'>last &lt; offset &amp;&amp; !offsets(partition).compareAndSet(last, offset)</span><span style=''>) {
+</span>115 <span style=''>      </span><span style='background: #F0ADAD'>last = offsets(partition).get</span><span style=''>
+</span>116 <span style=''>    }
+</span>117 <span style=''>
+</span>118 <span style=''>    def onCompleted(count: Int, time: Long): Unit =
+</span>119 <span style=''>      logger.debug(f&quot;Size of cached state for [$topic]: ${features.size}%d (removed $count%d entries in ${time}ms)&quot;)
+</span>120 <span style=''>
+</span>121 <span style=''>    </span><span style='background: #AEF1AE'>profile(onCompleted _) {
+</span>122 <span style=''></span><span style='background: #AEF1AE'>      var removed = 0
+</span>123 <span style=''></span><span style='background: #AEF1AE'>      val iter = features.values().iterator()
+</span>124 <span style=''></span><span style='background: #AEF1AE'>      while (iter.hasNext) {
+</span>125 <span style=''></span><span style='background: #AEF1AE'>        val next = iter.next()
+</span>126 <span style=''></span><span style='background: #AEF1AE'>        if (next.partition == partition &amp;&amp; next.offset &lt;= offset) {
+</span>127 <span style=''></span><span style='background: #AEF1AE'>          iter.remove()
+</span>128 <span style=''></span><span style='background: #AEF1AE'>          removed += 1
+</span>129 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>130 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>131 <span style=''></span><span style='background: #AEF1AE'>      removed
+</span>132 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>133 <span style=''>  }
+</span>134 <span style=''>
+</span>135 <span style=''>  /**
+</span>136 <span style=''>   * Persist any expired features
+</span>137 <span style=''>   *
+</span>138 <span style=''>   * @return list of last persisted offsets per partition
+</span>139 <span style=''>   */
+</span>140 <span style=''>  def persist(): Seq[PartitionOffset] =
+</span>141 <span style=''>    </span><span style='background: #AEF1AE'>persistence.getOrElse(throw new IllegalStateException(&quot;Persistence is disabled for this store&quot;)).persist()</span><span style=''>
+</span>142 <span style=''>
+</span>143 <span style=''>  override def close(): Unit = {
+</span>144 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(persistence)</span><span style=''>
+</span>145 <span style=''>    </span><span style='background: #AEF1AE'>offsetManager.removeOffsetListener(topic, this)</span><span style=''>
+</span>146 <span style=''>  }
+</span>147 <span style=''>
+</span>148 <span style=''>  /**
+</span>149 <span style=''>   * Create an offset holder for the partition if it doesn't already exist
+</span>150 <span style=''>   *
+</span>151 <span style=''>   * @param partition partition
+</span>152 <span style=''>   * @param offset offset
+</span>153 <span style=''>   */
+</span>154 <span style=''>  private def ensurePartition(partition: Int, offset: Long): Unit = </span><span style='background: #AEF1AE'>synchronized {
+</span>155 <span style=''></span><span style='background: #AEF1AE'>    while (offsets.length &lt;= partition) {
+</span>156 <span style=''></span><span style='background: #AEF1AE'>      offsets += new AtomicLong(-1L)
+</span>157 <span style=''></span><span style='background: #AEF1AE'>    }
+</span>158 <span style=''></span><span style='background: #AEF1AE'>    offsets(partition).set(offset)
+</span>159 <span style=''></span><span style='background: #AEF1AE'>  }</span><span style=''>
+</span>160 <span style=''>
+</span>161 <span style=''>  /**
+</span>162 <span style=''>   * Wrapper for managing scheduled persistence runs
+</span>163 <span style=''>   */
+</span>164 <span style=''>  private class Persistence(expiryMillis: Long, batchSize: Int) extends Closeable {
+</span>165 <span style=''>
+</span>166 <span style=''>    private val frequency = </span><span style='background: #AEF1AE'>KafkaFeatureCache.PersistInterval.toMillis.get</span><span style=''>
+</span>167 <span style=''>    private val executor = </span><span style='background: #AEF1AE'>ExitingExecutor(new ScheduledThreadPoolExecutor(1))</span><span style=''>
+</span>168 <span style=''>    private val schedule = </span><span style='background: #AEF1AE'>executor.scheduleWithFixedDelay(() =&gt; </span><span style='background: #F0ADAD'>persist()</span><span style='background: #AEF1AE'>, frequency, frequency, TimeUnit.MILLISECONDS)</span><span style=''>
+</span>169 <span style=''>
+</span>170 <span style=''>    /**
+</span>171 <span style=''>     * Persist any expired features
+</span>172 <span style=''>     *
+</span>173 <span style=''>     * @return list of last persisted offsets per partition
+</span>174 <span style=''>     */
+</span>175 <span style=''>    def persist(): Seq[PartitionOffset] = {
+</span>176 <span style=''>      logger.debug(s&quot;Running persistence for [$topic]&quot;)
+</span>177 <span style=''>      // lock per-partition to allow for multiple write threads
+</span>178 <span style=''>      // randomly access the partitions to avoid contention if multiple data stores are all on the same schedule
+</span>179 <span style=''>      </span><span style='background: #AEF1AE'>Random.shuffle(offsets.indices.toList).flatMap { partition =&gt;
+</span>180 <span style=''></span><span style='background: #AEF1AE'>        // if we don't get the lock just try again next run
+</span>181 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(s&quot;Acquiring lock for [$topic:$partition]&quot;)
+</span>182 <span style=''></span><span style='background: #AEF1AE'>        offsetManager.acquireLock(topic, partition, lockTimeout) match {
+</span>183 <span style=''></span><span style='background: #AEF1AE'>          case None </span><span style='background: #F0ADAD'>=&gt;
+</span>184 <span style=''></span><span style='background: #F0ADAD'>            logger.trace(s&quot;Could not acquire lock for [$topic:$partition] within ${lockTimeout}ms&quot;)
+</span>185 <span style=''></span><span style='background: #F0ADAD'>            None</span><span style='background: #AEF1AE'>
+</span>186 <span style=''></span><span style='background: #AEF1AE'>          case Some(lock) =&gt;
+</span>187 <span style=''></span><span style='background: #AEF1AE'>            try {
+</span>188 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Acquired lock for [$topic:$partition]&quot;)
+</span>189 <span style=''></span><span style='background: #AEF1AE'>              persist(partition).map(PartitionOffset(partition, _))
+</span>190 <span style=''></span><span style='background: #AEF1AE'>            } finally {
+</span>191 <span style=''></span><span style='background: #AEF1AE'>              lock.close()
+</span>192 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Released lock for [$topic:$partition]&quot;)
+</span>193 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>194 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>195 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>196 <span style=''>    }
+</span>197 <span style=''>
+</span>198 <span style=''>    /**
+</span>199 <span style=''>     * Delete a feature
+</span>200 <span style=''>     *
+</span>201 <span style=''>     * @param id feature id
+</span>202 <span style=''>     * @return true if feature was deleted
+</span>203 <span style=''>     */
+</span>204 <span style=''>    def delete(id: String): Boolean = {
+</span>205 <span style=''>      </span><span style='background: #AEF1AE'>WithClose(ds.getFeatureWriter(sft.getTypeName, ff.id(ff.featureId(id)), Transaction.AUTO_COMMIT)) { writer =&gt;
+</span>206 <span style=''></span><span style='background: #AEF1AE'>        if (writer.hasNext) {
+</span>207 <span style=''></span><span style='background: #AEF1AE'>          writer.next()
+</span>208 <span style=''></span><span style='background: #AEF1AE'>          writer.remove()
+</span>209 <span style=''></span><span style='background: #AEF1AE'>          true
+</span>210 <span style=''></span><span style='background: #AEF1AE'>        } else {
+</span>211 <span style=''></span><span style='background: #AEF1AE'>          false
+</span>212 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>213 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>214 <span style=''>    }
+</span>215 <span style=''>
+</span>216 <span style=''>    /**
+</span>217 <span style=''>     * Persist any expired features that haven't yet been persisted
+</span>218 <span style=''>     *
+</span>219 <span style=''>     * @param partition partition to persist
+</span>220 <span style=''>     * @param lastPersistedOffset result from previous recursive run, if any
+</span>221 <span style=''>     * @return offset of latest persisted feature
+</span>222 <span style=''>     */
+</span>223 <span style=''>    @tailrec
+</span>224 <span style=''>    private def persist(partition: Int, lastPersistedOffset: Option[Long] = None): Option[Long] = {
+</span>225 <span style=''>      val expiry = </span><span style='background: #AEF1AE'>clock.millis() - expiryMillis</span><span style=''>
+</span>226 <span style=''>
+</span>227 <span style=''>      val lastOffset = </span><span style='background: #AEF1AE'>offsetManager.getOffset(topic, partition)</span><span style=''>
+</span>228 <span style=''>      logger.debug(s&quot;Last persisted offsets for [$topic:$partition]: $lastOffset&quot;)
+</span>229 <span style=''>
+</span>230 <span style=''>      var nextOffset = </span><span style='background: #AEF1AE'>-1L</span><span style=''>
+</span>231 <span style=''>      // note: copy to a new collection so that any updates don't affect our persistence here
+</span>232 <span style=''>      val expired = {
+</span>233 <span style=''>        val builder = </span><span style='background: #AEF1AE'>Map.newBuilder[String, FeatureReference]</span><span style=''>
+</span>234 <span style=''>        </span><span style='background: #AEF1AE'>features.asScala.foreach { case (id, f) =&gt;
+</span>235 <span style=''></span><span style='background: #AEF1AE'>          // note: offset &gt; lastOffset ensures we don't operate on features that have already been processed
+</span>236 <span style=''></span><span style='background: #AEF1AE'>          if (f.partition == partition &amp;&amp; f.created &lt;= expiry &amp;&amp; f.offset &gt; lastOffset) {
+</span>237 <span style=''></span><span style='background: #AEF1AE'>            nextOffset = math.max(nextOffset, f.offset)
+</span>238 <span style=''></span><span style='background: #AEF1AE'>            builder += id -&gt; f
+</span>239 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>240 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>241 <span style=''>        </span><span style='background: #AEF1AE'>builder.result()</span><span style=''>
+</span>242 <span style=''>      }
+</span>243 <span style=''>      logger.debug(s&quot;Found ${expired.size} expired entries for [$topic:$partition]&quot;)
+</span>244 <span style=''>
+</span>245 <span style=''>      if (</span><span style='background: #AEF1AE'>expired.isEmpty</span><span style=''>) {
+</span>246 <span style=''>        </span><span style='background: #AEF1AE'>lastPersistedOffset</span><span style=''>
+</span>247 <span style=''>      } else </span><span style='background: #AEF1AE'>{
+</span>248 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(expired.values.map(e =&gt; s&quot;offset ${e.offset}: ${e.feature}&quot;).mkString(&quot;Expired entries:\n\t&quot;, &quot;\n\t&quot;, &quot;&quot;))
+</span>249 <span style=''></span><span style='background: #AEF1AE'>        val batch =
+</span>250 <span style=''></span><span style='background: #AEF1AE'>          if (expired.size &lt;= batchSize) {
+</span>251 <span style=''></span><span style='background: #AEF1AE'>            expired
+</span>252 <span style=''></span><span style='background: #AEF1AE'>          } else </span><span style='background: #F0ADAD'>{
+</span>253 <span style=''></span><span style='background: #F0ADAD'>            logger.trace(s&quot;Skipping persistence for ${expired.size - batchSize} features based on batch size of $batchSize&quot;)
+</span>254 <span style=''></span><span style='background: #F0ADAD'>            // sort by offset since we track persistence based on offset
+</span>255 <span style=''></span><span style='background: #F0ADAD'>            val sorted = expired.toList.sortBy(_._2.offset).take(batchSize)
+</span>256 <span style=''></span><span style='background: #F0ADAD'>            nextOffset = sorted.last._2.offset
+</span>257 <span style=''></span><span style='background: #F0ADAD'>            sorted.toMap
+</span>258 <span style=''></span><span style='background: #F0ADAD'>          }</span><span style='background: #AEF1AE'>
+</span>259 <span style=''></span><span style='background: #AEF1AE'>        persist(partition, batch)
+</span>260 <span style=''></span><span style='background: #AEF1AE'>
+</span>261 <span style=''></span><span style='background: #AEF1AE'>        logger.debug(s&quot;Committing offset [$topic:$partition:$nextOffset]&quot;)
+</span>262 <span style=''></span><span style='background: #AEF1AE'>        // this will trigger our listener and cause the feature to be removed from the cache
+</span>263 <span style=''></span><span style='background: #AEF1AE'>        offsetManager.setOffset(topic, partition, nextOffset)
+</span>264 <span style=''></span><span style='background: #AEF1AE'>        if (batch.size &lt; expired.size) {
+</span>265 <span style=''></span><span style='background: #AEF1AE'>          // we skipped some expired features, so run again immediately
+</span>266 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>persist(partition, Some(nextOffset))</span><span style='background: #AEF1AE'>
+</span>267 <span style=''></span><span style='background: #AEF1AE'>        } else {
+</span>268 <span style=''></span><span style='background: #AEF1AE'>          Some(nextOffset)
+</span>269 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>270 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>271 <span style=''>    }
+</span>272 <span style=''>
+</span>273 <span style=''>    /**
+</span>274 <span style=''>     * Persist expired features
+</span>275 <span style=''>     *
+</span>276 <span style=''>     * @param partition partition
+</span>277 <span style=''>     * @param batch expired features
+</span>278 <span style=''>     */
+</span>279 <span style=''>    private def persist(partition: Int, batch: Map[String, FeatureReference]): Unit = {
+</span>280 <span style=''>      // do an update query first
+</span>281 <span style=''>      val remaining = </span><span style='background: #AEF1AE'>persistUpdates(partition, batch)</span><span style=''>
+</span>282 <span style=''>      // if any weren't updates, add them as inserts
+</span>283 <span style=''>      if (</span><span style='background: #AEF1AE'>remaining.nonEmpty</span><span style=''>) {
+</span>284 <span style=''>        </span><span style='background: #AEF1AE'>persistAppends(partition, remaining)</span><span style=''>
+</span>285 <span style=''>      }
+</span>286 <span style=''>    }
+</span>287 <span style=''>
+</span>288 <span style=''>    /**
+</span>289 <span style=''>     * Attempt to persist expired features through modifying writes
+</span>290 <span style=''>     *
+</span>291 <span style=''>     * @param partition partition being persisted
+</span>292 <span style=''>     * @param batch expired feature
+</span>293 <span style=''>     * @return any features that were not persisted
+</span>294 <span style=''>     */
+</span>295 <span style=''>    private def persistUpdates(partition: Int, batch: Map[String, FeatureReference]): Iterable[FeatureReference] = {
+</span>296 <span style=''>      logger.debug(s&quot;Attempting persistent updates on ${batch.size} features&quot;)
+</span>297 <span style=''>      val persistedKeys = </span><span style='background: #AEF1AE'>scala.collection.mutable.Set.empty[String]</span><span style=''>
+</span>298 <span style=''>      </span><span style='background: #AEF1AE'>profile((c: Int, time: Long) =&gt; logger.debug(s&quot;Wrote $c updated feature(s) to persistent storage in ${time}ms&quot;)) {
+</span>299 <span style=''></span><span style='background: #AEF1AE'>        val filter = ff.id(batch.keys.map(ff.featureId).toSeq: _*)
+</span>300 <span style=''></span><span style='background: #AEF1AE'>        WithClose(ds.getFeatureWriter(sft.getTypeName, filter, Transaction.AUTO_COMMIT)) { writer =&gt;
+</span>301 <span style=''></span><span style='background: #AEF1AE'>          var count = 0
+</span>302 <span style=''></span><span style='background: #AEF1AE'>          while (writer.hasNext) </span><span style='background: #F0ADAD'>{
+</span>303 <span style=''></span><span style='background: #F0ADAD'>            val next = writer.next()
+</span>304 <span style=''></span><span style='background: #F0ADAD'>            batch.get(next.getID).foreach { p =&gt;
+</span>305 <span style=''></span><span style='background: #F0ADAD'>              logger.trace(s&quot;Persistent store modify [$topic:$partition:${p.offset}] ${p.feature}&quot;)
+</span>306 <span style=''></span><span style='background: #F0ADAD'>              persistedKeys += next.getID
+</span>307 <span style=''></span><span style='background: #F0ADAD'>              FeatureUtils.copyToFeature(next, p.feature, useProvidedFid = true)
+</span>308 <span style=''></span><span style='background: #F0ADAD'>              try {
+</span>309 <span style=''></span><span style='background: #F0ADAD'>                writer.write()
+</span>310 <span style=''></span><span style='background: #F0ADAD'>                count += 1
+</span>311 <span style=''></span><span style='background: #F0ADAD'>              } catch {
+</span>312 <span style=''></span><span style='background: #F0ADAD'>                case NonFatal(e) =&gt; logger.error(s&quot;Error persisting feature: ${p.feature}&quot;, e)
+</span>313 <span style=''></span><span style='background: #F0ADAD'>              }
+</span>314 <span style=''></span><span style='background: #F0ADAD'>            }
+</span>315 <span style=''></span><span style='background: #F0ADAD'>          }</span><span style='background: #AEF1AE'>
+</span>316 <span style=''></span><span style='background: #AEF1AE'>          count
+</span>317 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>318 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>319 <span style=''>      </span><span style='background: #AEF1AE'>batch.collect { case (k, v) if !persistedKeys.contains(k) =&gt; v }</span><span style=''>
+</span>320 <span style=''>    }
+</span>321 <span style=''>
+</span>322 <span style=''>    /**
+</span>323 <span style=''>     * Attempt to persist expired features through appending writes
+</span>324 <span style=''>     *
+</span>325 <span style=''>     * @param partition partition being persisted
+</span>326 <span style=''>     * @param batch expired feature
+</span>327 <span style=''>     */
+</span>328 <span style=''>    private def persistAppends(partition: Int, batch: Iterable[FeatureReference]): Unit = {
+</span>329 <span style=''>      logger.debug(s&quot;Attempting persistent appends on ${batch.size} features&quot;)
+</span>330 <span style=''>      </span><span style='background: #AEF1AE'>profile((c: Int, time: Long) =&gt; logger.debug(s&quot;Wrote $c new feature(s) to persistent storage in ${time}ms&quot;)) {
+</span>331 <span style=''></span><span style='background: #AEF1AE'>        WithClose(ds.getFeatureWriterAppend(sft.getTypeName, Transaction.AUTO_COMMIT)) { writer =&gt;
+</span>332 <span style=''></span><span style='background: #AEF1AE'>          var count = 0
+</span>333 <span style=''></span><span style='background: #AEF1AE'>          val helper = FeatureWriterHelper(writer, useProvidedFids = true)
+</span>334 <span style=''></span><span style='background: #AEF1AE'>          batch.foreach { p =&gt;
+</span>335 <span style=''></span><span style='background: #AEF1AE'>            logger.trace(s&quot;Persistent store append [$topic:$partition:${p.offset}] ${p.feature}&quot;)
+</span>336 <span style=''></span><span style='background: #AEF1AE'>            try {
+</span>337 <span style=''></span><span style='background: #AEF1AE'>              helper.write(p.feature)
+</span>338 <span style=''></span><span style='background: #AEF1AE'>              count += 1
+</span>339 <span style=''></span><span style='background: #AEF1AE'>            } catch {
+</span>340 <span style=''></span><span style='background: #AEF1AE'>              case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.error(s&quot;Error persisting feature: ${p.feature}&quot;, e)</span><span style='background: #AEF1AE'>
+</span>341 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>342 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>343 <span style=''></span><span style='background: #AEF1AE'>          count
+</span>344 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>345 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>346 <span style=''>    }
+</span>347 <span style=''>
+</span>348 <span style=''>    override def close(): Unit = {
+</span>349 <span style=''>      </span><span style='background: #AEF1AE'>schedule.cancel(true)</span><span style=''>
+</span>350 <span style=''>      </span><span style='background: #AEF1AE'>executor.shutdownNow()</span><span style=''>
+</span>351 <span style=''>      </span><span style='background: #AEF1AE'>executor.awaitTermination(1, TimeUnit.SECONDS)</span><span style=''>
+</span>352 <span style=''>    }
+</span>353 <span style=''>  }
+</span>354 <span style=''>}
+</span>355 <span style=''>
+</span>356 <span style=''>object KafkaFeatureCache {
+</span>357 <span style=''>
+</span>358 <span style=''>  val PersistInterval: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.lambda.persist.interval&quot;, &quot;1 minute&quot;)</span><span style=''>
+</span>359 <span style=''>  val LockTimeout: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.lambda.persist.lock.timeout&quot;, &quot;1 second&quot;)</span><span style=''>
+</span>360 <span style=''>
+</span>361 <span style=''>  trait ReadableFeatureCache {
+</span>362 <span style=''>
+</span>363 <span style=''>    /**
+</span>364 <span style=''>      * Returns most recent versions of all features currently in this cache
+</span>365 <span style=''>      *
+</span>366 <span style=''>      * @return
+</span>367 <span style=''>      */
+</span>368 <span style=''>    def all(): Iterator[SimpleFeature]
+</span>369 <span style=''>
+</span>370 <span style=''>    /**
+</span>371 <span style=''>      * Returns the most recent version of a feature in this cache, by feature ID
+</span>372 <span style=''>      *
+</span>373 <span style=''>      * @param id feature id
+</span>374 <span style=''>      * @return
+</span>375 <span style=''>      */
+</span>376 <span style=''>    def get(id: String): SimpleFeature
+</span>377 <span style=''>  }
+</span>378 <span style=''>
+</span>379 <span style=''>  trait WritableFeatureCache {
+</span>380 <span style=''>
+</span>381 <span style=''>    /**
+</span>382 <span style=''>      * Initialize this cached state for a given partition and offset
+</span>383 <span style=''>      *
+</span>384 <span style=''>      * @param partition partition
+</span>385 <span style=''>      * @param offset offset
+</span>386 <span style=''>      */
+</span>387 <span style=''>    def partitionAssigned(partition: Int, offset: Long): Unit
+</span>388 <span style=''>
+</span>389 <span style=''>    /**
+</span>390 <span style=''>      * Add a feature to the cached state
+</span>391 <span style=''>      *
+</span>392 <span style=''>      * @param feature feature
+</span>393 <span style=''>      * @param partition partition corresponding to the add message
+</span>394 <span style=''>      * @param offset offset corresponding to the add message
+</span>395 <span style=''>      * @param created time feature was created
+</span>396 <span style=''>      */
+</span>397 <span style=''>    def add(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit
+</span>398 <span style=''>
+</span>399 <span style=''>    /**
+</span>400 <span style=''>      * Deletes a feature from the cached state
+</span>401 <span style=''>      *
+</span>402 <span style=''>      * @param feature feature
+</span>403 <span style=''>      * @param partition partition corresponding to the delete message
+</span>404 <span style=''>      * @param offset offset corresponding to the delete message
+</span>405 <span style=''>      * @param created time feature was deleted
+</span>406 <span style=''>      */
+</span>407 <span style=''>    def delete(feature: SimpleFeature, partition: Int, offset: Long, created: Long): Unit
+</span>408 <span style=''>  }
+</span>409 <span style=''>
+</span>410 <span style=''>  /**
+</span>411 <span style=''>   * Partition and offset holder
+</span>412 <span style=''>   *
+</span>413 <span style=''>   * @param partition partition
+</span>414 <span style=''>   * @param offset offset
+</span>415 <span style=''>   */
+</span>416 <span style=''>  case class PartitionOffset(partition: Int, offset: Long)
+</span>417 <span style=''>
+</span>418 <span style=''>  /**
+</span>419 <span style=''>   * Feature holder used to track the latest feature in our state. Comparison is only based on the
+</span>420 <span style=''>   * partition and offset (which are unique) so that we don't have to hold onto expired features
+</span>421 <span style=''>   * in memory
+</span>422 <span style=''>   *
+</span>423 <span style=''>   * @param feature simple feature
+</span>424 <span style=''>   * @param partition kafka partition
+</span>425 <span style=''>   * @param offset kafka offset
+</span>426 <span style=''>   * @param created create time
+</span>427 <span style=''>   */
+</span>428 <span style=''>  private class FeatureReference(
+</span>429 <span style=''>      val feature: SimpleFeature,
+</span>430 <span style=''>      val partition: Int,
+</span>431 <span style=''>      val offset: Long,
+</span>432 <span style=''>      val created: Long) {
+</span>433 <span style=''>    override def equals(other: Any): Boolean = other match {
+</span>434 <span style=''>      case that: FeatureReference =&gt; </span><span style='background: #F0ADAD'>partition == that.partition &amp;&amp; offset == that.offset</span><span style=''>
+</span>435 <span style=''>      case _ =&gt; </span><span style='background: #F0ADAD'>false</span><span style=''>
+</span>436 <span style=''>    }
+</span>437 <span style=''>    override def hashCode(): Int = {
+</span>438 <span style=''>      val state = </span><span style='background: #F0ADAD'>Seq(partition, offset)</span><span style=''>
+</span>439 <span style=''>      </span><span style='background: #F0ADAD'>state.map(_.hashCode()).foldLeft(0)((a, b) =&gt; 31 * a + b)</span><span style=''>
+</span>440 <span style=''>    }
+</span>441 <span style=''>  }
+</span>442 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          53
+        </td>
+        <td>
+          703
+        </td>
+        <td>
+          2333
+          -
+          2380
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.ConcurrentHashMap[String,org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference]()
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          704
+        </td>
+        <td>
+          2665
+          -
+          2694
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.ArrayBuffer.empty[java.util.concurrent.atomic.AtomicLong]
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          705
+        </td>
+        <td>
+          2724
+          -
+          2766
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Option.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.LockTimeout.toMillis.get
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          706
+        </td>
+        <td>
+          2866
+          -
+          2876
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.concurrent.duration.FiniteDuration.toMillis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          e.toMillis
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          707
+        </td>
+        <td>
+          2850
+          -
+          2888
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new KafkaFeatureCache.this.Persistence(e.toMillis, batchSize)
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          708
+        </td>
+        <td>
+          2850
+          -
+          2888
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new KafkaFeatureCache.this.Persistence(e.toMillis, batchSize)
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          709
+        </td>
+        <td>
+          2796
+          -
+          2890
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.persist.map[KafkaFeatureCache.this.Persistence](((x0$1: org.locationtech.geomesa.lambda.data.LambdaDataStore.PersistenceConfig) =&gt; x0$1 match {
+  case (expiry: scala.concurrent.duration.FiniteDuration, batchSize: Int)org.locationtech.geomesa.lambda.data.LambdaDataStore.PersistenceConfig((e @ _), (batchSize @ _)) =&gt; new KafkaFeatureCache.this.Persistence(e.toMillis, batchSize)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          710
+        </td>
+        <td>
+          2926
+          -
+          2931
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          711
+        </td>
+        <td>
+          2894
+          -
+          2938
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.OffsetManager.addOffsetListener
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsetManager.addOffsetListener(KafkaFeatureCache.this.topic, this)
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          712
+        </td>
+        <td>
+          3086
+          -
+          3120
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.ensurePartition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.ensurePartition(partition, offset)
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          713
+        </td>
+        <td>
+          3193
+          -
+          3209
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.features.get(id)
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          714
+        </td>
+        <td>
+          3218
+          -
+          3232
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          result.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          715
+        </td>
+        <td>
+          3236
+          -
+          3240
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          716
+        </td>
+        <td>
+          3236
+          -
+          3240
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          717
+        </td>
+        <td>
+          3250
+          -
+          3264
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          result.feature
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          718
+        </td>
+        <td>
+          3250
+          -
+          3264
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          result.feature
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          719
+        </td>
+        <td>
+          3320
+          -
+          3344
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collection.iterator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.features.values().iterator()
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          720
+        </td>
+        <td>
+          3357
+          -
+          3366
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1.feature
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          721
+        </td>
+        <td>
+          3320
+          -
+          3367
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaIteratorConverter[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](KafkaFeatureCache.this.features.values().iterator()).asScala.map[org.geotools.api.feature.simple.SimpleFeature](((x$1: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; x$1.feature))
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          722
+        </td>
+        <td>
+          3475
+          -
+          3506
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsets.apply(partition).get().&lt;(offset)
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          727
+        </td>
+        <td>
+          3508
+          -
+          3769
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(scala.StringContext.apply(&quot;Adding [&quot;, &quot;:&quot;, &quot;] &quot;, &quot; created at &quot;).s(partition, offset, feature).+(scala.StringContext.apply(&quot;&quot;, &quot;&quot;).s(java.time.ZonedDateTime.ofInstant(java.time.Instant.ofEpochMilli(created), java.time.ZoneOffset.UTC))))
+  else
+    (): Unit);
+  {
+    KafkaFeatureCache.this.features.put(feature.getID(), new org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference(feature, partition, offset, created));
+    ()
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          723
+        </td>
+        <td>
+          3690
+          -
+          3703
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getID()
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          724
+        </td>
+        <td>
+          3705
+          -
+          3762
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference(feature, partition, offset, created)
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          725
+        </td>
+        <td>
+          3677
+          -
+          3763
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.features.put(feature.getID(), new org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference(feature, partition, offset, created))
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          726
+        </td>
+        <td>
+          3689
+          -
+          3689
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          728
+        </td>
+        <td>
+          3783
+          -
+          3939
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+  KafkaFeatureCache.this.logger.underlying.trace(scala.StringContext.apply(&quot;Ignoring [&quot;, &quot;:&quot;, &quot;] &quot;, &quot; created at &quot;).s(partition, offset, feature).+(scala.StringContext.apply(&quot;&quot;, &quot;&quot;).s(java.time.ZonedDateTime.ofInstant(java.time.Instant.ofEpochMilli(created), java.time.ZoneOffset.UTC))))
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          729
+        </td>
+        <td>
+          4231
+          -
+          4244
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getID()
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          730
+        </td>
+        <td>
+          4215
+          -
+          4245
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.features.remove(feature.getID())
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          738
+        </td>
+        <td>
+          4250
+          -
+          4556
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.persistence.foreach[Unit](((p: KafkaFeatureCache.this.Persistence) =&gt; try {
+  if (p.delete(feature.getID()))
+    (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+      KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store delete [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], offset.asInstanceOf[AnyRef], (feature: AnyRef))
+    else
+      (): Unit)
+  else
+    ()
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+    KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error deleting feature in persistent store: &quot;, &quot;&quot;).s(feature), e)
+  else
+    (): Unit)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          731
+        </td>
+        <td>
+          4310
+          -
+          4323
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getID()
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          732
+        </td>
+        <td>
+          4301
+          -
+          4324
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          p.delete(feature.getID())
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          734
+        </td>
+        <td>
+          4297
+          -
+          4297
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          735
+        </td>
+        <td>
+          4297
+          -
+          4297
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          736
+        </td>
+        <td>
+          4297
+          -
+          4425
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (p.delete(feature.getID()))
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store delete [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], offset.asInstanceOf[AnyRef], (feature: AnyRef))
+  else
+    (): Unit)
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          733
+        </td>
+        <td>
+          4338
+          -
+          4415
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+  KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store delete [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], offset.asInstanceOf[AnyRef], (feature: AnyRef))
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          737
+        </td>
+        <td>
+          4470
+          -
+          4542
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+  KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error deleting feature in persistent store: &quot;, &quot;&quot;).s(feature), e)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          739
+        </td>
+        <td>
+          4639
+          -
+          4666
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsets.length.&lt;=(partition)
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          742
+        </td>
+        <td>
+          4668
+          -
+          4817
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (KafkaFeatureCache.this.logger.underlying.isDebugEnabled())
+    KafkaFeatureCache.this.logger.underlying.debug(&quot;Offsets changed for [{}:{}]: (unassigned) -&gt; {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], offset.asInstanceOf[AnyRef])
+  else
+    (): Unit);
+  KafkaFeatureCache.this.ensurePartition(partition, offset);
+  return ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          743
+        </td>
+        <td>
+          4635
+          -
+          4635
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          744
+        </td>
+        <td>
+          4635
+          -
+          4635
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          740
+        </td>
+        <td>
+          4764
+          -
+          4798
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.ensurePartition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaFeatureCache.this.ensurePartition(partition, offset)
+        </td>
+      </tr><tr>
+        <td>
+          108
+        </td>
+        <td>
+          741
+        </td>
+        <td>
+          4805
+          -
+          4811
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          745
+        </td>
+        <td>
+          4865
+          -
+          4887
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsets.apply(partition).get()
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          746
+        </td>
+        <td>
+          4995
+          -
+          5042
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsets.apply(partition).compareAndSet(last, offset).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          747
+        </td>
+        <td>
+          4978
+          -
+          5042
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          last.&lt;(offset).&amp;&amp;(KafkaFeatureCache.this.offsets.apply(partition).compareAndSet(last, offset).unary_!)
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          750
+        </td>
+        <td>
+          5052
+          -
+          5081
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  last = KafkaFeatureCache.this.offsets.apply(partition).get();
+  while$1()
+}
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          751
+        </td>
+        <td>
+          4971
+          -
+          4971
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          752
+        </td>
+        <td>
+          4971
+          -
+          4971
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          748
+        </td>
+        <td>
+          5059
+          -
+          5081
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaFeatureCache.this.offsets.apply(partition).get()
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          749
+        </td>
+        <td>
+          5057
+          -
+          5057
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.while$1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          while$1()
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          753
+        </td>
+        <td>
+          5271
+          -
+          5282
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.onCompleted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          onCompleted(count, time)
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          769
+        </td>
+        <td>
+          5263
+          -
+          5568
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.stats.MethodProfiling.profile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.profile[Int]({
+  ((count: Int, time: Long) =&gt; onCompleted(count, time))
+})({
+  var removed: Int = 0;
+  val iter: java.util.Iterator[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference] = KafkaFeatureCache.this.features.values().iterator();
+  while$2(){
+    if (iter.hasNext())
+      {
+        {
+          val next: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference = iter.next();
+          if (next.partition.==(partition).&amp;&amp;(next.offset.&lt;=(offset)))
+            {
+              iter.remove();
+              removed = removed.+(1)
+            }
+          else
+            ()
+        };
+        while$2()
+      }
+    else
+      ()
+  };
+  removed
+})
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          770
+        </td>
+        <td>
+          5286
+          -
+          5286
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          754
+        </td>
+        <td>
+          5308
+          -
+          5309
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          755
+        </td>
+        <td>
+          5327
+          -
+          5355
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collection.iterator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.features.values().iterator()
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          756
+        </td>
+        <td>
+          5369
+          -
+          5381
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Iterator.hasNext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          iter.hasNext()
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          765
+        </td>
+        <td>
+          5383
+          -
+          5383
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.while$2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$2()
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          766
+        </td>
+        <td>
+          5383
+          -
+          5548
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    val next: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference = iter.next();
+    if (next.partition.==(partition).&amp;&amp;(next.offset.&lt;=(offset)))
+      {
+        iter.remove();
+        removed = removed.+(1)
+      }
+    else
+      ()
+  };
+  while$2()
+}
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          767
+        </td>
+        <td>
+          5362
+          -
+          5362
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          768
+        </td>
+        <td>
+          5362
+          -
+          5362
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          757
+        </td>
+        <td>
+          5404
+          -
+          5415
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Iterator.next
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          iter.next()
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          758
+        </td>
+        <td>
+          5459
+          -
+          5480
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          next.offset.&lt;=(offset)
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          759
+        </td>
+        <td>
+          5428
+          -
+          5480
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          next.partition.==(partition).&amp;&amp;(next.offset.&lt;=(offset))
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          762
+        </td>
+        <td>
+          5482
+          -
+          5540
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  iter.remove();
+  removed = removed.+(1)
+}
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          763
+        </td>
+        <td>
+          5424
+          -
+          5424
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          764
+        </td>
+        <td>
+          5424
+          -
+          5424
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          760
+        </td>
+        <td>
+          5494
+          -
+          5507
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Iterator.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          iter.remove()
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          761
+        </td>
+        <td>
+          5518
+          -
+          5530
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          removed.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          771
+        </td>
+        <td>
+          5727
+          -
+          5833
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.persist
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.persistence.getOrElse[KafkaFeatureCache.this.Persistence](throw new java.lang.IllegalStateException(&quot;Persistence is disabled for this store&quot;)).persist()
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          772
+        </td>
+        <td>
+          5889
+          -
+          5900
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.persistence
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.persistence
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          773
+        </td>
+        <td>
+          5888
+          -
+          5888
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.optionIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.optionIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          774
+        </td>
+        <td>
+          5872
+          -
+          5901
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[Option[KafkaFeatureCache.this.Persistence]](KafkaFeatureCache.this.persistence)(io.this.IsCloseable.optionIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          145
+        </td>
+        <td>
+          775
+        </td>
+        <td>
+          5941
+          -
+          5946
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          145
+        </td>
+        <td>
+          776
+        </td>
+        <td>
+          5906
+          -
+          5953
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.OffsetManager.removeOffsetListener
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsetManager.removeOffsetListener(KafkaFeatureCache.this.topic, this)
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          785
+        </td>
+        <td>
+          6177
+          -
+          6315
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.synchronized
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.synchronized[Unit]({
+  while$3(){
+    if (KafkaFeatureCache.this.offsets.length.&lt;=(partition))
+      {
+        KafkaFeatureCache.this.offsets.+=(new java.util.concurrent.atomic.AtomicLong(-1L));
+        while$3()
+      }
+    else
+      ()
+  };
+  KafkaFeatureCache.this.offsets.apply(partition).set(offset)
+})
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          777
+        </td>
+        <td>
+          6203
+          -
+          6230
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsets.length.&lt;=(partition)
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          781
+        </td>
+        <td>
+          6240
+          -
+          6270
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  KafkaFeatureCache.this.offsets.+=(new java.util.concurrent.atomic.AtomicLong(-1L));
+  while$3()
+}
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          782
+        </td>
+        <td>
+          6196
+          -
+          6196
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          783
+        </td>
+        <td>
+          6196
+          -
+          6196
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          778
+        </td>
+        <td>
+          6251
+          -
+          6270
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicLong(-1L)
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          779
+        </td>
+        <td>
+          6240
+          -
+          6270
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsets.+=(new java.util.concurrent.atomic.AtomicLong(-1L))
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          780
+        </td>
+        <td>
+          6248
+          -
+          6248
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.while$3
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$3()
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          784
+        </td>
+        <td>
+          6281
+          -
+          6311
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.set
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsets.apply(partition).set(offset)
+        </td>
+      </tr><tr>
+        <td>
+          166
+        </td>
+        <td>
+          786
+        </td>
+        <td>
+          6495
+          -
+          6541
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Option.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.PersistInterval.toMillis.get
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          787
+        </td>
+        <td>
+          6585
+          -
+          6619
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ScheduledThreadPoolExecutor.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.ScheduledThreadPoolExecutor(1)
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          788
+        </td>
+        <td>
+          6569
+          -
+          6569
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.concurrent.ExitingExecutor.apply$default$2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.concurrent.ExitingExecutor.apply$default$2[Nothing]
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          789
+        </td>
+        <td>
+          6569
+          -
+          6620
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.concurrent.ExitingExecutor.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.concurrent.ExitingExecutor.apply[java.util.concurrent.ScheduledThreadPoolExecutor](new java.util.concurrent.ScheduledThreadPoolExecutor(1), org.locationtech.geomesa.utils.concurrent.ExitingExecutor.apply$default$2[Nothing])
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          790
+        </td>
+        <td>
+          6686
+          -
+          6695
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.persist
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Persistence.this.persist()
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          791
+        </td>
+        <td>
+          6693
+          -
+          6693
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          792
+        </td>
+        <td>
+          6697
+          -
+          6706
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.frequency
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.frequency
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          793
+        </td>
+        <td>
+          6708
+          -
+          6717
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.frequency
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.frequency
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          794
+        </td>
+        <td>
+          6719
+          -
+          6740
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MILLISECONDS
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          795
+        </td>
+        <td>
+          6648
+          -
+          6741
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ScheduledThreadPoolExecutor.scheduleWithFixedDelay
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.executor.scheduleWithFixedDelay((() =&gt; {
+  Persistence.this.persist();
+  ()
+}), Persistence.this.frequency, Persistence.this.frequency, MILLISECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          796
+        </td>
+        <td>
+          7160
+          -
+          7182
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toList
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsets.indices.toList
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          797
+        </td>
+        <td>
+          7159
+          -
+          7159
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.immutable.List.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          immutable.this.List.canBuildFrom[Int]
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          811
+        </td>
+        <td>
+          7192
+          -
+          7192
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.immutable.List.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          immutable.this.List.canBuildFrom[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset]
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          812
+        </td>
+        <td>
+          7145
+          -
+          7879
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.immutable.List.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.util.Random.shuffle[Int, List](KafkaFeatureCache.this.offsets.indices.toList)(immutable.this.List.canBuildFrom[Int]).flatMap[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset, Seq[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset]](((partition: Int) =&gt; {
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(&quot;Acquiring lock for [{}:{}]&quot;, (scala.Array.apply[AnyRef]((KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  KafkaFeatureCache.this.offsetManager.acquireLock(KafkaFeatureCache.this.topic, partition, KafkaFeatureCache.this.lockTimeout) match {
+    case scala.None =&gt; {
+      (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+        KafkaFeatureCache.this.logger.underlying.trace(&quot;Could not acquire lock for [{}:{}] within {}ms&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], KafkaFeatureCache.this.lockTimeout.asInstanceOf[AnyRef])
+      else
+        (): Unit);
+      scala.this.Option.option2Iterable[Nothing](scala.None)
+    }
+    case (value: java.io.Closeable)Some[java.io.Closeable]((lock @ _)) =&gt; try {
+      (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+        KafkaFeatureCache.this.logger.underlying.trace(&quot;Acquired lock for [{}:{}]&quot;, (scala.Array.apply[AnyRef]((KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+      else
+        (): Unit);
+      scala.this.Option.option2Iterable[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset](Persistence.this.persist(partition, Persistence.this.persist$default$2).map[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset](((x$2: Long) =&gt; org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset.apply(partition, x$2))))
+    } finally {
+      lock.close();
+      (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+        KafkaFeatureCache.this.logger.underlying.trace(&quot;Released lock for [{}:{}]&quot;, (scala.Array.apply[AnyRef]((KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+      else
+        (): Unit)
+    }
+  }
+}))(immutable.this.List.canBuildFrom[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset])
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          798
+        </td>
+        <td>
+          7365
+          -
+          7370
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          799
+        </td>
+        <td>
+          7383
+          -
+          7394
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.lockTimeout
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.lockTimeout
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          800
+        </td>
+        <td>
+          7339
+          -
+          7395
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.OffsetManager.acquireLock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsetManager.acquireLock(KafkaFeatureCache.this.topic, partition, KafkaFeatureCache.this.lockTimeout)
+        </td>
+      </tr><tr>
+        <td>
+          183
+        </td>
+        <td>
+          803
+        </td>
+        <td>
+          7424
+          -
+          7543
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(&quot;Could not acquire lock for [{}:{}] within {}ms&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], KafkaFeatureCache.this.lockTimeout.asInstanceOf[AnyRef])
+  else
+    (): Unit);
+  scala.this.Option.option2Iterable[Nothing](scala.None)
+}
+        </td>
+      </tr><tr>
+        <td>
+          185
+        </td>
+        <td>
+          801
+        </td>
+        <td>
+          7539
+          -
+          7543
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          185
+        </td>
+        <td>
+          802
+        </td>
+        <td>
+          7539
+          -
+          7543
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Option.option2Iterable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.this.Option.option2Iterable[Nothing](scala.None)
+        </td>
+      </tr><tr>
+        <td>
+          187
+        </td>
+        <td>
+          807
+        </td>
+        <td>
+          7605
+          -
+          7727
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(&quot;Acquired lock for [{}:{}]&quot;, (scala.Array.apply[AnyRef]((KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  scala.this.Option.option2Iterable[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset](Persistence.this.persist(partition, Persistence.this.persist$default$2).map[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset](((x$2: Long) =&gt; org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset.apply(partition, x$2))))
+}
+        </td>
+      </tr><tr>
+        <td>
+          187
+        </td>
+        <td>
+          810
+        </td>
+        <td>
+          7585
+          -
+          7861
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(&quot;Acquired lock for [{}:{}]&quot;, (scala.Array.apply[AnyRef]((KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  scala.this.Option.option2Iterable[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset](Persistence.this.persist(partition, Persistence.this.persist$default$2).map[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset](((x$2: Long) =&gt; org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset.apply(partition, x$2))))
+} finally {
+  lock.close();
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(&quot;Released lock for [{}:{}]&quot;, (scala.Array.apply[AnyRef]((KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          804
+        </td>
+        <td>
+          7697
+          -
+          7726
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset.apply(partition, x$2)
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          805
+        </td>
+        <td>
+          7674
+          -
+          7727
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.persist(partition, Persistence.this.persist$default$2).map[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset](((x$2: Long) =&gt; org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset.apply(partition, x$2)))
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          806
+        </td>
+        <td>
+          7674
+          -
+          7727
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Option.option2Iterable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Option.option2Iterable[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset](Persistence.this.persist(partition, Persistence.this.persist$default$2).map[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset](((x$2: Long) =&gt; org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.PartitionOffset.apply(partition, x$2))))
+        </td>
+      </tr><tr>
+        <td>
+          190
+        </td>
+        <td>
+          809
+        </td>
+        <td>
+          7750
+          -
+          7861
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  lock.close();
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(&quot;Released lock for [{}:{}]&quot;, (scala.Array.apply[AnyRef]((KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          808
+        </td>
+        <td>
+          7766
+          -
+          7778
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.Closeable.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          lock.close()
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          813
+        </td>
+        <td>
+          8081
+          -
+          8096
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          814
+        </td>
+        <td>
+          8104
+          -
+          8120
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.featureId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.`package`.ff.featureId(id)
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          815
+        </td>
+        <td>
+          8098
+          -
+          8121
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.`package`.ff.id(org.locationtech.geomesa.filter.`package`.ff.featureId(id))
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          816
+        </td>
+        <td>
+          8123
+          -
+          8146
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          817
+        </td>
+        <td>
+          8061
+          -
+          8147
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.DataStore.getFeatureWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.ds.getFeatureWriter(KafkaFeatureCache.this.sft.getTypeName(), org.locationtech.geomesa.filter.`package`.ff.id(org.locationtech.geomesa.filter.`package`.ff.featureId(id)), org.geotools.api.data.Transaction.AUTO_COMMIT)
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          825
+        </td>
+        <td>
+          8149
+          -
+          8149
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          826
+        </td>
+        <td>
+          8051
+          -
+          8306
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature], Boolean](KafkaFeatureCache.this.ds.getFeatureWriter(KafkaFeatureCache.this.sft.getTypeName(), org.locationtech.geomesa.filter.`package`.ff.id(org.locationtech.geomesa.filter.`package`.ff.featureId(id)), org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature]) =&gt; if (writer.hasNext())
+  {
+    writer.next();
+    writer.remove();
+    true
+  }
+else
+  false))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          818
+        </td>
+        <td>
+          8173
+          -
+          8187
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureWriter.hasNext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.hasNext()
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          822
+        </td>
+        <td>
+          8189
+          -
+          8265
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  writer.next();
+  writer.remove();
+  true
+}
+        </td>
+      </tr><tr>
+        <td>
+          207
+        </td>
+        <td>
+          819
+        </td>
+        <td>
+          8201
+          -
+          8214
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureWriter.next
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.next()
+        </td>
+      </tr><tr>
+        <td>
+          208
+        </td>
+        <td>
+          820
+        </td>
+        <td>
+          8225
+          -
+          8240
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureWriter.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.remove()
+        </td>
+      </tr><tr>
+        <td>
+          209
+        </td>
+        <td>
+          821
+        </td>
+        <td>
+          8251
+          -
+          8255
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          823
+        </td>
+        <td>
+          8283
+          -
+          8288
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          824
+        </td>
+        <td>
+          8283
+          -
+          8288
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          225
+        </td>
+        <td>
+          827
+        </td>
+        <td>
+          8726
+          -
+          8738
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.expiryMillis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.expiryMillis
+        </td>
+      </tr><tr>
+        <td>
+          225
+        </td>
+        <td>
+          828
+        </td>
+        <td>
+          8709
+          -
+          8738
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.clock.millis().-(Persistence.this.expiryMillis)
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          829
+        </td>
+        <td>
+          8787
+          -
+          8792
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          830
+        </td>
+        <td>
+          8763
+          -
+          8804
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.OffsetManager.getOffset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsetManager.getOffset(KafkaFeatureCache.this.topic, partition)
+        </td>
+      </tr><tr>
+        <td>
+          230
+        </td>
+        <td>
+          831
+        </td>
+        <td>
+          8912
+          -
+          8915
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          -1L
+        </td>
+      </tr><tr>
+        <td>
+          233
+        </td>
+        <td>
+          832
+        </td>
+        <td>
+          9054
+          -
+          9094
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.immutable.Map.newBuilder
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.Map.newBuilder[String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference]
+        </td>
+      </tr><tr>
+        <td>
+          234
+        </td>
+        <td>
+          833
+        </td>
+        <td>
+          9103
+          -
+          9111
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.features
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.features
+        </td>
+      </tr><tr>
+        <td>
+          234
+        </td>
+        <td>
+          845
+        </td>
+        <td>
+          9103
+          -
+          9453
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.mapAsScalaConcurrentMapConverter[String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](KafkaFeatureCache.this.features).asScala.foreach[Any](((x0$1: (String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)) =&gt; x0$1 match {
+  case (_1: String, _2: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)((id @ _), (f @ _)) =&gt; if (f.partition.==(partition).&amp;&amp;(f.created.&lt;=(expiry)).&amp;&amp;(f.offset.&gt;(lastOffset)))
+    {
+      nextOffset = scala.math.`package`.max(nextOffset, f.offset);
+      builder.+=(scala.Predef.ArrowAssoc[String](id).-&gt;[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](f))
+    }
+  else
+    ()
+}))
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          834
+        </td>
+        <td>
+          9297
+          -
+          9316
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          f.created.&lt;=(expiry)
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          835
+        </td>
+        <td>
+          9320
+          -
+          9341
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          f.offset.&gt;(lastOffset)
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          836
+        </td>
+        <td>
+          9269
+          -
+          9341
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          f.partition.==(partition).&amp;&amp;(f.created.&lt;=(expiry)).&amp;&amp;(f.offset.&gt;(lastOffset))
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          841
+        </td>
+        <td>
+          9343
+          -
+          9443
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  nextOffset = scala.math.`package`.max(nextOffset, f.offset);
+  builder.+=(scala.Predef.ArrowAssoc[String](id).-&gt;[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](f))
+}
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          842
+        </td>
+        <td>
+          9265
+          -
+          9265
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          843
+        </td>
+        <td>
+          9265
+          -
+          9265
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          844
+        </td>
+        <td>
+          9265
+          -
+          9443
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (f.partition.==(partition).&amp;&amp;(f.created.&lt;=(expiry)).&amp;&amp;(f.offset.&gt;(lastOffset)))
+  {
+    nextOffset = scala.math.`package`.max(nextOffset, f.offset);
+    builder.+=(scala.Predef.ArrowAssoc[String](id).-&gt;[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](f))
+  }
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          237
+        </td>
+        <td>
+          837
+        </td>
+        <td>
+          9391
+          -
+          9399
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.offset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          f.offset
+        </td>
+      </tr><tr>
+        <td>
+          237
+        </td>
+        <td>
+          838
+        </td>
+        <td>
+          9370
+          -
+          9400
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.math.max
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.math.`package`.max(nextOffset, f.offset)
+        </td>
+      </tr><tr>
+        <td>
+          238
+        </td>
+        <td>
+          839
+        </td>
+        <td>
+          9424
+          -
+          9431
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.ArrowAssoc[String](id).-&gt;[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](f)
+        </td>
+      </tr><tr>
+        <td>
+          238
+        </td>
+        <td>
+          840
+        </td>
+        <td>
+          9413
+          -
+          9431
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.Builder.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          builder.+=(scala.Predef.ArrowAssoc[String](id).-&gt;[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](f))
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          846
+        </td>
+        <td>
+          9462
+          -
+          9478
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.Builder.result
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          builder.result()
+        </td>
+      </tr><tr>
+        <td>
+          245
+        </td>
+        <td>
+          847
+        </td>
+        <td>
+          9583
+          -
+          9598
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.MapLike.isEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          expired.isEmpty
+        </td>
+      </tr><tr>
+        <td>
+          246
+        </td>
+        <td>
+          848
+        </td>
+        <td>
+          9610
+          -
+          9629
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.lastPersistedOffset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          lastPersistedOffset
+        </td>
+      </tr><tr>
+        <td>
+          247
+        </td>
+        <td>
+          870
+        </td>
+        <td>
+          9643
+          -
+          10719
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(expired.values.map[String, Iterable[String]](((e: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; scala.StringContext.apply(&quot;offset &quot;, &quot;: &quot;, &quot;&quot;).s(e.offset, e.feature)))(collection.this.Iterable.canBuildFrom[String]).mkString(&quot;Expired entries:\n\t&quot;, &quot;\n\t&quot;, &quot;&quot;))
+  else
+    (): Unit);
+  val batch: scala.collection.immutable.Map[String,org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference] = if (expired.size.&lt;=(Persistence.this.batchSize))
+    expired
+  else
+    {
+      (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+        KafkaFeatureCache.this.logger.underlying.trace(&quot;Skipping persistence for {} features based on batch size of {}&quot;, (scala.Array.apply[AnyRef](expired.size.-(Persistence.this.batchSize).asInstanceOf[AnyRef], Persistence.this.batchSize.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+      else
+        (): Unit);
+      val sorted: List[(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)] = expired.toList.sortBy[Long](((x$3: (String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)) =&gt; x$3._2.offset))(math.this.Ordering.Long).take(Persistence.this.batchSize);
+      nextOffset = sorted.last._2.offset;
+      sorted.toMap[String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](scala.Predef.$conforms[(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)])
+    };
+  Persistence.this.persist(partition, batch);
+  (if (KafkaFeatureCache.this.logger.underlying.isDebugEnabled())
+    KafkaFeatureCache.this.logger.underlying.debug(&quot;Committing offset [{}:{}:{}]&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], nextOffset.asInstanceOf[AnyRef])
+  else
+    (): Unit);
+  KafkaFeatureCache.this.offsetManager.setOffset(KafkaFeatureCache.this.topic, partition, nextOffset);
+  if (batch.size.&lt;(expired.size))
+    Persistence.this.persist(partition, scala.Some.apply[Long](nextOffset))
+  else
+    scala.Some.apply[Long](nextOffset)
+}
+        </td>
+      </tr><tr>
+        <td>
+          250
+        </td>
+        <td>
+          849
+        </td>
+        <td>
+          9823
+          -
+          9832
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.batchSize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.batchSize
+        </td>
+      </tr><tr>
+        <td>
+          250
+        </td>
+        <td>
+          850
+        </td>
+        <td>
+          9807
+          -
+          9832
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          expired.size.&lt;=(Persistence.this.batchSize)
+        </td>
+      </tr><tr>
+        <td>
+          251
+        </td>
+        <td>
+          851
+        </td>
+        <td>
+          9848
+          -
+          9855
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.expired
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          expired
+        </td>
+      </tr><tr>
+        <td>
+          252
+        </td>
+        <td>
+          859
+        </td>
+        <td>
+          9873
+          -
+          10232
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(&quot;Skipping persistence for {} features based on batch size of {}&quot;, (scala.Array.apply[AnyRef](expired.size.-(Persistence.this.batchSize).asInstanceOf[AnyRef], Persistence.this.batchSize.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  val sorted: List[(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)] = expired.toList.sortBy[Long](((x$3: (String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)) =&gt; x$3._2.offset))(math.this.Ordering.Long).take(Persistence.this.batchSize);
+  nextOffset = sorted.last._2.offset;
+  sorted.toMap[String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](scala.Predef.$conforms[(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)])
+}
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          852
+        </td>
+        <td>
+          10120
+          -
+          10131
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.offset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$3._2.offset
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          853
+        </td>
+        <td>
+          10119
+          -
+          10119
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.math.Ordering.Long
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          math.this.Ordering.Long
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          854
+        </td>
+        <td>
+          10138
+          -
+          10147
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.batchSize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Persistence.this.batchSize
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          855
+        </td>
+        <td>
+          10098
+          -
+          10148
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.immutable.List.take
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          expired.toList.sortBy[Long](((x$3: (String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)) =&gt; x$3._2.offset))(math.this.Ordering.Long).take(Persistence.this.batchSize)
+        </td>
+      </tr><tr>
+        <td>
+          256
+        </td>
+        <td>
+          856
+        </td>
+        <td>
+          10174
+          -
+          10195
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.offset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          sorted.last._2.offset
+        </td>
+      </tr><tr>
+        <td>
+          257
+        </td>
+        <td>
+          857
+        </td>
+        <td>
+          10215
+          -
+          10215
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Predef.$conforms
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.$conforms[(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)]
+        </td>
+      </tr><tr>
+        <td>
+          257
+        </td>
+        <td>
+          858
+        </td>
+        <td>
+          10208
+          -
+          10220
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          sorted.toMap[String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](scala.Predef.$conforms[(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)])
+        </td>
+      </tr><tr>
+        <td>
+          259
+        </td>
+        <td>
+          860
+        </td>
+        <td>
+          10241
+          -
+          10266
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.persist
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.persist(partition, batch)
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          861
+        </td>
+        <td>
+          10468
+          -
+          10473
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          862
+        </td>
+        <td>
+          10444
+          -
+          10497
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.OffsetManager.setOffset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.offsetManager.setOffset(KafkaFeatureCache.this.topic, partition, nextOffset)
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          863
+        </td>
+        <td>
+          10523
+          -
+          10535
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          expired.size
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          864
+        </td>
+        <td>
+          10510
+          -
+          10535
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          batch.size.&lt;(expired.size)
+        </td>
+      </tr><tr>
+        <td>
+          266
+        </td>
+        <td>
+          865
+        </td>
+        <td>
+          10640
+          -
+          10656
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Some.apply[Long](nextOffset)
+        </td>
+      </tr><tr>
+        <td>
+          266
+        </td>
+        <td>
+          866
+        </td>
+        <td>
+          10621
+          -
+          10657
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.persist
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Persistence.this.persist(partition, scala.Some.apply[Long](nextOffset))
+        </td>
+      </tr><tr>
+        <td>
+          266
+        </td>
+        <td>
+          867
+        </td>
+        <td>
+          10621
+          -
+          10657
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.persist
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Persistence.this.persist(partition, scala.Some.apply[Long](nextOffset))
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          868
+        </td>
+        <td>
+          10685
+          -
+          10701
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[Long](nextOffset)
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          869
+        </td>
+        <td>
+          10685
+          -
+          10701
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[Long](nextOffset)
+        </td>
+      </tr><tr>
+        <td>
+          281
+        </td>
+        <td>
+          871
+        </td>
+        <td>
+          10997
+          -
+          11029
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.persistUpdates
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.persistUpdates(partition, batch)
+        </td>
+      </tr><tr>
+        <td>
+          283
+        </td>
+        <td>
+          872
+        </td>
+        <td>
+          11093
+          -
+          11111
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.nonEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          remaining.nonEmpty
+        </td>
+      </tr><tr>
+        <td>
+          283
+        </td>
+        <td>
+          875
+        </td>
+        <td>
+          11089
+          -
+          11089
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          283
+        </td>
+        <td>
+          876
+        </td>
+        <td>
+          11089
+          -
+          11089
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          284
+        </td>
+        <td>
+          873
+        </td>
+        <td>
+          11123
+          -
+          11159
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.persistAppends
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.persistAppends(partition, remaining)
+        </td>
+      </tr><tr>
+        <td>
+          284
+        </td>
+        <td>
+          874
+        </td>
+        <td>
+          11123
+          -
+          11159
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.persistAppends
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.persistAppends(partition, remaining)
+        </td>
+      </tr><tr>
+        <td>
+          297
+        </td>
+        <td>
+          877
+        </td>
+        <td>
+          11626
+          -
+          11668
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.mutable.Set.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.Set.empty[String]
+        </td>
+      </tr><tr>
+        <td>
+          298
+        </td>
+        <td>
+          905
+        </td>
+        <td>
+          11675
+          -
+          12598
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.stats.MethodProfiling.profile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.profile[Int](((c: Int, time: Long) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isDebugEnabled())
+  KafkaFeatureCache.this.logger.underlying.debug(&quot;Wrote {} updated feature(s) to persistent storage in {}ms&quot;, (scala.Array.apply[AnyRef](c.asInstanceOf[AnyRef], time.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+else
+  (): Unit)))({
+  val filter: org.geotools.api.filter.Id = org.locationtech.geomesa.filter.`package`.ff.id((batch.keys.map[org.geotools.api.filter.identity.FeatureId, Iterable[org.geotools.api.filter.identity.FeatureId]]({
+  ((x$1: String) =&gt; org.locationtech.geomesa.filter.`package`.ff.featureId(x$1))
+})(collection.this.Iterable.canBuildFrom[org.geotools.api.filter.identity.FeatureId]).toSeq: _*));
+  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature], Int](KafkaFeatureCache.this.ds.getFeatureWriter(KafkaFeatureCache.this.sft.getTypeName(), filter, org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
+    var count: Int = 0;
+    while$4(){
+      if (writer.hasNext())
+        {
+          {
+            val next: org.geotools.api.feature.simple.SimpleFeature = writer.next();
+            batch.get(next.getID()).foreach[Unit](((p: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; {
+              (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+                KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store modify [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], p.offset.asInstanceOf[AnyRef], (p.feature: AnyRef))
+              else
+                (): Unit);
+              persistedKeys.+=(next.getID());
+              org.locationtech.geomesa.utils.geotools.FeatureUtils.copyToFeature(next, p.feature, true);
+              try {
+                writer.write();
+                count = count.+(1)
+              } catch {
+                case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+                  KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error persisting feature: &quot;, &quot;&quot;).s(p.feature), e)
+                else
+                  (): Unit)
+              }
+            }))
+          };
+          while$4()
+        }
+      else
+        ()
+    };
+    count
+  }))(io.this.IsCloseable.closeableIsCloseable)
+})
+        </td>
+      </tr><tr>
+        <td>
+          299
+        </td>
+        <td>
+          878
+        </td>
+        <td>
+          11832
+          -
+          11844
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.featureId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.`package`.ff.featureId(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          299
+        </td>
+        <td>
+          879
+        </td>
+        <td>
+          11831
+          -
+          11831
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Iterable.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Iterable.canBuildFrom[org.geotools.api.filter.identity.FeatureId]
+        </td>
+      </tr><tr>
+        <td>
+          299
+        </td>
+        <td>
+          880
+        </td>
+        <td>
+          11817
+          -
+          11851
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toSeq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          batch.keys.map[org.geotools.api.filter.identity.FeatureId, Iterable[org.geotools.api.filter.identity.FeatureId]]({
+  ((x$1: String) =&gt; org.locationtech.geomesa.filter.`package`.ff.featureId(x$1))
+})(collection.this.Iterable.canBuildFrom[org.geotools.api.filter.identity.FeatureId]).toSeq
+        </td>
+      </tr><tr>
+        <td>
+          299
+        </td>
+        <td>
+          881
+        </td>
+        <td>
+          11811
+          -
+          11856
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.`package`.ff.id((batch.keys.map[org.geotools.api.filter.identity.FeatureId, Iterable[org.geotools.api.filter.identity.FeatureId]]({
+  ((x$1: String) =&gt; org.locationtech.geomesa.filter.`package`.ff.featureId(x$1))
+})(collection.this.Iterable.canBuildFrom[org.geotools.api.filter.identity.FeatureId]).toSeq: _*))
+        </td>
+      </tr><tr>
+        <td>
+          300
+        </td>
+        <td>
+          882
+        </td>
+        <td>
+          11895
+          -
+          11910
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          300
+        </td>
+        <td>
+          883
+        </td>
+        <td>
+          11920
+          -
+          11943
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+      </tr><tr>
+        <td>
+          300
+        </td>
+        <td>
+          884
+        </td>
+        <td>
+          11875
+          -
+          11944
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.DataStore.getFeatureWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.ds.getFeatureWriter(KafkaFeatureCache.this.sft.getTypeName(), filter, org.geotools.api.data.Transaction.AUTO_COMMIT)
+        </td>
+      </tr><tr>
+        <td>
+          300
+        </td>
+        <td>
+          903
+        </td>
+        <td>
+          11946
+          -
+          11946
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          300
+        </td>
+        <td>
+          904
+        </td>
+        <td>
+          11865
+          -
+          12590
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature], Int](KafkaFeatureCache.this.ds.getFeatureWriter(KafkaFeatureCache.this.sft.getTypeName(), filter, org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
+  var count: Int = 0;
+  while$4(){
+    if (writer.hasNext())
+      {
+        {
+          val next: org.geotools.api.feature.simple.SimpleFeature = writer.next();
+          batch.get(next.getID()).foreach[Unit](((p: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; {
+            (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+              KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store modify [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], p.offset.asInstanceOf[AnyRef], (p.feature: AnyRef))
+            else
+              (): Unit);
+            persistedKeys.+=(next.getID());
+            org.locationtech.geomesa.utils.geotools.FeatureUtils.copyToFeature(next, p.feature, true);
+            try {
+              writer.write();
+              count = count.+(1)
+            } catch {
+              case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+                KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error persisting feature: &quot;, &quot;&quot;).s(p.feature), e)
+              else
+                (): Unit)
+            }
+          }))
+        };
+        while$4()
+      }
+    else
+      ()
+  };
+  count
+}))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          301
+        </td>
+        <td>
+          885
+        </td>
+        <td>
+          11980
+          -
+          11981
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          302
+        </td>
+        <td>
+          886
+        </td>
+        <td>
+          11999
+          -
+          12013
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureWriter.hasNext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.hasNext()
+        </td>
+      </tr><tr>
+        <td>
+          302
+        </td>
+        <td>
+          899
+        </td>
+        <td>
+          12015
+          -
+          12015
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.while$4
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          while$4()
+        </td>
+      </tr><tr>
+        <td>
+          302
+        </td>
+        <td>
+          900
+        </td>
+        <td>
+          12015
+          -
+          12564
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  {
+    val next: org.geotools.api.feature.simple.SimpleFeature = writer.next();
+    batch.get(next.getID()).foreach[Unit](((p: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; {
+      (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+        KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store modify [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], p.offset.asInstanceOf[AnyRef], (p.feature: AnyRef))
+      else
+        (): Unit);
+      persistedKeys.+=(next.getID());
+      org.locationtech.geomesa.utils.geotools.FeatureUtils.copyToFeature(next, p.feature, true);
+      try {
+        writer.write();
+        count = count.+(1)
+      } catch {
+        case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+          KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error persisting feature: &quot;, &quot;&quot;).s(p.feature), e)
+        else
+          (): Unit)
+      }
+    }))
+  };
+  while$4()
+}
+        </td>
+      </tr><tr>
+        <td>
+          302
+        </td>
+        <td>
+          901
+        </td>
+        <td>
+          11992
+          -
+          11992
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          302
+        </td>
+        <td>
+          902
+        </td>
+        <td>
+          11992
+          -
+          11992
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          303
+        </td>
+        <td>
+          887
+        </td>
+        <td>
+          12040
+          -
+          12053
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureWriter.next
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          writer.next()
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          888
+        </td>
+        <td>
+          12076
+          -
+          12086
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          next.getID()
+        </td>
+      </tr><tr>
+        <td>
+          304
+        </td>
+        <td>
+          898
+        </td>
+        <td>
+          12066
+          -
+          12552
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          batch.get(next.getID()).foreach[Unit](((p: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; {
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store modify [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], p.offset.asInstanceOf[AnyRef], (p.feature: AnyRef))
+  else
+    (): Unit);
+  persistedKeys.+=(next.getID());
+  org.locationtech.geomesa.utils.geotools.FeatureUtils.copyToFeature(next, p.feature, true);
+  try {
+    writer.write();
+    count = count.+(1)
+  } catch {
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+      KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error persisting feature: &quot;, &quot;&quot;).s(p.feature), e)
+    else
+      (): Unit)
+  }
+}))
+        </td>
+      </tr><tr>
+        <td>
+          306
+        </td>
+        <td>
+          889
+        </td>
+        <td>
+          12234
+          -
+          12244
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          next.getID()
+        </td>
+      </tr><tr>
+        <td>
+          306
+        </td>
+        <td>
+          890
+        </td>
+        <td>
+          12217
+          -
+          12244
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.SetLike.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          persistedKeys.+=(next.getID())
+        </td>
+      </tr><tr>
+        <td>
+          307
+        </td>
+        <td>
+          891
+        </td>
+        <td>
+          12292
+          -
+          12301
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          p.feature
+        </td>
+      </tr><tr>
+        <td>
+          307
+        </td>
+        <td>
+          892
+        </td>
+        <td>
+          12320
+          -
+          12324
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          307
+        </td>
+        <td>
+          893
+        </td>
+        <td>
+          12259
+          -
+          12325
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.FeatureUtils.copyToFeature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.geotools.FeatureUtils.copyToFeature(next, p.feature, true)
+        </td>
+      </tr><tr>
+        <td>
+          308
+        </td>
+        <td>
+          896
+        </td>
+        <td>
+          12362
+          -
+          12403
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  writer.write();
+  count = count.+(1)
+}
+        </td>
+      </tr><tr>
+        <td>
+          309
+        </td>
+        <td>
+          894
+        </td>
+        <td>
+          12362
+          -
+          12376
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureWriter.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          writer.write()
+        </td>
+      </tr><tr>
+        <td>
+          310
+        </td>
+        <td>
+          895
+        </td>
+        <td>
+          12393
+          -
+          12403
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          count.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          312
+        </td>
+        <td>
+          897
+        </td>
+        <td>
+          12464
+          -
+          12522
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+  KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error persisting feature: &quot;, &quot;&quot;).s(p.feature), e)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          906
+        </td>
+        <td>
+          12636
+          -
+          12662
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          persistedKeys.contains(k).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          907
+        </td>
+        <td>
+          12666
+          -
+          12667
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.$anonfun.v
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          v
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          908
+        </td>
+        <td>
+          12619
+          -
+          12619
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.Persistence.$anonfun.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new $anonfun()
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          909
+        </td>
+        <td>
+          12619
+          -
+          12619
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.immutable.Iterable.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          immutable.this.Iterable.canBuildFrom[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference]
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          910
+        </td>
+        <td>
+          12605
+          -
+          12669
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.collect
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          batch.collect[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference, Iterable[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference]](({
+  @SerialVersionUID(value = 0) final &lt;synthetic&gt; class $anonfun extends scala.runtime.AbstractPartialFunction[(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference),org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference] with Serializable {
+    def &lt;init&gt;(): &lt;$anon: ((String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)) =&gt; org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference&gt; = {
+      $anonfun.super.&lt;init&gt;();
+      ()
+    };
+    final override def applyOrElse[A1 &lt;: (String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference), B1 &gt;: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference](x1: A1, default: A1 =&gt; B1): B1 = ((x1.asInstanceOf[(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)]: (String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)): (String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) @unchecked) match {
+      case (_1: String, _2: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)((k @ _), (v @ _)) if persistedKeys.contains(k).unary_! =&gt; v
+      case (defaultCase$ @ _) =&gt; default.apply(x1)
+    };
+    final def isDefinedAt(x1: (String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)): Boolean = ((x1.asInstanceOf[(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)]: (String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)): (String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) @unchecked) match {
+      case (_1: String, _2: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference)((k @ _), (v @ _)) if persistedKeys.contains(k).unary_! =&gt; true
+      case (defaultCase$ @ _) =&gt; false
+    }
+  };
+  new $anonfun()
+}: PartialFunction[(String, org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference),org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference]))(immutable.this.Iterable.canBuildFrom[org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference])
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          924
+        </td>
+        <td>
+          13031
+          -
+          13724
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.stats.MethodProfiling.profile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.profile[Int](((c: Int, time: Long) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isDebugEnabled())
+  KafkaFeatureCache.this.logger.underlying.debug(&quot;Wrote {} new feature(s) to persistent storage in {}ms&quot;, (scala.Array.apply[AnyRef](c.asInstanceOf[AnyRef], time.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+else
+  (): Unit)))(org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature], Int](KafkaFeatureCache.this.ds.getFeatureWriterAppend(KafkaFeatureCache.this.sft.getTypeName(), org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
+  var count: Int = 0;
+  val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, true);
+  batch.foreach[Unit](((p: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; {
+    (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+      KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store append [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], p.offset.asInstanceOf[AnyRef], (p.feature: AnyRef))
+    else
+      (): Unit);
+    try {
+      helper.write(p.feature);
+      count = count.+(1)
+    } catch {
+      case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+        KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error persisting feature: &quot;, &quot;&quot;).s(p.feature), e)
+      else
+        (): Unit)
+    }
+  }));
+  count
+}))(io.this.IsCloseable.closeableIsCloseable))
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          925
+        </td>
+        <td>
+          13140
+          -
+          13140
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          331
+        </td>
+        <td>
+          911
+        </td>
+        <td>
+          13186
+          -
+          13201
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          331
+        </td>
+        <td>
+          912
+        </td>
+        <td>
+          13203
+          -
+          13226
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+      </tr><tr>
+        <td>
+          331
+        </td>
+        <td>
+          913
+        </td>
+        <td>
+          13160
+          -
+          13227
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.DataStore.getFeatureWriterAppend
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureCache.this.ds.getFeatureWriterAppend(KafkaFeatureCache.this.sft.getTypeName(), org.geotools.api.data.Transaction.AUTO_COMMIT)
+        </td>
+      </tr><tr>
+        <td>
+          331
+        </td>
+        <td>
+          922
+        </td>
+        <td>
+          13229
+          -
+          13229
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          331
+        </td>
+        <td>
+          923
+        </td>
+        <td>
+          13150
+          -
+          13716
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature], Int](KafkaFeatureCache.this.ds.getFeatureWriterAppend(KafkaFeatureCache.this.sft.getTypeName(), org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.geotools.api.data.FeatureWriter[org.geotools.api.feature.simple.SimpleFeatureType,org.geotools.api.feature.simple.SimpleFeature]) =&gt; {
+  var count: Int = 0;
+  val helper: org.locationtech.geomesa.index.utils.FeatureWriterHelper = org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, true);
+  batch.foreach[Unit](((p: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; {
+    (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+      KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store append [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], p.offset.asInstanceOf[AnyRef], (p.feature: AnyRef))
+    else
+      (): Unit);
+    try {
+      helper.write(p.feature);
+      count = count.+(1)
+    } catch {
+      case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+        KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error persisting feature: &quot;, &quot;&quot;).s(p.feature), e)
+      else
+        (): Unit)
+    }
+  }));
+  count
+}))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          332
+        </td>
+        <td>
+          914
+        </td>
+        <td>
+          13263
+          -
+          13264
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          333
+        </td>
+        <td>
+          915
+        </td>
+        <td>
+          13288
+          -
+          13339
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.index.utils.FeatureWriterHelper.apply(writer, true)
+        </td>
+      </tr><tr>
+        <td>
+          334
+        </td>
+        <td>
+          921
+        </td>
+        <td>
+          13350
+          -
+          13690
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          batch.foreach[Unit](((p: org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference) =&gt; {
+  (if (KafkaFeatureCache.this.logger.underlying.isTraceEnabled())
+    KafkaFeatureCache.this.logger.underlying.trace(&quot;Persistent store append [{}:{}:{}] {}&quot;, (KafkaFeatureCache.this.topic: AnyRef), partition.asInstanceOf[AnyRef], p.offset.asInstanceOf[AnyRef], (p.feature: AnyRef))
+  else
+    (): Unit);
+  try {
+    helper.write(p.feature);
+    count = count.+(1)
+  } catch {
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+      KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error persisting feature: &quot;, &quot;&quot;).s(p.feature), e)
+    else
+      (): Unit)
+  }
+}))
+        </td>
+      </tr><tr>
+        <td>
+          336
+        </td>
+        <td>
+          919
+        </td>
+        <td>
+          13501
+          -
+          13549
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  helper.write(p.feature);
+  count = count.+(1)
+}
+        </td>
+      </tr><tr>
+        <td>
+          337
+        </td>
+        <td>
+          916
+        </td>
+        <td>
+          13514
+          -
+          13523
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          p.feature
+        </td>
+      </tr><tr>
+        <td>
+          337
+        </td>
+        <td>
+          917
+        </td>
+        <td>
+          13501
+          -
+          13524
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.FeatureWriterHelper.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          helper.write(p.feature)
+        </td>
+      </tr><tr>
+        <td>
+          338
+        </td>
+        <td>
+          918
+        </td>
+        <td>
+          13539
+          -
+          13549
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          count.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          340
+        </td>
+        <td>
+          920
+        </td>
+        <td>
+          13606
+          -
+          13664
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (KafkaFeatureCache.this.logger.underlying.isErrorEnabled())
+  KafkaFeatureCache.this.logger.underlying.error(scala.StringContext.apply(&quot;Error persisting feature: &quot;, &quot;&quot;).s(p.feature), e)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          349
+        </td>
+        <td>
+          926
+        </td>
+        <td>
+          13773
+          -
+          13794
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.cancel
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.schedule.cancel(true)
+        </td>
+      </tr><tr>
+        <td>
+          350
+        </td>
+        <td>
+          927
+        </td>
+        <td>
+          13801
+          -
+          13823
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ScheduledThreadPoolExecutor.shutdownNow
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.executor.shutdownNow()
+        </td>
+      </tr><tr>
+        <td>
+          351
+        </td>
+        <td>
+          928
+        </td>
+        <td>
+          13830
+          -
+          13876
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ThreadPoolExecutor.awaitTermination
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Persistence.this.executor.awaitTermination(1L, SECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          351
+        </td>
+        <td>
+          929
+        </td>
+        <td>
+          13855
+          -
+          13855
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          358
+        </td>
+        <td>
+          930
+        </td>
+        <td>
+          13958
+          -
+          14019
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.apply(&quot;geomesa.lambda.persist.interval&quot;, &quot;1 minute&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          359
+        </td>
+        <td>
+          931
+        </td>
+        <td>
+          14056
+          -
+          14121
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.apply(&quot;geomesa.lambda.persist.lock.timeout&quot;, &quot;1 second&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          434
+        </td>
+        <td>
+          932
+        </td>
+        <td>
+          16299
+          -
+          16313
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          that.partition
+        </td>
+      </tr><tr>
+        <td>
+          434
+        </td>
+        <td>
+          933
+        </td>
+        <td>
+          16327
+          -
+          16338
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.offset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          that.offset
+        </td>
+      </tr><tr>
+        <td>
+          434
+        </td>
+        <td>
+          934
+        </td>
+        <td>
+          16317
+          -
+          16338
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          FeatureReference.this.offset.==(that.offset)
+        </td>
+      </tr><tr>
+        <td>
+          434
+        </td>
+        <td>
+          935
+        </td>
+        <td>
+          16286
+          -
+          16338
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          FeatureReference.this.partition.==(that.partition).&amp;&amp;(FeatureReference.this.offset.==(that.offset))
+        </td>
+      </tr><tr>
+        <td>
+          434
+        </td>
+        <td>
+          936
+        </td>
+        <td>
+          16286
+          -
+          16338
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          FeatureReference.this.partition.==(that.partition).&amp;&amp;(FeatureReference.this.offset.==(that.offset))
+        </td>
+      </tr><tr>
+        <td>
+          435
+        </td>
+        <td>
+          937
+        </td>
+        <td>
+          16355
+          -
+          16360
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          435
+        </td>
+        <td>
+          938
+        </td>
+        <td>
+          16355
+          -
+          16360
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          438
+        </td>
+        <td>
+          939
+        </td>
+        <td>
+          16426
+          -
+          16435
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Int.toLong
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          FeatureReference.this.partition.toLong
+        </td>
+      </tr><tr>
+        <td>
+          438
+        </td>
+        <td>
+          940
+        </td>
+        <td>
+          16437
+          -
+          16443
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.lambda.stream.kafka.KafkaFeatureCache.FeatureReference.offset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          FeatureReference.this.offset
+        </td>
+      </tr><tr>
+        <td>
+          438
+        </td>
+        <td>
+          941
+        </td>
+        <td>
+          16422
+          -
+          16444
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.collection.Seq.apply[Long](FeatureReference.this.partition.toLong, FeatureReference.this.offset)
+        </td>
+      </tr><tr>
+        <td>
+          439
+        </td>
+        <td>
+          942
+        </td>
+        <td>
+          16461
+          -
+          16473
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Any.hashCode
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$4.hashCode()
+        </td>
+      </tr><tr>
+        <td>
+          439
+        </td>
+        <td>
+          943
+        </td>
+        <td>
+          16460
+          -
+          16460
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          collection.this.Seq.canBuildFrom[Int]
+        </td>
+      </tr><tr>
+        <td>
+          439
+        </td>
+        <td>
+          944
+        </td>
+        <td>
+          16484
+          -
+          16485
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          439
+        </td>
+        <td>
+          945
+        </td>
+        <td>
+          16497
+          -
+          16507
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          31.*(a).+(b)
+        </td>
+      </tr><tr>
+        <td>
+          439
+        </td>
+        <td>
+          946
+        </td>
+        <td>
+          16451
+          -
+          16508
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.foldLeft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          state.map[Int, Seq[Int]](((x$4: Long) =&gt; x$4.hashCode()))(collection.this.Seq.canBuildFrom[Int]).foldLeft[Int](0)(((a: Int, b: Int) =&gt; 31.*(a).+(b)))
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>

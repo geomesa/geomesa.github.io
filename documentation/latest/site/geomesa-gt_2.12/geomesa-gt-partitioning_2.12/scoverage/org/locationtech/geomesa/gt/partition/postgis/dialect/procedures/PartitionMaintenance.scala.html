@@ -1,0 +1,1007 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/gt/partition/postgis/dialect/procedures/PartitionMaintenance.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.gt.partition.postgis.dialect
+</span>10 <span style=''>package procedures
+</span>11 <span style=''>
+</span>12 <span style=''>import scala.util.hashing.MurmurHash3
+</span>13 <span style=''>
+</span>14 <span style=''>/**
+</span>15 <span style=''> * High level procedure to manage data shuffling between write-ahead table and partitioned tables
+</span>16 <span style=''> */
+</span>17 <span style=''>object PartitionMaintenance extends SqlProcedure with CronSchedule {
+</span>18 <span style=''>
+</span>19 <span style=''>  override def name(info: TypeInfo): FunctionName = </span><span style='background: #AEF1AE'>FunctionName(s&quot;${info.typeName}_partition_maintenance&quot;)</span><span style=''>
+</span>20 <span style=''>
+</span>21 <span style=''>  override def jobName(info: TypeInfo): SqlLiteral = </span><span style='background: #AEF1AE'>SqlLiteral(s&quot;${info.typeName}-part-maintenance&quot;)</span><span style=''>
+</span>22 <span style=''>
+</span>23 <span style=''>  override protected def createStatements(info: TypeInfo): Seq[String] =
+</span>24 <span style=''>    </span><span style='background: #AEF1AE'>Seq(proc(info)) ++ super.createStatements(info)</span><span style=''>
+</span>25 <span style=''>
+</span>26 <span style=''>  override protected def schedule(info: TypeInfo): SqlLiteral = {
+</span>27 <span style=''>    val minute = </span><span style='background: #AEF1AE'>info.partitions.cronMinute.getOrElse {
+</span>28 <span style=''></span><span style='background: #AEF1AE'>      // spread out the cron schedule so that all the feature types don't run at the exact same time
+</span>29 <span style=''></span><span style='background: #AEF1AE'>      // also don't run at same minute as roll-write-ahead (i.e. use 0-8)
+</span>30 <span style=''></span><span style='background: #AEF1AE'>      math.abs(MurmurHash3.stringHash(info.typeName) % 9)
+</span>31 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>32 <span style=''>    val minutes = </span><span style='background: #AEF1AE'>Seq(0, 10, 20, 30, 40, 50).map(_ + minute).mkString(&quot;,&quot;)</span><span style=''>
+</span>33 <span style=''>    </span><span style='background: #AEF1AE'>SqlLiteral(s&quot;$minutes * * * *&quot;)</span><span style=''>
+</span>34 <span style=''>  }
+</span>35 <span style=''>
+</span>36 <span style=''>  override protected def invocation(info: TypeInfo): SqlLiteral = </span><span style='background: #AEF1AE'>SqlLiteral(s&quot;CALL ${name(info).quoted}()&quot;)</span><span style=''>
+</span>37 <span style=''>
+</span>38 <span style=''>  private def proc(info: TypeInfo): String = {
+</span>39 <span style=''>    </span><span style='background: #AEF1AE'>s&quot;&quot;&quot;CREATE OR REPLACE PROCEDURE ${info.schema.quoted}.${name(info).quoted}() LANGUAGE plpgsql AS
+</span>40 <span style=''></span><span style='background: #AEF1AE'>       |  $$BODY$$
+</span>41 <span style=''></span><span style='background: #AEF1AE'>       |    DECLARE
+</span>42 <span style=''></span><span style='background: #AEF1AE'>       |      cur_time timestamp without time zone;        -- current time
+</span>43 <span style=''></span><span style='background: #AEF1AE'>       |    BEGIN
+</span>44 <span style=''></span><span style='background: #AEF1AE'>       |      -- constants
+</span>45 <span style=''></span><span style='background: #AEF1AE'>       |      cur_time := now();
+</span>46 <span style=''></span><span style='background: #AEF1AE'>       |      CALL ${PartitionWriteAheadLog.name(info).quoted}(cur_time);
+</span>47 <span style=''></span><span style='background: #AEF1AE'>       |      CALL ${MergeWriteAheadPartitions.name(info).quoted}(cur_time);
+</span>48 <span style=''></span><span style='background: #AEF1AE'>       |      CALL ${DropAgedOffPartitions.name(info).quoted}(cur_time);
+</span>49 <span style=''></span><span style='background: #AEF1AE'>       |    END;
+</span>50 <span style=''></span><span style='background: #AEF1AE'>       |  $$BODY$$;
+</span>51 <span style=''></span><span style='background: #AEF1AE'>       |&quot;&quot;&quot;.stripMargin</span><span style=''>
+</span>52 <span style=''>  }
+</span>53 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          19
+        </td>
+        <td>
+          1483
+        </td>
+        <td>
+          832
+          -
+          833
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          19
+        </td>
+        <td>
+          1484
+        </td>
+        <td>
+          848
+          -
+          871
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;_partition_maintenance&quot;
+        </td>
+      </tr><tr>
+        <td>
+          19
+        </td>
+        <td>
+          1485
+        </td>
+        <td>
+          834
+          -
+          847
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          19
+        </td>
+        <td>
+          1486
+        </td>
+        <td>
+          830
+          -
+          871
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;_partition_maintenance&quot;).s(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          19
+        </td>
+        <td>
+          1487
+        </td>
+        <td>
+          817
+          -
+          872
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dialect.this.`package`.FunctionName.apply(scala.StringContext.apply(&quot;&quot;, &quot;_partition_maintenance&quot;).s(info.typeName))
+        </td>
+      </tr><tr>
+        <td>
+          21
+        </td>
+        <td>
+          1488
+        </td>
+        <td>
+          940
+          -
+          941
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          21
+        </td>
+        <td>
+          1489
+        </td>
+        <td>
+          956
+          -
+          974
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;-part-maintenance&quot;
+        </td>
+      </tr><tr>
+        <td>
+          21
+        </td>
+        <td>
+          1490
+        </td>
+        <td>
+          942
+          -
+          955
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          21
+        </td>
+        <td>
+          1491
+        </td>
+        <td>
+          938
+          -
+          974
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;-part-maintenance&quot;).s(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          21
+        </td>
+        <td>
+          1492
+        </td>
+        <td>
+          927
+          -
+          975
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlLiteral.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dialect.this.`package`.SqlLiteral.apply(scala.StringContext.apply(&quot;&quot;, &quot;-part-maintenance&quot;).s(info.typeName))
+        </td>
+      </tr><tr>
+        <td>
+          24
+        </td>
+        <td>
+          1493
+        </td>
+        <td>
+          1058
+          -
+          1068
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.procedures.PartitionMaintenance.proc
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionMaintenance.this.proc(info)
+        </td>
+      </tr><tr>
+        <td>
+          24
+        </td>
+        <td>
+          1494
+        </td>
+        <td>
+          1073
+          -
+          1101
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.CronSchedule.createStatements
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionMaintenance.super.createStatements(info)
+        </td>
+      </tr><tr>
+        <td>
+          24
+        </td>
+        <td>
+          1495
+        </td>
+        <td>
+          1070
+          -
+          1070
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[String]
+        </td>
+      </tr><tr>
+        <td>
+          24
+        </td>
+        <td>
+          1496
+        </td>
+        <td>
+          1054
+          -
+          1101
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.++
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[String](PartitionMaintenance.this.proc(info)).++[String, Seq[String]](PartitionMaintenance.super.createStatements(info))(collection.this.Seq.canBuildFrom[String])
+        </td>
+      </tr><tr>
+        <td>
+          27
+        </td>
+        <td>
+          1499
+        </td>
+        <td>
+          1186
+          -
+          1463
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.partitions.cronMinute.getOrElse[Int](scala.math.`package`.abs(scala.util.hashing.MurmurHash3.stringHash(info.typeName).%(9)))
+        </td>
+      </tr><tr>
+        <td>
+          30
+        </td>
+        <td>
+          1497
+        </td>
+        <td>
+          1415
+          -
+          1456
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.%
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.util.hashing.MurmurHash3.stringHash(info.typeName).%(9)
+        </td>
+      </tr><tr>
+        <td>
+          30
+        </td>
+        <td>
+          1498
+        </td>
+        <td>
+          1406
+          -
+          1457
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.math.abs
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.math.`package`.abs(scala.util.hashing.MurmurHash3.stringHash(info.typeName).%(9))
+        </td>
+      </tr><tr>
+        <td>
+          32
+        </td>
+        <td>
+          1500
+        </td>
+        <td>
+          1482
+          -
+          1538
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.mkString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[Int](0, 10, 20, 30, 40, 50).map[Int, Seq[Int]](((x$1: Int) =&gt; x$1.+(minute)))(collection.this.Seq.canBuildFrom[Int]).mkString(&quot;,&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          33
+        </td>
+        <td>
+          1501
+        </td>
+        <td>
+          1554
+          -
+          1573
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot; * * * *&quot;).s(minutes)
+        </td>
+      </tr><tr>
+        <td>
+          33
+        </td>
+        <td>
+          1502
+        </td>
+        <td>
+          1543
+          -
+          1574
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlLiteral.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dialect.this.`package`.SqlLiteral.apply(scala.StringContext.apply(&quot;&quot;, &quot; * * * *&quot;).s(minutes))
+        </td>
+      </tr><tr>
+        <td>
+          36
+        </td>
+        <td>
+          1503
+        </td>
+        <td>
+          1659
+          -
+          1665
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;CALL &quot;
+        </td>
+      </tr><tr>
+        <td>
+          36
+        </td>
+        <td>
+          1504
+        </td>
+        <td>
+          1684
+          -
+          1687
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;()&quot;
+        </td>
+      </tr><tr>
+        <td>
+          36
+        </td>
+        <td>
+          1505
+        </td>
+        <td>
+          1666
+          -
+          1683
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionMaintenance.this.name(info).quoted
+        </td>
+      </tr><tr>
+        <td>
+          36
+        </td>
+        <td>
+          1506
+        </td>
+        <td>
+          1657
+          -
+          1687
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;CALL &quot;, &quot;()&quot;).s(PartitionMaintenance.this.name(info).quoted)
+        </td>
+      </tr><tr>
+        <td>
+          36
+        </td>
+        <td>
+          1507
+        </td>
+        <td>
+          1646
+          -
+          1688
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlLiteral.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dialect.this.`package`.SqlLiteral.apply(scala.StringContext.apply(&quot;CALL &quot;, &quot;()&quot;).s(PartitionMaintenance.this.name(info).quoted))
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          1508
+        </td>
+        <td>
+          1745
+          -
+          1774
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;CREATE OR REPLACE PROCEDURE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          1509
+        </td>
+        <td>
+          1794
+          -
+          1796
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          1510
+        </td>
+        <td>
+          1815
+          -
+          2050
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;() LANGUAGE plpgsql AS\n       |  $BODY$\n       |    DECLARE\n       |      cur_time timestamp without time zone;        -- current time\n       |    BEGIN\n       |      -- constants\n       |      cur_time := now();\n       |      CALL &quot;
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          1514
+        </td>
+        <td>
+          1775
+          -
+          1793
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          1515
+        </td>
+        <td>
+          1797
+          -
+          1814
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionMaintenance.this.name(info).quoted
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          1519
+        </td>
+        <td>
+          1741
+          -
+          2302
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;CREATE OR REPLACE PROCEDURE &quot;, &quot;.&quot;, &quot;() LANGUAGE plpgsql AS\n       |  $BODY$\n       |    DECLARE\n       |      cur_time timestamp without time zone;        -- current time\n       |    BEGIN\n       |      -- constants\n       |      cur_time := now();\n       |      CALL &quot;, &quot;(cur_time);\n       |      CALL &quot;, &quot;(cur_time);\n       |      CALL &quot;, &quot;(cur_time);\n       |    END;\n       |  $BODY$;\n       |&quot;).s(info.schema.quoted, PartitionMaintenance.this.name(info).quoted, PartitionWriteAheadLog.name(info).quoted, MergeWriteAheadPartitions.name(info).quoted, DropAgedOffPartitions.name(info).quoted)
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          1511
+        </td>
+        <td>
+          2092
+          -
+          2124
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;(cur_time);\n       |      CALL &quot;
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          1516
+        </td>
+        <td>
+          2051
+          -
+          2091
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionWriteAheadLog.name(info).quoted
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          1512
+        </td>
+        <td>
+          2169
+          -
+          2201
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;(cur_time);\n       |      CALL &quot;
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          1517
+        </td>
+        <td>
+          2125
+          -
+          2168
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MergeWriteAheadPartitions.name(info).quoted
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          1513
+        </td>
+        <td>
+          2242
+          -
+          2302
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;(cur_time);\n       |    END;\n       |  $BODY$;\n       |&quot;
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          1518
+        </td>
+        <td>
+          2202
+          -
+          2241
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          DropAgedOffPartitions.name(info).quoted
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          1520
+        </td>
+        <td>
+          1741
+          -
+          2314
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.stripMargin
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.augmentString(scala.StringContext.apply(&quot;CREATE OR REPLACE PROCEDURE &quot;, &quot;.&quot;, &quot;() LANGUAGE plpgsql AS\n       |  $BODY$\n       |    DECLARE\n       |      cur_time timestamp without time zone;        -- current time\n       |    BEGIN\n       |      -- constants\n       |      cur_time := now();\n       |      CALL &quot;, &quot;(cur_time);\n       |      CALL &quot;, &quot;(cur_time);\n       |      CALL &quot;, &quot;(cur_time);\n       |    END;\n       |  $BODY$;\n       |&quot;).s(info.schema.quoted, PartitionMaintenance.this.name(info).quoted, PartitionWriteAheadLog.name(info).quoted, MergeWriteAheadPartitions.name(info).quoted, DropAgedOffPartitions.name(info).quoted)).stripMargin
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>
