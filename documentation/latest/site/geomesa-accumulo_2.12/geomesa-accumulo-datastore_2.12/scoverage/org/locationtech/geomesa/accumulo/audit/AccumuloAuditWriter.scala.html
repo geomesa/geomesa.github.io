@@ -1,0 +1,4505 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/accumulo/audit/AccumuloAuditWriter.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.accumulo.audit
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.StrictLogging
+</span>12 <span style=''>import org.apache.accumulo.core.client.{AccumuloClient, BatchWriter}
+</span>13 <span style=''>import org.geotools.api.filter.Filter
+</span>14 <span style=''>import org.geotools.util.factory.Hints
+</span>15 <span style=''>import org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.ShutdownTimeout
+</span>16 <span style=''>import org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan
+</span>17 <span style=''>import org.locationtech.geomesa.accumulo.util.{GeoMesaBatchWriterConfig, TableManager}
+</span>18 <span style=''>import org.locationtech.geomesa.index.api.QueryPlan
+</span>19 <span style=''>import org.locationtech.geomesa.index.audit.AuditWriter
+</span>20 <span style=''>import org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent
+</span>21 <span style=''>import org.locationtech.geomesa.utils.audit.AuditProvider
+</span>22 <span style=''>import org.locationtech.geomesa.utils.concurrent.ExitingExecutor
+</span>23 <span style=''>import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
+</span>24 <span style=''>
+</span>25 <span style=''>import java.io.Closeable
+</span>26 <span style=''>import java.util.concurrent.atomic.AtomicBoolean
+</span>27 <span style=''>import java.util.concurrent.locks.ReentrantLock
+</span>28 <span style=''>import java.util.concurrent.{ScheduledThreadPoolExecutor, TimeUnit}
+</span>29 <span style=''>import scala.concurrent.{Future, Promise}
+</span>30 <span style=''>import scala.util.Try
+</span>31 <span style=''>import scala.util.control.NonFatal
+</span>32 <span style=''>
+</span>33 <span style=''>/**
+</span>34 <span style=''> * Audit writer that persists log entries to a table in Accumulo
+</span>35 <span style=''> *
+</span>36 <span style=''> * @param client accumulo client
+</span>37 <span style=''> * @param table table to write to
+</span>38 <span style=''> * @param auditProvider audit provider
+</span>39 <span style=''> * @param enabled enable table writes (entries will always be written to logs)
+</span>40 <span style=''> */
+</span>41 <span style=''>class AccumuloAuditWriter(
+</span>42 <span style=''>    client: AccumuloClient,
+</span>43 <span style=''>    val table: String,
+</span>44 <span style=''>    auditProvider: AuditProvider,
+</span>45 <span style=''>    enabled: Boolean
+</span>46 <span style=''>  ) extends AuditWriter(StoreType, auditProvider) with Runnable with Closeable with StrictLogging {
+</span>47 <span style=''>
+</span>48 <span style=''>  import scala.collection.JavaConverters._
+</span>49 <span style=''>
+</span>50 <span style=''>  private var writer: BatchWriter = _
+</span>51 <span style=''>
+</span>52 <span style=''>  private val queue = </span><span style='background: #AEF1AE'>new java.util.concurrent.ConcurrentLinkedQueue[(Promise[Unit], QueryEvent, Seq[AccumuloQueryPlan])]</span><span style=''>
+</span>53 <span style=''>
+</span>54 <span style=''>  private val running = </span><span style='background: #AEF1AE'>new AtomicBoolean(true)</span><span style=''>
+</span>55 <span style=''>  private val writeLock = </span><span style='background: #AEF1AE'>new ReentrantLock()</span><span style=''>
+</span>56 <span style=''>
+</span>57 <span style=''>  private val timeout = </span><span style='background: #AEF1AE'>ShutdownTimeout.toDuration.get.toMillis</span><span style=''>
+</span>58 <span style=''>
+</span>59 <span style=''>  private val scheduledRun = {
+</span>60 <span style=''>    val millis = </span><span style='background: #AEF1AE'>AccumuloAuditWriter.WriteInterval.toDuration.get.toMillis</span><span style=''>
+</span>61 <span style=''>    logger.debug(s&quot;Scheduling audit writer for ${millis}ms&quot;)
+</span>62 <span style=''>    </span><span style='background: #AEF1AE'>AccumuloAuditWriter.executor.scheduleWithFixedDelay(this, millis, millis, TimeUnit.MILLISECONDS)</span><span style=''>
+</span>63 <span style=''>  }
+</span>64 <span style=''>
+</span>65 <span style=''>  override def writeQueryEvent(
+</span>66 <span style=''>      typeName: String,
+</span>67 <span style=''>      user: String,
+</span>68 <span style=''>      filter: Filter,
+</span>69 <span style=''>      hints: Hints,
+</span>70 <span style=''>      plans: Seq[QueryPlan[_]],
+</span>71 <span style=''>      startTime: Long,
+</span>72 <span style=''>      endTime: Long,
+</span>73 <span style=''>      planTime: Long,
+</span>74 <span style=''>      scanTime: Long,
+</span>75 <span style=''>      hits: Long): Future[Unit] = {
+</span>76 <span style=''>    if (</span><span style='background: #AEF1AE'>running.get()</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>77 <span style=''></span><span style='background: #AEF1AE'>      val promise = Promise[Unit]()
+</span>78 <span style=''></span><span style='background: #AEF1AE'>      // note: we populate the metadata in the asynchronous thread
+</span>79 <span style=''></span><span style='background: #AEF1AE'>      val eventNoMeta = QueryEvent(storeType, typeName, user, filter, hints, startTime, endTime, planTime, scanTime, hits)
+</span>80 <span style=''></span><span style='background: #AEF1AE'>      queue.offer((promise, eventNoMeta, plans.asInstanceOf[Seq[AccumuloQueryPlan]])) // unbounded queue so will never fail
+</span>81 <span style=''></span><span style='background: #AEF1AE'>      promise.future
+</span>82 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''> else {
+</span>83 <span style=''>      </span><span style='background: #F0ADAD'>Future.failed(new RuntimeException(&quot;This AuditWriter instance has been closed&quot;))</span><span style=''>
+</span>84 <span style=''>    }
+</span>85 <span style=''>  }
+</span>86 <span style=''>
+</span>87 <span style=''>  override def run(): Unit = {
+</span>88 <span style=''>    if (</span><span style='background: #AEF1AE'>running.get() &amp;&amp; writeLock.tryLock()</span><span style=''>) {
+</span>89 <span style=''>      </span><span style='background: #AEF1AE'>try { writeQueuedEvents() } finally {
+</span>90 <span style=''></span><span style='background: #AEF1AE'>        writeLock.unlock()
+</span>91 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>92 <span style=''>    }
+</span>93 <span style=''>  }
+</span>94 <span style=''>
+</span>95 <span style=''>  private def writeQueuedEvents(): Unit = {
+</span>96 <span style=''>    try {
+</span>97 <span style=''>      </span><span style='background: #AEF1AE'>var promiseAndEvent = queue.poll()
+</span>98 <span style=''></span><span style='background: #AEF1AE'>      if (promiseAndEvent != null) {
+</span>99 <span style=''></span><span style='background: #AEF1AE'>        val stopTime = System.currentTimeMillis() + timeout
+</span>100 <span style=''></span><span style='background: #AEF1AE'>        if (enabled &amp;&amp; writer == null) {
+</span>101 <span style=''></span><span style='background: #AEF1AE'>          new TableManager(client).ensureTableExists(table)
+</span>102 <span style=''></span><span style='background: #AEF1AE'>          val writeConfig = GeoMesaBatchWriterConfig().setMaxMemory(10000L).setMaxWriteThreads(5)
+</span>103 <span style=''></span><span style='background: #AEF1AE'>          writer = client.createBatchWriter(table, writeConfig)
+</span>104 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>105 <span style=''></span><span style='background: #AEF1AE'>        while (promiseAndEvent != null) {
+</span>106 <span style=''></span><span style='background: #AEF1AE'>          val (promise, eventNoMeta, plans) = promiseAndEvent
+</span>107 <span style=''></span><span style='background: #AEF1AE'>          val write =
+</span>108 <span style=''></span><span style='background: #AEF1AE'>            Try {
+</span>109 <span style=''></span><span style='background: #AEF1AE'>              val event = eventNoMeta.copy(metadata = createMetadata(plans))
+</span>110 <span style=''></span><span style='background: #AEF1AE'>              AuditWriter.log(event)
+</span>111 <span style=''></span><span style='background: #AEF1AE'>              if (enabled) {
+</span>112 <span style=''></span><span style='background: #AEF1AE'>                writer.addMutation(AccumuloQueryEventTransform.toMutation(event))
+</span>113 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>114 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>115 <span style=''></span><span style='background: #AEF1AE'>          promise.complete(write)
+</span>116 <span style=''></span><span style='background: #AEF1AE'>          promiseAndEvent = if (running.get() || System.currentTimeMillis() &lt; stopTime) { queue.poll() } else { null }
+</span>117 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>118 <span style=''></span><span style='background: #AEF1AE'>        if (enabled) {
+</span>119 <span style=''></span><span style='background: #AEF1AE'>          writer.flush()
+</span>120 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>121 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>122 <span style=''>    } catch {
+</span>123 <span style=''>      case NonFatal(e) =&gt; </span><span style='background: #AEF1AE'>logger.error(&quot;Error writing audit logs:&quot;, e)</span><span style=''>
+</span>124 <span style=''>    }
+</span>125 <span style=''>  }
+</span>126 <span style=''>
+</span>127 <span style=''>  private def createMetadata(plans: Seq[AccumuloQueryPlan]): java.util.Map[String, AnyRef] = {
+</span>128 <span style=''>    // note: use tree maps for consistent ordering in json output
+</span>129 <span style=''>    val planMeta = </span><span style='background: #AEF1AE'>plans.map { plan =&gt;
+</span>130 <span style=''></span><span style='background: #AEF1AE'>      val planData = new java.util.TreeMap[String, AnyRef]()
+</span>131 <span style=''></span><span style='background: #AEF1AE'>      planData.put(&quot;index&quot;, plan.filter.index.identifier)
+</span>132 <span style=''></span><span style='background: #AEF1AE'>      val tables = new java.util.TreeMap[String, String]()
+</span>133 <span style=''></span><span style='background: #AEF1AE'>      planData.put(&quot;tables&quot;, tables)
+</span>134 <span style=''></span><span style='background: #AEF1AE'>      val locations = new java.util.TreeMap[String, java.util.Set[String]]()
+</span>135 <span style=''></span><span style='background: #AEF1AE'>      planData.put(&quot;locations&quot;, locations)
+</span>136 <span style=''></span><span style='background: #AEF1AE'>      plan.tables.foreach { table =&gt;
+</span>137 <span style=''></span><span style='background: #AEF1AE'>        tables.put(table, client.tableOperations().tableIdMap().get(table))
+</span>138 <span style=''></span><span style='background: #AEF1AE'>        val locate = client.tableOperations().locate(table, plan.ranges.asJava)
+</span>139 <span style=''></span><span style='background: #AEF1AE'>        locate.groupByTablet().asScala.keys.foreach { tablet =&gt;
+</span>140 <span style=''></span><span style='background: #AEF1AE'>          val location = locate.getTabletLocation(tablet)
+</span>141 <span style=''></span><span style='background: #AEF1AE'>          var tablets = locations.get(location)
+</span>142 <span style=''></span><span style='background: #AEF1AE'>          if (tablets == null) {
+</span>143 <span style=''></span><span style='background: #AEF1AE'>            tablets = new java.util.TreeSet[String]()
+</span>144 <span style=''></span><span style='background: #AEF1AE'>            locations.put(location, tablets)
+</span>145 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>146 <span style=''></span><span style='background: #AEF1AE'>          tablets.add(tablet.toString)
+</span>147 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>148 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>149 <span style=''></span><span style='background: #AEF1AE'>      planData.put(&quot;iterators&quot;, plan.iterators.map(_.toString).sorted.asJava)
+</span>150 <span style=''></span><span style='background: #AEF1AE'>      plan.join.foreach { case (_, join) =&gt; planData.put(&quot;join&quot;, join.filter.index.identifier) }
+</span>151 <span style=''></span><span style='background: #AEF1AE'>      plan.sort.foreach { sort =&gt;
+</span>152 <span style=''></span><span style='background: #AEF1AE'>        planData.put(&quot;sort&quot;, sort.map { case (field, descending) =&gt; s&quot;$field:${if (descending) { &quot;desc&quot; } else { &quot;asc&quot; }}&quot;}.asJava)
+</span>153 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>154 <span style=''></span><span style='background: #AEF1AE'>      plan.maxFeatures.foreach(m =&gt; planData.put(&quot;limit&quot;, Int.box(m)))
+</span>155 <span style=''></span><span style='background: #AEF1AE'>      planData
+</span>156 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>157 <span style=''>    </span><span style='background: #AEF1AE'>java.util.Map.of(&quot;queryPlans&quot;, planMeta.asJava)</span><span style=''>
+</span>158 <span style=''>  }
+</span>159 <span style=''>
+</span>160 <span style=''>  override def close(): Unit = {
+</span>161 <span style=''>    if (</span><span style='background: #AEF1AE'>running.compareAndSet(true, false)</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>162 <span style=''></span><span style='background: #AEF1AE'>      scheduledRun.cancel(false)
+</span>163 <span style=''></span><span style='background: #AEF1AE'>      try {
+</span>164 <span style=''></span><span style='background: #AEF1AE'>        if (writeLock.tryLock()) {
+</span>165 <span style=''></span><span style='background: #AEF1AE'>          // not currently running, so clean up any remaining events
+</span>166 <span style=''></span><span style='background: #AEF1AE'>          writeQueuedEvents()
+</span>167 <span style=''></span><span style='background: #AEF1AE'>        } else {
+</span>168 <span style=''></span><span style='background: #AEF1AE'>          // currently running, wait for run to end
+</span>169 <span style=''></span><span style='background: #AEF1AE'>          writeLock.lock()
+</span>170 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>171 <span style=''></span><span style='background: #AEF1AE'>        if (writer != null) {
+</span>172 <span style=''></span><span style='background: #AEF1AE'>          writer.close()
+</span>173 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>174 <span style=''></span><span style='background: #AEF1AE'>      } finally {
+</span>175 <span style=''></span><span style='background: #AEF1AE'>        writeLock.unlock()
+</span>176 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>177 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>178 <span style=''>  }
+</span>179 <span style=''>}
+</span>180 <span style=''>
+</span>181 <span style=''>object AccumuloAuditWriter {
+</span>182 <span style=''>
+</span>183 <span style=''>  val WriteInterval: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.accumulo.audit.interval&quot;, &quot;5 seconds&quot;)</span><span style=''>
+</span>184 <span style=''>  val ShutdownTimeout: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.accumulo.audit.shutdown.timeout&quot;, &quot;5 seconds&quot;)</span><span style=''>
+</span>185 <span style=''>
+</span>186 <span style=''>  private val executor = </span><span style='background: #AEF1AE'>ExitingExecutor(new ScheduledThreadPoolExecutor(5), force = true)</span><span style=''>
+</span>187 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          52
+        </td>
+        <td>
+          36
+        </td>
+        <td>
+          2216
+          -
+          2315
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentLinkedQueue.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.ConcurrentLinkedQueue[(scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan])]()
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          37
+        </td>
+        <td>
+          2341
+          -
+          2364
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicBoolean(true)
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          38
+        </td>
+        <td>
+          2391
+          -
+          2410
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.locks.ReentrantLock.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.locks.ReentrantLock()
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          39
+        </td>
+        <td>
+          2436
+          -
+          2475
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.concurrent.duration.Duration.toMillis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.ShutdownTimeout.toDuration.get.toMillis
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          40
+        </td>
+        <td>
+          2525
+          -
+          2582
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.concurrent.duration.Duration.toMillis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.WriteInterval.toDuration.get.toMillis
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          41
+        </td>
+        <td>
+          2722
+          -
+          2743
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MILLISECONDS
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          42
+        </td>
+        <td>
+          2648
+          -
+          2744
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ScheduledThreadPoolExecutor.scheduleWithFixedDelay
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.executor.scheduleWithFixedDelay(this, millis, millis, MILLISECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          43
+        </td>
+        <td>
+          3032
+          -
+          3045
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.running.get()
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          51
+        </td>
+        <td>
+          3047
+          -
+          3425
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val promise: scala.concurrent.Promise[Unit] = scala.concurrent.Promise.apply[Unit]();
+  val eventNoMeta: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent = org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent.apply(AccumuloAuditWriter.this.storeType, typeName, user, filter, hints, startTime, endTime, planTime, scanTime, hits);
+  AccumuloAuditWriter.this.queue.offer(scala.Tuple3.apply[scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]](promise, eventNoMeta, plans.asInstanceOf[Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]]));
+  promise.future
+}
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          44
+        </td>
+        <td>
+          3069
+          -
+          3084
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.concurrent.Promise.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.concurrent.Promise.apply[Unit]()
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          45
+        </td>
+        <td>
+          3187
+          -
+          3196
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.audit.AuditWriter.storeType
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.storeType
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          46
+        </td>
+        <td>
+          3176
+          -
+          3274
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent.apply(AccumuloAuditWriter.this.storeType, typeName, user, filter, hints, startTime, endTime, planTime, scanTime, hits)
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          47
+        </td>
+        <td>
+          3316
+          -
+          3358
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Any.asInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.asInstanceOf[Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]]
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          48
+        </td>
+        <td>
+          3293
+          -
+          3359
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple3.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Tuple3.apply[scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]](promise, eventNoMeta, plans.asInstanceOf[Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]])
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          49
+        </td>
+        <td>
+          3281
+          -
+          3360
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentLinkedQueue.offer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.queue.offer(scala.Tuple3.apply[scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]](promise, eventNoMeta, plans.asInstanceOf[Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]]))
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          50
+        </td>
+        <td>
+          3405
+          -
+          3419
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.concurrent.Promise.future
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          promise.future
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          52
+        </td>
+        <td>
+          3453
+          -
+          3518
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.RuntimeException.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new scala.`package`.RuntimeException(&quot;This AuditWriter instance has been closed&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          53
+        </td>
+        <td>
+          3439
+          -
+          3519
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.concurrent.Future.failed
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.concurrent.Future.failed[Nothing](new scala.`package`.RuntimeException(&quot;This AuditWriter instance has been closed&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          54
+        </td>
+        <td>
+          3439
+          -
+          3519
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.concurrent.Future.failed
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.concurrent.Future.failed[Nothing](new scala.`package`.RuntimeException(&quot;This AuditWriter instance has been closed&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          55
+        </td>
+        <td>
+          3587
+          -
+          3606
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.locks.ReentrantLock.tryLock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeLock.tryLock()
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          56
+        </td>
+        <td>
+          3570
+          -
+          3606
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.running.get().&amp;&amp;(AccumuloAuditWriter.this.writeLock.tryLock())
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          62
+        </td>
+        <td>
+          3566
+          -
+          3566
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          63
+        </td>
+        <td>
+          3566
+          -
+          3566
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          57
+        </td>
+        <td>
+          3622
+          -
+          3641
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.writeQueuedEvents
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeQueuedEvents()
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          58
+        </td>
+        <td>
+          3622
+          -
+          3641
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.writeQueuedEvents
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeQueuedEvents()
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          61
+        </td>
+        <td>
+          3616
+          -
+          3688
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  AccumuloAuditWriter.this.writeQueuedEvents()
+} finally AccumuloAuditWriter.this.writeLock.unlock()
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          59
+        </td>
+        <td>
+          3662
+          -
+          3680
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.locks.ReentrantLock.unlock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeLock.unlock()
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          60
+        </td>
+        <td>
+          3662
+          -
+          3680
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.concurrent.locks.ReentrantLock.unlock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeLock.unlock()
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          114
+        </td>
+        <td>
+          3760
+          -
+          4792
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  var promiseAndEvent: (scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]) = AccumuloAuditWriter.this.queue.poll();
+  if (promiseAndEvent.!=(null))
+    {
+      val stopTime: Long = java.lang.System.currentTimeMillis().+(AccumuloAuditWriter.this.timeout);
+      if (AccumuloAuditWriter.this.enabled.&amp;&amp;(AccumuloAuditWriter.this.writer.==(null)))
+        {
+          {
+            &lt;artifact&gt; val qual$1: org.locationtech.geomesa.accumulo.util.TableManager = new org.locationtech.geomesa.accumulo.util.TableManager(AccumuloAuditWriter.this.client);
+            &lt;artifact&gt; val x$1: String = AccumuloAuditWriter.this.table;
+            &lt;artifact&gt; val x$2: Boolean = qual$1.ensureTableExists$default$2;
+            qual$1.ensureTableExists(x$1, x$2)
+          };
+          val writeConfig: org.apache.accumulo.core.client.BatchWriterConfig = org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply(org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$1, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$2, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$3, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$4).setMaxMemory(10000L).setMaxWriteThreads(5);
+          AccumuloAuditWriter.this.writer_=(AccumuloAuditWriter.this.client.createBatchWriter(AccumuloAuditWriter.this.table, writeConfig))
+        }
+      else
+        ();
+      while$1(){
+        if (promiseAndEvent.!=(null))
+          {
+            {
+              &lt;synthetic&gt; &lt;artifact&gt; private[this] val x$1: (scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]) = (promiseAndEvent: (scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]) @unchecked) match {
+                case (_1: scala.concurrent.Promise[Unit], _2: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, _3: Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan])(scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan])((promise @ _), (eventNoMeta @ _), (plans @ _)) =&gt; scala.Tuple3.apply[scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]](promise, eventNoMeta, plans)
+              };
+              val promise: scala.concurrent.Promise[Unit] = x$1._1;
+              val eventNoMeta: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent = x$1._2;
+              val plans: Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan] = x$1._3;
+              val write: scala.util.Try[Unit] = scala.util.Try.apply[Unit]({
+                val event: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent = {
+                  &lt;artifact&gt; val x$3: java.util.Map[String,AnyRef] @scala.reflect.internal.annotations.uncheckedBounds = AccumuloAuditWriter.this.createMetadata(plans);
+                  &lt;artifact&gt; val x$4: String = eventNoMeta.copy$default$1;
+                  &lt;artifact&gt; val x$5: String = eventNoMeta.copy$default$2;
+                  &lt;artifact&gt; val x$6: String = eventNoMeta.copy$default$3;
+                  &lt;artifact&gt; val x$7: String = eventNoMeta.copy$default$4;
+                  &lt;artifact&gt; val x$8: java.util.Map[String,String] @scala.reflect.internal.annotations.uncheckedBounds = eventNoMeta.copy$default$5;
+                  &lt;artifact&gt; val x$9: Long = eventNoMeta.copy$default$7;
+                  &lt;artifact&gt; val x$10: Long = eventNoMeta.copy$default$8;
+                  &lt;artifact&gt; val x$11: Long = eventNoMeta.copy$default$9;
+                  &lt;artifact&gt; val x$12: Long = eventNoMeta.copy$default$10;
+                  &lt;artifact&gt; val x$13: Long = eventNoMeta.copy$default$11;
+                  eventNoMeta.copy(x$4, x$5, x$6, x$7, x$8, x$3, x$9, x$10, x$11, x$12, x$13)
+                };
+                org.locationtech.geomesa.index.audit.AuditWriter.log(event);
+                if (AccumuloAuditWriter.this.enabled)
+                  AccumuloAuditWriter.this.writer.addMutation(AccumuloQueryEventTransform.toMutation(event))
+                else
+                  ()
+              });
+              promise.complete(write);
+              promiseAndEvent = if (AccumuloAuditWriter.this.running.get().||(java.lang.System.currentTimeMillis().&lt;(stopTime)))
+                AccumuloAuditWriter.this.queue.poll()
+              else
+                null
+            };
+            while$1()
+          }
+        else
+          ()
+      };
+      if (AccumuloAuditWriter.this.enabled)
+        AccumuloAuditWriter.this.writer.flush()
+      else
+        ()
+    }
+  else
+    ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          64
+        </td>
+        <td>
+          3782
+          -
+          3794
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentLinkedQueue.poll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.queue.poll()
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          65
+        </td>
+        <td>
+          3805
+          -
+          3828
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          promiseAndEvent.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          111
+        </td>
+        <td>
+          3830
+          -
+          4792
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val stopTime: Long = java.lang.System.currentTimeMillis().+(AccumuloAuditWriter.this.timeout);
+  if (AccumuloAuditWriter.this.enabled.&amp;&amp;(AccumuloAuditWriter.this.writer.==(null)))
+    {
+      {
+        &lt;artifact&gt; val qual$1: org.locationtech.geomesa.accumulo.util.TableManager = new org.locationtech.geomesa.accumulo.util.TableManager(AccumuloAuditWriter.this.client);
+        &lt;artifact&gt; val x$1: String = AccumuloAuditWriter.this.table;
+        &lt;artifact&gt; val x$2: Boolean = qual$1.ensureTableExists$default$2;
+        qual$1.ensureTableExists(x$1, x$2)
+      };
+      val writeConfig: org.apache.accumulo.core.client.BatchWriterConfig = org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply(org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$1, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$2, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$3, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$4).setMaxMemory(10000L).setMaxWriteThreads(5);
+      AccumuloAuditWriter.this.writer_=(AccumuloAuditWriter.this.client.createBatchWriter(AccumuloAuditWriter.this.table, writeConfig))
+    }
+  else
+    ();
+  while$1(){
+    if (promiseAndEvent.!=(null))
+      {
+        {
+          &lt;synthetic&gt; &lt;artifact&gt; private[this] val x$1: (scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]) = (promiseAndEvent: (scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]) @unchecked) match {
+            case (_1: scala.concurrent.Promise[Unit], _2: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, _3: Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan])(scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan])((promise @ _), (eventNoMeta @ _), (plans @ _)) =&gt; scala.Tuple3.apply[scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]](promise, eventNoMeta, plans)
+          };
+          val promise: scala.concurrent.Promise[Unit] = x$1._1;
+          val eventNoMeta: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent = x$1._2;
+          val plans: Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan] = x$1._3;
+          val write: scala.util.Try[Unit] = scala.util.Try.apply[Unit]({
+            val event: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent = {
+              &lt;artifact&gt; val x$3: java.util.Map[String,AnyRef] @scala.reflect.internal.annotations.uncheckedBounds = AccumuloAuditWriter.this.createMetadata(plans);
+              &lt;artifact&gt; val x$4: String = eventNoMeta.copy$default$1;
+              &lt;artifact&gt; val x$5: String = eventNoMeta.copy$default$2;
+              &lt;artifact&gt; val x$6: String = eventNoMeta.copy$default$3;
+              &lt;artifact&gt; val x$7: String = eventNoMeta.copy$default$4;
+              &lt;artifact&gt; val x$8: java.util.Map[String,String] @scala.reflect.internal.annotations.uncheckedBounds = eventNoMeta.copy$default$5;
+              &lt;artifact&gt; val x$9: Long = eventNoMeta.copy$default$7;
+              &lt;artifact&gt; val x$10: Long = eventNoMeta.copy$default$8;
+              &lt;artifact&gt; val x$11: Long = eventNoMeta.copy$default$9;
+              &lt;artifact&gt; val x$12: Long = eventNoMeta.copy$default$10;
+              &lt;artifact&gt; val x$13: Long = eventNoMeta.copy$default$11;
+              eventNoMeta.copy(x$4, x$5, x$6, x$7, x$8, x$3, x$9, x$10, x$11, x$12, x$13)
+            };
+            org.locationtech.geomesa.index.audit.AuditWriter.log(event);
+            if (AccumuloAuditWriter.this.enabled)
+              AccumuloAuditWriter.this.writer.addMutation(AccumuloQueryEventTransform.toMutation(event))
+            else
+              ()
+          });
+          promise.complete(write);
+          promiseAndEvent = if (AccumuloAuditWriter.this.running.get().||(java.lang.System.currentTimeMillis().&lt;(stopTime)))
+            AccumuloAuditWriter.this.queue.poll()
+          else
+            null
+        };
+        while$1()
+      }
+    else
+      ()
+  };
+  if (AccumuloAuditWriter.this.enabled)
+    AccumuloAuditWriter.this.writer.flush()
+  else
+    ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          112
+        </td>
+        <td>
+          3801
+          -
+          3801
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          113
+        </td>
+        <td>
+          3801
+          -
+          3801
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          66
+        </td>
+        <td>
+          3884
+          -
+          3891
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.timeout
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.timeout
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          67
+        </td>
+        <td>
+          3855
+          -
+          3891
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.currentTimeMillis().+(AccumuloAuditWriter.this.timeout)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          68
+        </td>
+        <td>
+          3915
+          -
+          3929
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writer.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          69
+        </td>
+        <td>
+          3904
+          -
+          3929
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.enabled.&amp;&amp;(AccumuloAuditWriter.this.writer.==(null))
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          78
+        </td>
+        <td>
+          3931
+          -
+          4164
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    &lt;artifact&gt; val qual$1: org.locationtech.geomesa.accumulo.util.TableManager = new org.locationtech.geomesa.accumulo.util.TableManager(AccumuloAuditWriter.this.client);
+    &lt;artifact&gt; val x$1: String = AccumuloAuditWriter.this.table;
+    &lt;artifact&gt; val x$2: Boolean = qual$1.ensureTableExists$default$2;
+    qual$1.ensureTableExists(x$1, x$2)
+  };
+  val writeConfig: org.apache.accumulo.core.client.BatchWriterConfig = org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply(org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$1, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$2, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$3, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$4).setMaxMemory(10000L).setMaxWriteThreads(5);
+  AccumuloAuditWriter.this.writer_=(AccumuloAuditWriter.this.client.createBatchWriter(AccumuloAuditWriter.this.table, writeConfig))
+}
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          79
+        </td>
+        <td>
+          3900
+          -
+          3900
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          80
+        </td>
+        <td>
+          3900
+          -
+          3900
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          70
+        </td>
+        <td>
+          3960
+          -
+          3966
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.client
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.client
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          71
+        </td>
+        <td>
+          3943
+          -
+          3967
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.TableManager.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.accumulo.util.TableManager(AccumuloAuditWriter.this.client)
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          72
+        </td>
+        <td>
+          3986
+          -
+          3991
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.table
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.table
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          73
+        </td>
+        <td>
+          3943
+          -
+          3992
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.TableManager.ensureTableExists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          qual$1.ensureTableExists(x$1, x$2)
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          74
+        </td>
+        <td>
+          4021
+          -
+          4090
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.BatchWriterConfig.setMaxWriteThreads
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply(org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$1, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$2, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$3, org.locationtech.geomesa.accumulo.util.GeoMesaBatchWriterConfig.apply$default$4).setMaxMemory(10000L).setMaxWriteThreads(5)
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          75
+        </td>
+        <td>
+          4135
+          -
+          4140
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.table
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.table
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          76
+        </td>
+        <td>
+          4110
+          -
+          4154
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.AccumuloClient.createBatchWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.client.createBatchWriter(AccumuloAuditWriter.this.table, writeConfig)
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          77
+        </td>
+        <td>
+          4101
+          -
+          4154
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.writer_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writer_=(AccumuloAuditWriter.this.client.createBatchWriter(AccumuloAuditWriter.this.table, writeConfig))
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          81
+        </td>
+        <td>
+          4180
+          -
+          4203
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          promiseAndEvent.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          102
+        </td>
+        <td>
+          4205
+          -
+          4205
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.while$1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$1()
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          103
+        </td>
+        <td>
+          4205
+          -
+          4726
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    &lt;synthetic&gt; &lt;artifact&gt; private[this] val x$1: (scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]) = (promiseAndEvent: (scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]) @unchecked) match {
+      case (_1: scala.concurrent.Promise[Unit], _2: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, _3: Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan])(scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan])((promise @ _), (eventNoMeta @ _), (plans @ _)) =&gt; scala.Tuple3.apply[scala.concurrent.Promise[Unit], org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent, Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan]](promise, eventNoMeta, plans)
+    };
+    val promise: scala.concurrent.Promise[Unit] = x$1._1;
+    val eventNoMeta: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent = x$1._2;
+    val plans: Seq[org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan] = x$1._3;
+    val write: scala.util.Try[Unit] = scala.util.Try.apply[Unit]({
+      val event: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent = {
+        &lt;artifact&gt; val x$3: java.util.Map[String,AnyRef] @scala.reflect.internal.annotations.uncheckedBounds = AccumuloAuditWriter.this.createMetadata(plans);
+        &lt;artifact&gt; val x$4: String = eventNoMeta.copy$default$1;
+        &lt;artifact&gt; val x$5: String = eventNoMeta.copy$default$2;
+        &lt;artifact&gt; val x$6: String = eventNoMeta.copy$default$3;
+        &lt;artifact&gt; val x$7: String = eventNoMeta.copy$default$4;
+        &lt;artifact&gt; val x$8: java.util.Map[String,String] @scala.reflect.internal.annotations.uncheckedBounds = eventNoMeta.copy$default$5;
+        &lt;artifact&gt; val x$9: Long = eventNoMeta.copy$default$7;
+        &lt;artifact&gt; val x$10: Long = eventNoMeta.copy$default$8;
+        &lt;artifact&gt; val x$11: Long = eventNoMeta.copy$default$9;
+        &lt;artifact&gt; val x$12: Long = eventNoMeta.copy$default$10;
+        &lt;artifact&gt; val x$13: Long = eventNoMeta.copy$default$11;
+        eventNoMeta.copy(x$4, x$5, x$6, x$7, x$8, x$3, x$9, x$10, x$11, x$12, x$13)
+      };
+      org.locationtech.geomesa.index.audit.AuditWriter.log(event);
+      if (AccumuloAuditWriter.this.enabled)
+        AccumuloAuditWriter.this.writer.addMutation(AccumuloQueryEventTransform.toMutation(event))
+      else
+        ()
+    });
+    promise.complete(write);
+    promiseAndEvent = if (AccumuloAuditWriter.this.running.get().||(java.lang.System.currentTimeMillis().&lt;(stopTime)))
+      AccumuloAuditWriter.this.queue.poll()
+    else
+      null
+  };
+  while$1()
+}
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          104
+        </td>
+        <td>
+          4173
+          -
+          4173
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          105
+        </td>
+        <td>
+          4173
+          -
+          4173
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          106
+        </td>
+        <td>
+          82
+        </td>
+        <td>
+          4222
+          -
+          4222
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1._1
+        </td>
+      </tr><tr>
+        <td>
+          106
+        </td>
+        <td>
+          83
+        </td>
+        <td>
+          4231
+          -
+          4231
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1._2
+        </td>
+      </tr><tr>
+        <td>
+          106
+        </td>
+        <td>
+          84
+        </td>
+        <td>
+          4244
+          -
+          4244
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._3
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1._3
+        </td>
+      </tr><tr>
+        <td>
+          108
+        </td>
+        <td>
+          94
+        </td>
+        <td>
+          4303
+          -
+          4563
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.util.Try.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.util.Try.apply[Unit]({
+  val event: org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent = {
+    &lt;artifact&gt; val x$3: java.util.Map[String,AnyRef] @scala.reflect.internal.annotations.uncheckedBounds = AccumuloAuditWriter.this.createMetadata(plans);
+    &lt;artifact&gt; val x$4: String = eventNoMeta.copy$default$1;
+    &lt;artifact&gt; val x$5: String = eventNoMeta.copy$default$2;
+    &lt;artifact&gt; val x$6: String = eventNoMeta.copy$default$3;
+    &lt;artifact&gt; val x$7: String = eventNoMeta.copy$default$4;
+    &lt;artifact&gt; val x$8: java.util.Map[String,String] @scala.reflect.internal.annotations.uncheckedBounds = eventNoMeta.copy$default$5;
+    &lt;artifact&gt; val x$9: Long = eventNoMeta.copy$default$7;
+    &lt;artifact&gt; val x$10: Long = eventNoMeta.copy$default$8;
+    &lt;artifact&gt; val x$11: Long = eventNoMeta.copy$default$9;
+    &lt;artifact&gt; val x$12: Long = eventNoMeta.copy$default$10;
+    &lt;artifact&gt; val x$13: Long = eventNoMeta.copy$default$11;
+    eventNoMeta.copy(x$4, x$5, x$6, x$7, x$8, x$3, x$9, x$10, x$11, x$12, x$13)
+  };
+  org.locationtech.geomesa.index.audit.AuditWriter.log(event);
+  if (AccumuloAuditWriter.this.enabled)
+    AccumuloAuditWriter.this.writer.addMutation(AccumuloQueryEventTransform.toMutation(event))
+  else
+    ()
+})
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          85
+        </td>
+        <td>
+          4363
+          -
+          4384
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.createMetadata
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.createMetadata(plans)
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          86
+        </td>
+        <td>
+          4335
+          -
+          4385
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.audit.AuditedEvent.QueryEvent.copy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          eventNoMeta.copy(x$4, x$5, x$6, x$7, x$8, x$3, x$9, x$10, x$11, x$12, x$13)
+        </td>
+      </tr><tr>
+        <td>
+          110
+        </td>
+        <td>
+          87
+        </td>
+        <td>
+          4400
+          -
+          4422
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.audit.AuditWriter.log
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.index.audit.AuditWriter.log(event)
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          88
+        </td>
+        <td>
+          4441
+          -
+          4448
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.enabled
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.enabled
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          92
+        </td>
+        <td>
+          4437
+          -
+          4437
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          93
+        </td>
+        <td>
+          4437
+          -
+          4437
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          89
+        </td>
+        <td>
+          4487
+          -
+          4532
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloQueryEventTransform.toMutation
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloQueryEventTransform.toMutation(event)
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          90
+        </td>
+        <td>
+          4468
+          -
+          4533
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.BatchWriter.addMutation
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writer.addMutation(AccumuloQueryEventTransform.toMutation(event))
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          91
+        </td>
+        <td>
+          4468
+          -
+          4533
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.accumulo.core.client.BatchWriter.addMutation
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writer.addMutation(AccumuloQueryEventTransform.toMutation(event))
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          95
+        </td>
+        <td>
+          4574
+          -
+          4597
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.concurrent.Promise.complete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          promise.complete(write)
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          96
+        </td>
+        <td>
+          4647
+          -
+          4684
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.currentTimeMillis().&lt;(stopTime)
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          97
+        </td>
+        <td>
+          4630
+          -
+          4684
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.running.get().||(java.lang.System.currentTimeMillis().&lt;(stopTime))
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          98
+        </td>
+        <td>
+          4688
+          -
+          4700
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentLinkedQueue.poll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.queue.poll()
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          99
+        </td>
+        <td>
+          4688
+          -
+          4700
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentLinkedQueue.poll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.queue.poll()
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          100
+        </td>
+        <td>
+          4710
+          -
+          4714
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          101
+        </td>
+        <td>
+          4710
+          -
+          4714
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          106
+        </td>
+        <td>
+          4739
+          -
+          4746
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.enabled
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.enabled
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          109
+        </td>
+        <td>
+          4735
+          -
+          4735
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          110
+        </td>
+        <td>
+          4735
+          -
+          4735
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          107
+        </td>
+        <td>
+          4760
+          -
+          4774
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.BatchWriter.flush
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writer.flush()
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          108
+        </td>
+        <td>
+          4760
+          -
+          4774
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.accumulo.core.client.BatchWriter.flush
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writer.flush()
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          115
+        </td>
+        <td>
+          4833
+          -
+          4877
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          (if (AccumuloAuditWriter.this.logger.underlying.isErrorEnabled())
+  AccumuloAuditWriter.this.logger.underlying.error(&quot;Error writing audit logs:&quot;, e)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          173
+        </td>
+        <td>
+          5079
+          -
+          5079
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[java.util.TreeMap[String,AnyRef]]
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          174
+        </td>
+        <td>
+          5069
+          -
+          6428
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.map[java.util.TreeMap[String,AnyRef], Seq[java.util.TreeMap[String,AnyRef]]](((plan: org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan) =&gt; {
+  val planData: java.util.TreeMap[String,AnyRef] = new java.util.TreeMap[String,AnyRef]();
+  planData.put(&quot;index&quot;, plan.filter.index.identifier);
+  val tables: java.util.TreeMap[String,String] = new java.util.TreeMap[String,String]();
+  planData.put(&quot;tables&quot;, tables);
+  val locations: java.util.TreeMap[String,java.util.Set[String]] = new java.util.TreeMap[String,java.util.Set[String]]();
+  planData.put(&quot;locations&quot;, locations);
+  plan.tables.foreach[Unit](((table: String) =&gt; {
+    tables.put(table, AccumuloAuditWriter.this.client.tableOperations().tableIdMap().get(table));
+    val locate: org.apache.accumulo.core.client.admin.Locations = AccumuloAuditWriter.this.client.tableOperations().locate(table, scala.collection.JavaConverters.seqAsJavaListConverter[org.apache.accumulo.core.data.Range](plan.ranges).asJava);
+    scala.collection.JavaConverters.mapAsScalaMapConverter[org.apache.accumulo.core.data.TabletId, java.util.List[org.apache.accumulo.core.data.Range]](locate.groupByTablet()).asScala.keys.foreach[Boolean](((tablet: org.apache.accumulo.core.data.TabletId) =&gt; {
+      val location: String = locate.getTabletLocation(tablet);
+      var tablets: java.util.Set[String] = locations.get(location);
+      if (tablets.==(null))
+        {
+          tablets = new java.util.TreeSet[String]();
+          locations.put(location, tablets)
+        }
+      else
+        ();
+      tablets.add(tablet.toString())
+    }))
+  }));
+  planData.put(&quot;iterators&quot;, scala.collection.JavaConverters.seqAsJavaListConverter[String](plan.iterators.map[String, Seq[String]](((x$2: org.apache.accumulo.core.client.IteratorSetting) =&gt; x$2.toString()))(collection.this.Seq.canBuildFrom[String]).sorted[String](math.this.Ordering.String)).asJava);
+  plan.join.foreach[AnyRef](((x0$1: (org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.JoinFunction, org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan)) =&gt; x0$1 match {
+    case (_1: org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.JoinFunction, _2: org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan)(org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.JoinFunction, org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan)(_, (join @ _)) =&gt; planData.put(&quot;join&quot;, join.filter.index.identifier)
+  }));
+  plan.sort.foreach[AnyRef](((sort: Seq[(String, Boolean)]) =&gt; planData.put(&quot;sort&quot;, scala.collection.JavaConverters.seqAsJavaListConverter[String](sort.map[String, Seq[String]](((x0$2: (String, Boolean)) =&gt; x0$2 match {
+  case (_1: String, _2: Boolean)(String, Boolean)((field @ _), (descending @ _)) =&gt; scala.StringContext.apply(&quot;&quot;, &quot;:&quot;, &quot;&quot;).s(field, if (descending)
+    &quot;desc&quot;
+  else
+    &quot;asc&quot;)
+}))(collection.this.Seq.canBuildFrom[String])).asJava)));
+  plan.maxFeatures.foreach[AnyRef](((m: Int) =&gt; planData.put(&quot;limit&quot;, scala.Int.box(m))));
+  planData
+}))(collection.this.Seq.canBuildFrom[java.util.TreeMap[String,AnyRef]])
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          116
+        </td>
+        <td>
+          5110
+          -
+          5149
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.TreeMap[String,AnyRef]()
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          117
+        </td>
+        <td>
+          5169
+          -
+          5176
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;index&quot;
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          118
+        </td>
+        <td>
+          5178
+          -
+          5206
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.identifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.filter.index.identifier
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          119
+        </td>
+        <td>
+          5156
+          -
+          5207
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          planData.put(&quot;index&quot;, plan.filter.index.identifier)
+        </td>
+      </tr><tr>
+        <td>
+          132
+        </td>
+        <td>
+          120
+        </td>
+        <td>
+          5227
+          -
+          5266
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.TreeMap[String,String]()
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          121
+        </td>
+        <td>
+          5273
+          -
+          5303
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          planData.put(&quot;tables&quot;, tables)
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          122
+        </td>
+        <td>
+          5326
+          -
+          5380
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.TreeMap[String,java.util.Set[String]]()
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          123
+        </td>
+        <td>
+          5387
+          -
+          5423
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          planData.put(&quot;locations&quot;, locations)
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          141
+        </td>
+        <td>
+          5430
+          -
+          5987
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.tables.foreach[Unit](((table: String) =&gt; {
+  tables.put(table, AccumuloAuditWriter.this.client.tableOperations().tableIdMap().get(table));
+  val locate: org.apache.accumulo.core.client.admin.Locations = AccumuloAuditWriter.this.client.tableOperations().locate(table, scala.collection.JavaConverters.seqAsJavaListConverter[org.apache.accumulo.core.data.Range](plan.ranges).asJava);
+  scala.collection.JavaConverters.mapAsScalaMapConverter[org.apache.accumulo.core.data.TabletId, java.util.List[org.apache.accumulo.core.data.Range]](locate.groupByTablet()).asScala.keys.foreach[Boolean](((tablet: org.apache.accumulo.core.data.TabletId) =&gt; {
+    val location: String = locate.getTabletLocation(tablet);
+    var tablets: java.util.Set[String] = locations.get(location);
+    if (tablets.==(null))
+      {
+        tablets = new java.util.TreeSet[String]();
+        locations.put(location, tablets)
+      }
+    else
+      ();
+    tablets.add(tablet.toString())
+  }))
+}))
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          124
+        </td>
+        <td>
+          5487
+          -
+          5535
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.client.tableOperations().tableIdMap().get(table)
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          125
+        </td>
+        <td>
+          5469
+          -
+          5536
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tables.put(table, AccumuloAuditWriter.this.client.tableOperations().tableIdMap().get(table))
+        </td>
+      </tr><tr>
+        <td>
+          138
+        </td>
+        <td>
+          126
+        </td>
+        <td>
+          5597
+          -
+          5608
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.ranges
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.ranges
+        </td>
+      </tr><tr>
+        <td>
+          138
+        </td>
+        <td>
+          127
+        </td>
+        <td>
+          5597
+          -
+          5615
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.seqAsJavaListConverter[org.apache.accumulo.core.data.Range](plan.ranges).asJava
+        </td>
+      </tr><tr>
+        <td>
+          138
+        </td>
+        <td>
+          128
+        </td>
+        <td>
+          5558
+          -
+          5616
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.TableOperations.locate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.client.tableOperations().locate(table, scala.collection.JavaConverters.seqAsJavaListConverter[org.apache.accumulo.core.data.Range](plan.ranges).asJava)
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          129
+        </td>
+        <td>
+          5625
+          -
+          5647
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.Locations.groupByTablet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          locate.groupByTablet()
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          140
+        </td>
+        <td>
+          5625
+          -
+          5979
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.mapAsScalaMapConverter[org.apache.accumulo.core.data.TabletId, java.util.List[org.apache.accumulo.core.data.Range]](locate.groupByTablet()).asScala.keys.foreach[Boolean](((tablet: org.apache.accumulo.core.data.TabletId) =&gt; {
+  val location: String = locate.getTabletLocation(tablet);
+  var tablets: java.util.Set[String] = locations.get(location);
+  if (tablets.==(null))
+    {
+      tablets = new java.util.TreeSet[String]();
+      locations.put(location, tablets)
+    }
+  else
+    ();
+  tablets.add(tablet.toString())
+}))
+        </td>
+      </tr><tr>
+        <td>
+          140
+        </td>
+        <td>
+          130
+        </td>
+        <td>
+          5706
+          -
+          5738
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.admin.Locations.getTabletLocation
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          locate.getTabletLocation(tablet)
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          131
+        </td>
+        <td>
+          5763
+          -
+          5786
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          locations.get(location)
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          132
+        </td>
+        <td>
+          5801
+          -
+          5816
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tablets.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          135
+        </td>
+        <td>
+          5818
+          -
+          5930
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  tablets = new java.util.TreeSet[String]();
+  locations.put(location, tablets)
+}
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          136
+        </td>
+        <td>
+          5797
+          -
+          5797
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          137
+        </td>
+        <td>
+          5797
+          -
+          5797
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          143
+        </td>
+        <td>
+          133
+        </td>
+        <td>
+          5842
+          -
+          5873
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeSet.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.TreeSet[String]()
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          134
+        </td>
+        <td>
+          5886
+          -
+          5918
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          locations.put(location, tablets)
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          138
+        </td>
+        <td>
+          5953
+          -
+          5968
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.toString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tablet.toString()
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          139
+        </td>
+        <td>
+          5941
+          -
+          5969
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Set.add
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tablets.add(tablet.toString())
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          142
+        </td>
+        <td>
+          6007
+          -
+          6018
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;iterators&quot;
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          143
+        </td>
+        <td>
+          6039
+          -
+          6049
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.IteratorSetting.toString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$2.toString()
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          144
+        </td>
+        <td>
+          6038
+          -
+          6038
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[String]
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          145
+        </td>
+        <td>
+          6051
+          -
+          6051
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.math.Ordering.String
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          math.this.Ordering.String
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          146
+        </td>
+        <td>
+          6020
+          -
+          6057
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.SeqLike.sorted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.iterators.map[String, Seq[String]](((x$2: org.apache.accumulo.core.client.IteratorSetting) =&gt; x$2.toString()))(collection.this.Seq.canBuildFrom[String]).sorted[String](math.this.Ordering.String)
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          147
+        </td>
+        <td>
+          6020
+          -
+          6064
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.seqAsJavaListConverter[String](plan.iterators.map[String, Seq[String]](((x$2: org.apache.accumulo.core.client.IteratorSetting) =&gt; x$2.toString()))(collection.this.Seq.canBuildFrom[String]).sorted[String](math.this.Ordering.String)).asJava
+        </td>
+      </tr><tr>
+        <td>
+          149
+        </td>
+        <td>
+          148
+        </td>
+        <td>
+          5994
+          -
+          6065
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          planData.put(&quot;iterators&quot;, scala.collection.JavaConverters.seqAsJavaListConverter[String](plan.iterators.map[String, Seq[String]](((x$2: org.apache.accumulo.core.client.IteratorSetting) =&gt; x$2.toString()))(collection.this.Seq.canBuildFrom[String]).sorted[String](math.this.Ordering.String)).asJava)
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          149
+        </td>
+        <td>
+          6123
+          -
+          6129
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;join&quot;
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          150
+        </td>
+        <td>
+          6131
+          -
+          6159
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.identifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          join.filter.index.identifier
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          151
+        </td>
+        <td>
+          6110
+          -
+          6160
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          planData.put(&quot;join&quot;, join.filter.index.identifier)
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          152
+        </td>
+        <td>
+          6110
+          -
+          6160
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.TreeMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          planData.put(&quot;join&quot;, join.filter.index.identifier)
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          153
+        </td>
+        <td>
+          6072
+          -
+          6162
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.join.foreach[AnyRef](((x0$1: (org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.JoinFunction, org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan)) =&gt; x0$1 match {
+  case (_1: org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.JoinFunction, _2: org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan)(org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.JoinFunction, org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan)(_, (join @ _)) =&gt; planData.put(&quot;join&quot;, join.filter.index.identifier)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          168
+        </td>
+        <td>
+          6169
+          -
+          6336
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.sort.foreach[AnyRef](((sort: Seq[(String, Boolean)]) =&gt; planData.put(&quot;sort&quot;, scala.collection.JavaConverters.seqAsJavaListConverter[String](sort.map[String, Seq[String]](((x0$2: (String, Boolean)) =&gt; x0$2 match {
+  case (_1: String, _2: Boolean)(String, Boolean)((field @ _), (descending @ _)) =&gt; scala.StringContext.apply(&quot;&quot;, &quot;:&quot;, &quot;&quot;).s(field, if (descending)
+    &quot;desc&quot;
+  else
+    &quot;asc&quot;)
+}))(collection.this.Seq.canBuildFrom[String])).asJava)))
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          154
+        </td>
+        <td>
+          6218
+          -
+          6224
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;sort&quot;
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          155
+        </td>
+        <td>
+          6267
+          -
+          6268
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          156
+        </td>
+        <td>
+          6273
+          -
+          6275
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;:&quot;
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          157
+        </td>
+        <td>
+          6318
+          -
+          6319
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          158
+        </td>
+        <td>
+          6294
+          -
+          6300
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;desc&quot;
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          159
+        </td>
+        <td>
+          6294
+          -
+          6300
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;desc&quot;
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          160
+        </td>
+        <td>
+          6310
+          -
+          6315
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;asc&quot;
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          161
+        </td>
+        <td>
+          6310
+          -
+          6315
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;asc&quot;
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          162
+        </td>
+        <td>
+          6265
+          -
+          6319
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;:&quot;, &quot;&quot;).s(field, if (descending)
+  &quot;desc&quot;
+else
+  &quot;asc&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          163
+        </td>
+        <td>
+          6265
+          -
+          6319
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;:&quot;, &quot;&quot;).s(field, if (descending)
+  &quot;desc&quot;
+else
+  &quot;asc&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          164
+        </td>
+        <td>
+          6235
+          -
+          6235
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[String]
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          165
+        </td>
+        <td>
+          6226
+          -
+          6320
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sort.map[String, Seq[String]](((x0$2: (String, Boolean)) =&gt; x0$2 match {
+  case (_1: String, _2: Boolean)(String, Boolean)((field @ _), (descending @ _)) =&gt; scala.StringContext.apply(&quot;&quot;, &quot;:&quot;, &quot;&quot;).s(field, if (descending)
+    &quot;desc&quot;
+  else
+    &quot;asc&quot;)
+}))(collection.this.Seq.canBuildFrom[String])
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          166
+        </td>
+        <td>
+          6226
+          -
+          6327
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.seqAsJavaListConverter[String](sort.map[String, Seq[String]](((x0$2: (String, Boolean)) =&gt; x0$2 match {
+  case (_1: String, _2: Boolean)(String, Boolean)((field @ _), (descending @ _)) =&gt; scala.StringContext.apply(&quot;&quot;, &quot;:&quot;, &quot;&quot;).s(field, if (descending)
+    &quot;desc&quot;
+  else
+    &quot;asc&quot;)
+}))(collection.this.Seq.canBuildFrom[String])).asJava
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          167
+        </td>
+        <td>
+          6205
+          -
+          6328
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          planData.put(&quot;sort&quot;, scala.collection.JavaConverters.seqAsJavaListConverter[String](sort.map[String, Seq[String]](((x0$2: (String, Boolean)) =&gt; x0$2 match {
+  case (_1: String, _2: Boolean)(String, Boolean)((field @ _), (descending @ _)) =&gt; scala.StringContext.apply(&quot;&quot;, &quot;:&quot;, &quot;&quot;).s(field, if (descending)
+    &quot;desc&quot;
+  else
+    &quot;asc&quot;)
+}))(collection.this.Seq.canBuildFrom[String])).asJava)
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          169
+        </td>
+        <td>
+          6386
+          -
+          6393
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;limit&quot;
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          170
+        </td>
+        <td>
+          6395
+          -
+          6405
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.box
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Int.box(m)
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          171
+        </td>
+        <td>
+          6373
+          -
+          6406
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.TreeMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          planData.put(&quot;limit&quot;, scala.Int.box(m))
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          172
+        </td>
+        <td>
+          6343
+          -
+          6407
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.maxFeatures.foreach[AnyRef](((m: Int) =&gt; planData.put(&quot;limit&quot;, scala.Int.box(m))))
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          175
+        </td>
+        <td>
+          6450
+          -
+          6462
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;queryPlans&quot;
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          176
+        </td>
+        <td>
+          6464
+          -
+          6479
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.seqAsJavaListConverter[java.util.TreeMap[String,AnyRef]](planMeta).asJava
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          177
+        </td>
+        <td>
+          6433
+          -
+          6480
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.of
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Map.of[String, AnyRef](&quot;queryPlans&quot;, scala.collection.JavaConverters.seqAsJavaListConverter[java.util.TreeMap[String,AnyRef]](planMeta).asJava)
+        </td>
+      </tr><tr>
+        <td>
+          161
+        </td>
+        <td>
+          178
+        </td>
+        <td>
+          6527
+          -
+          6561
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.compareAndSet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.running.compareAndSet(true, false)
+        </td>
+      </tr><tr>
+        <td>
+          161
+        </td>
+        <td>
+          193
+        </td>
+        <td>
+          6563
+          -
+          6973
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  AccumuloAuditWriter.this.scheduledRun.cancel(false);
+  try {
+    if (AccumuloAuditWriter.this.writeLock.tryLock())
+      AccumuloAuditWriter.this.writeQueuedEvents()
+    else
+      AccumuloAuditWriter.this.writeLock.lock();
+    if (AccumuloAuditWriter.this.writer.!=(null))
+      AccumuloAuditWriter.this.writer.close()
+    else
+      ()
+  } finally AccumuloAuditWriter.this.writeLock.unlock()
+}
+        </td>
+      </tr><tr>
+        <td>
+          161
+        </td>
+        <td>
+          194
+        </td>
+        <td>
+          6523
+          -
+          6523
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          161
+        </td>
+        <td>
+          195
+        </td>
+        <td>
+          6523
+          -
+          6523
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          179
+        </td>
+        <td>
+          6571
+          -
+          6597
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.cancel
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.scheduledRun.cancel(false)
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          190
+        </td>
+        <td>
+          6618
+          -
+          6914
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  if (AccumuloAuditWriter.this.writeLock.tryLock())
+    AccumuloAuditWriter.this.writeQueuedEvents()
+  else
+    AccumuloAuditWriter.this.writeLock.lock();
+  if (AccumuloAuditWriter.this.writer.!=(null))
+    AccumuloAuditWriter.this.writer.close()
+  else
+    ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          180
+        </td>
+        <td>
+          6622
+          -
+          6641
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.locks.ReentrantLock.tryLock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeLock.tryLock()
+        </td>
+      </tr><tr>
+        <td>
+          166
+        </td>
+        <td>
+          181
+        </td>
+        <td>
+          6724
+          -
+          6743
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.writeQueuedEvents
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeQueuedEvents()
+        </td>
+      </tr><tr>
+        <td>
+          166
+        </td>
+        <td>
+          182
+        </td>
+        <td>
+          6724
+          -
+          6743
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.audit.AccumuloAuditWriter.writeQueuedEvents
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeQueuedEvents()
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          183
+        </td>
+        <td>
+          6823
+          -
+          6839
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.locks.ReentrantLock.lock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeLock.lock()
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          184
+        </td>
+        <td>
+          6823
+          -
+          6839
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.concurrent.locks.ReentrantLock.lock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeLock.lock()
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          185
+        </td>
+        <td>
+          6862
+          -
+          6876
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writer.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          188
+        </td>
+        <td>
+          6858
+          -
+          6858
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          189
+        </td>
+        <td>
+          6858
+          -
+          6858
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          186
+        </td>
+        <td>
+          6890
+          -
+          6904
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.BatchWriter.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writer.close()
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          187
+        </td>
+        <td>
+          6890
+          -
+          6904
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.accumulo.core.client.BatchWriter.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writer.close()
+        </td>
+      </tr><tr>
+        <td>
+          175
+        </td>
+        <td>
+          191
+        </td>
+        <td>
+          6941
+          -
+          6959
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.locks.ReentrantLock.unlock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeLock.unlock()
+        </td>
+      </tr><tr>
+        <td>
+          175
+        </td>
+        <td>
+          192
+        </td>
+        <td>
+          6941
+          -
+          6959
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.concurrent.locks.ReentrantLock.unlock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AccumuloAuditWriter.this.writeLock.unlock()
+        </td>
+      </tr><tr>
+        <td>
+          183
+        </td>
+        <td>
+          196
+        </td>
+        <td>
+          7049
+          -
+          7111
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.apply(&quot;geomesa.accumulo.audit.interval&quot;, &quot;5 seconds&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          184
+        </td>
+        <td>
+          197
+        </td>
+        <td>
+          7152
+          -
+          7222
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.apply(&quot;geomesa.accumulo.audit.shutdown.timeout&quot;, &quot;5 seconds&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          186
+        </td>
+        <td>
+          198
+        </td>
+        <td>
+          7265
+          -
+          7299
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ScheduledThreadPoolExecutor.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.ScheduledThreadPoolExecutor(5)
+        </td>
+      </tr><tr>
+        <td>
+          186
+        </td>
+        <td>
+          199
+        </td>
+        <td>
+          7309
+          -
+          7313
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          186
+        </td>
+        <td>
+          200
+        </td>
+        <td>
+          7249
+          -
+          7314
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.concurrent.ExitingExecutor.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.concurrent.ExitingExecutor.apply[java.util.concurrent.ScheduledThreadPoolExecutor](new java.util.concurrent.ScheduledThreadPoolExecutor(5), true)
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>
