@@ -35,7 +35,7 @@
 </span>11 <span style=''>import org.apache.kafka.clients.admin._
 </span>12 <span style=''>import org.apache.kafka.clients.producer.ProducerRecord
 </span>13 <span style=''>import org.apache.kafka.common.config.ConfigResource
-</span>14 <span style=''>import org.apache.kafka.common.errors.{InterruptException, WakeupException}
+</span>14 <span style=''>import org.apache.kafka.common.errors.{InterruptException, TopicExistsException, WakeupException}
 </span>15 <span style=''>import org.locationtech.geomesa.index.metadata.{KeyValueStoreMetadata, MetadataSerializer}
 </span>16 <span style=''>import org.locationtech.geomesa.kafka.data.KafkaDataStore.KafkaDataStoreConfig
 </span>17 <span style=''>import org.locationtech.geomesa.kafka.versions.{KafkaAdminVersions, KafkaConsumerVersions}
@@ -47,8 +47,8 @@
 </span>23 <span style=''>import java.nio.charset.StandardCharsets
 </span>24 <span style=''>import java.time.Duration
 </span>25 <span style=''>import java.time.temporal.ChronoUnit
-</span>26 <span style=''>import java.util.concurrent.atomic.AtomicBoolean
-</span>27 <span style=''>import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Future, TimeUnit}
+</span>26 <span style=''>import java.util.concurrent._
+</span>27 <span style=''>import java.util.concurrent.atomic.AtomicBoolean
 </span>28 <span style=''>import java.util.{Collections, Properties, UUID}
 </span>29 <span style=''>import scala.util.Try
 </span>30 <span style=''>import scala.util.control.NonFatal
@@ -63,7 +63,7 @@
 </span>39 <span style=''>class KafkaMetadata[T](val config: KafkaDataStoreConfig, val serializer: MetadataSerializer[T])
 </span>40 <span style=''>    extends KeyValueStoreMetadata[T] {
 </span>41 <span style=''>
-</span>42 <span style=''>  import KafkaMetadata.{CompactCleanupPolicy, CleanupPolicyConfig}
+</span>42 <span style=''>  import KafkaMetadata.{CleanupPolicyConfig, CompactCleanupPolicy}
 </span>43 <span style=''>  import org.apache.kafka.clients.consumer.ConsumerConfig.{AUTO_OFFSET_RESET_CONFIG, GROUP_ID_CONFIG}
 </span>44 <span style=''>
 </span>45 <span style=''>  import scala.collection.JavaConverters._
@@ -72,223 +72,235 @@
 </span>48 <span style=''>  private val consumer = </span><span style='background: #AEF1AE'>new LazyCloseable(new TopicMap())</span><span style=''>
 </span>49 <span style=''>
 </span>50 <span style=''>  override protected def checkIfTableExists: Boolean = {
-</span>51 <span style=''>    </span><span style='background: #AEF1AE'>adminClientOp { adminClient=&gt;
+</span>51 <span style=''>    </span><span style='background: #AEF1AE'>adminClientOp { adminClient =&gt;
 </span>52 <span style=''></span><span style='background: #AEF1AE'>      val exists = adminClient.listTopics().names().get.contains(config.catalog)
-</span>53 <span style=''></span><span style='background: #AEF1AE'>      // ensure that the topic has compaction enabled, in case it was created externally
-</span>54 <span style=''></span><span style='background: #AEF1AE'>      if (exists &amp;&amp; !checkCompactionPolicy(adminClient)){
-</span>55 <span style=''></span><span style='background: #AEF1AE'>        setCompactionPolicy(adminClient)
+</span>53 <span style=''></span><span style='background: #AEF1AE'>      if (exists){
+</span>54 <span style=''></span><span style='background: #AEF1AE'>        // ensure that the topic has compaction enabled, in case it was created externally
+</span>55 <span style=''></span><span style='background: #AEF1AE'>        ensureCompactionPolicy(adminClient)
 </span>56 <span style=''></span><span style='background: #AEF1AE'>      }
 </span>57 <span style=''></span><span style='background: #AEF1AE'>      exists
 </span>58 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
 </span>59 <span style=''>  }
 </span>60 <span style=''>
-</span>61 <span style=''>  private def checkCompactionPolicy(kClient: AdminClient): Boolean = {
-</span>62 <span style=''>    val cr = </span><span style='background: #AEF1AE'>Collections.singleton(new ConfigResource(ConfigResource.Type.TOPIC, config.catalog))</span><span style=''>
-</span>63 <span style=''>    val catalogConfigs = </span><span style='background: #AEF1AE'>kClient.describeConfigs(cr).all().get().values()</span><span style=''>
-</span>64 <span style=''>    </span><span style='background: #AEF1AE'>catalogConfigs.asScala.exists { config =&gt;
-</span>65 <span style=''></span><span style='background: #AEF1AE'>      config.get(CleanupPolicyConfig) != null &amp;&amp; config.get(CleanupPolicyConfig).value() == CompactCleanupPolicy
-</span>66 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>67 <span style=''>  }
-</span>68 <span style=''>
-</span>69 <span style=''>  private def setCompactionPolicy(kClient: AdminClient): Unit ={
-</span>70 <span style=''>    val catalogResource = </span><span style='background: #AEF1AE'>new ConfigResource(ConfigResource.Type.TOPIC, config.catalog)</span><span style=''>
-</span>71 <span style=''>    val catalogConfigEntry = </span><span style='background: #AEF1AE'>new ConfigEntry(CleanupPolicyConfig, CompactCleanupPolicy)</span><span style=''>
-</span>72 <span style=''>    val alterOps = </span><span style='background: #AEF1AE'>Collections.singleton(new AlterConfigOp(catalogConfigEntry, AlterConfigOp.OpType.SET))</span><span style=''>
-</span>73 <span style=''>    </span><span style='background: #AEF1AE'>kClient.incrementalAlterConfigs(Collections.singletonMap(catalogResource, alterOps), new AlterConfigsOptions()).all().get()</span><span style=''>
-</span>74 <span style=''>  }
-</span>75 <span style=''>
-</span>76 <span style=''>  override protected def createTable(): Unit = {
-</span>77 <span style=''>    val newTopic =
-</span>78 <span style=''>      </span><span style='background: #AEF1AE'>new NewTopic(config.catalog, 1, config.topics.replication.toShort)
-</span>79 <span style=''></span><span style='background: #AEF1AE'>          .configs(Collections.singletonMap(CleanupPolicyConfig, CompactCleanupPolicy))</span><span style=''>
-</span>80 <span style=''>    </span><span style='background: #AEF1AE'>adminClientOp(_.createTopics(Collections.singletonList(newTopic)).all().get)</span><span style=''>
-</span>81 <span style=''>  }
-</span>82 <span style=''>
-</span>83 <span style=''>  override protected def createEmptyBackup(timestamp: String): KafkaMetadata[T] =
-</span>84 <span style=''>    </span><span style='background: #F0ADAD'>new KafkaMetadata(config.copy(catalog = s&quot;${config.catalog}_${timestamp}_bak&quot;), serializer)</span><span style=''>
-</span>85 <span style=''>
-</span>86 <span style=''>  override protected def write(rows: Seq[(Array[Byte], Array[Byte])]): Unit = {
-</span>87 <span style=''>    </span><span style='background: #AEF1AE'>rows.foreach { case (row, value) =&gt;
-</span>88 <span style=''></span><span style='background: #AEF1AE'>      producer.instance.send(new ProducerRecord(config.catalog, row, value))
-</span>89 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>90 <span style=''>    </span><span style='background: #AEF1AE'>producer.instance.flush()</span><span style=''>
-</span>91 <span style=''>  }
-</span>92 <span style=''>
-</span>93 <span style=''>  override protected def delete(rows: Seq[Array[Byte]]): Unit = {
-</span>94 <span style=''>    </span><span style='background: #AEF1AE'>rows.foreach { row =&gt;
-</span>95 <span style=''></span><span style='background: #AEF1AE'>      producer.instance.send(new ProducerRecord(config.catalog, row, null))
-</span>96 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>97 <span style=''>    </span><span style='background: #AEF1AE'>producer.instance.flush()</span><span style=''>
-</span>98 <span style=''>  }
-</span>99 <span style=''>
-</span>100 <span style=''>  override protected def scanValue(row: Array[Byte]): Option[Array[Byte]] = </span><span style='background: #AEF1AE'>consumer.instance.get(row)</span><span style=''>
-</span>101 <span style=''>
-</span>102 <span style=''>  override protected def scanRows(prefix: Option[Array[Byte]]): CloseableIterator[(Array[Byte], Array[Byte])] = {
-</span>103 <span style=''>    prefix match {
-</span>104 <span style=''>      case None =&gt; </span><span style='background: #AEF1AE'>consumer.instance.all()</span><span style=''>
-</span>105 <span style=''>      case Some(p) =&gt; </span><span style='background: #AEF1AE'>consumer.instance.prefix(p)</span><span style=''>
-</span>106 <span style=''>    }
-</span>107 <span style=''>  }
-</span>108 <span style=''>
-</span>109 <span style=''>  override def close(): Unit = </span><span style='background: #AEF1AE'>CloseWithLogging(Seq(producer, consumer))</span><span style=''>
-</span>110 <span style=''>
-</span>111 <span style=''>  private def adminClientOp[V](fn: AdminClient =&gt; V): V = {
-</span>112 <span style=''>    val props = </span><span style='background: #AEF1AE'>new Properties()</span><span style=''>
-</span>113 <span style=''>    </span><span style='background: #AEF1AE'>props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, config.brokers)</span><span style=''>
-</span>114 <span style=''>    </span><span style='background: #AEF1AE'>config.consumers.properties.foreach { case (k, v) =&gt; props.put(k, v) }</span><span style=''>
-</span>115 <span style=''>    </span><span style='background: #AEF1AE'>config.producers.properties.foreach { case (k, v) =&gt; </span><span style='background: #F0ADAD'>props.put(k, v)</span><span style='background: #AEF1AE'> }</span><span style=''>
-</span>116 <span style=''>    </span><span style='background: #AEF1AE'>WithClose(AdminClient.create(props)) { admin =&gt; fn(admin) }</span><span style=''>
-</span>117 <span style=''>  }
-</span>118 <span style=''>
-</span>119 <span style=''>  /**
-</span>120 <span style=''>   * Models the topic as a map of key-value pairs
-</span>121 <span style=''>   */
-</span>122 <span style=''>  private class TopicMap extends Runnable with Closeable {
-</span>123 <span style=''>
-</span>124 <span style=''>    private val groupId = </span><span style='background: #AEF1AE'>UUID.randomUUID().toString</span><span style=''>
-</span>125 <span style=''>    private val poll = </span><span style='background: #AEF1AE'>Duration.of(100, ChronoUnit.MILLIS)</span><span style=''>
-</span>126 <span style=''>
-</span>127 <span style=''>    private val state = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[KeyBytes, Array[Byte]]()</span><span style=''>
-</span>128 <span style=''>    private val complete = </span><span style='background: #AEF1AE'>new CountDownLatch(1)</span><span style=''>
-</span>129 <span style=''>    private val closed = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
+</span>61 <span style=''>  override protected def createTable(): Unit = {
+</span>62 <span style=''>    val newTopic =
+</span>63 <span style=''>      </span><span style='background: #AEF1AE'>new NewTopic(config.catalog, 1, config.topics.replication.toShort)
+</span>64 <span style=''></span><span style='background: #AEF1AE'>          .configs(Collections.singletonMap(CleanupPolicyConfig, CompactCleanupPolicy))</span><span style=''>
+</span>65 <span style=''>    </span><span style='background: #AEF1AE'>adminClientOp { adminClient =&gt;
+</span>66 <span style=''></span><span style='background: #AEF1AE'>      try {
+</span>67 <span style=''></span><span style='background: #AEF1AE'>        adminClient.createTopics(Collections.singletonList(newTopic)).all().get()
+</span>68 <span style=''></span><span style='background: #AEF1AE'>      } catch {
+</span>69 <span style=''></span><span style='background: #AEF1AE'>        case e: ExecutionException if e.getCause.isInstanceOf[TopicExistsException] =&gt;
+</span>70 <span style=''></span><span style='background: #AEF1AE'>          // already created somewhere else
+</span>71 <span style=''></span><span style='background: #AEF1AE'>          // ensure that the topic has compaction enabled, in case it was created externally
+</span>72 <span style=''></span><span style='background: #AEF1AE'>          ensureCompactionPolicy(adminClient)
+</span>73 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>74 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>75 <span style=''>  }
+</span>76 <span style=''>
+</span>77 <span style=''>  override protected def createEmptyBackup(timestamp: String): KafkaMetadata[T] =
+</span>78 <span style=''>    </span><span style='background: #F0ADAD'>new KafkaMetadata(config.copy(catalog = s&quot;${config.catalog}_${timestamp}_bak&quot;), serializer)</span><span style=''>
+</span>79 <span style=''>
+</span>80 <span style=''>  override protected def write(rows: Seq[(Array[Byte], Array[Byte])]): Unit = {
+</span>81 <span style=''>    </span><span style='background: #AEF1AE'>rows.foreach { case (row, value) =&gt;
+</span>82 <span style=''></span><span style='background: #AEF1AE'>      producer.instance.send(new ProducerRecord(config.catalog, row, value))
+</span>83 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>84 <span style=''>    </span><span style='background: #AEF1AE'>producer.instance.flush()</span><span style=''>
+</span>85 <span style=''>  }
+</span>86 <span style=''>
+</span>87 <span style=''>  override protected def delete(rows: Seq[Array[Byte]]): Unit = {
+</span>88 <span style=''>    </span><span style='background: #AEF1AE'>rows.foreach { row =&gt;
+</span>89 <span style=''></span><span style='background: #AEF1AE'>      producer.instance.send(new ProducerRecord(config.catalog, row, null))
+</span>90 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>91 <span style=''>    </span><span style='background: #AEF1AE'>producer.instance.flush()</span><span style=''>
+</span>92 <span style=''>  }
+</span>93 <span style=''>
+</span>94 <span style=''>  override protected def scanValue(row: Array[Byte]): Option[Array[Byte]] = </span><span style='background: #AEF1AE'>consumer.instance.get(row)</span><span style=''>
+</span>95 <span style=''>
+</span>96 <span style=''>  override protected def scanRows(prefix: Option[Array[Byte]]): CloseableIterator[(Array[Byte], Array[Byte])] = {
+</span>97 <span style=''>    prefix match {
+</span>98 <span style=''>      case None =&gt; </span><span style='background: #AEF1AE'>consumer.instance.all()</span><span style=''>
+</span>99 <span style=''>      case Some(p) =&gt; </span><span style='background: #AEF1AE'>consumer.instance.prefix(p)</span><span style=''>
+</span>100 <span style=''>    }
+</span>101 <span style=''>  }
+</span>102 <span style=''>
+</span>103 <span style=''>  override def close(): Unit = </span><span style='background: #AEF1AE'>CloseWithLogging(Seq(producer, consumer))</span><span style=''>
+</span>104 <span style=''>
+</span>105 <span style=''>  /**
+</span>106 <span style=''>   * Ensure that the topic has a cleanup policy of 'compact', so that feature types aren't aged off
+</span>107 <span style=''>   *
+</span>108 <span style=''>   * @param adminClient admin client
+</span>109 <span style=''>   */
+</span>110 <span style=''>  private def ensureCompactionPolicy(adminClient: AdminClient): Unit = {
+</span>111 <span style=''>    val catalogResource = </span><span style='background: #AEF1AE'>new ConfigResource(ConfigResource.Type.TOPIC, config.catalog)</span><span style=''>
+</span>112 <span style=''>    val catalogConfigs = </span><span style='background: #AEF1AE'>adminClient.describeConfigs(Collections.singleton(catalogResource)).all().get().values()</span><span style=''>
+</span>113 <span style=''>    val isCompact = </span><span style='background: #AEF1AE'>catalogConfigs.asScala.exists { config =&gt;
+</span>114 <span style=''></span><span style='background: #AEF1AE'>      config.get(CleanupPolicyConfig) != null &amp;&amp; config.get(CleanupPolicyConfig).value() == CompactCleanupPolicy
+</span>115 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>116 <span style=''>    if (</span><span style='background: #AEF1AE'>!isCompact</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>117 <span style=''></span><span style='background: #AEF1AE'>      val catalogConfigEntry = new ConfigEntry(CleanupPolicyConfig, CompactCleanupPolicy)
+</span>118 <span style=''></span><span style='background: #AEF1AE'>      val alterOps = Collections.singleton(new AlterConfigOp(catalogConfigEntry, AlterConfigOp.OpType.SET))
+</span>119 <span style=''></span><span style='background: #AEF1AE'>      adminClient.incrementalAlterConfigs(Collections.singletonMap(catalogResource, alterOps)).all().get()
+</span>120 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>121 <span style=''>  }
+</span>122 <span style=''>
+</span>123 <span style=''>  private def adminClientOp[V](fn: AdminClient =&gt; V): V = {
+</span>124 <span style=''>    val props = </span><span style='background: #AEF1AE'>new Properties()</span><span style=''>
+</span>125 <span style=''>    </span><span style='background: #AEF1AE'>props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, config.brokers)</span><span style=''>
+</span>126 <span style=''>    </span><span style='background: #AEF1AE'>config.consumers.properties.foreach { case (k, v) =&gt; props.put(k, v) }</span><span style=''>
+</span>127 <span style=''>    </span><span style='background: #AEF1AE'>config.producers.properties.foreach { case (k, v) =&gt; </span><span style='background: #F0ADAD'>props.put(k, v)</span><span style='background: #AEF1AE'> }</span><span style=''>
+</span>128 <span style=''>    </span><span style='background: #AEF1AE'>WithClose(AdminClient.create(props)) { admin =&gt; fn(admin) }</span><span style=''>
+</span>129 <span style=''>  }
 </span>130 <span style=''>
-</span>131 <span style=''>    private val consumer =
-</span>132 <span style=''>      </span><span style='background: #AEF1AE'>KafkaDataStore.consumer(config.brokers,
-</span>133 <span style=''></span><span style='background: #AEF1AE'>        config.consumers.properties ++ Map(GROUP_ID_CONFIG -&gt; groupId, AUTO_OFFSET_RESET_CONFIG -&gt; &quot;earliest&quot;))</span><span style=''>
-</span>134 <span style=''>
-</span>135 <span style=''>    private var future: Future[_] = _
-</span>136 <span style=''>
-</span>137 <span style=''>    </span><span style='background: #AEF1AE'>KafkaConsumerVersions.subscribe(consumer, config.catalog)</span><span style=''>
-</span>138 <span style=''>    </span><span style='background: #AEF1AE'>doInitialLoad()</span><span style=''>
-</span>139 <span style=''>
-</span>140 <span style=''>    override def run(): Unit = {
-</span>141 <span style=''>      try {
-</span>142 <span style=''>        </span><span style='background: #AEF1AE'>var interrupted = Thread.currentThread().isInterrupted
-</span>143 <span style=''></span><span style='background: #AEF1AE'>        while (!interrupted) {
-</span>144 <span style=''></span><span style='background: #AEF1AE'>          try {
-</span>145 <span style=''></span><span style='background: #AEF1AE'>            val result = KafkaConsumerVersions.poll(consumer, poll)
-</span>146 <span style=''></span><span style='background: #AEF1AE'>            if (!result.isEmpty) {
-</span>147 <span style=''></span><span style='background: #AEF1AE'>              val records = result.iterator()
-</span>148 <span style=''></span><span style='background: #AEF1AE'>              while (records.hasNext) {
-</span>149 <span style=''></span><span style='background: #AEF1AE'>                val r = records.next()
-</span>150 <span style=''></span><span style='background: #AEF1AE'>                val v = r.value()
-</span>151 <span style=''></span><span style='background: #AEF1AE'>                if (v == null) {
-</span>152 <span style=''></span><span style='background: #AEF1AE'>                  state.remove(KeyBytes(r.key()))
-</span>153 <span style=''></span><span style='background: #AEF1AE'>                } else {
-</span>154 <span style=''></span><span style='background: #AEF1AE'>                  </span><span style='background: #F0ADAD'>state.put(KeyBytes(r.key()), v)</span><span style='background: #AEF1AE'>
-</span>155 <span style=''></span><span style='background: #AEF1AE'>                }
-</span>156 <span style=''></span><span style='background: #AEF1AE'>              }
-</span>157 <span style=''></span><span style='background: #AEF1AE'>              consumer.commitAsync()
-</span>158 <span style=''></span><span style='background: #AEF1AE'>            }
-</span>159 <span style=''></span><span style='background: #AEF1AE'>          } catch {
-</span>160 <span style=''></span><span style='background: #AEF1AE'>            case _: WakeupException | _: InterruptException | _: InterruptedException =&gt; interrupted = true
-</span>161 <span style=''></span><span style='background: #AEF1AE'>            case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt;
-</span>162 <span style=''></span><span style='background: #F0ADAD'>              logger.warn(s&quot;Consumer [$groupId] error receiving message from topic:&quot;, e)
-</span>163 <span style=''></span><span style='background: #F0ADAD'>              Thread.sleep(1000)</span><span style='background: #AEF1AE'>
-</span>164 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>165 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
-</span>166 <span style=''>      } finally {
-</span>167 <span style=''>        </span><span style='background: #AEF1AE'>complete.countDown()</span><span style=''>
-</span>168 <span style=''>      }
-</span>169 <span style=''>    }
-</span>170 <span style=''>
-</span>171 <span style=''>    private def doInitialLoad(): Unit = {
-</span>172 <span style=''>      try {
-</span>173 <span style=''>        </span><span style='background: #AEF1AE'>val offsets = scala.collection.mutable.Map.empty[Int, Long]
-</span>174 <span style=''></span><span style='background: #AEF1AE'>        // noinspection RedundantCollectionConversion
-</span>175 <span style=''></span><span style='background: #AEF1AE'>        val partitions = consumer.partitionsFor(config.catalog).asScala.map(_.partition).toSeq
-</span>176 <span style=''></span><span style='background: #AEF1AE'>        // note: end offsets are the *next* offset that will be returned, so subtract one to track the last offset
-</span>177 <span style=''></span><span style='background: #AEF1AE'>        // we will actually consume
-</span>178 <span style=''></span><span style='background: #AEF1AE'>        offsets ++=
-</span>179 <span style=''></span><span style='background: #AEF1AE'>            KafkaConsumerVersions.endOffsets(consumer, config.catalog, partitions)
-</span>180 <span style=''></span><span style='background: #AEF1AE'>                .collect { case (p, o) if o &gt; 0 =&gt; (p, o - 1) }
-</span>181 <span style=''></span><span style='background: #AEF1AE'>        while (offsets.nonEmpty) {
-</span>182 <span style=''></span><span style='background: #AEF1AE'>          val result = KafkaConsumerVersions.poll(consumer, poll)
-</span>183 <span style=''></span><span style='background: #AEF1AE'>          if (!result.isEmpty) {
-</span>184 <span style=''></span><span style='background: #AEF1AE'>            val records = result.iterator()
-</span>185 <span style=''></span><span style='background: #AEF1AE'>            while (records.hasNext) {
-</span>186 <span style=''></span><span style='background: #AEF1AE'>              val r = records.next()
-</span>187 <span style=''></span><span style='background: #AEF1AE'>              val v = r.value()
-</span>188 <span style=''></span><span style='background: #AEF1AE'>              if (v == null) {
-</span>189 <span style=''></span><span style='background: #AEF1AE'>                </span><span style='background: #F0ADAD'>state.remove(KeyBytes(r.key()))</span><span style='background: #AEF1AE'>
-</span>190 <span style=''></span><span style='background: #AEF1AE'>              } else {
-</span>191 <span style=''></span><span style='background: #AEF1AE'>                state.put(KeyBytes(r.key()), v)
-</span>192 <span style=''></span><span style='background: #AEF1AE'>              }
-</span>193 <span style=''></span><span style='background: #AEF1AE'>              if (offsets.get(r.partition()).exists(o =&gt; r.offset() &gt;= o)) {
-</span>194 <span style=''></span><span style='background: #AEF1AE'>                offsets.remove(r.partition())
-</span>195 <span style=''></span><span style='background: #AEF1AE'>              }
-</span>196 <span style=''></span><span style='background: #AEF1AE'>            }
-</span>197 <span style=''></span><span style='background: #AEF1AE'>            consumer.commitAsync()
-</span>198 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>199 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>200 <span style=''></span><span style='background: #AEF1AE'>        lazy val stateStrings =
-</span>201 <span style=''></span><span style='background: #AEF1AE'>          state.asScala.map { case (k, v) =&gt; new String(k.bytes, StandardCharsets.UTF_8) -&gt; new String(v, StandardCharsets.UTF_8)}
-</span>202 <span style=''></span><span style='background: #AEF1AE'>        logger.debug(s&quot;Completed initial load of catalog '${config.catalog}': \n  ${stateStrings.mkString(&quot;\n  &quot;)}&quot;)
-</span>203 <span style=''></span><span style='background: #AEF1AE'>
-</span>204 <span style=''></span><span style='background: #AEF1AE'>        future = CachedThreadPool.submit(this)
-</span>205 <span style=''></span><span style='background: #AEF1AE'>        sys.addShutdownHook(future.cancel(true))</span><span style=''> // prevent consumer from hanging if ds isn't disposed properly
-</span>206 <span style=''>      } catch {
-</span>207 <span style=''>        case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt; complete.countDown(); throw e</span><span style=''>
-</span>208 <span style=''>      }
-</span>209 <span style=''>    }
-</span>210 <span style=''>
-</span>211 <span style=''>    def get(key: Array[Byte]): Option[Array[Byte]] = </span><span style='background: #AEF1AE'>Option(state.get(KeyBytes(key)))</span><span style=''>
-</span>212 <span style=''>
-</span>213 <span style=''>    def all(): CloseableIterator[(Array[Byte], Array[Byte])] =
-</span>214 <span style=''>      </span><span style='background: #AEF1AE'>CloseableIterator(state.asScala.iterator.map { case (k, v) =&gt; k.bytes -&gt; v })</span><span style=''>
-</span>215 <span style=''>
-</span>216 <span style=''>    def prefix(prefix: Array[Byte]): CloseableIterator[(Array[Byte], Array[Byte])] =
-</span>217 <span style=''>      </span><span style='background: #AEF1AE'>all().filter { case (k, _) =&gt; k.startsWith(prefix) }</span><span style=''>
-</span>218 <span style=''>
-</span>219 <span style=''>    override def close(): Unit = {
-</span>220 <span style=''>      try {
-</span>221 <span style=''>        </span><span style='background: #AEF1AE'>if (future != null) {
-</span>222 <span style=''></span><span style='background: #AEF1AE'>          future.cancel(true)
-</span>223 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>224 <span style=''></span><span style='background: #AEF1AE'>        complete.await(10, TimeUnit.SECONDS)</span><span style=''>
-</span>225 <span style=''>      } finally {
-</span>226 <span style=''>        // avoid checking consumer assignment if consumer is already closed, which will throw an error
-</span>227 <span style=''>        </span><span style='background: #AEF1AE'>if (closed.compareAndSet(false, true)) {
-</span>228 <span style=''></span><span style='background: #AEF1AE'>          cleanupConsumer()
-</span>229 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
-</span>230 <span style=''>      }
-</span>231 <span style=''>    }
-</span>232 <span style=''>
-</span>233 <span style=''>    private def cleanupConsumer(): Unit = {
-</span>234 <span style=''>      try {
-</span>235 <span style=''>        </span><span style='background: #AEF1AE'>val topics = consumer.assignment()
-</span>236 <span style=''></span><span style='background: #AEF1AE'>        consumer.unsubscribe()
-</span>237 <span style=''></span><span style='background: #AEF1AE'>        if (!topics.isEmpty) {
-</span>238 <span style=''></span><span style='background: #AEF1AE'>          Try(adminClientOp(KafkaAdminVersions.deleteConsumerGroupOffsets(_, groupId, topics))).failed.foreach { e =&gt;
-</span>239 <span style=''></span><span style='background: #AEF1AE'>            logger.warn(&quot;Error deleting consumer group offsets:&quot;, e)
-</span>240 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>131 <span style=''>  /**
+</span>132 <span style=''>   * Models the topic as a map of key-value pairs
+</span>133 <span style=''>   */
+</span>134 <span style=''>  private class TopicMap extends Runnable with Closeable {
+</span>135 <span style=''>
+</span>136 <span style=''>    private val groupId = </span><span style='background: #AEF1AE'>UUID.randomUUID().toString</span><span style=''>
+</span>137 <span style=''>    private val poll = </span><span style='background: #AEF1AE'>Duration.of(100, ChronoUnit.MILLIS)</span><span style=''>
+</span>138 <span style=''>
+</span>139 <span style=''>    private val state = </span><span style='background: #AEF1AE'>new ConcurrentHashMap[KeyBytes, Array[Byte]]()</span><span style=''>
+</span>140 <span style=''>    private val complete = </span><span style='background: #AEF1AE'>new CountDownLatch(1)</span><span style=''>
+</span>141 <span style=''>    private val closed = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
+</span>142 <span style=''>
+</span>143 <span style=''>    private val consumer =
+</span>144 <span style=''>      </span><span style='background: #AEF1AE'>KafkaDataStore.consumer(config.brokers,
+</span>145 <span style=''></span><span style='background: #AEF1AE'>        config.consumers.properties ++ Map(GROUP_ID_CONFIG -&gt; groupId, AUTO_OFFSET_RESET_CONFIG -&gt; &quot;earliest&quot;))</span><span style=''>
+</span>146 <span style=''>
+</span>147 <span style=''>    private var future: Future[_] = _
+</span>148 <span style=''>
+</span>149 <span style=''>    </span><span style='background: #AEF1AE'>KafkaConsumerVersions.subscribe(consumer, config.catalog)</span><span style=''>
+</span>150 <span style=''>    </span><span style='background: #AEF1AE'>doInitialLoad()</span><span style=''>
+</span>151 <span style=''>
+</span>152 <span style=''>    override def run(): Unit = {
+</span>153 <span style=''>      try {
+</span>154 <span style=''>        </span><span style='background: #AEF1AE'>var interrupted = Thread.currentThread().isInterrupted
+</span>155 <span style=''></span><span style='background: #AEF1AE'>        while (!interrupted) {
+</span>156 <span style=''></span><span style='background: #AEF1AE'>          try {
+</span>157 <span style=''></span><span style='background: #AEF1AE'>            val result = KafkaConsumerVersions.poll(consumer, poll)
+</span>158 <span style=''></span><span style='background: #AEF1AE'>            if (!result.isEmpty) {
+</span>159 <span style=''></span><span style='background: #AEF1AE'>              val records = result.iterator()
+</span>160 <span style=''></span><span style='background: #AEF1AE'>              while (records.hasNext) {
+</span>161 <span style=''></span><span style='background: #AEF1AE'>                val r = records.next()
+</span>162 <span style=''></span><span style='background: #AEF1AE'>                val v = r.value()
+</span>163 <span style=''></span><span style='background: #AEF1AE'>                if (v == null) {
+</span>164 <span style=''></span><span style='background: #AEF1AE'>                  state.remove(KeyBytes(r.key()))
+</span>165 <span style=''></span><span style='background: #AEF1AE'>                } else {
+</span>166 <span style=''></span><span style='background: #AEF1AE'>                  </span><span style='background: #F0ADAD'>state.put(KeyBytes(r.key()), v)</span><span style='background: #AEF1AE'>
+</span>167 <span style=''></span><span style='background: #AEF1AE'>                }
+</span>168 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>169 <span style=''></span><span style='background: #AEF1AE'>              consumer.commitAsync()
+</span>170 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>171 <span style=''></span><span style='background: #AEF1AE'>          } catch {
+</span>172 <span style=''></span><span style='background: #AEF1AE'>            case _: WakeupException | _: InterruptException | _: InterruptedException =&gt; interrupted = true
+</span>173 <span style=''></span><span style='background: #AEF1AE'>            case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt;
+</span>174 <span style=''></span><span style='background: #F0ADAD'>              logger.warn(s&quot;Consumer [$groupId] error receiving message from topic:&quot;, e)
+</span>175 <span style=''></span><span style='background: #F0ADAD'>              Thread.sleep(1000)</span><span style='background: #AEF1AE'>
+</span>176 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>177 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>178 <span style=''>      } finally {
+</span>179 <span style=''>        </span><span style='background: #AEF1AE'>complete.countDown()</span><span style=''>
+</span>180 <span style=''>      }
+</span>181 <span style=''>    }
+</span>182 <span style=''>
+</span>183 <span style=''>    private def doInitialLoad(): Unit = {
+</span>184 <span style=''>      try {
+</span>185 <span style=''>        </span><span style='background: #AEF1AE'>val offsets = scala.collection.mutable.Map.empty[Int, Long]
+</span>186 <span style=''></span><span style='background: #AEF1AE'>        // noinspection RedundantCollectionConversion
+</span>187 <span style=''></span><span style='background: #AEF1AE'>        val partitions = consumer.partitionsFor(config.catalog).asScala.map(_.partition).toSeq
+</span>188 <span style=''></span><span style='background: #AEF1AE'>        // note: end offsets are the *next* offset that will be returned, so subtract one to track the last offset
+</span>189 <span style=''></span><span style='background: #AEF1AE'>        // we will actually consume
+</span>190 <span style=''></span><span style='background: #AEF1AE'>        offsets ++=
+</span>191 <span style=''></span><span style='background: #AEF1AE'>            KafkaConsumerVersions.endOffsets(consumer, config.catalog, partitions)
+</span>192 <span style=''></span><span style='background: #AEF1AE'>                .collect { case (p, o) if o &gt; 0 =&gt; (p, o - 1) }
+</span>193 <span style=''></span><span style='background: #AEF1AE'>        while (offsets.nonEmpty) {
+</span>194 <span style=''></span><span style='background: #AEF1AE'>          val result = KafkaConsumerVersions.poll(consumer, poll)
+</span>195 <span style=''></span><span style='background: #AEF1AE'>          if (!result.isEmpty) {
+</span>196 <span style=''></span><span style='background: #AEF1AE'>            val records = result.iterator()
+</span>197 <span style=''></span><span style='background: #AEF1AE'>            while (records.hasNext) {
+</span>198 <span style=''></span><span style='background: #AEF1AE'>              val r = records.next()
+</span>199 <span style=''></span><span style='background: #AEF1AE'>              val v = r.value()
+</span>200 <span style=''></span><span style='background: #AEF1AE'>              if (v == null) {
+</span>201 <span style=''></span><span style='background: #AEF1AE'>                </span><span style='background: #F0ADAD'>state.remove(KeyBytes(r.key()))</span><span style='background: #AEF1AE'>
+</span>202 <span style=''></span><span style='background: #AEF1AE'>              } else {
+</span>203 <span style=''></span><span style='background: #AEF1AE'>                state.put(KeyBytes(r.key()), v)
+</span>204 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>205 <span style=''></span><span style='background: #AEF1AE'>              if (offsets.get(r.partition()).exists(o =&gt; r.offset() &gt;= o)) {
+</span>206 <span style=''></span><span style='background: #AEF1AE'>                offsets.remove(r.partition())
+</span>207 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>208 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>209 <span style=''></span><span style='background: #AEF1AE'>            consumer.commitAsync()
+</span>210 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>211 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>212 <span style=''></span><span style='background: #AEF1AE'>        lazy val stateStrings =
+</span>213 <span style=''></span><span style='background: #AEF1AE'>          state.asScala.map { case (k, v) =&gt; new String(k.bytes, StandardCharsets.UTF_8) -&gt; new String(v, StandardCharsets.UTF_8)}
+</span>214 <span style=''></span><span style='background: #AEF1AE'>        logger.debug(s&quot;Completed initial load of catalog '${config.catalog}': \n  ${stateStrings.mkString(&quot;\n  &quot;)}&quot;)
+</span>215 <span style=''></span><span style='background: #AEF1AE'>
+</span>216 <span style=''></span><span style='background: #AEF1AE'>        future = CachedThreadPool.submit(this)
+</span>217 <span style=''></span><span style='background: #AEF1AE'>        sys.addShutdownHook(future.cancel(true))</span><span style=''> // prevent consumer from hanging if ds isn't disposed properly
+</span>218 <span style=''>      } catch {
+</span>219 <span style=''>        case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt; complete.countDown(); throw e</span><span style=''>
+</span>220 <span style=''>      }
+</span>221 <span style=''>    }
+</span>222 <span style=''>
+</span>223 <span style=''>    def get(key: Array[Byte]): Option[Array[Byte]] = </span><span style='background: #AEF1AE'>Option(state.get(KeyBytes(key)))</span><span style=''>
+</span>224 <span style=''>
+</span>225 <span style=''>    def all(): CloseableIterator[(Array[Byte], Array[Byte])] =
+</span>226 <span style=''>      </span><span style='background: #AEF1AE'>CloseableIterator(state.asScala.iterator.map { case (k, v) =&gt; k.bytes -&gt; v })</span><span style=''>
+</span>227 <span style=''>
+</span>228 <span style=''>    def prefix(prefix: Array[Byte]): CloseableIterator[(Array[Byte], Array[Byte])] =
+</span>229 <span style=''>      </span><span style='background: #AEF1AE'>all().filter { case (k, _) =&gt; k.startsWith(prefix) }</span><span style=''>
+</span>230 <span style=''>
+</span>231 <span style=''>    override def close(): Unit = {
+</span>232 <span style=''>      try {
+</span>233 <span style=''>        </span><span style='background: #AEF1AE'>if (future != null) {
+</span>234 <span style=''></span><span style='background: #AEF1AE'>          future.cancel(true)
+</span>235 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>236 <span style=''></span><span style='background: #AEF1AE'>        complete.await(10, TimeUnit.SECONDS)</span><span style=''>
+</span>237 <span style=''>      } finally {
+</span>238 <span style=''>        // avoid checking consumer assignment if consumer is already closed, which will throw an error
+</span>239 <span style=''>        </span><span style='background: #AEF1AE'>if (closed.compareAndSet(false, true)) {
+</span>240 <span style=''></span><span style='background: #AEF1AE'>          cleanupConsumer()
 </span>241 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
-</span>242 <span style=''>      } finally {
-</span>243 <span style=''>        </span><span style='background: #AEF1AE'>consumer.close()</span><span style=''>
-</span>244 <span style=''>      }
-</span>245 <span style=''>    }
-</span>246 <span style=''>  }
-</span>247 <span style=''>
-</span>248 <span style=''>  /**
-</span>249 <span style=''>   * Supports using a byte array as a map key
-</span>250 <span style=''>   *
-</span>251 <span style=''>   * @param bytes bytes
-</span>252 <span style=''>   */
-</span>253 <span style=''>  private case class KeyBytes(bytes: Array[Byte]) {
-</span>254 <span style=''>    override def hashCode(): Int = </span><span style='background: #AEF1AE'>java.util.Arrays.hashCode(bytes)</span><span style=''>
-</span>255 <span style=''>    override def equals(obj: Any): Boolean = {
-</span>256 <span style=''>      obj match {
-</span>257 <span style=''>        case KeyBytes(other) =&gt; </span><span style='background: #AEF1AE'>java.util.Arrays.equals(bytes, other)</span><span style=''>
-</span>258 <span style=''>        case _ =&gt; </span><span style='background: #F0ADAD'>false</span><span style=''>
-</span>259 <span style=''>      }
-</span>260 <span style=''>    }
-</span>261 <span style=''>  }
-</span>262 <span style=''>}
-</span>263 <span style=''>
-</span>264 <span style=''>object KafkaMetadata {
-</span>265 <span style=''>  private val CleanupPolicyConfig = </span><span style='background: #AEF1AE'>&quot;cleanup.policy&quot;</span><span style=''>
-</span>266 <span style=''>  private val CompactCleanupPolicy = </span><span style='background: #AEF1AE'>&quot;compact&quot;</span><span style=''>
-</span>267 <span style=''>}
+</span>242 <span style=''>      }
+</span>243 <span style=''>    }
+</span>244 <span style=''>
+</span>245 <span style=''>    private def cleanupConsumer(): Unit = {
+</span>246 <span style=''>      try {
+</span>247 <span style=''>        </span><span style='background: #AEF1AE'>val topics = consumer.assignment()
+</span>248 <span style=''></span><span style='background: #AEF1AE'>        consumer.unsubscribe()
+</span>249 <span style=''></span><span style='background: #AEF1AE'>        if (!topics.isEmpty) {
+</span>250 <span style=''></span><span style='background: #AEF1AE'>          Try(adminClientOp(KafkaAdminVersions.deleteConsumerGroupOffsets(_, groupId, topics))).failed.foreach { e =&gt;
+</span>251 <span style=''></span><span style='background: #AEF1AE'>            logger.warn(&quot;Error deleting consumer group offsets:&quot;, e)
+</span>252 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>253 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>254 <span style=''>      } finally {
+</span>255 <span style=''>        </span><span style='background: #AEF1AE'>consumer.close()</span><span style=''>
+</span>256 <span style=''>      }
+</span>257 <span style=''>    }
+</span>258 <span style=''>  }
+</span>259 <span style=''>
+</span>260 <span style=''>  /**
+</span>261 <span style=''>   * Supports using a byte array as a map key
+</span>262 <span style=''>   *
+</span>263 <span style=''>   * @param bytes bytes
+</span>264 <span style=''>   */
+</span>265 <span style=''>  private case class KeyBytes(bytes: Array[Byte]) {
+</span>266 <span style=''>    override def hashCode(): Int = </span><span style='background: #AEF1AE'>java.util.Arrays.hashCode(bytes)</span><span style=''>
+</span>267 <span style=''>    override def equals(obj: Any): Boolean = {
+</span>268 <span style=''>      obj match {
+</span>269 <span style=''>        case KeyBytes(other) =&gt; </span><span style='background: #AEF1AE'>java.util.Arrays.equals(bytes, other)</span><span style=''>
+</span>270 <span style=''>        case _ =&gt; </span><span style='background: #F0ADAD'>false</span><span style=''>
+</span>271 <span style=''>      }
+</span>272 <span style=''>    }
+</span>273 <span style=''>  }
+</span>274 <span style=''>}
+</span>275 <span style=''>
+</span>276 <span style=''>object KafkaMetadata {
+</span>277 <span style=''>  private val CleanupPolicyConfig = </span><span style='background: #AEF1AE'>&quot;cleanup.policy&quot;</span><span style=''>
+</span>278 <span style=''>  private val CompactCleanupPolicy = </span><span style='background: #AEF1AE'>&quot;compact&quot;</span><span style=''>
+</span>279 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -309,9 +321,9 @@
           96179
         </td>
         <td>
-          2142
+          2112
           -
-          2156
+          2126
         </td>
         <td>
           Select
@@ -333,9 +345,9 @@
           96181
         </td>
         <td>
-          2118
+          2088
           -
-          2186
+          2156
         </td>
         <td>
           Apply
@@ -357,9 +369,9 @@
           96180
         </td>
         <td>
-          2158
+          2128
           -
-          2185
+          2155
         </td>
         <td>
           Select
@@ -381,9 +393,9 @@
           96182
         </td>
         <td>
-          2101
+          2071
           -
-          2187
+          2157
         </td>
         <td>
           Apply
@@ -405,9 +417,9 @@
           96183
         </td>
         <td>
-          2231
+          2201
           -
-          2245
+          2215
         </td>
         <td>
           Apply
@@ -429,9 +441,9 @@
           96185
         </td>
         <td>
-          2213
+          2183
           -
-          2246
+          2216
         </td>
         <td>
           ApplyToImplicitArgs
@@ -453,9 +465,9 @@
           96184
         </td>
         <td>
-          2213
+          2183
           -
-          2213
+          2183
         </td>
         <td>
           Select
@@ -474,12 +486,12 @@
           51
         </td>
         <td>
-          96194
+          96192
         </td>
         <td>
-          2309
+          2279
           -
-          2634
+          2571
         </td>
         <td>
           Apply
@@ -493,8 +505,8 @@
         <td style="background: #AEF1AE">
           KafkaMetadata.this.adminClientOp[Boolean](((adminClient: org.apache.kafka.clients.admin.AdminClient) =&gt; {
   val exists: Boolean = adminClient.listTopics().names().get().contains(KafkaMetadata.this.config.catalog);
-  if (exists.&amp;&amp;(KafkaMetadata.this.checkCompactionPolicy(adminClient).unary_!))
-    KafkaMetadata.this.setCompactionPolicy(adminClient)
+  if (exists)
+    KafkaMetadata.this.ensureCompactionPolicy(adminClient)
   else
     ();
   exists
@@ -508,9 +520,9 @@
           96187
         </td>
         <td>
-          2358
+          2329
           -
-          2419
+          2390
         </td>
         <td>
           Apply
@@ -532,9 +544,9 @@
           96186
         </td>
         <td>
-          2404
+          2375
           -
-          2418
+          2389
         </td>
         <td>
           Select
@@ -550,159 +562,39 @@
         </td>
       </tr><tr>
         <td>
-          54
-        </td>
-        <td>
-          96189
-        </td>
-        <td>
-          2519
-          -
-          2564
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Boolean.&amp;&amp;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          exists.&amp;&amp;(KafkaMetadata.this.checkCompactionPolicy(adminClient).unary_!)
-        </td>
-      </tr><tr>
-        <td>
-          54
-        </td>
-        <td>
-          96188
-        </td>
-        <td>
-          2529
-          -
-          2564
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.Boolean.unary_!
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.this.checkCompactionPolicy(adminClient).unary_!
-        </td>
-      </tr><tr>
-        <td>
-          54
-        </td>
-        <td>
-          96193
-        </td>
-        <td>
-          2515
-          -
-          2515
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          54
-        </td>
-        <td>
-          96192
-        </td>
-        <td>
-          2515
-          -
-          2515
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          55
+          53
         </td>
         <td>
           96191
         </td>
         <td>
-          2575
+          2397
           -
-          2607
+          2397
         </td>
         <td>
           Block
         </td>
         <td>
-          org.locationtech.geomesa.kafka.data.KafkaMetadata.setCompactionPolicy
+          &lt;nosymbol&gt;
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          KafkaMetadata.this.setCompactionPolicy(adminClient)
+          ()
         </td>
       </tr><tr>
         <td>
-          55
+          53
         </td>
         <td>
           96190
         </td>
         <td>
-          2575
+          2397
           -
-          2607
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaMetadata.setCompactionPolicy
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.this.setCompactionPolicy(adminClient)
-        </td>
-      </tr><tr>
-        <td>
-          62
-        </td>
-        <td>
-          96195
-        </td>
-        <td>
-          2765
-          -
-          2790
+          2397
         </td>
         <td>
           Literal
@@ -714,331 +606,67 @@
           
         </td>
         <td style="background: #AEF1AE">
-          TOPIC
+          ()
         </td>
       </tr><tr>
         <td>
-          62
+          55
         </td>
         <td>
-          96197
+          96189
         </td>
         <td>
-          2746
+          2509
           -
-          2807
+          2544
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.ensureCompactionPolicy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.this.ensureCompactionPolicy(adminClient)
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          96188
+        </td>
+        <td>
+          2509
+          -
+          2544
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.apache.kafka.common.config.ConfigResource.&lt;init&gt;
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.ensureCompactionPolicy
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          new org.apache.kafka.common.config.ConfigResource(TOPIC, KafkaMetadata.this.config.catalog)
-        </td>
-      </tr><tr>
-        <td>
-          62
-        </td>
-        <td>
-          96196
-        </td>
-        <td>
-          2792
-          -
-          2806
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaDataStore.KafkaDataStoreConfig.catalog
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.this.config.catalog
-        </td>
-      </tr><tr>
-        <td>
-          62
-        </td>
-        <td>
-          96198
-        </td>
-        <td>
-          2724
-          -
-          2808
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.Collections.singleton
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          java.util.Collections.singleton[org.apache.kafka.common.config.ConfigResource](new org.apache.kafka.common.config.ConfigResource(TOPIC, KafkaMetadata.this.config.catalog))
+          KafkaMetadata.this.ensureCompactionPolicy(adminClient)
         </td>
       </tr><tr>
         <td>
           63
         </td>
         <td>
-          96199
+          96193
         </td>
         <td>
-          2834
+          2664
           -
-          2882
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.Map.values
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          kClient.describeConfigs(cr).all().get().values()
-        </td>
-      </tr><tr>
-        <td>
-          64
-        </td>
-        <td>
-          96206
-        </td>
-        <td>
-          2887
-          -
-          3047
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.collection.IterableLike.exists
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          scala.collection.JavaConverters.collectionAsScalaIterableConverter[org.apache.kafka.clients.admin.Config](catalogConfigs).asScala.exists(((config: org.apache.kafka.clients.admin.Config) =&gt; config.get(KafkaMetadata.CleanupPolicyConfig).!=(null).&amp;&amp;(config.get(KafkaMetadata.CleanupPolicyConfig).value().==(KafkaMetadata.CompactCleanupPolicy))))
-        </td>
-      </tr><tr>
-        <td>
-          65
-        </td>
-        <td>
-          96201
-        </td>
-        <td>
-          2970
-          -
-          2974
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          null
-        </td>
-      </tr><tr>
-        <td>
-          65
-        </td>
-        <td>
-          96200
-        </td>
-        <td>
-          2946
-          -
-          2965
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaMetadata.CleanupPolicyConfig
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.CleanupPolicyConfig
-        </td>
-      </tr><tr>
-        <td>
-          65
-        </td>
-        <td>
-          96203
-        </td>
-        <td>
-          3021
-          -
-          3041
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaMetadata.CompactCleanupPolicy
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.CompactCleanupPolicy
-        </td>
-      </tr><tr>
-        <td>
-          65
-        </td>
-        <td>
-          96202
-        </td>
-        <td>
-          2989
-          -
-          3008
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaMetadata.CleanupPolicyConfig
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.CleanupPolicyConfig
-        </td>
-      </tr><tr>
-        <td>
-          65
-        </td>
-        <td>
-          96205
-        </td>
-        <td>
-          2935
-          -
-          3041
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Boolean.&amp;&amp;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          config.get(KafkaMetadata.CleanupPolicyConfig).!=(null).&amp;&amp;(config.get(KafkaMetadata.CleanupPolicyConfig).value().==(KafkaMetadata.CompactCleanupPolicy))
-        </td>
-      </tr><tr>
-        <td>
-          65
-        </td>
-        <td>
-          96204
-        </td>
-        <td>
-          2978
-          -
-          3041
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.lang.Object.==
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          config.get(KafkaMetadata.CleanupPolicyConfig).value().==(KafkaMetadata.CompactCleanupPolicy)
-        </td>
-      </tr><tr>
-        <td>
-          70
-        </td>
-        <td>
-          96207
-        </td>
-        <td>
-          3163
-          -
-          3188
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          TOPIC
-        </td>
-      </tr><tr>
-        <td>
-          70
-        </td>
-        <td>
-          96209
-        </td>
-        <td>
-          3144
-          -
-          3205
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.common.config.ConfigResource.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new org.apache.kafka.common.config.ConfigResource(TOPIC, KafkaMetadata.this.config.catalog)
-        </td>
-      </tr><tr>
-        <td>
-          70
-        </td>
-        <td>
-          96208
-        </td>
-        <td>
-          3190
-          -
-          3204
+          2678
         </td>
         <td>
           Select
@@ -1054,207 +682,15 @@
         </td>
       </tr><tr>
         <td>
-          71
+          63
         </td>
         <td>
-          96211
+          96195
         </td>
         <td>
-          3272
+          2683
           -
-          3292
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaMetadata.CompactCleanupPolicy
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.CompactCleanupPolicy
-        </td>
-      </tr><tr>
-        <td>
-          71
-        </td>
-        <td>
-          96210
-        </td>
-        <td>
-          3251
-          -
-          3270
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaMetadata.CleanupPolicyConfig
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.CleanupPolicyConfig
-        </td>
-      </tr><tr>
-        <td>
-          71
-        </td>
-        <td>
-          96212
-        </td>
-        <td>
-          3235
-          -
-          3293
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.admin.ConfigEntry.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new org.apache.kafka.clients.admin.ConfigEntry(KafkaMetadata.CleanupPolicyConfig, KafkaMetadata.CompactCleanupPolicy)
-        </td>
-      </tr><tr>
-        <td>
-          72
-        </td>
-        <td>
-          96213
-        </td>
-        <td>
-          3335
-          -
-          3398
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.admin.AlterConfigOp.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new org.apache.kafka.clients.admin.AlterConfigOp(catalogConfigEntry, SET)
-        </td>
-      </tr><tr>
-        <td>
-          72
-        </td>
-        <td>
-          96214
-        </td>
-        <td>
-          3313
-          -
-          3399
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.Collections.singleton
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          java.util.Collections.singleton[org.apache.kafka.clients.admin.AlterConfigOp](new org.apache.kafka.clients.admin.AlterConfigOp(catalogConfigEntry, SET))
-        </td>
-      </tr><tr>
-        <td>
-          73
-        </td>
-        <td>
-          96215
-        </td>
-        <td>
-          3404
-          -
-          3527
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.common.KafkaFuture.get
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          kClient.incrementalAlterConfigs(java.util.Collections.singletonMap[org.apache.kafka.common.config.ConfigResource, java.util.Collection[org.apache.kafka.clients.admin.AlterConfigOp]](catalogResource, alterOps), new org.apache.kafka.clients.admin.AlterConfigsOptions()).all().get()
-        </td>
-      </tr><tr>
-        <td>
-          73
-        </td>
-        <td>
-          96216
-        </td>
-        <td>
-          3525
-          -
-          3525
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          78
-        </td>
-        <td>
-          96217
-        </td>
-        <td>
-          3620
-          -
-          3634
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaDataStore.KafkaDataStoreConfig.catalog
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.this.config.catalog
-        </td>
-      </tr><tr>
-        <td>
-          78
-        </td>
-        <td>
-          96219
-        </td>
-        <td>
-          3639
-          -
-          3672
+          2716
         </td>
         <td>
           Select
@@ -1270,15 +706,15 @@
         </td>
       </tr><tr>
         <td>
-          78
+          63
         </td>
         <td>
-          96218
+          96194
         </td>
         <td>
-          3636
+          2680
           -
-          3637
+          2681
         </td>
         <td>
           Literal
@@ -1294,15 +730,15 @@
         </td>
       </tr><tr>
         <td>
-          79
+          64
         </td>
         <td>
-          96221
+          96197
         </td>
         <td>
-          3739
+          2783
           -
-          3759
+          2803
         </td>
         <td>
           Select
@@ -1318,15 +754,15 @@
         </td>
       </tr><tr>
         <td>
-          79
+          64
         </td>
         <td>
-          96220
+          96196
         </td>
         <td>
-          3718
+          2762
           -
-          3737
+          2781
         </td>
         <td>
           Select
@@ -1342,15 +778,15 @@
         </td>
       </tr><tr>
         <td>
-          79
+          64
         </td>
         <td>
-          96223
+          96199
         </td>
         <td>
-          3607
+          2651
           -
-          3761
+          2805
         </td>
         <td>
           Apply
@@ -1366,15 +802,15 @@
         </td>
       </tr><tr>
         <td>
-          79
+          64
         </td>
         <td>
-          96222
+          96198
         </td>
         <td>
-          3693
+          2737
           -
-          3760
+          2804
         </td>
         <td>
           Apply
@@ -1390,15 +826,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          65
         </td>
         <td>
-          96225
+          96205
         </td>
         <td>
-          3766
+          2810
           -
-          3842
+          3234
         </td>
         <td>
           Apply
@@ -1410,43 +846,23 @@
           
         </td>
         <td style="background: #AEF1AE">
-          KafkaMetadata.this.adminClientOp[Void](((x$1: org.apache.kafka.clients.admin.AdminClient) =&gt; x$1.createTopics(java.util.Collections.singletonList[org.apache.kafka.clients.admin.NewTopic](newTopic)).all().get()))
+          KafkaMetadata.this.adminClientOp[Any](((adminClient: org.apache.kafka.clients.admin.AdminClient) =&gt; try {
+  adminClient.createTopics(java.util.Collections.singletonList[org.apache.kafka.clients.admin.NewTopic](newTopic)).all().get()
+} catch {
+  case (e @ (_: java.util.concurrent.ExecutionException)) if e.getCause().isInstanceOf[org.apache.kafka.common.errors.TopicExistsException] =&gt; KafkaMetadata.this.ensureCompactionPolicy(adminClient)
+}))
         </td>
       </tr><tr>
         <td>
-          80
+          65
         </td>
         <td>
-          96224
+          96206
         </td>
         <td>
-          3780
+          2824
           -
-          3841
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.common.KafkaFuture.get
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          x$1.createTopics(java.util.Collections.singletonList[org.apache.kafka.clients.admin.NewTopic](newTopic)).all().get()
-        </td>
-      </tr><tr>
-        <td>
-          80
-        </td>
-        <td>
-          96226
-        </td>
-        <td>
-          3779
-          -
-          3779
+          2824
         </td>
         <td>
           Literal
@@ -1462,15 +878,135 @@
         </td>
       </tr><tr>
         <td>
-          84
+          67
         </td>
         <td>
-          96227
+          96201
         </td>
         <td>
-          3976
+          2861
           -
-          3977
+          2934
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.kafka.common.KafkaFuture.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          adminClient.createTopics(java.util.Collections.singletonList[org.apache.kafka.clients.admin.NewTopic](newTopic)).all().get()
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          96200
+        </td>
+        <td>
+          2861
+          -
+          2934
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.common.KafkaFuture.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          adminClient.createTopics(java.util.Collections.singletonList[org.apache.kafka.clients.admin.NewTopic](newTopic)).all().get()
+        </td>
+      </tr><tr>
+        <td>
+          69
+        </td>
+        <td>
+          96202
+        </td>
+        <td>
+          2989
+          -
+          3034
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Any.isInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          e.getCause().isInstanceOf[org.apache.kafka.common.errors.TopicExistsException]
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          96203
+        </td>
+        <td>
+          3185
+          -
+          3220
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.ensureCompactionPolicy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.this.ensureCompactionPolicy(adminClient)
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          96204
+        </td>
+        <td>
+          3185
+          -
+          3220
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.ensureCompactionPolicy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.this.ensureCompactionPolicy(adminClient)
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          96207
+        </td>
+        <td>
+          3368
+          -
+          3369
         </td>
         <td>
           Literal
@@ -1486,15 +1022,15 @@
         </td>
       </tr><tr>
         <td>
-          84
+          78
         </td>
         <td>
-          96229
+          96209
         </td>
         <td>
-          4006
+          3398
           -
-          4011
+          3403
         </td>
         <td>
           Literal
@@ -1510,15 +1046,15 @@
         </td>
       </tr><tr>
         <td>
-          84
+          78
         </td>
         <td>
-          96228
+          96208
         </td>
         <td>
-          3993
+          3385
           -
-          3995
+          3387
         </td>
         <td>
           Literal
@@ -1534,15 +1070,15 @@
         </td>
       </tr><tr>
         <td>
-          84
+          78
         </td>
         <td>
-          96231
+          96211
         </td>
         <td>
-          3974
+          3366
           -
-          4011
+          3403
         </td>
         <td>
           Apply
@@ -1558,15 +1094,15 @@
         </td>
       </tr><tr>
         <td>
-          84
+          78
         </td>
         <td>
-          96230
+          96210
         </td>
         <td>
-          3978
+          3370
           -
-          3992
+          3384
         </td>
         <td>
           Select
@@ -1582,15 +1118,15 @@
         </td>
       </tr><tr>
         <td>
-          84
+          78
         </td>
         <td>
-          96233
+          96213
         </td>
         <td>
-          4014
+          3406
           -
-          4024
+          3416
         </td>
         <td>
           Select
@@ -1606,15 +1142,15 @@
         </td>
       </tr><tr>
         <td>
-          84
+          78
         </td>
         <td>
-          96232
+          96212
         </td>
         <td>
-          3952
+          3344
           -
-          4012
+          3404
         </td>
         <td>
           Apply
@@ -1630,15 +1166,15 @@
         </td>
       </tr><tr>
         <td>
-          84
+          78
         </td>
         <td>
-          96234
+          96214
         </td>
         <td>
-          3934
+          3326
           -
-          4025
+          3417
         </td>
         <td>
           Apply
@@ -1654,15 +1190,15 @@
         </td>
       </tr><tr>
         <td>
-          87
+          81
         </td>
         <td>
-          96239
+          96219
         </td>
         <td>
-          4111
+          3503
           -
-          4229
+          3621
         </td>
         <td>
           Apply
@@ -1680,15 +1216,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          82
         </td>
         <td>
-          96235
+          96215
         </td>
         <td>
-          4195
+          3587
           -
-          4209
+          3601
         </td>
         <td>
           Select
@@ -1704,15 +1240,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          82
         </td>
         <td>
-          96237
+          96217
         </td>
         <td>
-          4153
+          3545
           -
-          4223
+          3615
         </td>
         <td>
           Apply
@@ -1728,15 +1264,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          82
         </td>
         <td>
-          96236
+          96216
         </td>
         <td>
-          4176
+          3568
           -
-          4222
+          3614
         </td>
         <td>
           Apply
@@ -1752,15 +1288,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          82
         </td>
         <td>
-          96238
+          96218
         </td>
         <td>
-          4153
+          3545
           -
-          4223
+          3615
         </td>
         <td>
           Block
@@ -1776,15 +1312,159 @@
         </td>
       </tr><tr>
         <td>
-          90
+          84
         </td>
         <td>
-          96240
+          96220
         </td>
         <td>
-          4234
+          3626
           -
-          4259
+          3651
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.flush
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.this.producer.instance.flush()
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          96225
+        </td>
+        <td>
+          3727
+          -
+          3830
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rows.foreach[java.util.concurrent.Future[org.apache.kafka.clients.producer.RecordMetadata]](((row: Array[Byte]) =&gt; KafkaMetadata.this.producer.instance.send(new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](KafkaMetadata.this.config.catalog, row, null))))
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          96221
+        </td>
+        <td>
+          3797
+          -
+          3811
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaDataStore.KafkaDataStoreConfig.catalog
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.this.config.catalog
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          96223
+        </td>
+        <td>
+          3778
+          -
+          3823
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.ProducerRecord.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](KafkaMetadata.this.config.catalog, row, null)
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          96222
+        </td>
+        <td>
+          3818
+          -
+          3822
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          96224
+        </td>
+        <td>
+          3755
+          -
+          3824
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.send
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.this.producer.instance.send(new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](KafkaMetadata.this.config.catalog, row, null))
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          96226
+        </td>
+        <td>
+          3835
+          -
+          3860
         </td>
         <td>
           Apply
@@ -1803,156 +1483,12 @@
           94
         </td>
         <td>
-          96245
+          96227
         </td>
         <td>
-          4335
+          3942
           -
-          4438
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.collection.IterableLike.foreach
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          rows.foreach[java.util.concurrent.Future[org.apache.kafka.clients.producer.RecordMetadata]](((row: Array[Byte]) =&gt; KafkaMetadata.this.producer.instance.send(new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](KafkaMetadata.this.config.catalog, row, null))))
-        </td>
-      </tr><tr>
-        <td>
-          95
-        </td>
-        <td>
-          96241
-        </td>
-        <td>
-          4405
-          -
-          4419
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaDataStore.KafkaDataStoreConfig.catalog
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.this.config.catalog
-        </td>
-      </tr><tr>
-        <td>
-          95
-        </td>
-        <td>
-          96243
-        </td>
-        <td>
-          4386
-          -
-          4431
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.producer.ProducerRecord.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](KafkaMetadata.this.config.catalog, row, null)
-        </td>
-      </tr><tr>
-        <td>
-          95
-        </td>
-        <td>
-          96242
-        </td>
-        <td>
-          4426
-          -
-          4430
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          null
-        </td>
-      </tr><tr>
-        <td>
-          95
-        </td>
-        <td>
-          96244
-        </td>
-        <td>
-          4363
-          -
-          4432
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.producer.Producer.send
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.this.producer.instance.send(new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](KafkaMetadata.this.config.catalog, row, null))
-        </td>
-      </tr><tr>
-        <td>
-          97
-        </td>
-        <td>
-          96246
-        </td>
-        <td>
-          4443
-          -
-          4468
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.producer.Producer.flush
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.this.producer.instance.flush()
-        </td>
-      </tr><tr>
-        <td>
-          100
-        </td>
-        <td>
-          96247
-        </td>
-        <td>
-          4550
-          -
-          4576
+          3968
         </td>
         <td>
           Apply
@@ -1968,15 +1504,15 @@
         </td>
       </tr><tr>
         <td>
-          104
+          98
         </td>
         <td>
-          96249
+          96229
         </td>
         <td>
-          4730
+          4122
           -
-          4753
+          4145
         </td>
         <td>
           Block
@@ -1992,15 +1528,15 @@
         </td>
       </tr><tr>
         <td>
-          104
+          98
         </td>
         <td>
-          96248
+          96228
         </td>
         <td>
-          4730
+          4122
           -
-          4753
+          4145
         </td>
         <td>
           Apply
@@ -2016,15 +1552,15 @@
         </td>
       </tr><tr>
         <td>
-          105
+          99
         </td>
         <td>
-          96251
+          96231
         </td>
         <td>
-          4776
+          4168
           -
-          4803
+          4195
         </td>
         <td>
           Block
@@ -2040,15 +1576,15 @@
         </td>
       </tr><tr>
         <td>
-          105
+          99
         </td>
         <td>
-          96250
+          96230
         </td>
         <td>
-          4776
+          4168
           -
-          4803
+          4195
         </td>
         <td>
           Apply
@@ -2064,15 +1600,15 @@
         </td>
       </tr><tr>
         <td>
-          109
+          103
         </td>
         <td>
-          96253
+          96233
         </td>
         <td>
-          4877
+          4269
           -
-          4885
+          4277
         </td>
         <td>
           Select
@@ -2088,15 +1624,15 @@
         </td>
       </tr><tr>
         <td>
-          109
+          103
         </td>
         <td>
-          96252
+          96232
         </td>
         <td>
-          4867
+          4259
           -
-          4875
+          4267
         </td>
         <td>
           Select
@@ -2112,15 +1648,15 @@
         </td>
       </tr><tr>
         <td>
-          109
+          103
         </td>
         <td>
-          96255
+          96235
         </td>
         <td>
-          4862
+          4254
           -
-          4862
+          4254
         </td>
         <td>
           Select
@@ -2136,15 +1672,15 @@
         </td>
       </tr><tr>
         <td>
-          109
+          103
         </td>
         <td>
-          96254
+          96234
         </td>
         <td>
-          4863
+          4255
           -
-          4886
+          4278
         </td>
         <td>
           Apply
@@ -2160,15 +1696,15 @@
         </td>
       </tr><tr>
         <td>
-          109
+          103
         </td>
         <td>
-          96257
+          96237
         </td>
         <td>
-          4862
+          4254
           -
-          4862
+          4254
         </td>
         <td>
           Literal
@@ -2184,15 +1720,15 @@
         </td>
       </tr><tr>
         <td>
-          109
+          103
         </td>
         <td>
-          96256
+          96236
         </td>
         <td>
-          4846
+          4238
           -
-          4887
+          4279
         </td>
         <td>
           ApplyToImplicitArgs
@@ -2208,15 +1744,550 @@
         </td>
       </tr><tr>
         <td>
+          111
+        </td>
+        <td>
+          96239
+        </td>
+        <td>
+          4580
+          -
+          4594
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaDataStore.KafkaDataStoreConfig.catalog
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.this.config.catalog
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          96238
+        </td>
+        <td>
+          4553
+          -
+          4578
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TOPIC
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          96240
+        </td>
+        <td>
+          4534
+          -
+          4595
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.common.config.ConfigResource.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.kafka.common.config.ConfigResource(TOPIC, KafkaMetadata.this.config.catalog)
+        </td>
+      </tr><tr>
+        <td>
           112
+        </td>
+        <td>
+          96241
+        </td>
+        <td>
+          4621
+          -
+          4709
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.values
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          adminClient.describeConfigs(java.util.Collections.singleton[org.apache.kafka.common.config.ConfigResource](catalogResource)).all().get().values()
+        </td>
+      </tr><tr>
+        <td>
+          113
+        </td>
+        <td>
+          96248
+        </td>
+        <td>
+          4730
+          -
+          4890
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.exists
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.collectionAsScalaIterableConverter[org.apache.kafka.clients.admin.Config](catalogConfigs).asScala.exists(((config: org.apache.kafka.clients.admin.Config) =&gt; config.get(KafkaMetadata.CleanupPolicyConfig).!=(null).&amp;&amp;(config.get(KafkaMetadata.CleanupPolicyConfig).value().==(KafkaMetadata.CompactCleanupPolicy))))
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          96243
+        </td>
+        <td>
+          4813
+          -
+          4817
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          96242
+        </td>
+        <td>
+          4789
+          -
+          4808
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.CleanupPolicyConfig
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.CleanupPolicyConfig
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          96245
+        </td>
+        <td>
+          4864
+          -
+          4884
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.CompactCleanupPolicy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.CompactCleanupPolicy
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          96244
+        </td>
+        <td>
+          4832
+          -
+          4851
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.CleanupPolicyConfig
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.CleanupPolicyConfig
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          96247
+        </td>
+        <td>
+          4778
+          -
+          4884
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          config.get(KafkaMetadata.CleanupPolicyConfig).!=(null).&amp;&amp;(config.get(KafkaMetadata.CleanupPolicyConfig).value().==(KafkaMetadata.CompactCleanupPolicy))
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          96246
+        </td>
+        <td>
+          4821
+          -
+          4884
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          config.get(KafkaMetadata.CleanupPolicyConfig).value().==(KafkaMetadata.CompactCleanupPolicy)
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          96249
+        </td>
+        <td>
+          4899
+          -
+          4909
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          isCompact.unary_!
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          96257
+        </td>
+        <td>
+          4911
+          -
+          5223
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val catalogConfigEntry: org.apache.kafka.clients.admin.ConfigEntry = new org.apache.kafka.clients.admin.ConfigEntry(KafkaMetadata.CleanupPolicyConfig, KafkaMetadata.CompactCleanupPolicy);
+  val alterOps: java.util.Set[org.apache.kafka.clients.admin.AlterConfigOp] = java.util.Collections.singleton[org.apache.kafka.clients.admin.AlterConfigOp](new org.apache.kafka.clients.admin.AlterConfigOp(catalogConfigEntry, SET));
+  {
+    adminClient.incrementalAlterConfigs(java.util.Collections.singletonMap[org.apache.kafka.common.config.ConfigResource, java.util.Collection[org.apache.kafka.clients.admin.AlterConfigOp]](catalogResource, alterOps)).all().get();
+    ()
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          96259
+        </td>
+        <td>
+          4895
+          -
+          4895
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          116
         </td>
         <td>
           96258
         </td>
         <td>
-          4965
+          4895
           -
+          4895
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          96251
+        </td>
+        <td>
           4981
+          -
+          5001
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.CompactCleanupPolicy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.CompactCleanupPolicy
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          96250
+        </td>
+        <td>
+          4960
+          -
+          4979
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.CleanupPolicyConfig
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.CleanupPolicyConfig
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          96252
+        </td>
+        <td>
+          4944
+          -
+          5002
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.admin.ConfigEntry.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.kafka.clients.admin.ConfigEntry(KafkaMetadata.CleanupPolicyConfig, KafkaMetadata.CompactCleanupPolicy)
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          96253
+        </td>
+        <td>
+          5046
+          -
+          5109
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.admin.AlterConfigOp.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.kafka.clients.admin.AlterConfigOp(catalogConfigEntry, SET)
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          96254
+        </td>
+        <td>
+          5024
+          -
+          5110
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collections.singleton
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Collections.singleton[org.apache.kafka.clients.admin.AlterConfigOp](new org.apache.kafka.clients.admin.AlterConfigOp(catalogConfigEntry, SET))
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          96255
+        </td>
+        <td>
+          5117
+          -
+          5217
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.common.KafkaFuture.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          adminClient.incrementalAlterConfigs(java.util.Collections.singletonMap[org.apache.kafka.common.config.ConfigResource, java.util.Collection[org.apache.kafka.clients.admin.AlterConfigOp]](catalogResource, alterOps)).all().get()
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          96256
+        </td>
+        <td>
+          5215
+          -
+          5215
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          96260
+        </td>
+        <td>
+          5305
+          -
+          5321
         </td>
         <td>
           Apply
@@ -2232,15 +2303,15 @@
         </td>
       </tr><tr>
         <td>
-          113
+          125
         </td>
         <td>
-          96259
+          96261
         </td>
         <td>
-          4996
+          5336
           -
-          5038
+          5378
         </td>
         <td>
           Literal
@@ -2256,15 +2327,15 @@
         </td>
       </tr><tr>
         <td>
-          113
+          125
         </td>
         <td>
-          96261
+          96263
         </td>
         <td>
-          4986
+          5326
           -
-          5055
+          5395
         </td>
         <td>
           Apply
@@ -2280,15 +2351,15 @@
         </td>
       </tr><tr>
         <td>
-          113
+          125
         </td>
         <td>
-          96260
+          96262
         </td>
         <td>
-          5040
+          5380
           -
-          5054
+          5394
         </td>
         <td>
           Select
@@ -2304,15 +2375,15 @@
         </td>
       </tr><tr>
         <td>
-          114
+          126
         </td>
         <td>
-          96263
+          96265
         </td>
         <td>
-          5113
+          5453
           -
-          5128
+          5468
         </td>
         <td>
           Block
@@ -2328,15 +2399,15 @@
         </td>
       </tr><tr>
         <td>
-          114
+          126
         </td>
         <td>
-          96262
+          96264
         </td>
         <td>
-          5113
+          5453
           -
-          5128
+          5468
         </td>
         <td>
           Apply
@@ -2352,15 +2423,15 @@
         </td>
       </tr><tr>
         <td>
-          114
+          126
         </td>
         <td>
-          96264
+          96266
         </td>
         <td>
-          5060
+          5400
           -
-          5130
+          5470
         </td>
         <td>
           Apply
@@ -2378,15 +2449,15 @@
         </td>
       </tr><tr>
         <td>
-          115
+          127
         </td>
         <td>
-          96265
+          96267
         </td>
         <td>
-          5188
+          5528
           -
-          5203
+          5543
         </td>
         <td>
           Apply
@@ -2402,15 +2473,15 @@
         </td>
       </tr><tr>
         <td>
-          115
+          127
         </td>
         <td>
-          96267
+          96269
         </td>
         <td>
-          5135
+          5475
           -
-          5205
+          5545
         </td>
         <td>
           Apply
@@ -2428,15 +2499,15 @@
         </td>
       </tr><tr>
         <td>
-          115
+          127
         </td>
         <td>
-          96266
+          96268
         </td>
         <td>
-          5188
+          5528
           -
-          5203
+          5543
         </td>
         <td>
           Block
@@ -2452,15 +2523,15 @@
         </td>
       </tr><tr>
         <td>
-          116
+          128
         </td>
         <td>
-          96269
+          96271
         </td>
         <td>
-          5258
+          5598
           -
-          5267
+          5607
         </td>
         <td>
           Apply
@@ -2476,15 +2547,15 @@
         </td>
       </tr><tr>
         <td>
-          116
+          128
         </td>
         <td>
-          96268
+          96270
         </td>
         <td>
-          5220
+          5560
           -
-          5245
+          5585
         </td>
         <td>
           Apply
@@ -2500,15 +2571,15 @@
         </td>
       </tr><tr>
         <td>
-          116
+          128
         </td>
         <td>
-          96271
+          96273
         </td>
         <td>
-          5210
+          5550
           -
-          5269
+          5609
         </td>
         <td>
           ApplyToImplicitArgs
@@ -2524,15 +2595,15 @@
         </td>
       </tr><tr>
         <td>
-          116
+          128
         </td>
         <td>
-          96270
+          96272
         </td>
         <td>
-          5247
+          5587
           -
-          5247
+          5587
         </td>
         <td>
           Select
@@ -2548,15 +2619,15 @@
         </td>
       </tr><tr>
         <td>
-          124
+          136
         </td>
         <td>
-          96272
+          96274
         </td>
         <td>
-          5423
+          5763
           -
-          5449
+          5789
         </td>
         <td>
           Apply
@@ -2572,15 +2643,15 @@
         </td>
       </tr><tr>
         <td>
-          125
+          137
         </td>
         <td>
-          96273
+          96275
         </td>
         <td>
-          5473
+          5813
           -
-          5508
+          5848
         </td>
         <td>
           Apply
@@ -2596,15 +2667,15 @@
         </td>
       </tr><tr>
         <td>
-          127
+          139
         </td>
         <td>
-          96274
+          96276
         </td>
         <td>
-          5534
+          5874
           -
-          5580
+          5920
         </td>
         <td>
           Apply
@@ -2620,15 +2691,15 @@
         </td>
       </tr><tr>
         <td>
-          128
+          140
         </td>
         <td>
-          96275
+          96277
         </td>
         <td>
-          5608
+          5948
           -
-          5629
+          5969
         </td>
         <td>
           Apply
@@ -2644,15 +2715,15 @@
         </td>
       </tr><tr>
         <td>
-          129
+          141
         </td>
         <td>
-          96276
+          96278
         </td>
         <td>
-          5655
+          5995
           -
-          5679
+          6019
         </td>
         <td>
           Apply
@@ -2668,15 +2739,15 @@
         </td>
       </tr><tr>
         <td>
-          132
+          144
         </td>
         <td>
-          96277
+          96279
         </td>
         <td>
-          5738
+          6078
           -
-          5752
+          6092
         </td>
         <td>
           Select
@@ -2692,15 +2763,15 @@
         </td>
       </tr><tr>
         <td>
-          132
+          144
         </td>
         <td>
-          96284
+          96286
         </td>
         <td>
-          5714
+          6054
           -
-          5865
+          6205
         </td>
         <td>
           Apply
@@ -2716,15 +2787,15 @@
         </td>
       </tr><tr>
         <td>
-          133
+          145
         </td>
         <td>
-          96279
+          96281
         </td>
         <td>
-          5816
+          6156
           -
-          5823
+          6163
         </td>
         <td>
           Select
@@ -2740,15 +2811,15 @@
         </td>
       </tr><tr>
         <td>
-          133
+          145
         </td>
         <td>
-          96278
+          96280
         </td>
         <td>
-          5797
+          6137
           -
-          5812
+          6152
         </td>
         <td>
           Literal
@@ -2764,15 +2835,15 @@
         </td>
       </tr><tr>
         <td>
-          133
+          145
         </td>
         <td>
-          96281
+          96283
         </td>
         <td>
-          5825
+          6165
           -
-          5863
+          6203
         </td>
         <td>
           Apply
@@ -2788,15 +2859,15 @@
         </td>
       </tr><tr>
         <td>
-          133
+          145
         </td>
         <td>
-          96280
+          96282
         </td>
         <td>
-          5797
+          6137
           -
-          5823
+          6163
         </td>
         <td>
           Apply
@@ -2812,15 +2883,15 @@
         </td>
       </tr><tr>
         <td>
-          133
+          145
         </td>
         <td>
-          96283
+          96285
         </td>
         <td>
-          5762
+          6102
           -
-          5864
+          6204
         </td>
         <td>
           Apply
@@ -2836,15 +2907,15 @@
         </td>
       </tr><tr>
         <td>
-          133
+          145
         </td>
         <td>
-          96282
+          96284
         </td>
         <td>
-          5793
+          6133
           -
-          5864
+          6204
         </td>
         <td>
           Apply
@@ -2860,15 +2931,15 @@
         </td>
       </tr><tr>
         <td>
-          137
+          149
         </td>
         <td>
-          96285
+          96287
         </td>
         <td>
-          5942
+          6282
           -
-          5950
+          6290
         </td>
         <td>
           Select
@@ -2884,15 +2955,15 @@
         </td>
       </tr><tr>
         <td>
-          137
+          149
         </td>
         <td>
-          96287
+          96289
         </td>
         <td>
-          5910
+          6250
           -
-          5967
+          6307
         </td>
         <td>
           Apply
@@ -2908,15 +2979,15 @@
         </td>
       </tr><tr>
         <td>
-          137
+          149
         </td>
         <td>
-          96286
+          96288
         </td>
         <td>
-          5952
+          6292
           -
-          5966
+          6306
         </td>
         <td>
           Select
@@ -2932,15 +3003,15 @@
         </td>
       </tr><tr>
         <td>
-          138
+          150
         </td>
         <td>
-          96288
+          96290
         </td>
         <td>
-          5972
+          6312
           -
-          5987
+          6327
         </td>
         <td>
           Apply
@@ -2956,15 +3027,15 @@
         </td>
       </tr><tr>
         <td>
-          141
+          153
         </td>
         <td>
-          96325
+          96327
         </td>
         <td>
-          6042
+          6382
           -
-          6952
+          7292
         </td>
         <td>
           Block
@@ -3025,15 +3096,15 @@
         </td>
       </tr><tr>
         <td>
-          142
+          154
         </td>
         <td>
-          96289
+          96291
         </td>
         <td>
-          6060
+          6400
           -
-          6096
+          6436
         </td>
         <td>
           Apply
@@ -3049,15 +3120,15 @@
         </td>
       </tr><tr>
         <td>
-          143
+          155
         </td>
         <td>
-          96290
+          96292
         </td>
         <td>
-          6112
+          6452
           -
-          6124
+          6464
         </td>
         <td>
           Select
@@ -3073,15 +3144,15 @@
         </td>
       </tr><tr>
         <td>
-          143
+          155
         </td>
         <td>
-          96323
+          96325
         </td>
         <td>
-          6105
+          6445
           -
-          6105
+          6445
         </td>
         <td>
           Literal
@@ -3097,15 +3168,15 @@
         </td>
       </tr><tr>
         <td>
-          143
+          155
         </td>
         <td>
-          96322
+          96324
         </td>
         <td>
-          6138
+          6478
           -
-          6942
+          7282
         </td>
         <td>
           Block
@@ -3158,15 +3229,15 @@
         </td>
       </tr><tr>
         <td>
-          143
+          155
         </td>
         <td>
-          96324
+          96326
         </td>
         <td>
-          6105
+          6445
           -
-          6105
+          6445
         </td>
         <td>
           Block
@@ -3182,15 +3253,15 @@
         </td>
       </tr><tr>
         <td>
-          144
+          156
         </td>
         <td>
-          96316
+          96318
         </td>
         <td>
-          6156
+          6496
           -
-          6648
+          6988
         </td>
         <td>
           Block
@@ -3231,15 +3302,15 @@
         </td>
       </tr><tr>
         <td>
-          144
+          156
         </td>
         <td>
-          96321
+          96323
         </td>
         <td>
-          6138
+          6478
           -
-          6138
+          6478
         </td>
         <td>
           Apply
@@ -3255,15 +3326,15 @@
         </td>
       </tr><tr>
         <td>
-          145
+          157
         </td>
         <td>
-          96291
+          96293
         </td>
         <td>
-          6196
+          6536
           -
-          6204
+          6544
         </td>
         <td>
           Select
@@ -3279,15 +3350,15 @@
         </td>
       </tr><tr>
         <td>
-          145
+          157
         </td>
         <td>
-          96293
+          96295
         </td>
         <td>
-          6169
+          6509
           -
-          6211
+          6551
         </td>
         <td>
           Apply
@@ -3303,15 +3374,15 @@
         </td>
       </tr><tr>
         <td>
-          145
+          157
         </td>
         <td>
-          96292
+          96294
         </td>
         <td>
-          6206
+          6546
           -
-          6210
+          6550
         </td>
         <td>
           Select
@@ -3327,15 +3398,15 @@
         </td>
       </tr><tr>
         <td>
-          146
+          158
         </td>
         <td>
-          96294
+          96296
         </td>
         <td>
-          6228
+          6568
           -
-          6243
+          6583
         </td>
         <td>
           Select
@@ -3351,15 +3422,15 @@
         </td>
       </tr><tr>
         <td>
-          146
+          158
         </td>
         <td>
-          96313
+          96315
         </td>
         <td>
-          6245
+          6585
           -
-          6648
+          6988
         </td>
         <td>
           Block
@@ -3394,15 +3465,15 @@
         </td>
       </tr><tr>
         <td>
-          146
+          158
         </td>
         <td>
-          96315
+          96317
         </td>
         <td>
-          6224
+          6564
           -
-          6224
+          6564
         </td>
         <td>
           Block
@@ -3418,15 +3489,15 @@
         </td>
       </tr><tr>
         <td>
-          146
+          158
         </td>
         <td>
-          96314
+          96316
         </td>
         <td>
-          6224
+          6564
           -
-          6224
+          6564
         </td>
         <td>
           Literal
@@ -3442,15 +3513,15 @@
         </td>
       </tr><tr>
         <td>
-          147
+          159
         </td>
         <td>
-          96295
+          96297
         </td>
         <td>
-          6275
+          6615
           -
-          6292
+          6632
         </td>
         <td>
           Apply
@@ -3466,15 +3537,15 @@
         </td>
       </tr><tr>
         <td>
-          148
+          160
         </td>
         <td>
-          96296
+          96298
         </td>
         <td>
-          6314
+          6654
           -
-          6329
+          6669
         </td>
         <td>
           Apply
@@ -3490,15 +3561,15 @@
         </td>
       </tr><tr>
         <td>
-          148
+          160
         </td>
         <td>
-          96309
+          96311
         </td>
         <td>
-          6331
+          6671
           -
-          6597
+          6937
         </td>
         <td>
           Block
@@ -3524,15 +3595,15 @@
         </td>
       </tr><tr>
         <td>
-          148
+          160
         </td>
         <td>
-          96308
+          96310
         </td>
         <td>
-          6331
+          6671
           -
-          6331
+          6671
         </td>
         <td>
           Apply
@@ -3548,15 +3619,15 @@
         </td>
       </tr><tr>
         <td>
-          148
+          160
         </td>
         <td>
-          96311
+          96313
         </td>
         <td>
-          6307
+          6647
           -
-          6307
+          6647
         </td>
         <td>
           Block
@@ -3572,15 +3643,15 @@
         </td>
       </tr><tr>
         <td>
-          148
+          160
         </td>
         <td>
-          96310
+          96312
         </td>
         <td>
-          6307
+          6647
           -
-          6307
+          6647
         </td>
         <td>
           Literal
@@ -3596,15 +3667,15 @@
         </td>
       </tr><tr>
         <td>
-          149
+          161
         </td>
         <td>
-          96297
+          96299
         </td>
         <td>
-          6357
+          6697
           -
-          6371
+          6711
         </td>
         <td>
           Apply
@@ -3620,15 +3691,15 @@
         </td>
       </tr><tr>
         <td>
-          150
+          162
         </td>
         <td>
-          96298
+          96300
         </td>
         <td>
-          6396
+          6736
           -
-          6405
+          6745
         </td>
         <td>
           Apply
@@ -3644,15 +3715,15 @@
         </td>
       </tr><tr>
         <td>
-          151
+          163
         </td>
         <td>
-          96299
+          96301
         </td>
         <td>
-          6426
+          6766
           -
-          6435
+          6775
         </td>
         <td>
           Apply
@@ -3668,63 +3739,63 @@
         </td>
       </tr><tr>
         <td>
-          152
-        </td>
-        <td>
-          96301
-        </td>
-        <td>
-          6470
-          -
-          6487
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaMetadata.KeyBytes.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          KafkaMetadata.this.KeyBytes.apply(r.key())
-        </td>
-      </tr><tr>
-        <td>
-          152
-        </td>
-        <td>
-          96300
-        </td>
-        <td>
-          6479
-          -
-          6486
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.consumer.ConsumerRecord.key
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          r.key()
-        </td>
-      </tr><tr>
-        <td>
-          152
+          164
         </td>
         <td>
           96303
         </td>
         <td>
-          6457
+          6810
           -
-          6488
+          6827
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.KeyBytes.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaMetadata.this.KeyBytes.apply(r.key())
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          96302
+        </td>
+        <td>
+          6819
+          -
+          6826
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecord.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          r.key()
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          96305
+        </td>
+        <td>
+          6797
+          -
+          6828
         </td>
         <td>
           Block
@@ -3740,15 +3811,15 @@
         </td>
       </tr><tr>
         <td>
-          152
+          164
         </td>
         <td>
-          96302
+          96304
         </td>
         <td>
-          6457
+          6797
           -
-          6488
+          6828
         </td>
         <td>
           Apply
@@ -3764,15 +3835,15 @@
         </td>
       </tr><tr>
         <td>
-          154
+          166
         </td>
         <td>
-          96305
+          96307
         </td>
         <td>
-          6542
+          6882
           -
-          6559
+          6899
         </td>
         <td>
           Apply
@@ -3788,15 +3859,15 @@
         </td>
       </tr><tr>
         <td>
-          154
+          166
         </td>
         <td>
-          96304
+          96306
         </td>
         <td>
-          6551
+          6891
           -
-          6558
+          6898
         </td>
         <td>
           Apply
@@ -3812,15 +3883,15 @@
         </td>
       </tr><tr>
         <td>
-          154
+          166
         </td>
         <td>
-          96307
+          96309
         </td>
         <td>
-          6532
+          6872
           -
-          6563
+          6903
         </td>
         <td>
           Block
@@ -3836,15 +3907,15 @@
         </td>
       </tr><tr>
         <td>
-          154
+          166
         </td>
         <td>
-          96306
+          96308
         </td>
         <td>
-          6532
+          6872
           -
-          6563
+          6903
         </td>
         <td>
           Apply
@@ -3860,15 +3931,15 @@
         </td>
       </tr><tr>
         <td>
-          157
+          169
         </td>
         <td>
-          96312
+          96314
         </td>
         <td>
-          6612
+          6952
           -
-          6634
+          6974
         </td>
         <td>
           Apply
@@ -3884,15 +3955,15 @@
         </td>
       </tr><tr>
         <td>
-          160
+          172
         </td>
         <td>
-          96317
+          96319
         </td>
         <td>
-          6772
+          7112
           -
-          6776
+          7116
         </td>
         <td>
           Literal
@@ -3908,15 +3979,15 @@
         </td>
       </tr><tr>
         <td>
-          160
+          172
         </td>
         <td>
-          96318
+          96320
         </td>
         <td>
-          6758
+          7098
           -
-          6776
+          7116
         </td>
         <td>
           Assign
@@ -3932,15 +4003,15 @@
         </td>
       </tr><tr>
         <td>
-          161
+          173
         </td>
         <td>
-          96320
+          96322
         </td>
         <td>
-          6806
+          7146
           -
-          6930
+          7270
         </td>
         <td>
           Block
@@ -3962,15 +4033,15 @@
         </td>
       </tr><tr>
         <td>
-          163
+          175
         </td>
         <td>
-          96319
+          96321
         </td>
         <td>
-          6912
+          7252
           -
-          6930
+          7270
         </td>
         <td>
           Apply
@@ -3986,15 +4057,15 @@
         </td>
       </tr><tr>
         <td>
-          167
+          179
         </td>
         <td>
-          96327
+          96329
         </td>
         <td>
-          6979
+          7319
           -
-          6999
+          7339
         </td>
         <td>
           Block
@@ -4010,15 +4081,15 @@
         </td>
       </tr><tr>
         <td>
-          167
+          179
         </td>
         <td>
-          96326
+          96328
         </td>
         <td>
-          6979
+          7319
           -
-          6999
+          7339
         </td>
         <td>
           Apply
@@ -4034,15 +4105,15 @@
         </td>
       </tr><tr>
         <td>
-          172
+          184
         </td>
         <td>
-          96388
+          96390
         </td>
         <td>
-          7077
+          7417
           -
-          8641
+          8981
         </td>
         <td>
           Block
@@ -4056,7 +4127,7 @@
         <td style="background: #AEF1AE">
           {
   val offsets: scala.collection.mutable.Map[Int,Long] = scala.collection.mutable.Map.empty[Int, Long];
-  val partitions: Seq[Int] = scala.collection.JavaConverters.asScalaBufferConverter[org.apache.kafka.common.PartitionInfo](TopicMap.this.consumer.partitionsFor(KafkaMetadata.this.config.catalog)).asScala.map[Int, scala.collection.mutable.Buffer[Int]](((x$2: org.apache.kafka.common.PartitionInfo) =&gt; x$2.partition()))(mutable.this.Buffer.canBuildFrom[Int]).toSeq;
+  val partitions: Seq[Int] = scala.collection.JavaConverters.asScalaBufferConverter[org.apache.kafka.common.PartitionInfo](TopicMap.this.consumer.partitionsFor(KafkaMetadata.this.config.catalog)).asScala.map[Int, scala.collection.mutable.Buffer[Int]](((x$1: org.apache.kafka.common.PartitionInfo) =&gt; x$1.partition()))(mutable.this.Buffer.canBuildFrom[Int]).toSeq;
   offsets.++=(org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.endOffsets(TopicMap.this.consumer, KafkaMetadata.this.config.catalog, partitions).collect[(Int, Long), scala.collection.TraversableOnce[(Int, Long)]](({
     @SerialVersionUID(value = 0) final &lt;synthetic&gt; class $anonfun extends scala.runtime.AbstractPartialFunction[(Int, Long),(Int, Long)] with Serializable {
       def &lt;init&gt;(): &lt;$anon: ((Int, Long)) =&gt; (Int, Long)&gt; = {
@@ -4131,15 +4202,15 @@
         </td>
       </tr><tr>
         <td>
-          173
+          185
         </td>
         <td>
-          96328
+          96330
         </td>
         <td>
-          7091
+          7431
           -
-          7136
+          7476
         </td>
         <td>
           TypeApply
@@ -4155,15 +4226,15 @@
         </td>
       </tr><tr>
         <td>
-          175
+          187
         </td>
         <td>
-          96329
+          96331
         </td>
         <td>
-          7239
+          7579
           -
-          7253
+          7593
         </td>
         <td>
           Select
@@ -4179,15 +4250,15 @@
         </td>
       </tr><tr>
         <td>
-          175
+          187
         </td>
         <td>
-          96331
+          96333
         </td>
         <td>
-          7267
+          7607
           -
-          7278
+          7618
         </td>
         <td>
           Apply
@@ -4199,19 +4270,19 @@
           
         </td>
         <td style="background: #AEF1AE">
-          x$2.partition()
+          x$1.partition()
         </td>
       </tr><tr>
         <td>
-          175
+          187
         </td>
         <td>
-          96330
+          96332
         </td>
         <td>
-          7216
+          7556
           -
-          7254
+          7594
         </td>
         <td>
           Apply
@@ -4227,15 +4298,15 @@
         </td>
       </tr><tr>
         <td>
-          175
+          187
         </td>
         <td>
-          96333
+          96335
         </td>
         <td>
-          7216
+          7556
           -
-          7285
+          7625
         </td>
         <td>
           Select
@@ -4247,19 +4318,19 @@
           
         </td>
         <td style="background: #AEF1AE">
-          scala.collection.JavaConverters.asScalaBufferConverter[org.apache.kafka.common.PartitionInfo](TopicMap.this.consumer.partitionsFor(KafkaMetadata.this.config.catalog)).asScala.map[Int, scala.collection.mutable.Buffer[Int]](((x$2: org.apache.kafka.common.PartitionInfo) =&gt; x$2.partition()))(mutable.this.Buffer.canBuildFrom[Int]).toSeq
+          scala.collection.JavaConverters.asScalaBufferConverter[org.apache.kafka.common.PartitionInfo](TopicMap.this.consumer.partitionsFor(KafkaMetadata.this.config.catalog)).asScala.map[Int, scala.collection.mutable.Buffer[Int]](((x$1: org.apache.kafka.common.PartitionInfo) =&gt; x$1.partition()))(mutable.this.Buffer.canBuildFrom[Int]).toSeq
         </td>
       </tr><tr>
         <td>
-          175
+          187
         </td>
         <td>
-          96332
+          96334
         </td>
         <td>
-          7266
+          7606
           -
-          7266
+          7606
         </td>
         <td>
           TypeApply
@@ -4275,15 +4346,15 @@
         </td>
       </tr><tr>
         <td>
-          178
+          190
         </td>
         <td>
-          96343
+          96345
         </td>
         <td>
-          7445
+          7785
           -
-          7603
+          7943
         </td>
         <td>
           Apply
@@ -4315,15 +4386,15 @@
         </td>
       </tr><tr>
         <td>
-          179
+          191
         </td>
         <td>
-          96335
+          96337
         </td>
         <td>
-          7512
+          7852
           -
-          7526
+          7866
         </td>
         <td>
           Select
@@ -4339,15 +4410,15 @@
         </td>
       </tr><tr>
         <td>
-          179
+          191
         </td>
         <td>
-          96334
+          96336
         </td>
         <td>
-          7502
+          7842
           -
-          7510
+          7850
         </td>
         <td>
           Select
@@ -4363,15 +4434,15 @@
         </td>
       </tr><tr>
         <td>
-          180
+          192
         </td>
         <td>
-          96337
+          96339
         </td>
         <td>
-          7595
+          7935
           -
-          7600
+          7940
         </td>
         <td>
           Apply
@@ -4387,15 +4458,15 @@
         </td>
       </tr><tr>
         <td>
-          180
+          192
         </td>
         <td>
-          96336
+          96338
         </td>
         <td>
-          7582
+          7922
           -
-          7587
+          7927
         </td>
         <td>
           Apply
@@ -4411,15 +4482,15 @@
         </td>
       </tr><tr>
         <td>
-          180
+          192
         </td>
         <td>
-          96339
+          96341
         </td>
         <td>
-          7591
+          7931
           -
-          7601
+          7941
         </td>
         <td>
           Block
@@ -4435,15 +4506,15 @@
         </td>
       </tr><tr>
         <td>
-          180
+          192
         </td>
         <td>
-          96338
+          96340
         </td>
         <td>
-          7591
+          7931
           -
-          7601
+          7941
         </td>
         <td>
           Apply
@@ -4459,15 +4530,15 @@
         </td>
       </tr><tr>
         <td>
-          180
+          192
         </td>
         <td>
-          96341
+          96343
         </td>
         <td>
-          7565
+          7905
           -
-          7565
+          7905
         </td>
         <td>
           TypeApply
@@ -4483,15 +4554,15 @@
         </td>
       </tr><tr>
         <td>
-          180
+          192
         </td>
         <td>
-          96340
+          96342
         </td>
         <td>
-          7565
+          7905
           -
-          7565
+          7905
         </td>
         <td>
           Apply
@@ -4507,15 +4578,15 @@
         </td>
       </tr><tr>
         <td>
-          180
+          192
         </td>
         <td>
-          96342
+          96344
         </td>
         <td>
-          7469
+          7809
           -
-          7603
+          7943
         </td>
         <td>
           ApplyToImplicitArgs
@@ -4547,15 +4618,15 @@
         </td>
       </tr><tr>
         <td>
-          181
+          193
         </td>
         <td>
-          96344
+          96346
         </td>
         <td>
-          7619
+          7959
           -
-          7635
+          7975
         </td>
         <td>
           Select
@@ -4571,15 +4642,15 @@
         </td>
       </tr><tr>
         <td>
-          181
+          193
         </td>
         <td>
-          96379
+          96381
         </td>
         <td>
-          7637
+          7977
           -
-          8264
+          8604
         </td>
         <td>
           Block
@@ -4627,15 +4698,15 @@
         </td>
       </tr><tr>
         <td>
-          181
+          193
         </td>
         <td>
-          96378
+          96380
         </td>
         <td>
-          7637
+          7977
           -
-          7637
+          7977
         </td>
         <td>
           Apply
@@ -4651,15 +4722,15 @@
         </td>
       </tr><tr>
         <td>
-          181
+          193
         </td>
         <td>
-          96381
+          96383
         </td>
         <td>
-          7612
+          7952
           -
-          7612
+          7952
         </td>
         <td>
           Block
@@ -4675,15 +4746,15 @@
         </td>
       </tr><tr>
         <td>
-          181
+          193
         </td>
         <td>
-          96380
+          96382
         </td>
         <td>
-          7612
+          7952
           -
-          7612
+          7952
         </td>
         <td>
           Literal
@@ -4699,15 +4770,15 @@
         </td>
       </tr><tr>
         <td>
-          182
+          194
         </td>
         <td>
-          96345
+          96347
         </td>
         <td>
-          7689
+          8029
           -
-          7697
+          8037
         </td>
         <td>
           Select
@@ -4723,15 +4794,15 @@
         </td>
       </tr><tr>
         <td>
-          182
+          194
         </td>
         <td>
-          96347
+          96349
         </td>
         <td>
-          7662
+          8002
           -
-          7704
+          8044
         </td>
         <td>
           Apply
@@ -4747,15 +4818,15 @@
         </td>
       </tr><tr>
         <td>
-          182
+          194
         </td>
         <td>
-          96346
+          96348
         </td>
         <td>
-          7699
+          8039
           -
-          7703
+          8043
         </td>
         <td>
           Select
@@ -4771,15 +4842,15 @@
         </td>
       </tr><tr>
         <td>
-          183
+          195
         </td>
         <td>
-          96348
+          96350
         </td>
         <td>
-          7719
+          8059
           -
-          7734
+          8074
         </td>
         <td>
           Select
@@ -4795,15 +4866,15 @@
         </td>
       </tr><tr>
         <td>
-          183
+          195
         </td>
         <td>
-          96375
+          96377
         </td>
         <td>
-          7736
+          8076
           -
-          8254
+          8594
         </td>
         <td>
           Block
@@ -4842,15 +4913,15 @@
         </td>
       </tr><tr>
         <td>
-          183
+          195
         </td>
         <td>
-          96377
+          96379
         </td>
         <td>
-          7715
+          8055
           -
-          7715
+          8055
         </td>
         <td>
           Block
@@ -4866,15 +4937,15 @@
         </td>
       </tr><tr>
         <td>
-          183
+          195
         </td>
         <td>
-          96376
+          96378
         </td>
         <td>
-          7715
+          8055
           -
-          7715
+          8055
         </td>
         <td>
           Literal
@@ -4890,15 +4961,15 @@
         </td>
       </tr><tr>
         <td>
-          184
+          196
         </td>
         <td>
-          96349
+          96351
         </td>
         <td>
-          7764
+          8104
           -
-          7781
+          8121
         </td>
         <td>
           Apply
@@ -4914,15 +4985,15 @@
         </td>
       </tr><tr>
         <td>
-          185
+          197
         </td>
         <td>
-          96350
+          96352
         </td>
         <td>
-          7801
+          8141
           -
-          7816
+          8156
         </td>
         <td>
           Apply
@@ -4938,15 +5009,15 @@
         </td>
       </tr><tr>
         <td>
-          185
+          197
         </td>
         <td>
-          96371
+          96373
         </td>
         <td>
-          7818
+          8158
           -
-          8207
+          8547
         </td>
         <td>
           Block
@@ -4976,15 +5047,15 @@
         </td>
       </tr><tr>
         <td>
-          185
+          197
         </td>
         <td>
-          96370
+          96372
         </td>
         <td>
-          7818
+          8158
           -
-          7818
+          8158
         </td>
         <td>
           Apply
@@ -5000,15 +5071,15 @@
         </td>
       </tr><tr>
         <td>
-          185
+          197
         </td>
         <td>
-          96373
+          96375
         </td>
         <td>
-          7794
+          8134
           -
-          7794
+          8134
         </td>
         <td>
           Block
@@ -5024,15 +5095,15 @@
         </td>
       </tr><tr>
         <td>
-          185
+          197
         </td>
         <td>
-          96372
+          96374
         </td>
         <td>
-          7794
+          8134
           -
-          7794
+          8134
         </td>
         <td>
           Literal
@@ -5048,15 +5119,15 @@
         </td>
       </tr><tr>
         <td>
-          186
+          198
         </td>
         <td>
-          96351
+          96353
         </td>
         <td>
-          7842
+          8182
           -
-          7856
+          8196
         </td>
         <td>
           Apply
@@ -5072,15 +5143,15 @@
         </td>
       </tr><tr>
         <td>
-          187
+          199
         </td>
         <td>
-          96352
+          96354
         </td>
         <td>
-          7879
+          8219
           -
-          7888
+          8228
         </td>
         <td>
           Apply
@@ -5096,15 +5167,15 @@
         </td>
       </tr><tr>
         <td>
-          188
+          200
         </td>
         <td>
-          96353
+          96355
         </td>
         <td>
-          7907
+          8247
           -
-          7916
+          8256
         </td>
         <td>
           Apply
@@ -5120,63 +5191,63 @@
         </td>
       </tr><tr>
         <td>
-          189
-        </td>
-        <td>
-          96355
-        </td>
-        <td>
-          7949
-          -
-          7966
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.kafka.data.KafkaMetadata.KeyBytes.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          KafkaMetadata.this.KeyBytes.apply(r.key())
-        </td>
-      </tr><tr>
-        <td>
-          189
-        </td>
-        <td>
-          96354
-        </td>
-        <td>
-          7958
-          -
-          7965
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.kafka.clients.consumer.ConsumerRecord.key
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          r.key()
-        </td>
-      </tr><tr>
-        <td>
-          189
+          201
         </td>
         <td>
           96357
         </td>
         <td>
-          7936
+          8289
           -
-          7967
+          8306
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaMetadata.KeyBytes.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaMetadata.this.KeyBytes.apply(r.key())
+        </td>
+      </tr><tr>
+        <td>
+          201
+        </td>
+        <td>
+          96356
+        </td>
+        <td>
+          8298
+          -
+          8305
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecord.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          r.key()
+        </td>
+      </tr><tr>
+        <td>
+          201
+        </td>
+        <td>
+          96359
+        </td>
+        <td>
+          8276
+          -
+          8307
         </td>
         <td>
           Block
@@ -5192,15 +5263,15 @@
         </td>
       </tr><tr>
         <td>
-          189
+          201
         </td>
         <td>
-          96356
+          96358
         </td>
         <td>
-          7936
+          8276
           -
-          7967
+          8307
         </td>
         <td>
           Apply
@@ -5216,15 +5287,15 @@
         </td>
       </tr><tr>
         <td>
-          191
+          203
         </td>
         <td>
-          96359
+          96361
         </td>
         <td>
-          8017
+          8357
           -
-          8034
+          8374
         </td>
         <td>
           Apply
@@ -5240,15 +5311,15 @@
         </td>
       </tr><tr>
         <td>
-          191
+          203
         </td>
         <td>
-          96358
+          96360
         </td>
         <td>
-          8026
+          8366
           -
-          8033
+          8373
         </td>
         <td>
           Apply
@@ -5264,15 +5335,15 @@
         </td>
       </tr><tr>
         <td>
-          191
+          203
         </td>
         <td>
-          96361
+          96363
         </td>
         <td>
-          8007
+          8347
           -
-          8038
+          8378
         </td>
         <td>
           Block
@@ -5288,15 +5359,15 @@
         </td>
       </tr><tr>
         <td>
-          191
+          203
         </td>
         <td>
-          96360
+          96362
         </td>
         <td>
-          8007
+          8347
           -
-          8038
+          8378
         </td>
         <td>
           Apply
@@ -5312,15 +5383,15 @@
         </td>
       </tr><tr>
         <td>
-          193
+          205
         </td>
         <td>
-          96363
+          96365
         </td>
         <td>
-          8112
+          8452
           -
-          8127
+          8467
         </td>
         <td>
           Apply
@@ -5336,15 +5407,15 @@
         </td>
       </tr><tr>
         <td>
-          193
+          205
         </td>
         <td>
-          96362
+          96364
         </td>
         <td>
-          8085
+          8425
           -
-          8098
+          8438
         </td>
         <td>
           Apply
@@ -5360,15 +5431,15 @@
         </td>
       </tr><tr>
         <td>
-          193
+          205
         </td>
         <td>
-          96364
+          96366
         </td>
         <td>
-          8073
+          8413
           -
-          8128
+          8468
         </td>
         <td>
           Apply
@@ -5384,15 +5455,15 @@
         </td>
       </tr><tr>
         <td>
-          193
+          205
         </td>
         <td>
-          96369
+          96371
         </td>
         <td>
-          8069
+          8409
           -
-          8069
+          8409
         </td>
         <td>
           Block
@@ -5408,15 +5479,15 @@
         </td>
       </tr><tr>
         <td>
-          193
+          205
         </td>
         <td>
-          96368
+          96370
         </td>
         <td>
-          8069
+          8409
           -
-          8069
+          8409
         </td>
         <td>
           Literal
@@ -5432,15 +5503,15 @@
         </td>
       </tr><tr>
         <td>
-          194
+          206
         </td>
         <td>
-          96365
+          96367
         </td>
         <td>
-          8163
+          8503
           -
-          8176
+          8516
         </td>
         <td>
           Apply
@@ -5456,15 +5527,15 @@
         </td>
       </tr><tr>
         <td>
-          194
+          206
         </td>
         <td>
-          96367
+          96369
         </td>
         <td>
-          8148
+          8488
           -
-          8177
+          8517
         </td>
         <td>
           Block
@@ -5480,15 +5551,15 @@
         </td>
       </tr><tr>
         <td>
-          194
+          206
         </td>
         <td>
-          96366
+          96368
         </td>
         <td>
-          8148
+          8488
           -
-          8177
+          8517
         </td>
         <td>
           Apply
@@ -5504,15 +5575,15 @@
         </td>
       </tr><tr>
         <td>
-          197
+          209
         </td>
         <td>
-          96374
+          96376
         </td>
         <td>
-          8220
+          8560
           -
-          8242
+          8582
         </td>
         <td>
           Apply
@@ -5528,15 +5599,15 @@
         </td>
       </tr><tr>
         <td>
-          204
+          216
         </td>
         <td>
-          96383
+          96385
         </td>
         <td>
-          8554
+          8894
           -
-          8592
+          8932
         </td>
         <td>
           Apply
@@ -5552,15 +5623,15 @@
         </td>
       </tr><tr>
         <td>
-          204
+          216
         </td>
         <td>
-          96382
+          96384
         </td>
         <td>
-          8563
+          8903
           -
-          8592
+          8932
         </td>
         <td>
           Apply
@@ -5576,15 +5647,15 @@
         </td>
       </tr><tr>
         <td>
-          205
+          217
         </td>
         <td>
-          96385
+          96387
         </td>
         <td>
-          8634
+          8974
           -
-          8634
+          8974
         </td>
         <td>
           Literal
@@ -5600,15 +5671,15 @@
         </td>
       </tr><tr>
         <td>
-          205
+          217
         </td>
         <td>
-          96384
+          96386
         </td>
         <td>
-          8621
+          8961
           -
-          8640
+          8980
         </td>
         <td>
           Apply
@@ -5624,15 +5695,15 @@
         </td>
       </tr><tr>
         <td>
-          205
+          217
         </td>
         <td>
-          96387
+          96389
         </td>
         <td>
-          8620
+          8960
           -
-          8620
+          8960
         </td>
         <td>
           Literal
@@ -5648,15 +5719,15 @@
         </td>
       </tr><tr>
         <td>
-          205
+          217
         </td>
         <td>
-          96386
+          96388
         </td>
         <td>
-          8601
+          8941
           -
-          8641
+          8981
         </td>
         <td>
           Apply
@@ -5675,15 +5746,15 @@
         </td>
       </tr><tr>
         <td>
-          207
+          219
         </td>
         <td>
-          96389
+          96391
         </td>
         <td>
-          8749
+          9089
           -
-          8769
+          9109
         </td>
         <td>
           Apply
@@ -5699,15 +5770,15 @@
         </td>
       </tr><tr>
         <td>
-          207
+          219
         </td>
         <td>
-          96391
+          96393
         </td>
         <td>
-          8746
+          9086
           -
-          8778
+          9118
         </td>
         <td>
           Block
@@ -5726,15 +5797,15 @@
         </td>
       </tr><tr>
         <td>
-          207
+          219
         </td>
         <td>
-          96390
+          96392
         </td>
         <td>
-          8771
+          9111
           -
-          8778
+          9118
         </td>
         <td>
           Throw
@@ -5750,15 +5821,15 @@
         </td>
       </tr><tr>
         <td>
-          211
+          223
         </td>
         <td>
-          96393
+          96395
         </td>
         <td>
-          8854
+          9194
           -
-          8878
+          9218
         </td>
         <td>
           Apply
@@ -5774,15 +5845,15 @@
         </td>
       </tr><tr>
         <td>
-          211
+          223
         </td>
         <td>
-          96392
+          96394
         </td>
         <td>
-          8864
+          9204
           -
-          8877
+          9217
         </td>
         <td>
           Apply
@@ -5798,15 +5869,15 @@
         </td>
       </tr><tr>
         <td>
-          211
+          223
         </td>
         <td>
-          96394
+          96396
         </td>
         <td>
-          8847
+          9187
           -
-          8879
+          9219
         </td>
         <td>
           Apply
@@ -5822,15 +5893,15 @@
         </td>
       </tr><tr>
         <td>
-          214
+          226
         </td>
         <td>
-          96395
+          96397
         </td>
         <td>
-          8968
+          9308
           -
-          8973
+          9313
         </td>
         <td>
           Select
@@ -5846,15 +5917,15 @@
         </td>
       </tr><tr>
         <td>
-          214
+          226
         </td>
         <td>
-          96397
+          96399
         </td>
         <td>
-          9012
+          9352
           -
-          9024
+          9364
         </td>
         <td>
           Block
@@ -5870,15 +5941,15 @@
         </td>
       </tr><tr>
         <td>
-          214
+          226
         </td>
         <td>
-          96396
+          96398
         </td>
         <td>
-          9012
+          9352
           -
-          9024
+          9364
         </td>
         <td>
           Apply
@@ -5894,15 +5965,15 @@
         </td>
       </tr><tr>
         <td>
-          214
+          226
         </td>
         <td>
-          96399
+          96401
         </td>
         <td>
-          8950
+          9290
           -
-          8950
+          9290
         </td>
         <td>
           TypeApply
@@ -5918,15 +5989,15 @@
         </td>
       </tr><tr>
         <td>
-          214
+          226
         </td>
         <td>
-          96398
+          96400
         </td>
         <td>
-          8968
+          9308
           -
-          9026
+          9366
         </td>
         <td>
           Apply
@@ -5944,15 +6015,15 @@
         </td>
       </tr><tr>
         <td>
-          214
+          226
         </td>
         <td>
-          96400
+          96402
         </td>
         <td>
-          8950
+          9290
           -
-          9027
+          9367
         </td>
         <td>
           Apply
@@ -5970,15 +6041,15 @@
         </td>
       </tr><tr>
         <td>
-          217
+          229
         </td>
         <td>
-          96401
+          96403
         </td>
         <td>
-          9163
+          9503
           -
-          9169
+          9509
         </td>
         <td>
           ApplyImplicitView
@@ -5994,15 +6065,15 @@
         </td>
       </tr><tr>
         <td>
-          217
+          229
         </td>
         <td>
-          96403
+          96405
         </td>
         <td>
-          9150
+          9490
           -
-          9170
+          9510
         </td>
         <td>
           Block
@@ -6018,15 +6089,15 @@
         </td>
       </tr><tr>
         <td>
-          217
+          229
         </td>
         <td>
-          96402
+          96404
         </td>
         <td>
-          9150
+          9490
           -
-          9170
+          9510
         </td>
         <td>
           Apply
@@ -6042,15 +6113,15 @@
         </td>
       </tr><tr>
         <td>
-          217
+          229
         </td>
         <td>
-          96404
+          96406
         </td>
         <td>
-          9120
+          9460
           -
-          9172
+          9512
         </td>
         <td>
           Apply
@@ -6068,15 +6139,15 @@
         </td>
       </tr><tr>
         <td>
-          220
+          232
         </td>
         <td>
-          96412
+          96414
         </td>
         <td>
-          9229
+          9569
           -
-          9335
+          9675
         </td>
         <td>
           Block
@@ -6101,15 +6172,15 @@
         </td>
       </tr><tr>
         <td>
-          221
+          233
         </td>
         <td>
-          96405
+          96407
         </td>
         <td>
-          9233
+          9573
           -
-          9247
+          9587
         </td>
         <td>
           Apply
@@ -6125,15 +6196,15 @@
         </td>
       </tr><tr>
         <td>
-          221
+          233
         </td>
         <td>
-          96409
+          96411
         </td>
         <td>
-          9229
+          9569
           -
-          9229
+          9569
         </td>
         <td>
           Block
@@ -6149,15 +6220,15 @@
         </td>
       </tr><tr>
         <td>
-          221
+          233
         </td>
         <td>
-          96408
+          96410
         </td>
         <td>
-          9229
+          9569
           -
-          9229
+          9569
         </td>
         <td>
           Literal
@@ -6173,15 +6244,15 @@
         </td>
       </tr><tr>
         <td>
-          222
+          234
         </td>
         <td>
-          96407
+          96409
         </td>
         <td>
-          9261
+          9601
           -
-          9280
+          9620
         </td>
         <td>
           Block
@@ -6197,15 +6268,15 @@
         </td>
       </tr><tr>
         <td>
-          222
+          234
         </td>
         <td>
-          96406
+          96408
         </td>
         <td>
-          9261
+          9601
           -
-          9280
+          9620
         </td>
         <td>
           Apply
@@ -6221,15 +6292,15 @@
         </td>
       </tr><tr>
         <td>
-          224
+          236
         </td>
         <td>
-          96411
+          96413
         </td>
         <td>
-          9313
+          9653
           -
-          9313
+          9653
         </td>
         <td>
           Literal
@@ -6245,15 +6316,15 @@
         </td>
       </tr><tr>
         <td>
-          224
+          236
         </td>
         <td>
-          96410
+          96412
         </td>
         <td>
-          9299
+          9639
           -
-          9335
+          9675
         </td>
         <td>
           Apply
@@ -6269,15 +6340,15 @@
         </td>
       </tr><tr>
         <td>
-          227
+          239
         </td>
         <td>
-          96413
+          96415
         </td>
         <td>
-          9469
+          9809
           -
-          9502
+          9842
         </td>
         <td>
           Apply
@@ -6293,15 +6364,15 @@
         </td>
       </tr><tr>
         <td>
-          227
+          239
         </td>
         <td>
-          96417
+          96419
         </td>
         <td>
-          9465
+          9805
           -
-          9465
+          9805
         </td>
         <td>
           Block
@@ -6317,15 +6388,15 @@
         </td>
       </tr><tr>
         <td>
-          227
+          239
         </td>
         <td>
-          96416
+          96418
         </td>
         <td>
-          9465
+          9805
           -
-          9465
+          9805
         </td>
         <td>
           Literal
@@ -6341,15 +6412,15 @@
         </td>
       </tr><tr>
         <td>
-          227
+          239
         </td>
         <td>
-          96418
+          96420
         </td>
         <td>
-          9465
+          9805
           -
-          9543
+          9883
         </td>
         <td>
           If
@@ -6368,15 +6439,15 @@ else
         </td>
       </tr><tr>
         <td>
-          228
+          240
         </td>
         <td>
-          96415
+          96417
         </td>
         <td>
-          9516
+          9856
           -
-          9533
+          9873
         </td>
         <td>
           Block
@@ -6392,15 +6463,15 @@ else
         </td>
       </tr><tr>
         <td>
-          228
+          240
         </td>
         <td>
-          96414
+          96416
         </td>
         <td>
-          9516
+          9856
           -
-          9533
+          9873
         </td>
         <td>
           Apply
@@ -6416,15 +6487,15 @@ else
         </td>
       </tr><tr>
         <td>
-          234
+          246
         </td>
         <td>
-          96429
+          96431
         </td>
         <td>
-          9623
+          9963
           -
-          9928
+          10268
         </td>
         <td>
           Block
@@ -6440,7 +6511,7 @@ else
   val topics: java.util.Set[org.apache.kafka.common.TopicPartition] = TopicMap.this.consumer.assignment();
   TopicMap.this.consumer.unsubscribe();
   if (topics.isEmpty().unary_!)
-    scala.util.Try.apply[Unit](KafkaMetadata.this.adminClientOp[Unit](((x$3: org.apache.kafka.clients.admin.AdminClient) =&gt; org.locationtech.geomesa.kafka.versions.KafkaAdminVersions.deleteConsumerGroupOffsets(x$3, TopicMap.this.groupId, topics)))).failed.foreach[Unit](((e: Throwable) =&gt; (if (KafkaMetadata.this.logger.underlying.isWarnEnabled())
+    scala.util.Try.apply[Unit](KafkaMetadata.this.adminClientOp[Unit](((x$2: org.apache.kafka.clients.admin.AdminClient) =&gt; org.locationtech.geomesa.kafka.versions.KafkaAdminVersions.deleteConsumerGroupOffsets(x$2, TopicMap.this.groupId, topics)))).failed.foreach[Unit](((e: Throwable) =&gt; (if (KafkaMetadata.this.logger.underlying.isWarnEnabled())
       KafkaMetadata.this.logger.underlying.warn(&quot;Error deleting consumer group offsets:&quot;, e)
     else
       (): Unit)))
@@ -6450,15 +6521,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          247
         </td>
         <td>
-          96419
+          96421
         </td>
         <td>
-          9636
+          9976
           -
-          9657
+          9997
         </td>
         <td>
           Apply
@@ -6474,15 +6545,15 @@ else
         </td>
       </tr><tr>
         <td>
-          236
+          248
         </td>
         <td>
-          96420
+          96422
         </td>
         <td>
-          9666
+          10006
           -
-          9688
+          10028
         </td>
         <td>
           Apply
@@ -6498,15 +6569,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          249
         </td>
         <td>
-          96421
+          96423
         </td>
         <td>
-          9701
+          10041
           -
-          9716
+          10056
         </td>
         <td>
           Select
@@ -6522,15 +6593,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          249
         </td>
         <td>
-          96427
+          96429
         </td>
         <td>
-          9697
+          10037
           -
-          9697
+          10037
         </td>
         <td>
           Literal
@@ -6546,15 +6617,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          249
         </td>
         <td>
-          96428
+          96430
         </td>
         <td>
-          9697
+          10037
           -
-          9697
+          10037
         </td>
         <td>
           Block
@@ -6570,15 +6641,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          250
         </td>
         <td>
-          96423
+          96425
         </td>
         <td>
-          9748
+          10088
           -
-          9813
+          10153
         </td>
         <td>
           Apply
@@ -6590,19 +6661,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.kafka.versions.KafkaAdminVersions.deleteConsumerGroupOffsets(x$3, TopicMap.this.groupId, topics)
+          org.locationtech.geomesa.kafka.versions.KafkaAdminVersions.deleteConsumerGroupOffsets(x$2, TopicMap.this.groupId, topics)
         </td>
       </tr><tr>
         <td>
-          238
+          250
         </td>
         <td>
-          96422
+          96424
         </td>
         <td>
-          9797
+          10137
           -
-          9804
+          10144
         </td>
         <td>
           Select
@@ -6618,15 +6689,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          250
         </td>
         <td>
-          96425
+          96427
         </td>
         <td>
-          9730
+          10070
           -
-          9918
+          10258
         </td>
         <td>
           Apply
@@ -6638,22 +6709,22 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          scala.util.Try.apply[Unit](KafkaMetadata.this.adminClientOp[Unit](((x$3: org.apache.kafka.clients.admin.AdminClient) =&gt; org.locationtech.geomesa.kafka.versions.KafkaAdminVersions.deleteConsumerGroupOffsets(x$3, TopicMap.this.groupId, topics)))).failed.foreach[Unit](((e: Throwable) =&gt; (if (KafkaMetadata.this.logger.underlying.isWarnEnabled())
+          scala.util.Try.apply[Unit](KafkaMetadata.this.adminClientOp[Unit](((x$2: org.apache.kafka.clients.admin.AdminClient) =&gt; org.locationtech.geomesa.kafka.versions.KafkaAdminVersions.deleteConsumerGroupOffsets(x$2, TopicMap.this.groupId, topics)))).failed.foreach[Unit](((e: Throwable) =&gt; (if (KafkaMetadata.this.logger.underlying.isWarnEnabled())
   KafkaMetadata.this.logger.underlying.warn(&quot;Error deleting consumer group offsets:&quot;, e)
 else
   (): Unit)))
         </td>
       </tr><tr>
         <td>
-          238
+          250
         </td>
         <td>
-          96424
+          96426
         </td>
         <td>
-          9734
+          10074
           -
-          9814
+          10154
         </td>
         <td>
           Apply
@@ -6665,19 +6736,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          KafkaMetadata.this.adminClientOp[Unit](((x$3: org.apache.kafka.clients.admin.AdminClient) =&gt; org.locationtech.geomesa.kafka.versions.KafkaAdminVersions.deleteConsumerGroupOffsets(x$3, TopicMap.this.groupId, topics)))
+          KafkaMetadata.this.adminClientOp[Unit](((x$2: org.apache.kafka.clients.admin.AdminClient) =&gt; org.locationtech.geomesa.kafka.versions.KafkaAdminVersions.deleteConsumerGroupOffsets(x$2, TopicMap.this.groupId, topics)))
         </td>
       </tr><tr>
         <td>
-          238
+          250
         </td>
         <td>
-          96426
+          96428
         </td>
         <td>
-          9730
+          10070
           -
-          9918
+          10258
         </td>
         <td>
           Block
@@ -6689,22 +6760,22 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          scala.util.Try.apply[Unit](KafkaMetadata.this.adminClientOp[Unit](((x$3: org.apache.kafka.clients.admin.AdminClient) =&gt; org.locationtech.geomesa.kafka.versions.KafkaAdminVersions.deleteConsumerGroupOffsets(x$3, TopicMap.this.groupId, topics)))).failed.foreach[Unit](((e: Throwable) =&gt; (if (KafkaMetadata.this.logger.underlying.isWarnEnabled())
+          scala.util.Try.apply[Unit](KafkaMetadata.this.adminClientOp[Unit](((x$2: org.apache.kafka.clients.admin.AdminClient) =&gt; org.locationtech.geomesa.kafka.versions.KafkaAdminVersions.deleteConsumerGroupOffsets(x$2, TopicMap.this.groupId, topics)))).failed.foreach[Unit](((e: Throwable) =&gt; (if (KafkaMetadata.this.logger.underlying.isWarnEnabled())
   KafkaMetadata.this.logger.underlying.warn(&quot;Error deleting consumer group offsets:&quot;, e)
 else
   (): Unit)))
         </td>
       </tr><tr>
         <td>
-          243
+          255
         </td>
         <td>
-          96431
+          96433
         </td>
         <td>
-          9955
+          10295
           -
-          9971
+          10311
         </td>
         <td>
           Block
@@ -6720,15 +6791,15 @@ else
         </td>
       </tr><tr>
         <td>
-          243
+          255
         </td>
         <td>
-          96430
+          96432
         </td>
         <td>
-          9955
+          10295
           -
-          9971
+          10311
         </td>
         <td>
           Apply
@@ -6744,15 +6815,15 @@ else
         </td>
       </tr><tr>
         <td>
-          254
+          266
         </td>
         <td>
-          96433
+          96435
         </td>
         <td>
-          10165
+          10505
           -
-          10197
+          10537
         </td>
         <td>
           Apply
@@ -6768,15 +6839,15 @@ else
         </td>
       </tr><tr>
         <td>
-          254
+          266
         </td>
         <td>
-          96432
+          96434
         </td>
         <td>
-          10191
+          10531
           -
-          10196
+          10536
         </td>
         <td>
           Select
@@ -6792,15 +6863,15 @@ else
         </td>
       </tr><tr>
         <td>
-          257
+          269
         </td>
         <td>
-          96435
+          96437
         </td>
         <td>
-          10295
+          10635
           -
-          10332
+          10672
         </td>
         <td>
           Apply
@@ -6816,15 +6887,15 @@ else
         </td>
       </tr><tr>
         <td>
-          257
+          269
         </td>
         <td>
-          96434
+          96436
         </td>
         <td>
-          10319
+          10659
           -
-          10324
+          10664
         </td>
         <td>
           Select
@@ -6840,15 +6911,15 @@ else
         </td>
       </tr><tr>
         <td>
-          257
+          269
         </td>
         <td>
-          96436
+          96438
         </td>
         <td>
-          10295
+          10635
           -
-          10332
+          10672
         </td>
         <td>
           Block
@@ -6864,15 +6935,15 @@ else
         </td>
       </tr><tr>
         <td>
-          258
+          270
         </td>
         <td>
-          96437
+          96439
         </td>
         <td>
-          10351
+          10691
           -
-          10356
+          10696
         </td>
         <td>
           Literal
@@ -6888,15 +6959,15 @@ else
         </td>
       </tr><tr>
         <td>
-          258
+          270
         </td>
         <td>
-          96438
+          96440
         </td>
         <td>
-          10351
+          10691
           -
-          10356
+          10696
         </td>
         <td>
           Block
@@ -6912,15 +6983,15 @@ else
         </td>
       </tr><tr>
         <td>
-          265
+          277
         </td>
         <td>
-          96439
+          96441
         </td>
         <td>
-          10437
+          10777
           -
-          10453
+          10793
         </td>
         <td>
           Literal
@@ -6936,15 +7007,15 @@ else
         </td>
       </tr><tr>
         <td>
-          266
+          278
         </td>
         <td>
-          96440
+          96442
         </td>
         <td>
-          10491
+          10831
           -
-          10500
+          10840
         </td>
         <td>
           Literal
