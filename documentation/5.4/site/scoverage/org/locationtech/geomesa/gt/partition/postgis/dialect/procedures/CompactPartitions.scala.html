@@ -1,0 +1,3335 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/gt/partition/postgis/dialect/procedures/CompactPartitions.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.gt.partition.postgis.dialect
+</span>10 <span style=''>package procedures
+</span>11 <span style=''>
+</span>12 <span style=''>import org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData
+</span>13 <span style=''>import org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable
+</span>14 <span style=''>
+</span>15 <span style=''>/**
+</span>16 <span style=''> * Re-sorts a partition table. Can be used for maintenance if time-latent data comes in and degrades performance
+</span>17 <span style=''> * of the BRIN index
+</span>18 <span style=''> */
+</span>19 <span style=''>object CompactPartitions extends SqlProcedure {
+</span>20 <span style=''>
+</span>21 <span style=''>  override def name(info: TypeInfo): FunctionName = </span><span style='background: #AEF1AE'>FunctionName(s&quot;${info.typeName}_compact_partitions&quot;)</span><span style=''>
+</span>22 <span style=''>
+</span>23 <span style=''>  override protected def createStatements(info: TypeInfo): Seq[String] = </span><span style='background: #AEF1AE'>Seq(proc(info))</span><span style=''>
+</span>24 <span style=''>
+</span>25 <span style=''>  private def proc(info: TypeInfo): String = {
+</span>26 <span style=''>    </span><span style='background: #AEF1AE'>s&quot;&quot;&quot;CREATE OR REPLACE PROCEDURE ${info.schema.quoted}.${name(info).quoted}(for_date timestamp without time zone) LANGUAGE plpgsql AS
+</span>27 <span style=''></span><span style='background: #AEF1AE'>       |  $$BODY$$
+</span>28 <span style=''></span><span style='background: #AEF1AE'>       |    DECLARE
+</span>29 <span style=''></span><span style='background: #AEF1AE'>       |      partition_name text;
+</span>30 <span style=''></span><span style='background: #AEF1AE'>       |      spill_partition text;
+</span>31 <span style=''></span><span style='background: #AEF1AE'>       |      min_dtg timestamp without time zone;         -- min date in our partitioned tables
+</span>32 <span style=''></span><span style='background: #AEF1AE'>       |      partition_start timestamp without time zone; -- start bounds for the partition we're writing
+</span>33 <span style=''></span><span style='background: #AEF1AE'>       |      partition_end timestamp without time zone;   -- end bounds for the partition we're writing
+</span>34 <span style=''></span><span style='background: #AEF1AE'>       |      partition_size int;                          -- size of the partition, in hours
+</span>35 <span style=''></span><span style='background: #AEF1AE'>       |      partition_tablespace text;
+</span>36 <span style=''></span><span style='background: #AEF1AE'>       |      index_tablespace text;                       -- index tablespace
+</span>37 <span style=''></span><span style='background: #AEF1AE'>       |      table_wa_logging text;                       -- wa log options
+</span>38 <span style=''></span><span style='background: #AEF1AE'>       |      unsorted_count bigint;
+</span>39 <span style=''></span><span style='background: #AEF1AE'>       |      pexists boolean;                             -- table exists check
+</span>40 <span style=''></span><span style='background: #AEF1AE'>       |    BEGIN
+</span>41 <span style=''></span><span style='background: #AEF1AE'>       |      IF for_date IS NULL THEN
+</span>42 <span style=''></span><span style='background: #AEF1AE'>       |        RAISE EXCEPTION 'date is null' USING HINT = 'Please use a valid date';
+</span>43 <span style=''></span><span style='background: #AEF1AE'>       |      END IF;
+</span>44 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>45 <span style=''></span><span style='background: #AEF1AE'>       |      SELECT COALESCE(
+</span>46 <span style=''></span><span style='background: #AEF1AE'>       |        (SELECT value::int FROM ${info.schema.quoted}.${UserDataTable.Name.quoted}
+</span>47 <span style=''></span><span style='background: #AEF1AE'>       |          WHERE type_name = ${literal(info.typeName)} AND key = ${literal(SftUserData.IntervalHours.key)}),
+</span>48 <span style=''></span><span style='background: #AEF1AE'>       |          ${SftUserData.IntervalHours.default})
+</span>49 <span style=''></span><span style='background: #AEF1AE'>       |        INTO partition_size;
+</span>50 <span style=''></span><span style='background: #AEF1AE'>       |      partition_name := ${info.tables.mainPartitions.name.asLiteral} || '_' ||
+</span>51 <span style=''></span><span style='background: #AEF1AE'>       |        to_char(${info.schema.quoted}.truncate_to_partition(for_date, partition_size), 'YYYY_MM_DD_HH24');
+</span>52 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>53 <span style=''></span><span style='background: #AEF1AE'>       |      SELECT value FROM ${info.schema.quoted}.${UserDataTable.Name.quoted}
+</span>54 <span style=''></span><span style='background: #AEF1AE'>       |        WHERE type_name = ${literal(info.typeName)} AND key = ${literal(SftUserData.MainTableSpace.key)}
+</span>55 <span style=''></span><span style='background: #AEF1AE'>       |        INTO partition_tablespace;
+</span>56 <span style=''></span><span style='background: #AEF1AE'>       |      IF partition_tablespace IS NULL THEN
+</span>57 <span style=''></span><span style='background: #AEF1AE'>       |        index_tablespace := '';
+</span>58 <span style=''></span><span style='background: #AEF1AE'>       |        partition_tablespace := '';
+</span>59 <span style=''></span><span style='background: #AEF1AE'>       |      ELSE
+</span>60 <span style=''></span><span style='background: #AEF1AE'>       |        index_tablespace := ' USING INDEX TABLESPACE '|| quote_ident(partition_tablespace);
+</span>61 <span style=''></span><span style='background: #AEF1AE'>       |        partition_tablespace := ' TABLESPACE ' || quote_ident(partition_tablespace);
+</span>62 <span style=''></span><span style='background: #AEF1AE'>       |      END IF;
+</span>63 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>64 <span style=''></span><span style='background: #AEF1AE'>       |      SELECT COALESCE(
+</span>65 <span style=''></span><span style='background: #AEF1AE'>       |        (SELECT value FROM ${info.schema.quoted}.${UserDataTable.Name.quoted}
+</span>66 <span style=''></span><span style='background: #AEF1AE'>       |          WHERE type_name = ${literal(info.typeName)} AND key = ${literal(SftUserData.WalLogEnabled.key)}),
+</span>67 <span style=''></span><span style='background: #AEF1AE'>       |          '${SftUserData.WalLogEnabled.default}'
+</span>68 <span style=''></span><span style='background: #AEF1AE'>       |        ) INTO table_wa_logging;
+</span>69 <span style=''></span><span style='background: #AEF1AE'>       |      IF table_wa_logging IS NULL OR NOT table_wa_logging::boolean THEN
+</span>70 <span style=''></span><span style='background: #AEF1AE'>       |        table_wa_logging := '';
+</span>71 <span style=''></span><span style='background: #AEF1AE'>       |      ELSE
+</span>72 <span style=''></span><span style='background: #AEF1AE'>       |        table_wa_logging := 'UNLOGGED ';
+</span>73 <span style=''></span><span style='background: #AEF1AE'>       |      END IF;
+</span>74 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>75 <span style=''></span><span style='background: #AEF1AE'>       |      RAISE INFO '% Compacting partition table %', timeofday()::timestamp, partition_name;
+</span>76 <span style=''></span><span style='background: #AEF1AE'>       |      LOCK TABLE ONLY ${info.tables.mainPartitions.name.qualified} IN SHARE UPDATE EXCLUSIVE MODE;
+</span>77 <span style=''></span><span style='background: #AEF1AE'>       |      -- lock the child table to prevent any inserts that would be lost
+</span>78 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'LOCK TABLE ${info.schema.quoted}.' || quote_ident(partition_name) ||
+</span>79 <span style=''></span><span style='background: #AEF1AE'>       |        ' IN SHARE ROW EXCLUSIVE MODE';
+</span>80 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'SELECT ${info.cols.dtg.quoted} FROM ${info.schema.quoted}.' || quote_ident(partition_name) ||
+</span>81 <span style=''></span><span style='background: #AEF1AE'>       |        ' LIMIT 1' INTO min_dtg;
+</span>82 <span style=''></span><span style='background: #AEF1AE'>       |      partition_start := ${info.schema.quoted}.truncate_to_partition(min_dtg, partition_size);
+</span>83 <span style=''></span><span style='background: #AEF1AE'>       |      partition_end := partition_start + make_interval(hours =&gt; partition_size);
+</span>84 <span style=''></span><span style='background: #AEF1AE'>       |      spill_partition := ${info.tables.spillPartitions.name.asLiteral} || '_' || to_char(partition_start, 'YYYY_MM_DD_HH24');
+</span>85 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>86 <span style=''></span><span style='background: #AEF1AE'>       |      SELECT EXISTS(SELECT FROM pg_tables WHERE schemaname = ${info.schema.asLiteral} AND tablename = spill_partition)
+</span>87 <span style=''></span><span style='background: #AEF1AE'>       |        INTO pexists;
+</span>88 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>89 <span style=''></span><span style='background: #AEF1AE'>       |      -- use &quot;create table as&quot; (vs create then insert) for performance benefits related to WAL skipping
+</span>90 <span style=''></span><span style='background: #AEF1AE'>       |      IF pexists THEN
+</span>91 <span style=''></span><span style='background: #AEF1AE'>       |        -- lock the child table to prevent any inserts that would be lost
+</span>92 <span style=''></span><span style='background: #AEF1AE'>       |        EXECUTE 'LOCK TABLE ${info.schema.quoted}.' || quote_ident(spill_partition) ||
+</span>93 <span style=''></span><span style='background: #AEF1AE'>       |          ' IN SHARE ROW EXCLUSIVE MODE';
+</span>94 <span style=''></span><span style='background: #AEF1AE'>       |        EXECUTE 'CREATE ' || table_wa_logging || 'TABLE ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||
+</span>95 <span style=''></span><span style='background: #AEF1AE'>       |          partition_tablespace || ' AS SELECT * FROM' ||
+</span>96 <span style=''></span><span style='background: #AEF1AE'>       |          ' (SELECT * FROM ${info.schema.quoted}.' || quote_ident(partition_name) ||
+</span>97 <span style=''></span><span style='background: #AEF1AE'>       |          ' UNION ALL SELECT * FROM ${info.schema.quoted}.' || quote_ident(spill_partition) ||
+</span>98 <span style=''></span><span style='background: #AEF1AE'>       |          ') results' ||
+</span>99 <span style=''></span><span style='background: #AEF1AE'>       |          ' ORDER BY _st_sortablehash(${info.cols.geom.quoted})';
+</span>100 <span style=''></span><span style='background: #AEF1AE'>       |        GET DIAGNOSTICS unsorted_count := ROW_COUNT;
+</span>101 <span style=''></span><span style='background: #AEF1AE'>       |      ELSE
+</span>102 <span style=''></span><span style='background: #AEF1AE'>       |        EXECUTE 'CREATE ' || table_wa_logging || 'TABLE ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||
+</span>103 <span style=''></span><span style='background: #AEF1AE'>       |          partition_tablespace || ' AS SELECT * FROM ' || quote_ident(partition_name) ||
+</span>104 <span style=''></span><span style='background: #AEF1AE'>       |          ' ORDER BY _st_sortablehash(${info.cols.geom.quoted})';
+</span>105 <span style=''></span><span style='background: #AEF1AE'>       |        GET DIAGNOSTICS unsorted_count := ROW_COUNT;
+</span>106 <span style=''></span><span style='background: #AEF1AE'>       |      END IF;
+</span>107 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>108 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||
+</span>109 <span style=''></span><span style='background: #AEF1AE'>       |        ' ADD CONSTRAINT ' || quote_ident(partition_name || '_pkey_tmp_sort') ||
+</span>110 <span style=''></span><span style='background: #AEF1AE'>       |        ' PRIMARY KEY (fid, ${info.cols.dtg.quoted})' || index_tablespace;
+</span>111 <span style=''></span><span style='background: #AEF1AE'>       |      -- creating a constraint allows it to be attached to the parent without any additional checks
+</span>112 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'ALTER TABLE  ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||
+</span>113 <span style=''></span><span style='background: #AEF1AE'>       |        ' ADD CONSTRAINT ' || quote_ident(partition_name || '_constraint_tmp_sort') ||
+</span>114 <span style=''></span><span style='background: #AEF1AE'>       |        ' CHECK ( ${info.cols.dtg.quoted} &gt;= ' || quote_literal(partition_start) ||
+</span>115 <span style=''></span><span style='background: #AEF1AE'>       |        ' AND ${info.cols.dtg.quoted} &lt; ' || quote_literal(partition_end) || ' )';
+</span>116 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>117 <span style=''></span><span style='background: #AEF1AE'>       |      -- create indices before attaching to minimize time to attach, copied from PartitionTables code
+</span>118 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'CREATE INDEX IF NOT EXISTS ' || quote_ident(partition_name || '_${info.cols.geom.raw}_tmp_sort') ||
+</span>119 <span style=''></span><span style='background: #AEF1AE'>       |        ' ON ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||
+</span>120 <span style=''></span><span style='background: #AEF1AE'>       |        ' USING BRIN(${info.cols.geom.quoted})' || partition_tablespace;
+</span>121 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'CREATE INDEX IF NOT EXISTS ' || quote_ident(partition_name || '_${info.cols.dtg.raw}_tmp_sort') ||
+</span>122 <span style=''></span><span style='background: #AEF1AE'>       |        ' ON ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||
+</span>123 <span style=''></span><span style='background: #AEF1AE'>       |        ' (${info.cols.dtg.quoted})' || partition_tablespace;
+</span>124 <span style=''></span><span style='background: #AEF1AE'>       |${info.cols.indexed.map { col =&gt;
+</span>125 <span style=''></span><span style='background: #AEF1AE'>    s&quot;&quot;&quot;      EXECUTE 'CREATE INDEX IF NOT EXISTS ' || quote_ident(partition_name || '_${col.raw}_tmp_sort') ||
+</span>126 <span style=''></span><span style='background: #AEF1AE'>       |        ' ON ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||
+</span>127 <span style=''></span><span style='background: #AEF1AE'>       |        ' (${col.quoted})' || partition_tablespace;&quot;&quot;&quot;.stripMargin}.mkString(&quot;\n&quot;)}
+</span>128 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>129 <span style=''></span><span style='background: #AEF1AE'>       |      RAISE INFO '% Dropping old partition table (queries will be blocked) %', timeofday()::timestamp, partition_name;
+</span>130 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'DROP TABLE IF EXISTS ${info.schema.quoted}.' || quote_ident(partition_name);
+</span>131 <span style=''></span><span style='background: #AEF1AE'>       |      IF pexists THEN
+</span>132 <span style=''></span><span style='background: #AEF1AE'>       |        EXECUTE 'DROP TABLE IF EXISTS ${info.schema.quoted}.' || quote_ident(spill_partition);
+</span>133 <span style=''></span><span style='background: #AEF1AE'>       |      END IF;
+</span>134 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>135 <span style=''></span><span style='background: #AEF1AE'>       |      RAISE INFO '% Renaming newly sorted partition table %', timeofday()::timestamp, partition_name;
+</span>136 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||
+</span>137 <span style=''></span><span style='background: #AEF1AE'>       |        ' RENAME TO ' || quote_ident(partition_name);
+</span>138 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_name) ||
+</span>139 <span style=''></span><span style='background: #AEF1AE'>       |        ' RENAME CONSTRAINT ' || quote_ident(partition_name || '_pkey_tmp_sort') ||
+</span>140 <span style=''></span><span style='background: #AEF1AE'>       |        ' TO ' || quote_ident(partition_name || '_pkey');
+</span>141 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'ALTER INDEX ' || quote_ident(partition_name || '_${info.cols.geom.raw}_tmp_sort') ||
+</span>142 <span style=''></span><span style='background: #AEF1AE'>       |        ' RENAME TO ' || quote_ident(partition_name || '_${info.cols.geom.raw}');
+</span>143 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'ALTER INDEX ' || quote_ident(partition_name || '_${info.cols.dtg.raw}_tmp_sort') ||
+</span>144 <span style=''></span><span style='background: #AEF1AE'>       |        ' RENAME TO ' || quote_ident(partition_name || '_${info.cols.dtg.raw}');
+</span>145 <span style=''></span><span style='background: #AEF1AE'>       |${info.cols.indexed.map { col =&gt;
+</span>146 <span style=''></span><span style='background: #AEF1AE'>    s&quot;&quot;&quot;      EXECUTE 'ALTER INDEX ' || quote_ident(partition_name || '_${col.raw}_tmp_sort') ||
+</span>147 <span style=''></span><span style='background: #AEF1AE'>       |        ' RENAME TO ' || quote_ident(partition_name || '_${col.raw}');&quot;&quot;&quot;.stripMargin}.mkString(&quot;\n&quot;)}
+</span>148 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>149 <span style=''></span><span style='background: #AEF1AE'>       |      RAISE INFO '% Attaching newly sorted partition table %', timeofday()::timestamp, partition_name;
+</span>150 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'ALTER TABLE ${info.tables.mainPartitions.name.qualified}' ||
+</span>151 <span style=''></span><span style='background: #AEF1AE'>       |        ' ATTACH PARTITION ${info.schema.quoted}.' || quote_ident(partition_name) ||
+</span>152 <span style=''></span><span style='background: #AEF1AE'>       |        ' FOR VALUES FROM (' || quote_literal(partition_start) || ') TO (' ||
+</span>153 <span style=''></span><span style='background: #AEF1AE'>       |        quote_literal(partition_end) || ' );';
+</span>154 <span style=''></span><span style='background: #AEF1AE'>       |      RAISE INFO '% Done compacting partition table %', timeofday()::timestamp, partition_name;
+</span>155 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>156 <span style=''></span><span style='background: #AEF1AE'>       |      -- now that we've attached the table we can drop the redundant constraint
+</span>157 <span style=''></span><span style='background: #AEF1AE'>       |      RAISE INFO '% Dropping constraint for partition table %', timeofday()::timestamp, partition_name;
+</span>158 <span style=''></span><span style='background: #AEF1AE'>       |      EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_name) ||
+</span>159 <span style=''></span><span style='background: #AEF1AE'>       |        ' DROP CONSTRAINT ' || quote_ident(partition_name || '_constraint_tmp_sort');
+</span>160 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>161 <span style=''></span><span style='background: #AEF1AE'>       |      -- mark the partition to be analyzed in a separate thread
+</span>162 <span style=''></span><span style='background: #AEF1AE'>       |      INSERT INTO ${info.tables.analyzeQueue.name.qualified}(partition_name, enqueued)
+</span>163 <span style=''></span><span style='background: #AEF1AE'>       |        VALUES (partition_name, now());
+</span>164 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>165 <span style=''></span><span style='background: #AEF1AE'>       |      -- commit to release our locks
+</span>166 <span style=''></span><span style='background: #AEF1AE'>       |      COMMIT;
+</span>167 <span style=''></span><span style='background: #AEF1AE'>       |      RAISE INFO '% Done compacting % rows in partition %', timeofday()::timestamp, unsorted_count, partition_name;
+</span>168 <span style=''></span><span style='background: #AEF1AE'>       |
+</span>169 <span style=''></span><span style='background: #AEF1AE'>       |    END;
+</span>170 <span style=''></span><span style='background: #AEF1AE'>       |  $$BODY$$;
+</span>171 <span style=''></span><span style='background: #AEF1AE'>       |&quot;&quot;&quot;.stripMargin</span><span style=''>
+</span>172 <span style=''>  }
+</span>173 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          21
+        </td>
+        <td>
+          89731
+        </td>
+        <td>
+          1006
+          -
+          1026
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;_compact_partitions&quot;
+        </td>
+      </tr><tr>
+        <td>
+          21
+        </td>
+        <td>
+          89730
+        </td>
+        <td>
+          990
+          -
+          991
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          21
+        </td>
+        <td>
+          89733
+        </td>
+        <td>
+          988
+          -
+          1026
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;_compact_partitions&quot;).s(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          21
+        </td>
+        <td>
+          89732
+        </td>
+        <td>
+          992
+          -
+          1005
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          21
+        </td>
+        <td>
+          89734
+        </td>
+        <td>
+          975
+          -
+          1027
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dialect.this.`package`.FunctionName.apply(scala.StringContext.apply(&quot;&quot;, &quot;_compact_partitions&quot;).s(info.typeName))
+        </td>
+      </tr><tr>
+        <td>
+          23
+        </td>
+        <td>
+          89735
+        </td>
+        <td>
+          1106
+          -
+          1116
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.procedures.CompactPartitions.proc
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          CompactPartitions.this.proc(info)
+        </td>
+      </tr><tr>
+        <td>
+          23
+        </td>
+        <td>
+          89736
+        </td>
+        <td>
+          1102
+          -
+          1117
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[String](CompactPartitions.this.proc(info))
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          89737
+        </td>
+        <td>
+          1174
+          -
+          1203
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;CREATE OR REPLACE PROCEDURE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          89739
+        </td>
+        <td>
+          1244
+          -
+          2378
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;(for_date timestamp without time zone) LANGUAGE plpgsql AS\n       |  $BODY$\n       |    DECLARE\n       |      partition_name text;\n       |      spill_partition text;\n       |      min_dtg timestamp without time zone;         -- min date in our partitioned tables\n       |      partition_start timestamp without time zone; -- start bounds for the partition we\'re writing\n       |      partition_end timestamp without time zone;   -- end bounds for the partition we\'re writing\n       |      partition_size int;                          -- size of the partition, in hours\n       |      partition_tablespace text;\n       |      index_tablespace text;                       -- index tablespace\n       |      table_wa_logging text;                       -- wa log options\n       |      unsorted_count bigint;\n       |      pexists boolean;                             -- table exists check\n       |    BEGIN\n       |      IF for_date IS NULL THEN\n       |        RAISE EXCEPTION \'date is null\' USING HINT = \'Please use a valid date\';\n       |      END IF;\n       |\n       |      SELECT COALESCE(\n       |        (SELECT value::int FROM &quot;
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          89738
+        </td>
+        <td>
+          1223
+          -
+          1225
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          89795
+        </td>
+        <td>
+          1204
+          -
+          1222
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          89796
+        </td>
+        <td>
+          1226
+          -
+          1243
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.FunctionName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          CompactPartitions.this.name(info).quoted
+        </td>
+      </tr><tr>
+        <td>
+          26
+        </td>
+        <td>
+          89858
+        </td>
+        <td>
+          1170
+          -
+          11264
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;CREATE OR REPLACE PROCEDURE &quot;, &quot;.&quot;, &quot;(for_date timestamp without time zone) LANGUAGE plpgsql AS\n       |  $BODY$\n       |    DECLARE\n       |      partition_name text;\n       |      spill_partition text;\n       |      min_dtg timestamp without time zone;         -- min date in our partitioned tables\n       |      partition_start timestamp without time zone; -- start bounds for the partition we\'re writing\n       |      partition_end timestamp without time zone;   -- end bounds for the partition we\'re writing\n       |      partition_size int;                          -- size of the partition, in hours\n       |      partition_tablespace text;\n       |      index_tablespace text;                       -- index tablespace\n       |      table_wa_logging text;                       -- wa log options\n       |      unsorted_count bigint;\n       |      pexists boolean;                             -- table exists check\n       |    BEGIN\n       |      IF for_date IS NULL THEN\n       |        RAISE EXCEPTION \'date is null\' USING HINT = \'Please use a valid date\';\n       |      END IF;\n       |\n       |      SELECT COALESCE(\n       |        (SELECT value::int FROM &quot;, &quot;.&quot;, &quot;\n       |          WHERE type_name = &quot;, &quot; AND key = &quot;, &quot;),\n       |          &quot;, &quot;)\n       |        INTO partition_size;\n       |      partition_name := &quot;, &quot; || \'_\' ||\n       |        to_char(&quot;, &quot;.truncate_to_partition(for_date, partition_size), \'YYYY_MM_DD_HH24\');\n       |\n       |      SELECT value FROM &quot;, &quot;.&quot;, &quot;\n       |        WHERE type_name = &quot;, &quot; AND key = &quot;, &quot;\n       |        INTO partition_tablespace;\n       |      IF partition_tablespace IS NULL THEN\n       |        index_tablespace := \'\';\n       |        partition_tablespace := \'\';\n       |      ELSE\n       |        index_tablespace := \' USING INDEX TABLESPACE \'|| quote_ident(partition_tablespace);\n       |        partition_tablespace := \' TABLESPACE \' || quote_ident(partition_tablespace);\n       |      END IF;\n       |\n       |      SELECT COALESCE(\n       |        (SELECT value FROM &quot;, &quot;.&quot;, &quot;\n       |          WHERE type_name = &quot;, &quot; AND key = &quot;, &quot;),\n       |          \'&quot;, &quot;\'\n       |        ) INTO table_wa_logging;\n       |      IF table_wa_logging IS NULL OR NOT table_wa_logging::boolean THEN\n       |        table_wa_logging := \'\';\n       |      ELSE\n       |        table_wa_logging := \'UNLOGGED \';\n       |      END IF;\n       |\n       |      RAISE INFO \'% Compacting partition table %\', timeofday()::timestamp, partition_name;\n       |      LOCK TABLE ONLY &quot;, &quot; IN SHARE UPDATE EXCLUSIVE MODE;\n       |      -- lock the child table to prevent any inserts that would be lost\n       |      EXECUTE \'LOCK TABLE &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |        \' IN SHARE ROW EXCLUSIVE MODE\';\n       |      EXECUTE \'SELECT &quot;, &quot; FROM &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |        \' LIMIT 1\' INTO min_dtg;\n       |      partition_start := &quot;, &quot;.truncate_to_partition(min_dtg, partition_size);\n       |      partition_end := partition_start + make_interval(hours =&gt; partition_size);\n       |      spill_partition := &quot;, &quot; || \'_\' || to_char(partition_start, \'YYYY_MM_DD_HH24\');\n       |\n       |      SELECT EXISTS(SELECT FROM pg_tables WHERE schemaname = &quot;, &quot; AND tablename = spill_partition)\n       |        INTO pexists;\n       |\n       |      -- use \&quot;create table as\&quot; (vs create then insert) for performance benefits related to WAL skipping\n       |      IF pexists THEN\n       |        -- lock the child table to prevent any inserts that would be lost\n       |        EXECUTE \'LOCK TABLE &quot;, &quot;.\' || quote_ident(spill_partition) ||\n       |          \' IN SHARE ROW EXCLUSIVE MODE\';\n       |        EXECUTE \'CREATE \' || table_wa_logging || \'TABLE &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |          partition_tablespace || \' AS SELECT * FROM\' ||\n       |          \' (SELECT * FROM &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |          \' UNION ALL SELECT * FROM &quot;, &quot;.\' || quote_ident(spill_partition) ||\n       |          \') results\' ||\n       |          \' ORDER BY _st_sortablehash(&quot;, &quot;)\';\n       |        GET DIAGNOSTICS unsorted_count := ROW_COUNT;\n       |      ELSE\n       |        EXECUTE \'CREATE \' || table_wa_logging || \'TABLE &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |          partition_tablespace || \' AS SELECT * FROM \' || quote_ident(partition_name) ||\n       |          \' ORDER BY _st_sortablehash(&quot;, &quot;)\';\n       |        GET DIAGNOSTICS unsorted_count := ROW_COUNT;\n       |      END IF;\n       |\n       |      EXECUTE \'ALTER TABLE &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' ADD CONSTRAINT \' || quote_ident(partition_name || \'_pkey_tmp_sort\') ||\n       |        \' PRIMARY KEY (fid, &quot;, &quot;)\' || index_tablespace;\n       |      -- creating a constraint allows it to be attached to the parent without any additional checks\n       |      EXECUTE \'ALTER TABLE  &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' ADD CONSTRAINT \' || quote_ident(partition_name || \'_constraint_tmp_sort\') ||\n       |        \' CHECK ( &quot;, &quot; &gt;= \' || quote_literal(partition_start) ||\n       |        \' AND &quot;, &quot; &lt; \' || quote_literal(partition_end) || \' )\';\n       |\n       |      -- create indices before attaching to minimize time to attach, copied from PartitionTables code\n       |      EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' ON &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' USING BRIN(&quot;, &quot;)\' || partition_tablespace;\n       |      EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' ON &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' (&quot;, &quot;)\' || partition_tablespace;\n       |&quot;, &quot;\n       |\n       |      RAISE INFO \'% Dropping old partition table (queries will be blocked) %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'DROP TABLE IF EXISTS &quot;, &quot;.\' || quote_ident(partition_name);\n       |      IF pexists THEN\n       |        EXECUTE \'DROP TABLE IF EXISTS &quot;, &quot;.\' || quote_ident(spill_partition);\n       |      END IF;\n       |\n       |      RAISE INFO \'% Renaming newly sorted partition table %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'ALTER TABLE &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name);\n       |      EXECUTE \'ALTER TABLE &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |        \' RENAME CONSTRAINT \' || quote_ident(partition_name || \'_pkey_tmp_sort\') ||\n       |        \' TO \' || quote_ident(partition_name || \'_pkey\');\n       |      EXECUTE \'ALTER INDEX \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name || \'_&quot;, &quot;\');\n       |      EXECUTE \'ALTER INDEX \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name || \'_&quot;, &quot;\');\n       |&quot;, &quot;\n       |\n       |      RAISE INFO \'% Attaching newly sorted partition table %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'ALTER TABLE &quot;, &quot;\' ||\n       |        \' ATTACH PARTITION &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |        \' FOR VALUES FROM (\' || quote_literal(partition_start) || \') TO (\' ||\n       |        quote_literal(partition_end) || \' );\';\n       |      RAISE INFO \'% Done compacting partition table %\', timeofday()::timestamp, partition_name;\n       |\n       |      -- now that we\'ve attached the table we can drop the redundant constraint\n       |      RAISE INFO \'% Dropping constraint for partition table %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'ALTER TABLE &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |        \' DROP CONSTRAINT \' || quote_ident(partition_name || \'_constraint_tmp_sort\');\n       |\n       |      -- mark the partition to be analyzed in a separate thread\n       |      INSERT INTO &quot;, &quot;(partition_name, enqueued)\n       |        VALUES (partition_name, now());\n       |\n       |      -- commit to release our locks\n       |      COMMIT;\n       |      RAISE INFO \'% Done compacting % rows in partition %\', timeofday()::timestamp, unsorted_count, partition_name;\n       |\n       |    END;\n       |  $BODY$;\n       |&quot;).s(info.schema.quoted, CompactPartitions.this.name(info).quoted, info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable.Name.quoted, `package`.literal(info.typeName), `package`.literal(org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.IntervalHours.key), org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.IntervalHours.default, info.tables.mainPartitions.name.asLiteral, info.schema.quoted, info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable.Name.quoted, `package`.literal(info.typeName), `package`.literal(org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.MainTableSpace.key), info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable.Name.quoted, `package`.literal(info.typeName), `package`.literal(org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.WalLogEnabled.key), org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.WalLogEnabled.default, info.tables.mainPartitions.name.qualified, info.schema.quoted, info.cols.dtg.quoted, info.schema.quoted, info.schema.quoted, info.tables.spillPartitions.name.asLiteral, info.schema.asLiteral, info.schema.quoted, info.schema.quoted, info.schema.quoted, info.schema.quoted, info.cols.geom.quoted, info.schema.quoted, info.cols.geom.quoted, info.schema.quoted, info.cols.dtg.quoted, info.schema.quoted, info.cols.dtg.quoted, info.cols.dtg.quoted, info.cols.geom.raw, info.schema.quoted, info.cols.geom.quoted, info.cols.dtg.raw, info.schema.quoted, info.cols.dtg.quoted, info.cols.indexed.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;      EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' ON &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' (&quot;, &quot;)\' || partition_tablespace;&quot;).s(col.raw, info.schema.quoted, col.quoted)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;), info.schema.quoted, info.schema.quoted, info.schema.quoted, info.schema.quoted, info.cols.geom.raw, info.cols.geom.raw, info.cols.dtg.raw, info.cols.dtg.raw, info.cols.indexed.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;      EXECUTE \'ALTER INDEX \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name || \'_&quot;, &quot;\');&quot;).s(col.raw, col.raw)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;), info.tables.mainPartitions.name.qualified, info.schema.quoted, info.schema.quoted, info.tables.analyzeQueue.name.qualified)
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          89741
+        </td>
+        <td>
+          2427
+          -
+          2465
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n       |          WHERE type_name = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          89740
+        </td>
+        <td>
+          2398
+          -
+          2400
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          89797
+        </td>
+        <td>
+          2379
+          -
+          2397
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          89798
+        </td>
+        <td>
+          2401
+          -
+          2426
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable.Name.quoted
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          89743
+        </td>
+        <td>
+          2541
+          -
+          2563
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;),\n       |          &quot;
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          89742
+        </td>
+        <td>
+          2489
+          -
+          2501
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; AND key = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          89799
+        </td>
+        <td>
+          2474
+          -
+          2487
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          89801
+        </td>
+        <td>
+          2510
+          -
+          2539
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.IntervalHours.key
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          89800
+        </td>
+        <td>
+          2466
+          -
+          2488
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          89802
+        </td>
+        <td>
+          2502
+          -
+          2540
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.IntervalHours.key)
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          89744
+        </td>
+        <td>
+          2598
+          -
+          2670
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;)\n       |        INTO partition_size;\n       |      partition_name := &quot;
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          89803
+        </td>
+        <td>
+          2564
+          -
+          2597
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.default
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.IntervalHours.default
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          89745
+        </td>
+        <td>
+          2713
+          -
+          2749
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; || \'_\' ||\n       |        to_char(&quot;
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          89804
+        </td>
+        <td>
+          2671
+          -
+          2712
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlIdentifier.asLiteral
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.tables.mainPartitions.name.asLiteral
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          89746
+        </td>
+        <td>
+          2769
+          -
+          2881
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.truncate_to_partition(for_date, partition_size), \'YYYY_MM_DD_HH24\');\n       |\n       |      SELECT value FROM &quot;
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          89805
+        </td>
+        <td>
+          2750
+          -
+          2768
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          53
+        </td>
+        <td>
+          89747
+        </td>
+        <td>
+          2901
+          -
+          2903
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          53
+        </td>
+        <td>
+          89748
+        </td>
+        <td>
+          2930
+          -
+          2966
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n       |        WHERE type_name = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          53
+        </td>
+        <td>
+          89807
+        </td>
+        <td>
+          2904
+          -
+          2929
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable.Name.quoted
+        </td>
+      </tr><tr>
+        <td>
+          53
+        </td>
+        <td>
+          89806
+        </td>
+        <td>
+          2882
+          -
+          2900
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          89749
+        </td>
+        <td>
+          2990
+          -
+          3002
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; AND key = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          89750
+        </td>
+        <td>
+          3043
+          -
+          3532
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n       |        INTO partition_tablespace;\n       |      IF partition_tablespace IS NULL THEN\n       |        index_tablespace := \'\';\n       |        partition_tablespace := \'\';\n       |      ELSE\n       |        index_tablespace := \' USING INDEX TABLESPACE \'|| quote_ident(partition_tablespace);\n       |        partition_tablespace := \' TABLESPACE \' || quote_ident(partition_tablespace);\n       |      END IF;\n       |\n       |      SELECT COALESCE(\n       |        (SELECT value FROM &quot;
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          89809
+        </td>
+        <td>
+          2967
+          -
+          2989
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          89808
+        </td>
+        <td>
+          2975
+          -
+          2988
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          89811
+        </td>
+        <td>
+          3003
+          -
+          3042
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.MainTableSpace.key)
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          89810
+        </td>
+        <td>
+          3011
+          -
+          3041
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.MainTableSpace.key
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          89751
+        </td>
+        <td>
+          3552
+          -
+          3554
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          89752
+        </td>
+        <td>
+          3581
+          -
+          3619
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n       |          WHERE type_name = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          89813
+        </td>
+        <td>
+          3555
+          -
+          3580
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable.Name.quoted
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          89812
+        </td>
+        <td>
+          3533
+          -
+          3551
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          89753
+        </td>
+        <td>
+          3643
+          -
+          3655
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; AND key = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          89754
+        </td>
+        <td>
+          3695
+          -
+          3718
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;),\n       |          \'&quot;
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          89815
+        </td>
+        <td>
+          3620
+          -
+          3642
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(info.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          89814
+        </td>
+        <td>
+          3628
+          -
+          3641
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TypeInfo.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.typeName
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          89817
+        </td>
+        <td>
+          3656
+          -
+          3694
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          `package`.literal(org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.WalLogEnabled.key)
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          89816
+        </td>
+        <td>
+          3664
+          -
+          3693
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.WalLogEnabled.key
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          89755
+        </td>
+        <td>
+          3753
+          -
+          4145
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\'\n       |        ) INTO table_wa_logging;\n       |      IF table_wa_logging IS NULL OR NOT table_wa_logging::boolean THEN\n       |        table_wa_logging := \'\';\n       |      ELSE\n       |        table_wa_logging := \'UNLOGGED \';\n       |      END IF;\n       |\n       |      RAISE INFO \'% Compacting partition table %\', timeofday()::timestamp, partition_name;\n       |      LOCK TABLE ONLY &quot;
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          89818
+        </td>
+        <td>
+          3719
+          -
+          3752
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.default
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.WalLogEnabled.default
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          89756
+        </td>
+        <td>
+          4188
+          -
+          4336
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; IN SHARE UPDATE EXCLUSIVE MODE;\n       |      -- lock the child table to prevent any inserts that would be lost\n       |      EXECUTE \'LOCK TABLE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          89819
+        </td>
+        <td>
+          4146
+          -
+          4187
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableIdentifier.qualified
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.tables.mainPartitions.name.qualified
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          89757
+        </td>
+        <td>
+          4356
+          -
+          4472
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name) ||\n       |        \' IN SHARE ROW EXCLUSIVE MODE\';\n       |      EXECUTE \'SELECT &quot;
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          89820
+        </td>
+        <td>
+          4337
+          -
+          4355
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          89759
+        </td>
+        <td>
+          4521
+          -
+          4633
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name) ||\n       |        \' LIMIT 1\' INTO min_dtg;\n       |      partition_start := &quot;
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          89758
+        </td>
+        <td>
+          4494
+          -
+          4501
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; FROM &quot;
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          89821
+        </td>
+        <td>
+          4473
+          -
+          4493
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.quoted
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          89822
+        </td>
+        <td>
+          4502
+          -
+          4520
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          89760
+        </td>
+        <td>
+          4653
+          -
+          4825
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.truncate_to_partition(min_dtg, partition_size);\n       |      partition_end := partition_start + make_interval(hours =&gt; partition_size);\n       |      spill_partition := &quot;
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          89823
+        </td>
+        <td>
+          4634
+          -
+          4652
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          89761
+        </td>
+        <td>
+          4869
+          -
+          5004
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; || \'_\' || to_char(partition_start, \'YYYY_MM_DD_HH24\');\n       |\n       |      SELECT EXISTS(SELECT FROM pg_tables WHERE schemaname = &quot;
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          89824
+        </td>
+        <td>
+          4826
+          -
+          4868
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlIdentifier.asLiteral
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.tables.spillPartitions.name.asLiteral
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          89762
+        </td>
+        <td>
+          5027
+          -
+          5361
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; AND tablename = spill_partition)\n       |        INTO pexists;\n       |\n       |      -- use \&quot;create table as\&quot; (vs create then insert) for performance benefits related to WAL skipping\n       |      IF pexists THEN\n       |        -- lock the child table to prevent any inserts that would be lost\n       |        EXECUTE \'LOCK TABLE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          89825
+        </td>
+        <td>
+          5005
+          -
+          5026
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SqlIdentifier.asLiteral
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.asLiteral
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          89763
+        </td>
+        <td>
+          5381
+          -
+          5534
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(spill_partition) ||\n       |          \' IN SHARE ROW EXCLUSIVE MODE\';\n       |        EXECUTE \'CREATE \' || table_wa_logging || \'TABLE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          89826
+        </td>
+        <td>
+          5362
+          -
+          5380
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          89764
+        </td>
+        <td>
+          5554
+          -
+          5707
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |          partition_tablespace || \' AS SELECT * FROM\' ||\n       |          \' (SELECT * FROM &quot;
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          89827
+        </td>
+        <td>
+          5535
+          -
+          5553
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          89765
+        </td>
+        <td>
+          5727
+          -
+          5809
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name) ||\n       |          \' UNION ALL SELECT * FROM &quot;
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          89828
+        </td>
+        <td>
+          5708
+          -
+          5726
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          89766
+        </td>
+        <td>
+          5829
+          -
+          5947
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(spill_partition) ||\n       |          \') results\' ||\n       |          \' ORDER BY _st_sortablehash(&quot;
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          89829
+        </td>
+        <td>
+          5810
+          -
+          5828
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          89767
+        </td>
+        <td>
+          5970
+          -
+          6119
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;)\';\n       |        GET DIAGNOSTICS unsorted_count := ROW_COUNT;\n       |      ELSE\n       |        EXECUTE \'CREATE \' || table_wa_logging || \'TABLE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          89830
+        </td>
+        <td>
+          5948
+          -
+          5969
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.geom.quoted
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          89768
+        </td>
+        <td>
+          6139
+          -
+          6335
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |          partition_tablespace || \' AS SELECT * FROM \' || quote_ident(partition_name) ||\n       |          \' ORDER BY _st_sortablehash(&quot;
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          89831
+        </td>
+        <td>
+          6120
+          -
+          6138
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          89769
+        </td>
+        <td>
+          6358
+          -
+          6490
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;)\';\n       |        GET DIAGNOSTICS unsorted_count := ROW_COUNT;\n       |      END IF;\n       |\n       |      EXECUTE \'ALTER TABLE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          89832
+        </td>
+        <td>
+          6336
+          -
+          6357
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.geom.quoted
+        </td>
+      </tr><tr>
+        <td>
+          108
+        </td>
+        <td>
+          89770
+        </td>
+        <td>
+          6510
+          -
+          6688
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' ADD CONSTRAINT \' || quote_ident(partition_name || \'_pkey_tmp_sort\') ||\n       |        \' PRIMARY KEY (fid, &quot;
+        </td>
+      </tr><tr>
+        <td>
+          108
+        </td>
+        <td>
+          89833
+        </td>
+        <td>
+          6491
+          -
+          6509
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          110
+        </td>
+        <td>
+          89771
+        </td>
+        <td>
+          6710
+          -
+          6879
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;)\' || index_tablespace;\n       |      -- creating a constraint allows it to be attached to the parent without any additional checks\n       |      EXECUTE \'ALTER TABLE  &quot;
+        </td>
+      </tr><tr>
+        <td>
+          110
+        </td>
+        <td>
+          89834
+        </td>
+        <td>
+          6689
+          -
+          6709
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.quoted
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          89772
+        </td>
+        <td>
+          6899
+          -
+          7073
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' ADD CONSTRAINT \' || quote_ident(partition_name || \'_constraint_tmp_sort\') ||\n       |        \' CHECK ( &quot;
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          89835
+        </td>
+        <td>
+          6880
+          -
+          6898
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          89773
+        </td>
+        <td>
+          7095
+          -
+          7161
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; &gt;= \' || quote_literal(partition_start) ||\n       |        \' AND &quot;
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          89836
+        </td>
+        <td>
+          7074
+          -
+          7094
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.quoted
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          89774
+        </td>
+        <td>
+          7183
+          -
+          7436
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; &lt; \' || quote_literal(partition_end) || \' )\';\n       |\n       |      -- create indices before attaching to minimize time to attach, copied from PartitionTables code\n       |      EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(partition_name || \'_&quot;
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          89837
+        </td>
+        <td>
+          7162
+          -
+          7182
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.quoted
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          89775
+        </td>
+        <td>
+          7456
+          -
+          7493
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;_tmp_sort\') ||\n       |        \' ON &quot;
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          89838
+        </td>
+        <td>
+          7437
+          -
+          7455
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.raw
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.geom.raw
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          89776
+        </td>
+        <td>
+          7513
+          -
+          7595
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' USING BRIN(&quot;
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          89839
+        </td>
+        <td>
+          7494
+          -
+          7512
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          89777
+        </td>
+        <td>
+          7618
+          -
+          7734
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;)\' || partition_tablespace;\n       |      EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(partition_name || \'_&quot;
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          89840
+        </td>
+        <td>
+          7596
+          -
+          7617
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.geom.quoted
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          89778
+        </td>
+        <td>
+          7753
+          -
+          7790
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;_tmp_sort\') ||\n       |        \' ON &quot;
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          89841
+        </td>
+        <td>
+          7735
+          -
+          7752
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.raw
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.raw
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          89779
+        </td>
+        <td>
+          7810
+          -
+          7882
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' (&quot;
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          89842
+        </td>
+        <td>
+          7791
+          -
+          7809
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          89780
+        </td>
+        <td>
+          7904
+          -
+          7941
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;)\' || partition_tablespace;\n       |&quot;
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          89843
+        </td>
+        <td>
+          7883
+          -
+          7903
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.quoted
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          89781
+        </td>
+        <td>
+          8270
+          -
+          8452
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n       |\n       |      RAISE INFO \'% Dropping old partition table (queries will be blocked) %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'DROP TABLE IF EXISTS &quot;
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          89844
+        </td>
+        <td>
+          7942
+          -
+          8269
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.mkString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.indexed.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;      EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' ON &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' (&quot;, &quot;)\' || partition_tablespace;&quot;).s(col.raw, info.schema.quoted, col.quoted)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          89782
+        </td>
+        <td>
+          8472
+          -
+          8584
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name);\n       |      IF pexists THEN\n       |        EXECUTE \'DROP TABLE IF EXISTS &quot;
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          89845
+        </td>
+        <td>
+          8453
+          -
+          8471
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          132
+        </td>
+        <td>
+          89783
+        </td>
+        <td>
+          8604
+          -
+          8817
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(spill_partition);\n       |      END IF;\n       |\n       |      RAISE INFO \'% Renaming newly sorted partition table %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'ALTER TABLE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          132
+        </td>
+        <td>
+          89846
+        </td>
+        <td>
+          8585
+          -
+          8603
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          89784
+        </td>
+        <td>
+          8837
+          -
+          8987
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name);\n       |      EXECUTE \'ALTER TABLE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          89847
+        </td>
+        <td>
+          8818
+          -
+          8836
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          138
+        </td>
+        <td>
+          89785
+        </td>
+        <td>
+          9007
+          -
+          9275
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name) ||\n       |        \' RENAME CONSTRAINT \' || quote_ident(partition_name || \'_pkey_tmp_sort\') ||\n       |        \' TO \' || quote_ident(partition_name || \'_pkey\');\n       |      EXECUTE \'ALTER INDEX \' || quote_ident(partition_name || \'_&quot;
+        </td>
+      </tr><tr>
+        <td>
+          138
+        </td>
+        <td>
+          89848
+        </td>
+        <td>
+          8988
+          -
+          9006
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          89786
+        </td>
+        <td>
+          9295
+          -
+          9376
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name || \'_&quot;
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          89849
+        </td>
+        <td>
+          9276
+          -
+          9294
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.raw
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.geom.raw
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          89787
+        </td>
+        <td>
+          9396
+          -
+          9473
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\');\n       |      EXECUTE \'ALTER INDEX \' || quote_ident(partition_name || \'_&quot;
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          89850
+        </td>
+        <td>
+          9377
+          -
+          9395
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.raw
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.geom.raw
+        </td>
+      </tr><tr>
+        <td>
+          143
+        </td>
+        <td>
+          89788
+        </td>
+        <td>
+          9492
+          -
+          9573
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name || \'_&quot;
+        </td>
+      </tr><tr>
+        <td>
+          143
+        </td>
+        <td>
+          89851
+        </td>
+        <td>
+          9474
+          -
+          9491
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.raw
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.raw
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          89789
+        </td>
+        <td>
+          9592
+          -
+          9605
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\');\n       |&quot;
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          89852
+        </td>
+        <td>
+          9574
+          -
+          9591
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName.raw
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.dtg.raw
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          89790
+        </td>
+        <td>
+          9844
+          -
+          10001
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n       |\n       |      RAISE INFO \'% Attaching newly sorted partition table %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'ALTER TABLE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          89853
+        </td>
+        <td>
+          9606
+          -
+          9843
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.mkString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.cols.indexed.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;      EXECUTE \'ALTER INDEX \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name || \'_&quot;, &quot;\');&quot;).s(col.raw, col.raw)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          89791
+        </td>
+        <td>
+          10044
+          -
+          10085
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\' ||\n       |        \' ATTACH PARTITION &quot;
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          89854
+        </td>
+        <td>
+          10002
+          -
+          10043
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableIdentifier.qualified
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.tables.mainPartitions.name.qualified
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          89792
+        </td>
+        <td>
+          10105
+          -
+          10632
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name) ||\n       |        \' FOR VALUES FROM (\' || quote_literal(partition_start) || \') TO (\' ||\n       |        quote_literal(partition_end) || \' );\';\n       |      RAISE INFO \'% Done compacting partition table %\', timeofday()::timestamp, partition_name;\n       |\n       |      -- now that we\'ve attached the table we can drop the redundant constraint\n       |      RAISE INFO \'% Dropping constraint for partition table %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'ALTER TABLE &quot;
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          89855
+        </td>
+        <td>
+          10086
+          -
+          10104
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          89793
+        </td>
+        <td>
+          10652
+          -
+          10891
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.\' || quote_ident(partition_name) ||\n       |        \' DROP CONSTRAINT \' || quote_ident(partition_name || \'_constraint_tmp_sort\');\n       |\n       |      -- mark the partition to be analyzed in a separate thread\n       |      INSERT INTO &quot;
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          89856
+        </td>
+        <td>
+          10633
+          -
+          10651
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.SchemaName.quoted
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.schema.quoted
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          89794
+        </td>
+        <td>
+          10932
+          -
+          11264
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;(partition_name, enqueued)\n       |        VALUES (partition_name, now());\n       |\n       |      -- commit to release our locks\n       |      COMMIT;\n       |      RAISE INFO \'% Done compacting % rows in partition %\', timeofday()::timestamp, unsorted_count, partition_name;\n       |\n       |    END;\n       |  $BODY$;\n       |&quot;
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          89857
+        </td>
+        <td>
+          10892
+          -
+          10931
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.gt.partition.postgis.dialect.TableIdentifier.qualified
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          info.tables.analyzeQueue.name.qualified
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          89859
+        </td>
+        <td>
+          1170
+          -
+          11276
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.stripMargin
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.augmentString(scala.StringContext.apply(&quot;CREATE OR REPLACE PROCEDURE &quot;, &quot;.&quot;, &quot;(for_date timestamp without time zone) LANGUAGE plpgsql AS\n       |  $BODY$\n       |    DECLARE\n       |      partition_name text;\n       |      spill_partition text;\n       |      min_dtg timestamp without time zone;         -- min date in our partitioned tables\n       |      partition_start timestamp without time zone; -- start bounds for the partition we\'re writing\n       |      partition_end timestamp without time zone;   -- end bounds for the partition we\'re writing\n       |      partition_size int;                          -- size of the partition, in hours\n       |      partition_tablespace text;\n       |      index_tablespace text;                       -- index tablespace\n       |      table_wa_logging text;                       -- wa log options\n       |      unsorted_count bigint;\n       |      pexists boolean;                             -- table exists check\n       |    BEGIN\n       |      IF for_date IS NULL THEN\n       |        RAISE EXCEPTION \'date is null\' USING HINT = \'Please use a valid date\';\n       |      END IF;\n       |\n       |      SELECT COALESCE(\n       |        (SELECT value::int FROM &quot;, &quot;.&quot;, &quot;\n       |          WHERE type_name = &quot;, &quot; AND key = &quot;, &quot;),\n       |          &quot;, &quot;)\n       |        INTO partition_size;\n       |      partition_name := &quot;, &quot; || \'_\' ||\n       |        to_char(&quot;, &quot;.truncate_to_partition(for_date, partition_size), \'YYYY_MM_DD_HH24\');\n       |\n       |      SELECT value FROM &quot;, &quot;.&quot;, &quot;\n       |        WHERE type_name = &quot;, &quot; AND key = &quot;, &quot;\n       |        INTO partition_tablespace;\n       |      IF partition_tablespace IS NULL THEN\n       |        index_tablespace := \'\';\n       |        partition_tablespace := \'\';\n       |      ELSE\n       |        index_tablespace := \' USING INDEX TABLESPACE \'|| quote_ident(partition_tablespace);\n       |        partition_tablespace := \' TABLESPACE \' || quote_ident(partition_tablespace);\n       |      END IF;\n       |\n       |      SELECT COALESCE(\n       |        (SELECT value FROM &quot;, &quot;.&quot;, &quot;\n       |          WHERE type_name = &quot;, &quot; AND key = &quot;, &quot;),\n       |          \'&quot;, &quot;\'\n       |        ) INTO table_wa_logging;\n       |      IF table_wa_logging IS NULL OR NOT table_wa_logging::boolean THEN\n       |        table_wa_logging := \'\';\n       |      ELSE\n       |        table_wa_logging := \'UNLOGGED \';\n       |      END IF;\n       |\n       |      RAISE INFO \'% Compacting partition table %\', timeofday()::timestamp, partition_name;\n       |      LOCK TABLE ONLY &quot;, &quot; IN SHARE UPDATE EXCLUSIVE MODE;\n       |      -- lock the child table to prevent any inserts that would be lost\n       |      EXECUTE \'LOCK TABLE &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |        \' IN SHARE ROW EXCLUSIVE MODE\';\n       |      EXECUTE \'SELECT &quot;, &quot; FROM &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |        \' LIMIT 1\' INTO min_dtg;\n       |      partition_start := &quot;, &quot;.truncate_to_partition(min_dtg, partition_size);\n       |      partition_end := partition_start + make_interval(hours =&gt; partition_size);\n       |      spill_partition := &quot;, &quot; || \'_\' || to_char(partition_start, \'YYYY_MM_DD_HH24\');\n       |\n       |      SELECT EXISTS(SELECT FROM pg_tables WHERE schemaname = &quot;, &quot; AND tablename = spill_partition)\n       |        INTO pexists;\n       |\n       |      -- use \&quot;create table as\&quot; (vs create then insert) for performance benefits related to WAL skipping\n       |      IF pexists THEN\n       |        -- lock the child table to prevent any inserts that would be lost\n       |        EXECUTE \'LOCK TABLE &quot;, &quot;.\' || quote_ident(spill_partition) ||\n       |          \' IN SHARE ROW EXCLUSIVE MODE\';\n       |        EXECUTE \'CREATE \' || table_wa_logging || \'TABLE &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |          partition_tablespace || \' AS SELECT * FROM\' ||\n       |          \' (SELECT * FROM &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |          \' UNION ALL SELECT * FROM &quot;, &quot;.\' || quote_ident(spill_partition) ||\n       |          \') results\' ||\n       |          \' ORDER BY _st_sortablehash(&quot;, &quot;)\';\n       |        GET DIAGNOSTICS unsorted_count := ROW_COUNT;\n       |      ELSE\n       |        EXECUTE \'CREATE \' || table_wa_logging || \'TABLE &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |          partition_tablespace || \' AS SELECT * FROM \' || quote_ident(partition_name) ||\n       |          \' ORDER BY _st_sortablehash(&quot;, &quot;)\';\n       |        GET DIAGNOSTICS unsorted_count := ROW_COUNT;\n       |      END IF;\n       |\n       |      EXECUTE \'ALTER TABLE &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' ADD CONSTRAINT \' || quote_ident(partition_name || \'_pkey_tmp_sort\') ||\n       |        \' PRIMARY KEY (fid, &quot;, &quot;)\' || index_tablespace;\n       |      -- creating a constraint allows it to be attached to the parent without any additional checks\n       |      EXECUTE \'ALTER TABLE  &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' ADD CONSTRAINT \' || quote_ident(partition_name || \'_constraint_tmp_sort\') ||\n       |        \' CHECK ( &quot;, &quot; &gt;= \' || quote_literal(partition_start) ||\n       |        \' AND &quot;, &quot; &lt; \' || quote_literal(partition_end) || \' )\';\n       |\n       |      -- create indices before attaching to minimize time to attach, copied from PartitionTables code\n       |      EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' ON &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' USING BRIN(&quot;, &quot;)\' || partition_tablespace;\n       |      EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' ON &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' (&quot;, &quot;)\' || partition_tablespace;\n       |&quot;, &quot;\n       |\n       |      RAISE INFO \'% Dropping old partition table (queries will be blocked) %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'DROP TABLE IF EXISTS &quot;, &quot;.\' || quote_ident(partition_name);\n       |      IF pexists THEN\n       |        EXECUTE \'DROP TABLE IF EXISTS &quot;, &quot;.\' || quote_ident(spill_partition);\n       |      END IF;\n       |\n       |      RAISE INFO \'% Renaming newly sorted partition table %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'ALTER TABLE &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name);\n       |      EXECUTE \'ALTER TABLE &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |        \' RENAME CONSTRAINT \' || quote_ident(partition_name || \'_pkey_tmp_sort\') ||\n       |        \' TO \' || quote_ident(partition_name || \'_pkey\');\n       |      EXECUTE \'ALTER INDEX \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name || \'_&quot;, &quot;\');\n       |      EXECUTE \'ALTER INDEX \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name || \'_&quot;, &quot;\');\n       |&quot;, &quot;\n       |\n       |      RAISE INFO \'% Attaching newly sorted partition table %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'ALTER TABLE &quot;, &quot;\' ||\n       |        \' ATTACH PARTITION &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |        \' FOR VALUES FROM (\' || quote_literal(partition_start) || \') TO (\' ||\n       |        quote_literal(partition_end) || \' );\';\n       |      RAISE INFO \'% Done compacting partition table %\', timeofday()::timestamp, partition_name;\n       |\n       |      -- now that we\'ve attached the table we can drop the redundant constraint\n       |      RAISE INFO \'% Dropping constraint for partition table %\', timeofday()::timestamp, partition_name;\n       |      EXECUTE \'ALTER TABLE &quot;, &quot;.\' || quote_ident(partition_name) ||\n       |        \' DROP CONSTRAINT \' || quote_ident(partition_name || \'_constraint_tmp_sort\');\n       |\n       |      -- mark the partition to be analyzed in a separate thread\n       |      INSERT INTO &quot;, &quot;(partition_name, enqueued)\n       |        VALUES (partition_name, now());\n       |\n       |      -- commit to release our locks\n       |      COMMIT;\n       |      RAISE INFO \'% Done compacting % rows in partition %\', timeofday()::timestamp, unsorted_count, partition_name;\n       |\n       |    END;\n       |  $BODY$;\n       |&quot;).s(info.schema.quoted, CompactPartitions.this.name(info).quoted, info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable.Name.quoted, `package`.literal(info.typeName), `package`.literal(org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.IntervalHours.key), org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.IntervalHours.default, info.tables.mainPartitions.name.asLiteral, info.schema.quoted, info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable.Name.quoted, `package`.literal(info.typeName), `package`.literal(org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.MainTableSpace.key), info.schema.quoted, org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable.Name.quoted, `package`.literal(info.typeName), `package`.literal(org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.WalLogEnabled.key), org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData.WalLogEnabled.default, info.tables.mainPartitions.name.qualified, info.schema.quoted, info.cols.dtg.quoted, info.schema.quoted, info.schema.quoted, info.tables.spillPartitions.name.asLiteral, info.schema.asLiteral, info.schema.quoted, info.schema.quoted, info.schema.quoted, info.schema.quoted, info.cols.geom.quoted, info.schema.quoted, info.cols.geom.quoted, info.schema.quoted, info.cols.dtg.quoted, info.schema.quoted, info.cols.dtg.quoted, info.cols.dtg.quoted, info.cols.geom.raw, info.schema.quoted, info.cols.geom.quoted, info.cols.dtg.raw, info.schema.quoted, info.cols.dtg.quoted, info.cols.indexed.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;      EXECUTE \'CREATE INDEX IF NOT EXISTS \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' ON &quot;, &quot;.\' || quote_ident(partition_name || \'_tmp_sort\') ||\n       |        \' (&quot;, &quot;)\' || partition_tablespace;&quot;).s(col.raw, info.schema.quoted, col.quoted)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;), info.schema.quoted, info.schema.quoted, info.schema.quoted, info.schema.quoted, info.cols.geom.raw, info.cols.geom.raw, info.cols.dtg.raw, info.cols.dtg.raw, info.cols.indexed.map[String, Seq[String]](((col: org.locationtech.geomesa.gt.partition.postgis.dialect.ColumnName) =&gt; scala.Predef.augmentString(scala.StringContext.apply(&quot;      EXECUTE \'ALTER INDEX \' || quote_ident(partition_name || \'_&quot;, &quot;_tmp_sort\') ||\n       |        \' RENAME TO \' || quote_ident(partition_name || \'_&quot;, &quot;\');&quot;).s(col.raw, col.raw)).stripMargin))(collection.this.Seq.canBuildFrom[String]).mkString(&quot;\n&quot;), info.tables.mainPartitions.name.qualified, info.schema.quoted, info.schema.quoted, info.tables.analyzeQueue.name.qualified)).stripMargin
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>

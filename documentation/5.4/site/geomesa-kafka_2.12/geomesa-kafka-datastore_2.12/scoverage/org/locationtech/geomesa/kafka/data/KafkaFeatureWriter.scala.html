@@ -1,0 +1,3980 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/kafka/data/KafkaFeatureWriter.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.kafka.data
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.LazyLogging
+</span>12 <span style=''>import io.micrometer.core.instrument.{Metrics, Tags}
+</span>13 <span style=''>import org.apache.kafka.clients.consumer.OffsetAndMetadata
+</span>14 <span style=''>import org.apache.kafka.clients.producer.{Producer, ProducerRecord}
+</span>15 <span style=''>import org.apache.kafka.common.TopicPartition
+</span>16 <span style=''>import org.geotools.api.data.Transaction
+</span>17 <span style=''>import org.geotools.api.feature.simple.SimpleFeatureType
+</span>18 <span style=''>import org.geotools.api.filter.{Filter, Id}
+</span>19 <span style=''>import org.geotools.util.factory.Hints
+</span>20 <span style=''>import org.locationtech.geomesa.features.{FastSettableFeature, ScalaSimpleFeature}
+</span>21 <span style=''>import org.locationtech.geomesa.index.geotools.{FastSettableFeatureWriter, GeoMesaFeatureWriter}
+</span>22 <span style=''>import org.locationtech.geomesa.kafka.utils.{GeoMessage, GeoMessageSerializer}
+</span>23 <span style=''>import org.locationtech.geomesa.kafka.versions.RecordVersions
+</span>24 <span style=''>import org.locationtech.geomesa.security.VisibilityChecker
+</span>25 <span style=''>
+</span>26 <span style=''>import java.io.Flushable
+</span>27 <span style=''>import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
+</span>28 <span style=''>
+</span>29 <span style=''>trait KafkaFeatureWriter extends FastSettableFeatureWriter with Flushable {
+</span>30 <span style=''>
+</span>31 <span style=''>  /**
+</span>32 <span style=''>    * Sends a 'clear' message that will delete any features written so far
+</span>33 <span style=''>    */
+</span>34 <span style=''>  def clear(): Unit
+</span>35 <span style=''>}
+</span>36 <span style=''>
+</span>37 <span style=''>object KafkaFeatureWriter {
+</span>38 <span style=''>
+</span>39 <span style=''>  private val featureIds = </span><span style='background: #AEF1AE'>new AtomicLong(0)</span><span style=''>
+</span>40 <span style=''>  private val FeatureIdHints = </span><span style='background: #AEF1AE'>Seq(Hints.USE_PROVIDED_FID, Hints.PROVIDED_FID)</span><span style=''>
+</span>41 <span style=''>  private val MetricsPrefix = </span><span style='background: #AEF1AE'>s&quot;${KafkaDataStore.MetricsPrefix}.producer&quot;</span><span style=''>
+</span>42 <span style=''>
+</span>43 <span style=''>  class AppendKafkaFeatureWriter(
+</span>44 <span style=''>      sft: SimpleFeatureType,
+</span>45 <span style=''>      producer: KafkaFeatureProducer,
+</span>46 <span style=''>      protected val serializer: GeoMessageSerializer,
+</span>47 <span style=''>      tags: Tags
+</span>48 <span style=''>    ) extends KafkaFeatureWriter with LazyLogging {
+</span>49 <span style=''>
+</span>50 <span style=''>    protected val topic: String = </span><span style='background: #AEF1AE'>KafkaDataStore.topic(sft)</span><span style=''>
+</span>51 <span style=''>
+</span>52 <span style=''>    protected val feature = </span><span style='background: #AEF1AE'>new ScalaSimpleFeature(sft, &quot;-1&quot;)</span><span style=''>
+</span>53 <span style=''>
+</span>54 <span style=''>    private val writeCounter = </span><span style='background: #AEF1AE'>Metrics.counter(s&quot;$MetricsPrefix.produced&quot;, tags.and(&quot;op&quot;, &quot;update&quot;))</span><span style=''>
+</span>55 <span style=''>    private val clearCounter = </span><span style='background: #AEF1AE'>Metrics.counter(s&quot;$MetricsPrefix.produced&quot;, tags.and(&quot;op&quot;, &quot;clear&quot;))</span><span style=''>
+</span>56 <span style=''>
+</span>57 <span style=''>    override def getFeatureType: SimpleFeatureType = </span><span style='background: #F0ADAD'>sft</span><span style=''>
+</span>58 <span style=''>
+</span>59 <span style=''>    override def hasNext: Boolean = </span><span style='background: #F0ADAD'>false</span><span style=''>
+</span>60 <span style=''>
+</span>61 <span style=''>    override def next(): FastSettableFeature = {
+</span>62 <span style=''>      </span><span style='background: #AEF1AE'>reset(featureIds.getAndIncrement().toString)</span><span style=''>
+</span>63 <span style=''>      </span><span style='background: #AEF1AE'>feature</span><span style=''>
+</span>64 <span style=''>    }
+</span>65 <span style=''>
+</span>66 <span style=''>    override def write(): Unit = {
+</span>67 <span style=''>      val sf = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.featureWithFid(feature)</span><span style=''>
+</span>68 <span style=''>      // we've handled the fid hints, remove them so that we don't serialize them
+</span>69 <span style=''>      </span><span style='background: #AEF1AE'>FeatureIdHints.foreach(sf.getUserData.remove)</span><span style=''>
+</span>70 <span style=''>      logger.debug(s&quot;Writing update to $topic: $sf&quot;)
+</span>71 <span style=''>      val (key, value, headers) = serializer.serialize(GeoMessage.change(sf))
+</span>72 <span style=''>      val record = </span><span style='background: #AEF1AE'>new ProducerRecord(topic, key, value)</span><span style=''>
+</span>73 <span style=''>      </span><span style='background: #AEF1AE'>headers.foreach { case (k, v) =&gt; RecordVersions.setHeader(record, k, v) }</span><span style=''>
+</span>74 <span style=''>      </span><span style='background: #AEF1AE'>producer.send(record)</span><span style=''>
+</span>75 <span style=''>      </span><span style='background: #AEF1AE'>writeCounter.increment()</span><span style=''>
+</span>76 <span style=''>    }
+</span>77 <span style=''>
+</span>78 <span style=''>    override def remove(): Unit = </span><span style='background: #F0ADAD'>throw new UnsupportedOperationException()</span><span style=''>
+</span>79 <span style=''>
+</span>80 <span style=''>    override def flush(): Unit = </span><span style='background: #F0ADAD'>producer.flush()</span><span style=''>
+</span>81 <span style=''>
+</span>82 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>producer.flush()</span><span style=''> // note: the producer is shared, so don't close it
+</span>83 <span style=''>
+</span>84 <span style=''>    override def clear(): Unit = {
+</span>85 <span style=''>      logger.debug(s&quot;Writing clear to $topic&quot;)
+</span>86 <span style=''>      val (key, value, headers) = serializer.serialize(GeoMessage.clear())
+</span>87 <span style=''>      val record = </span><span style='background: #AEF1AE'>new ProducerRecord(topic, key, value)</span><span style=''>
+</span>88 <span style=''>      </span><span style='background: #AEF1AE'>headers.foreach { case (k, v) =&gt; RecordVersions.setHeader(record, k, v) }</span><span style=''>
+</span>89 <span style=''>      </span><span style='background: #AEF1AE'>producer.send(record)</span><span style=''>
+</span>90 <span style=''>      </span><span style='background: #AEF1AE'>clearCounter.increment()</span><span style=''>
+</span>91 <span style=''>    }
+</span>92 <span style=''>
+</span>93 <span style=''>    protected def reset(id: String): Unit = {
+</span>94 <span style=''>      </span><span style='background: #AEF1AE'>feature.setId(id)</span><span style=''>
+</span>95 <span style=''>      var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
+</span>96 <span style=''>      while (</span><span style='background: #AEF1AE'>i &lt; sft.getAttributeCount</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>97 <span style=''></span><span style='background: #AEF1AE'>        feature.setAttributeNoConvert(i, null)
+</span>98 <span style=''></span><span style='background: #AEF1AE'>        i += 1
+</span>99 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>100 <span style=''>      </span><span style='background: #AEF1AE'>feature.getUserData.clear()</span><span style=''>
+</span>101 <span style=''>    }
+</span>102 <span style=''>  }
+</span>103 <span style=''>
+</span>104 <span style=''>  class ModifyKafkaFeatureWriter(
+</span>105 <span style=''>      sft: SimpleFeatureType,
+</span>106 <span style=''>      producer: KafkaFeatureProducer,
+</span>107 <span style=''>      serializer: GeoMessageSerializer,
+</span>108 <span style=''>      tags: Tags,
+</span>109 <span style=''>      filter: Filter
+</span>110 <span style=''>    ) extends AppendKafkaFeatureWriter(sft, producer, serializer, tags) {
+</span>111 <span style=''>
+</span>112 <span style=''>    import scala.collection.JavaConverters._
+</span>113 <span style=''>
+</span>114 <span style=''>    private val ids: Iterator[String] = </span><span style='background: #AEF1AE'>filter</span><span style=''> match {
+</span>115 <span style=''>      case ids: Id =&gt; </span><span style='background: #AEF1AE'>ids.getIDs.iterator.asScala.map(_.toString)</span><span style=''>
+</span>116 <span style=''>      case _ =&gt; </span><span style='background: #F0ADAD'>throw new UnsupportedOperationException(&quot;Only modify by ID is supported&quot;)</span><span style=''>
+</span>117 <span style=''>    }
+</span>118 <span style=''>
+</span>119 <span style=''>    private val deleteCounter = </span><span style='background: #AEF1AE'>Metrics.counter(s&quot;$MetricsPrefix.produced&quot;, tags.and(&quot;op&quot;, &quot;delete&quot;))</span><span style=''>
+</span>120 <span style=''>
+</span>121 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>ids.hasNext</span><span style=''>
+</span>122 <span style=''>
+</span>123 <span style=''>    override def next(): FastSettableFeature = {
+</span>124 <span style=''>      import org.locationtech.geomesa.utils.conversions.ScalaImplicits.RichIterator
+</span>125 <span style=''>      </span><span style='background: #AEF1AE'>reset(ids.headOption.getOrElse(</span><span style='background: #F0ADAD'>featureIds.getAndIncrement().toString</span><span style='background: #AEF1AE'>))</span><span style=''>
+</span>126 <span style=''>      // default to using the provided fid
+</span>127 <span style=''>      </span><span style='background: #AEF1AE'>feature.getUserData.put(Hints.USE_PROVIDED_FID, java.lang.Boolean.TRUE)</span><span style=''>
+</span>128 <span style=''>      </span><span style='background: #AEF1AE'>feature</span><span style=''>
+</span>129 <span style=''>    }
+</span>130 <span style=''>
+</span>131 <span style=''>    override def remove(): Unit = {
+</span>132 <span style=''>      val id = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.featureWithFid(feature).getID</span><span style=''>
+</span>133 <span style=''>      logger.debug(s&quot;Writing delete to $topic: $id&quot;)
+</span>134 <span style=''>      val (key, value, headers) = serializer.serialize(GeoMessage.delete(id))
+</span>135 <span style=''>      val record = </span><span style='background: #AEF1AE'>new ProducerRecord(topic, key, value)</span><span style=''>
+</span>136 <span style=''>      </span><span style='background: #AEF1AE'>headers.foreach { case (k, v) =&gt; RecordVersions.setHeader(record, k, v) }</span><span style=''>
+</span>137 <span style=''>      </span><span style='background: #AEF1AE'>producer.send(record)</span><span style=''>
+</span>138 <span style=''>      </span><span style='background: #AEF1AE'>deleteCounter.increment()</span><span style=''>
+</span>139 <span style=''>    }
+</span>140 <span style=''>  }
+</span>141 <span style=''>
+</span>142 <span style=''>  trait RequiredVisibilityWriter extends AppendKafkaFeatureWriter with VisibilityChecker {
+</span>143 <span style=''>    abstract override def write(): Unit = {
+</span>144 <span style=''>      </span><span style='background: #AEF1AE'>requireVisibilities(feature)</span><span style=''>
+</span>145 <span style=''>      </span><span style='background: #AEF1AE'>super.write()</span><span style=''>
+</span>146 <span style=''>    }
+</span>147 <span style=''>  }
+</span>148 <span style=''>
+</span>149 <span style=''>  trait KafkaFeatureProducer extends Flushable {
+</span>150 <span style=''>    def send(record: ProducerRecord[Array[Byte], Array[Byte]]): Unit
+</span>151 <span style=''>  }
+</span>152 <span style=''>
+</span>153 <span style=''>  case class AutoCommitProducer(producer: Producer[Array[Byte], Array[Byte]]) extends KafkaFeatureProducer {
+</span>154 <span style=''>    override def send(record: ProducerRecord[Array[Byte], Array[Byte]]): Unit = </span><span style='background: #AEF1AE'>producer.send(record)</span><span style=''>
+</span>155 <span style=''>    override def flush(): Unit = </span><span style='background: #AEF1AE'>producer.flush()</span><span style=''>
+</span>156 <span style=''>  }
+</span>157 <span style=''>
+</span>158 <span style=''>  case class KafkaTransactionState(producer: Producer[Array[Byte], Array[Byte]])
+</span>159 <span style=''>      extends Transaction.State with KafkaFeatureProducer {
+</span>160 <span style=''>
+</span>161 <span style=''>    private val tx = </span><span style='background: #AEF1AE'>new AtomicReference[Transaction](null)</span><span style=''>
+</span>162 <span style=''>    private var inTransaction = </span><span style='background: #AEF1AE'>false</span><span style=''>
+</span>163 <span style=''>
+</span>164 <span style=''>    override def send(record: ProducerRecord[Array[Byte], Array[Byte]]): Unit = {
+</span>165 <span style=''>      if (</span><span style='background: #AEF1AE'>!inTransaction</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>166 <span style=''></span><span style='background: #AEF1AE'>        inTransaction = true
+</span>167 <span style=''></span><span style='background: #AEF1AE'>        producer.beginTransaction()
+</span>168 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>169 <span style=''>      </span><span style='background: #AEF1AE'>producer.send(record)</span><span style=''>
+</span>170 <span style=''>    }
+</span>171 <span style=''>
+</span>172 <span style=''>    /**
+</span>173 <span style=''>     * Sends offsets to the consumer coordinator, as part of a consume/transform/produce operation.
+</span>174 <span style=''>     * See `org.apache.kafka.clients.producer.KafkaProducer#sendOffsetsToTransaction(Map,String)`
+</span>175 <span style=''>     *
+</span>176 <span style=''>     * @param offsets offsets to send
+</span>177 <span style=''>     * @param consumerGroupId consumer group id
+</span>178 <span style=''>     */
+</span>179 <span style=''>    def sendOffsets(offsets: java.util.Map[TopicPartition, OffsetAndMetadata], consumerGroupId: String): Unit = {
+</span>180 <span style=''>      if (</span><span style='background: #F0ADAD'>inTransaction</span><span style=''>) {
+</span>181 <span style=''>        </span><span style='background: #F0ADAD'>producer.sendOffsetsToTransaction(offsets, consumerGroupId)</span><span style=''>
+</span>182 <span style=''>      }
+</span>183 <span style=''>    }
+</span>184 <span style=''>
+</span>185 <span style=''>    override def flush(): Unit = </span><span style='background: #AEF1AE'>producer.flush()</span><span style=''>
+</span>186 <span style=''>
+</span>187 <span style=''>    override def setTransaction(transaction: Transaction): Unit = {
+</span>188 <span style=''>      if (</span><span style='background: #AEF1AE'>transaction == null</span><span style=''>) {
+</span>189 <span style=''>        // null transaction indicates the transaction has been closed
+</span>190 <span style=''>        </span><span style='background: #AEF1AE'>try {
+</span>191 <span style=''></span><span style='background: #AEF1AE'>          if (inTransaction) </span><span style='background: #F0ADAD'>{
+</span>192 <span style=''></span><span style='background: #F0ADAD'>            inTransaction = false
+</span>193 <span style=''></span><span style='background: #F0ADAD'>            producer.commitTransaction()
+</span>194 <span style=''></span><span style='background: #F0ADAD'>          }</span><span style='background: #AEF1AE'>
+</span>195 <span style=''></span><span style='background: #AEF1AE'>        } finally {
+</span>196 <span style=''></span><span style='background: #AEF1AE'>          producer.close()
+</span>197 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>198 <span style=''>      } else </span><span style='background: #AEF1AE'>if (tx.compareAndSet(null, transaction)) {
+</span>199 <span style=''></span><span style='background: #AEF1AE'>        producer.initTransactions()
+</span>200 <span style=''></span><span style='background: #AEF1AE'>      } else {
+</span>201 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>throw new IllegalStateException(
+</span>202 <span style=''></span><span style='background: #F0ADAD'>          s&quot;State is already associated with transaction ${tx.get} and can't be associated with $transaction&quot;)</span><span style='background: #AEF1AE'>
+</span>203 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>204 <span style=''>    }
+</span>205 <span style=''>
+</span>206 <span style=''>    override def commit(): Unit = {
+</span>207 <span style=''>      if (</span><span style='background: #AEF1AE'>inTransaction</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>208 <span style=''></span><span style='background: #AEF1AE'>        inTransaction = false
+</span>209 <span style=''></span><span style='background: #AEF1AE'>        producer.commitTransaction()
+</span>210 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>211 <span style=''>    }
+</span>212 <span style=''>
+</span>213 <span style=''>    override def rollback(): Unit = {
+</span>214 <span style=''>      if (</span><span style='background: #AEF1AE'>inTransaction</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>215 <span style=''></span><span style='background: #AEF1AE'>        inTransaction = false
+</span>216 <span style=''></span><span style='background: #AEF1AE'>        producer.abortTransaction()
+</span>217 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>218 <span style=''>    }
+</span>219 <span style=''>
+</span>220 <span style=''>    override def addAuthorization(authID: String): Unit = </span><span style='background: #F0ADAD'>{}</span><span style=''>
+</span>221 <span style=''>  }
+</span>222 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          1622
+        </td>
+        <td>
+          1681
+          -
+          1698
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicLong(0L)
+        </td>
+      </tr><tr>
+        <td>
+          40
+        </td>
+        <td>
+          1623
+        </td>
+        <td>
+          1734
+          -
+          1756
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+      </tr><tr>
+        <td>
+          40
+        </td>
+        <td>
+          1624
+        </td>
+        <td>
+          1758
+          -
+          1776
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.util.factory.Hints.PROVIDED_FID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.util.factory.Hints.PROVIDED_FID
+        </td>
+      </tr><tr>
+        <td>
+          40
+        </td>
+        <td>
+          1625
+        </td>
+        <td>
+          1730
+          -
+          1777
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[org.geotools.util.factory.Hints.Key](org.geotools.util.factory.Hints.USE_PROVIDED_FID, org.geotools.util.factory.Hints.PROVIDED_FID)
+        </td>
+      </tr><tr>
+        <td>
+          41
+        </td>
+        <td>
+          1626
+        </td>
+        <td>
+          1810
+          -
+          1811
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          41
+        </td>
+        <td>
+          1627
+        </td>
+        <td>
+          1841
+          -
+          1851
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.producer&quot;
+        </td>
+      </tr><tr>
+        <td>
+          41
+        </td>
+        <td>
+          1628
+        </td>
+        <td>
+          1812
+          -
+          1840
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaDataStore.MetricsPrefix
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaDataStore.MetricsPrefix
+        </td>
+      </tr><tr>
+        <td>
+          41
+        </td>
+        <td>
+          1629
+        </td>
+        <td>
+          1808
+          -
+          1851
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;.producer&quot;).s(KafkaDataStore.MetricsPrefix)
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          1630
+        </td>
+        <td>
+          2134
+          -
+          2137
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          1631
+        </td>
+        <td>
+          2113
+          -
+          2138
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaDataStore.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaDataStore.topic(AppendKafkaFeatureWriter.this.sft)
+        </td>
+      </tr><tr>
+        <td>
+          52
+        </td>
+        <td>
+          1632
+        </td>
+        <td>
+          2191
+          -
+          2194
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          52
+        </td>
+        <td>
+          1633
+        </td>
+        <td>
+          2196
+          -
+          2200
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;-1&quot;
+        </td>
+      </tr><tr>
+        <td>
+          52
+        </td>
+        <td>
+          1634
+        </td>
+        <td>
+          2168
+          -
+          2201
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.ScalaSimpleFeature.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.features.ScalaSimpleFeature(AppendKafkaFeatureWriter.this.sft, &quot;-1&quot;, features.this.ScalaSimpleFeature.&lt;init&gt;$default$3, features.this.ScalaSimpleFeature.&lt;init&gt;$default$4)
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          1635
+        </td>
+        <td>
+          2252
+          -
+          2253
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          1636
+        </td>
+        <td>
+          2266
+          -
+          2276
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.produced&quot;
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          1637
+        </td>
+        <td>
+          2253
+          -
+          2266
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.MetricsPrefix
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureWriter.this.MetricsPrefix
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          1638
+        </td>
+        <td>
+          2250
+          -
+          2276
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;.produced&quot;).s(KafkaFeatureWriter.this.MetricsPrefix)
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          1639
+        </td>
+        <td>
+          2278
+          -
+          2302
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Tags.and
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.tags.and(&quot;op&quot;, &quot;update&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          1640
+        </td>
+        <td>
+          2234
+          -
+          2303
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Metrics.counter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.micrometer.core.instrument.Metrics.counter(scala.StringContext.apply(&quot;&quot;, &quot;.produced&quot;).s(KafkaFeatureWriter.this.MetricsPrefix), AppendKafkaFeatureWriter.this.tags.and(&quot;op&quot;, &quot;update&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          1641
+        </td>
+        <td>
+          2353
+          -
+          2354
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          1642
+        </td>
+        <td>
+          2367
+          -
+          2377
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.produced&quot;
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          1643
+        </td>
+        <td>
+          2354
+          -
+          2367
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.MetricsPrefix
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureWriter.this.MetricsPrefix
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          1644
+        </td>
+        <td>
+          2351
+          -
+          2377
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;.produced&quot;).s(KafkaFeatureWriter.this.MetricsPrefix)
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          1645
+        </td>
+        <td>
+          2379
+          -
+          2402
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Tags.and
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.tags.and(&quot;op&quot;, &quot;clear&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          1646
+        </td>
+        <td>
+          2335
+          -
+          2403
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Metrics.counter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.micrometer.core.instrument.Metrics.counter(scala.StringContext.apply(&quot;&quot;, &quot;.produced&quot;).s(KafkaFeatureWriter.this.MetricsPrefix), AppendKafkaFeatureWriter.this.tags.and(&quot;op&quot;, &quot;clear&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          1647
+        </td>
+        <td>
+          2458
+          -
+          2461
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AppendKafkaFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          1648
+        </td>
+        <td>
+          2499
+          -
+          2504
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          1649
+        </td>
+        <td>
+          2567
+          -
+          2604
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Any.toString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureWriter.this.featureIds.getAndIncrement().toString()
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          1650
+        </td>
+        <td>
+          2561
+          -
+          2605
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.reset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.reset(KafkaFeatureWriter.this.featureIds.getAndIncrement().toString())
+        </td>
+      </tr><tr>
+        <td>
+          63
+        </td>
+        <td>
+          1651
+        </td>
+        <td>
+          2612
+          -
+          2619
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.feature
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          1652
+        </td>
+        <td>
+          2713
+          -
+          2720
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.feature
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          1653
+        </td>
+        <td>
+          2677
+          -
+          2721
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.featureWithFid
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.featureWithFid(AppendKafkaFeatureWriter.this.feature)
+        </td>
+      </tr><tr>
+        <td>
+          69
+        </td>
+        <td>
+          1654
+        </td>
+        <td>
+          2833
+          -
+          2854
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          eta$0$1.remove(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          69
+        </td>
+        <td>
+          1655
+        </td>
+        <td>
+          2810
+          -
+          2855
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureWriter.this.FeatureIdHints.foreach[Object]({
+  &lt;synthetic&gt; val eta$0$1: java.util.Map[Object,Object] = sf.getUserData();
+  ((x$1: Any) =&gt; eta$0$1.remove(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          1656
+        </td>
+        <td>
+          2920
+          -
+          2920
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1._1
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          1657
+        </td>
+        <td>
+          2925
+          -
+          2925
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1._2
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          1658
+        </td>
+        <td>
+          2932
+          -
+          2932
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._3
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1._3
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          1659
+        </td>
+        <td>
+          3025
+          -
+          3030
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          1660
+        </td>
+        <td>
+          3006
+          -
+          3043
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.ProducerRecord.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](AppendKafkaFeatureWriter.this.topic, key, value)
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          1661
+        </td>
+        <td>
+          3083
+          -
+          3121
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader(record, k, v)
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          1662
+        </td>
+        <td>
+          3083
+          -
+          3121
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader(record, k, v)
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          1663
+        </td>
+        <td>
+          3050
+          -
+          3123
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          headers.foreach[Unit](((x0$1: (String, Array[Byte])) =&gt; x0$1 match {
+  case (_1: String, _2: Array[Byte])(String, Array[Byte])((k @ _), (v @ _)) =&gt; org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader(record, k, v)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          1664
+        </td>
+        <td>
+          3130
+          -
+          3151
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaFeatureProducer.send
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.producer.send(record)
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          1665
+        </td>
+        <td>
+          3158
+          -
+          3182
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Counter.increment
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.writeCounter.increment()
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          1666
+        </td>
+        <td>
+          3224
+          -
+          3265
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.UnsupportedOperationException()
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          1667
+        </td>
+        <td>
+          3300
+          -
+          3316
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.Flushable.flush
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AppendKafkaFeatureWriter.this.producer.flush()
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          1668
+        </td>
+        <td>
+          3351
+          -
+          3367
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.Flushable.flush
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.producer.flush()
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          1669
+        </td>
+        <td>
+          3513
+          -
+          3513
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$2._1
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          1670
+        </td>
+        <td>
+          3518
+          -
+          3518
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$2._2
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          1671
+        </td>
+        <td>
+          3525
+          -
+          3525
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._3
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$2._3
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          1672
+        </td>
+        <td>
+          3615
+          -
+          3620
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          1673
+        </td>
+        <td>
+          3596
+          -
+          3633
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.ProducerRecord.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](AppendKafkaFeatureWriter.this.topic, key, value)
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          1674
+        </td>
+        <td>
+          3673
+          -
+          3711
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader(record, k, v)
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          1675
+        </td>
+        <td>
+          3673
+          -
+          3711
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader(record, k, v)
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          1676
+        </td>
+        <td>
+          3640
+          -
+          3713
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          headers.foreach[Unit](((x0$1: (String, Array[Byte])) =&gt; x0$1 match {
+  case (_1: String, _2: Array[Byte])(String, Array[Byte])((k @ _), (v @ _)) =&gt; org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader(record, k, v)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          1677
+        </td>
+        <td>
+          3720
+          -
+          3741
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaFeatureProducer.send
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.producer.send(record)
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          1678
+        </td>
+        <td>
+          3748
+          -
+          3772
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Counter.increment
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.clearCounter.increment()
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          1679
+        </td>
+        <td>
+          3832
+          -
+          3849
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.AbstractSimpleFeature.AbstractMutableSimpleFeature.setId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.feature.setId(id)
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          1680
+        </td>
+        <td>
+          3864
+          -
+          3865
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          1681
+        </td>
+        <td>
+          3883
+          -
+          3904
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getAttributeCount
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.sft.getAttributeCount()
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          1682
+        </td>
+        <td>
+          3879
+          -
+          3904
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.&lt;(AppendKafkaFeatureWriter.this.sft.getAttributeCount())
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          1685
+        </td>
+        <td>
+          3906
+          -
+          3906
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.while$1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$1()
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          1686
+        </td>
+        <td>
+          3906
+          -
+          3977
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    AppendKafkaFeatureWriter.this.feature.setAttributeNoConvert(i, null);
+    i = i.+(1)
+  };
+  while$1()
+}
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          1687
+        </td>
+        <td>
+          3872
+          -
+          3872
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          1688
+        </td>
+        <td>
+          3872
+          -
+          3872
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          1683
+        </td>
+        <td>
+          3916
+          -
+          3954
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.ScalaSimpleFeature.setAttributeNoConvert
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.feature.setAttributeNoConvert(i, null)
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          1684
+        </td>
+        <td>
+          3963
+          -
+          3969
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          1689
+        </td>
+        <td>
+          3984
+          -
+          4011
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AppendKafkaFeatureWriter.this.feature.getUserData().clear()
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          1690
+        </td>
+        <td>
+          4365
+          -
+          4371
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.ModifyKafkaFeatureWriter.filter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ModifyKafkaFeatureWriter.this.filter
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          1691
+        </td>
+        <td>
+          4402
+          -
+          4421
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Set.iterator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ids.getIDs().iterator()
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          1692
+        </td>
+        <td>
+          4434
+          -
+          4444
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.toString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$3.toString()
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          1693
+        </td>
+        <td>
+          4402
+          -
+          4445
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaIteratorConverter[Object](ids.getIDs().iterator()).asScala.map[String](((x$3: Object) =&gt; x$3.toString()))
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          1694
+        </td>
+        <td>
+          4402
+          -
+          4445
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.Iterator.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaIteratorConverter[Object](ids.getIDs().iterator()).asScala.map[String](((x$3: Object) =&gt; x$3.toString()))
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          1695
+        </td>
+        <td>
+          4462
+          -
+          4535
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.UnsupportedOperationException(&quot;Only modify by ID is supported&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          1696
+        </td>
+        <td>
+          4462
+          -
+          4535
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.UnsupportedOperationException(&quot;Only modify by ID is supported&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          1697
+        </td>
+        <td>
+          4593
+          -
+          4594
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          1698
+        </td>
+        <td>
+          4607
+          -
+          4617
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.produced&quot;
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          1699
+        </td>
+        <td>
+          4594
+          -
+          4607
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.MetricsPrefix
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaFeatureWriter.this.MetricsPrefix
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          1700
+        </td>
+        <td>
+          4591
+          -
+          4617
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;.produced&quot;).s(KafkaFeatureWriter.this.MetricsPrefix)
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          1701
+        </td>
+        <td>
+          4619
+          -
+          4643
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Tags.and
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ModifyKafkaFeatureWriter.this.tags.and(&quot;op&quot;, &quot;delete&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          1702
+        </td>
+        <td>
+          4575
+          -
+          4644
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Metrics.counter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.micrometer.core.instrument.Metrics.counter(scala.StringContext.apply(&quot;&quot;, &quot;.produced&quot;).s(KafkaFeatureWriter.this.MetricsPrefix), ModifyKafkaFeatureWriter.this.tags.and(&quot;op&quot;, &quot;delete&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          1703
+        </td>
+        <td>
+          4682
+          -
+          4693
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.Iterator.hasNext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ModifyKafkaFeatureWriter.this.ids.hasNext
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          1704
+        </td>
+        <td>
+          4840
+          -
+          4843
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.ModifyKafkaFeatureWriter.ids
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ModifyKafkaFeatureWriter.this.ids
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          1705
+        </td>
+        <td>
+          4865
+          -
+          4902
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Any.toString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaFeatureWriter.this.featureIds.getAndIncrement().toString()
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          1706
+        </td>
+        <td>
+          4840
+          -
+          4903
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.conversions.ScalaImplicits.RichIterator[String](ModifyKafkaFeatureWriter.this.ids).headOption.getOrElse[String](KafkaFeatureWriter.this.featureIds.getAndIncrement().toString())
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          1707
+        </td>
+        <td>
+          4834
+          -
+          4904
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.reset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ModifyKafkaFeatureWriter.this.reset(org.locationtech.geomesa.utils.conversions.ScalaImplicits.RichIterator[String](ModifyKafkaFeatureWriter.this.ids).headOption.getOrElse[String](KafkaFeatureWriter.this.featureIds.getAndIncrement().toString()))
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          1708
+        </td>
+        <td>
+          4978
+          -
+          5000
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          1709
+        </td>
+        <td>
+          5002
+          -
+          5024
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.lang.Boolean.TRUE
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.Boolean.TRUE
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          1710
+        </td>
+        <td>
+          4954
+          -
+          5025
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ModifyKafkaFeatureWriter.this.feature.getUserData().put(org.geotools.util.factory.Hints.USE_PROVIDED_FID, java.lang.Boolean.TRUE)
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          1711
+        </td>
+        <td>
+          5032
+          -
+          5039
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ModifyKafkaFeatureWriter.this.feature
+        </td>
+      </tr><tr>
+        <td>
+          132
+        </td>
+        <td>
+          1712
+        </td>
+        <td>
+          5098
+          -
+          5148
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.featureWithFid(ModifyKafkaFeatureWriter.this.feature).getID()
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          1713
+        </td>
+        <td>
+          5213
+          -
+          5213
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$4._1
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          1714
+        </td>
+        <td>
+          5218
+          -
+          5218
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$4._2
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          1715
+        </td>
+        <td>
+          5225
+          -
+          5225
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple3._3
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$4._3
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          1716
+        </td>
+        <td>
+          5318
+          -
+          5323
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.topic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ModifyKafkaFeatureWriter.this.topic
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          1717
+        </td>
+        <td>
+          5299
+          -
+          5336
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.ProducerRecord.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte],Array[Byte]](ModifyKafkaFeatureWriter.this.topic, key, value)
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          1718
+        </td>
+        <td>
+          5376
+          -
+          5414
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader(record, k, v)
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          1719
+        </td>
+        <td>
+          5376
+          -
+          5414
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader(record, k, v)
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          1720
+        </td>
+        <td>
+          5343
+          -
+          5416
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          headers.foreach[Unit](((x0$1: (String, Array[Byte])) =&gt; x0$1 match {
+  case (_1: String, _2: Array[Byte])(String, Array[Byte])((k @ _), (v @ _)) =&gt; org.locationtech.geomesa.kafka.versions.RecordVersions.setHeader(record, k, v)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          1721
+        </td>
+        <td>
+          5423
+          -
+          5444
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaFeatureProducer.send
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ModifyKafkaFeatureWriter.this.producer.send(record)
+        </td>
+      </tr><tr>
+        <td>
+          138
+        </td>
+        <td>
+          1722
+        </td>
+        <td>
+          5451
+          -
+          5476
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Counter.increment
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ModifyKafkaFeatureWriter.this.deleteCounter.increment()
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          1723
+        </td>
+        <td>
+          5649
+          -
+          5656
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RequiredVisibilityWriter.this.feature
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          1724
+        </td>
+        <td>
+          5629
+          -
+          5657
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.security.VisibilityChecker.requireVisibilities
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RequiredVisibilityWriter.this.requireVisibilities(RequiredVisibilityWriter.this.feature)
+        </td>
+      </tr><tr>
+        <td>
+          145
+        </td>
+        <td>
+          1725
+        </td>
+        <td>
+          5664
+          -
+          5677
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.AppendKafkaFeatureWriter.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RequiredVisibilityWriter.super.write()
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          1726
+        </td>
+        <td>
+          6001
+          -
+          6022
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.send
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AutoCommitProducer.this.producer.send(record)
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          1727
+        </td>
+        <td>
+          6014
+          -
+          6014
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          1728
+        </td>
+        <td>
+          6056
+          -
+          6072
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.flush
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AutoCommitProducer.this.producer.flush()
+        </td>
+      </tr><tr>
+        <td>
+          161
+        </td>
+        <td>
+          1729
+        </td>
+        <td>
+          6241
+          -
+          6279
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicReference.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicReference[org.geotools.api.data.Transaction](null)
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          1730
+        </td>
+        <td>
+          6312
+          -
+          6317
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          1731
+        </td>
+        <td>
+          6411
+          -
+          6425
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.inTransaction.unary_!
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          1734
+        </td>
+        <td>
+          6427
+          -
+          6501
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  KafkaTransactionState.this.inTransaction_=(true);
+  KafkaTransactionState.this.producer.beginTransaction()
+}
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          1735
+        </td>
+        <td>
+          6407
+          -
+          6407
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          1736
+        </td>
+        <td>
+          6407
+          -
+          6407
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          166
+        </td>
+        <td>
+          1732
+        </td>
+        <td>
+          6437
+          -
+          6457
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaTransactionState.inTransaction_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.inTransaction_=(true)
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          1733
+        </td>
+        <td>
+          6466
+          -
+          6493
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.beginTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.producer.beginTransaction()
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          1737
+        </td>
+        <td>
+          6508
+          -
+          6529
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.send
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.producer.send(record)
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          1738
+        </td>
+        <td>
+          6521
+          -
+          6521
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          1739
+        </td>
+        <td>
+          6968
+          -
+          6981
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaTransactionState.inTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaTransactionState.this.inTransaction
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          1742
+        </td>
+        <td>
+          6964
+          -
+          6964
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          1743
+        </td>
+        <td>
+          6964
+          -
+          6964
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          1740
+        </td>
+        <td>
+          6993
+          -
+          7052
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.sendOffsetsToTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaTransactionState.this.producer.sendOffsetsToTransaction(offsets, consumerGroupId)
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          1741
+        </td>
+        <td>
+          6993
+          -
+          7052
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.sendOffsetsToTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaTransactionState.this.producer.sendOffsetsToTransaction(offsets, consumerGroupId)
+        </td>
+      </tr><tr>
+        <td>
+          185
+        </td>
+        <td>
+          1744
+        </td>
+        <td>
+          7101
+          -
+          7117
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.flush
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.producer.flush()
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          1745
+        </td>
+        <td>
+          7197
+          -
+          7216
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          transaction.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          190
+        </td>
+        <td>
+          1755
+        </td>
+        <td>
+          7298
+          -
+          7478
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  if (KafkaTransactionState.this.inTransaction)
+    {
+      KafkaTransactionState.this.inTransaction_=(false);
+      KafkaTransactionState.this.producer.commitTransaction()
+    }
+  else
+    ()
+} finally KafkaTransactionState.this.producer.close()
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          1746
+        </td>
+        <td>
+          7318
+          -
+          7331
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaTransactionState.inTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.inTransaction
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          1749
+        </td>
+        <td>
+          7333
+          -
+          7421
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  KafkaTransactionState.this.inTransaction_=(false);
+  KafkaTransactionState.this.producer.commitTransaction()
+}
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          1750
+        </td>
+        <td>
+          7314
+          -
+          7314
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          1751
+        </td>
+        <td>
+          7314
+          -
+          7314
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          1752
+        </td>
+        <td>
+          7314
+          -
+          7421
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (KafkaTransactionState.this.inTransaction)
+  {
+    KafkaTransactionState.this.inTransaction_=(false);
+    KafkaTransactionState.this.producer.commitTransaction()
+  }
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          192
+        </td>
+        <td>
+          1747
+        </td>
+        <td>
+          7347
+          -
+          7368
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaTransactionState.inTransaction_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaTransactionState.this.inTransaction_=(false)
+        </td>
+      </tr><tr>
+        <td>
+          193
+        </td>
+        <td>
+          1748
+        </td>
+        <td>
+          7381
+          -
+          7409
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.commitTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          KafkaTransactionState.this.producer.commitTransaction()
+        </td>
+      </tr><tr>
+        <td>
+          196
+        </td>
+        <td>
+          1753
+        </td>
+        <td>
+          7452
+          -
+          7468
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.producer.close()
+        </td>
+      </tr><tr>
+        <td>
+          196
+        </td>
+        <td>
+          1754
+        </td>
+        <td>
+          7452
+          -
+          7468
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.producer.close()
+        </td>
+      </tr><tr>
+        <td>
+          198
+        </td>
+        <td>
+          1756
+        </td>
+        <td>
+          7496
+          -
+          7531
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicReference.compareAndSet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.tx.compareAndSet(null, transaction)
+        </td>
+      </tr><tr>
+        <td>
+          198
+        </td>
+        <td>
+          1761
+        </td>
+        <td>
+          7492
+          -
+          7745
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (KafkaTransactionState.this.tx.compareAndSet(null, transaction))
+  KafkaTransactionState.this.producer.initTransactions()
+else
+  throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;State is already associated with transaction &quot;, &quot; and can\'t be associated with &quot;, &quot;&quot;).s(KafkaTransactionState.this.tx.get(), transaction))
+        </td>
+      </tr><tr>
+        <td>
+          199
+        </td>
+        <td>
+          1757
+        </td>
+        <td>
+          7543
+          -
+          7570
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.initTransactions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.producer.initTransactions()
+        </td>
+      </tr><tr>
+        <td>
+          199
+        </td>
+        <td>
+          1758
+        </td>
+        <td>
+          7543
+          -
+          7570
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.initTransactions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.producer.initTransactions()
+        </td>
+      </tr><tr>
+        <td>
+          201
+        </td>
+        <td>
+          1759
+        </td>
+        <td>
+          7594
+          -
+          7737
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;State is already associated with transaction &quot;, &quot; and can\'t be associated with &quot;, &quot;&quot;).s(KafkaTransactionState.this.tx.get(), transaction))
+        </td>
+      </tr><tr>
+        <td>
+          201
+        </td>
+        <td>
+          1760
+        </td>
+        <td>
+          7594
+          -
+          7737
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;State is already associated with transaction &quot;, &quot; and can\'t be associated with &quot;, &quot;&quot;).s(KafkaTransactionState.this.tx.get(), transaction))
+        </td>
+      </tr><tr>
+        <td>
+          207
+        </td>
+        <td>
+          1762
+        </td>
+        <td>
+          7799
+          -
+          7812
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaTransactionState.inTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.inTransaction
+        </td>
+      </tr><tr>
+        <td>
+          207
+        </td>
+        <td>
+          1765
+        </td>
+        <td>
+          7814
+          -
+          7890
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  KafkaTransactionState.this.inTransaction_=(false);
+  KafkaTransactionState.this.producer.commitTransaction()
+}
+        </td>
+      </tr><tr>
+        <td>
+          207
+        </td>
+        <td>
+          1766
+        </td>
+        <td>
+          7795
+          -
+          7795
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          207
+        </td>
+        <td>
+          1767
+        </td>
+        <td>
+          7795
+          -
+          7795
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          208
+        </td>
+        <td>
+          1763
+        </td>
+        <td>
+          7824
+          -
+          7845
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaTransactionState.inTransaction_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.inTransaction_=(false)
+        </td>
+      </tr><tr>
+        <td>
+          209
+        </td>
+        <td>
+          1764
+        </td>
+        <td>
+          7854
+          -
+          7882
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.commitTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.producer.commitTransaction()
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          1768
+        </td>
+        <td>
+          7946
+          -
+          7959
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaTransactionState.inTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.inTransaction
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          1771
+        </td>
+        <td>
+          7961
+          -
+          8036
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  KafkaTransactionState.this.inTransaction_=(false);
+  KafkaTransactionState.this.producer.abortTransaction()
+}
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          1772
+        </td>
+        <td>
+          7942
+          -
+          7942
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          1773
+        </td>
+        <td>
+          7942
+          -
+          7942
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          215
+        </td>
+        <td>
+          1769
+        </td>
+        <td>
+          7971
+          -
+          7992
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.data.KafkaFeatureWriter.KafkaTransactionState.inTransaction_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.inTransaction_=(false)
+        </td>
+      </tr><tr>
+        <td>
+          216
+        </td>
+        <td>
+          1770
+        </td>
+        <td>
+          8001
+          -
+          8028
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.producer.Producer.abortTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          KafkaTransactionState.this.producer.abortTransaction()
+        </td>
+      </tr><tr>
+        <td>
+          220
+        </td>
+        <td>
+          1774
+        </td>
+        <td>
+          8102
+          -
+          8104
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>

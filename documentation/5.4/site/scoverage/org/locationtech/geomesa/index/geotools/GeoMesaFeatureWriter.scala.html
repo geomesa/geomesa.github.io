@@ -1,0 +1,7307 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/index/geotools/GeoMesaFeatureWriter.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.index.geotools
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.LazyLogging
+</span>12 <span style=''>import io.micrometer.core.instrument.{Metrics, Timer}
+</span>13 <span style=''>import org.geotools.api.data.{Query, Transaction}
+</span>14 <span style=''>import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+</span>15 <span style=''>import org.geotools.api.filter.Filter
+</span>16 <span style=''>import org.geotools.data.DataUtilities
+</span>17 <span style=''>import org.geotools.filter.identity.FeatureIdImpl
+</span>18 <span style=''>import org.geotools.util.factory.Hints
+</span>19 <span style=''>import org.locationtech.geomesa.features.{FastSettableFeature, ScalaSimpleFeature}
+</span>20 <span style=''>import org.locationtech.geomesa.index.api.GeoMesaFeatureIndex
+</span>21 <span style=''>import org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter
+</span>22 <span style=''>import org.locationtech.geomesa.index.conf.partition.TablePartition
+</span>23 <span style=''>import org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.WriteException
+</span>24 <span style=''>import org.locationtech.geomesa.index.stats.GeoMesaStats.StatUpdater
+</span>25 <span style=''>import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+</span>26 <span style=''>import org.locationtech.geomesa.utils.io.{CloseQuietly, FlushQuietly}
+</span>27 <span style=''>import org.locationtech.geomesa.utils.uuid.{FeatureIdGenerator, Z3FeatureIdGenerator}
+</span>28 <span style=''>
+</span>29 <span style=''>import java.io.{Closeable, Flushable}
+</span>30 <span style=''>import java.util.concurrent.TimeUnit
+</span>31 <span style=''>import java.util.concurrent.atomic.AtomicLong
+</span>32 <span style=''>import scala.util.control.NonFatal
+</span>33 <span style=''>
+</span>34 <span style=''>trait GeoMesaFeatureWriter[DS &lt;: GeoMesaDataStore[DS]] extends FastSettableFeatureWriter with Flushable with LazyLogging {
+</span>35 <span style=''>
+</span>36 <span style=''>  def ds: DS
+</span>37 <span style=''>  def sft: SimpleFeatureType
+</span>38 <span style=''>  def indices: Seq[GeoMesaFeatureIndex[_, _]]
+</span>39 <span style=''>
+</span>40 <span style=''>  // flushables/closeables defined in subclasses, so we can manage them here
+</span>41 <span style=''>  protected def flushables(): Seq[Flushable]
+</span>42 <span style=''>  protected def closeables(): Seq[Closeable]
+</span>43 <span style=''>
+</span>44 <span style=''>  private val appendTimer = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.writeTimer(ds, sft, &quot;append&quot;)</span><span style=''>
+</span>45 <span style=''>  private val updateTimer = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.writeTimer(ds, sft, &quot;update&quot;)</span><span style=''>
+</span>46 <span style=''>  private val deleteTimer = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.writeTimer(ds, sft, &quot;delete&quot;)</span><span style=''>
+</span>47 <span style=''>  private val flushTimer = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.writeTimer(ds, sft, &quot;flush&quot;)</span><span style=''>
+</span>48 <span style=''>
+</span>49 <span style=''>  protected val statUpdater: StatUpdater = </span><span style='background: #AEF1AE'>ds.stats.writer.updater(sft)</span><span style=''>
+</span>50 <span style=''>
+</span>51 <span style=''>  override def getFeatureType: SimpleFeatureType = </span><span style='background: #AEF1AE'>sft</span><span style=''>
+</span>52 <span style=''>
+</span>53 <span style=''>  override def flush(): Unit = {
+</span>54 <span style=''>    val start = </span><span style='background: #AEF1AE'>System.nanoTime()</span><span style=''>
+</span>55 <span style=''>    try {
+</span>56 <span style=''>      </span><span style='background: #AEF1AE'>val errors = flushables().flatMap(FlushQuietly(_))
+</span>57 <span style=''></span><span style='background: #AEF1AE'>      if (errors.nonEmpty) {
+</span>58 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>propagateExceptions(errors)</span><span style='background: #AEF1AE'>
+</span>59 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>60 <span style=''>    } finally {
+</span>61 <span style=''>      </span><span style='background: #AEF1AE'>flushTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)</span><span style=''>
+</span>62 <span style=''>    }
+</span>63 <span style=''>  }
+</span>64 <span style=''>
+</span>65 <span style=''>  override def close(): Unit = {
+</span>66 <span style=''>    val start = </span><span style='background: #AEF1AE'>System.nanoTime()</span><span style=''>
+</span>67 <span style=''>    try {
+</span>68 <span style=''>      </span><span style='background: #AEF1AE'>val errors = closeables().flatMap(CloseQuietly(_))
+</span>69 <span style=''></span><span style='background: #AEF1AE'>      if (errors.nonEmpty) {
+</span>70 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>propagateExceptions(errors)</span><span style='background: #AEF1AE'>
+</span>71 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>72 <span style=''>    } finally {
+</span>73 <span style=''>      // we count closes as flushes for timing purposes
+</span>74 <span style=''>      </span><span style='background: #AEF1AE'>flushTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)</span><span style=''>
+</span>75 <span style=''>    }
+</span>76 <span style=''>  }
+</span>77 <span style=''>
+</span>78 <span style=''>  protected def getWriter(feature: SimpleFeature): IndexWriter
+</span>79 <span style=''>
+</span>80 <span style=''>  protected def updateFeature(update: FastSettableFeature, previous: SimpleFeature): Unit = {
+</span>81 <span style=''>    val start = </span><span style='background: #AEF1AE'>System.nanoTime()</span><span style=''>
+</span>82 <span style=''>    try {
+</span>83 <span style=''>      // see if there's a suggested ID to use for this feature, else create one based on the feature
+</span>84 <span style=''>      </span><span style='background: #AEF1AE'>val writable = GeoMesaFeatureWriter.featureWithFid(update)
+</span>85 <span style=''></span><span style='background: #AEF1AE'>      try {
+</span>86 <span style=''></span><span style='background: #AEF1AE'>        val writer = getWriter(writable)
+</span>87 <span style=''></span><span style='background: #AEF1AE'>        val remover = getWriter(previous)
+</span>88 <span style=''></span><span style='background: #AEF1AE'>        if (writer.eq(remover)) {
+</span>89 <span style=''></span><span style='background: #AEF1AE'>          // `update` will calculate all mutations up front in case the feature is not valid, so we don't write partial entries
+</span>90 <span style=''></span><span style='background: #AEF1AE'>          writer.update(writable, previous)
+</span>91 <span style=''></span><span style='background: #AEF1AE'>        } else </span><span style='background: #F0ADAD'>{
+</span>92 <span style=''></span><span style='background: #F0ADAD'>          remover.delete(previous)
+</span>93 <span style=''></span><span style='background: #F0ADAD'>          writer.append(writable)
+</span>94 <span style=''></span><span style='background: #F0ADAD'>        }</span><span style='background: #AEF1AE'>
+</span>95 <span style=''></span><span style='background: #AEF1AE'>      } catch {
+</span>96 <span style=''></span><span style='background: #AEF1AE'>        case NonFatal(e) =&gt; throwWriteErrors(e, writable)
+</span>97 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>98 <span style=''></span><span style='background: #AEF1AE'>      statUpdater.add(writable)</span><span style=''>
+</span>99 <span style=''>    } finally {
+</span>100 <span style=''>      </span><span style='background: #AEF1AE'>updateTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)</span><span style=''>
+</span>101 <span style=''>    }
+</span>102 <span style=''>  }
+</span>103 <span style=''>
+</span>104 <span style=''>  protected def appendFeature(feature: FastSettableFeature): Unit = {
+</span>105 <span style=''>    val start = </span><span style='background: #AEF1AE'>System.nanoTime()</span><span style=''>
+</span>106 <span style=''>    try {
+</span>107 <span style=''>      // see if there's a suggested ID to use for this feature, else create one based on the feature
+</span>108 <span style=''>      </span><span style='background: #AEF1AE'>val writable = GeoMesaFeatureWriter.featureWithFid(feature)
+</span>109 <span style=''></span><span style='background: #AEF1AE'>      try {
+</span>110 <span style=''></span><span style='background: #AEF1AE'>        // `append` will calculate all mutations up front in case the feature is not valid, so we don't write partial entries
+</span>111 <span style=''></span><span style='background: #AEF1AE'>        getWriter(writable).append(writable)
+</span>112 <span style=''></span><span style='background: #AEF1AE'>      } catch {
+</span>113 <span style=''></span><span style='background: #AEF1AE'>        case NonFatal(e) =&gt; throwWriteErrors(e, writable)
+</span>114 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>115 <span style=''></span><span style='background: #AEF1AE'>      statUpdater.add(writable)</span><span style=''>
+</span>116 <span style=''>    } finally {
+</span>117 <span style=''>      </span><span style='background: #AEF1AE'>appendTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)</span><span style=''>
+</span>118 <span style=''>    }
+</span>119 <span style=''>  }
+</span>120 <span style=''>
+</span>121 <span style=''>  protected def removeFeature(feature: SimpleFeature): Unit = {
+</span>122 <span style=''>    val start = </span><span style='background: #AEF1AE'>System.nanoTime()</span><span style=''>
+</span>123 <span style=''>    try {
+</span>124 <span style=''>      // the feature has come directly from our reader, so it should be valid and already have a FID
+</span>125 <span style=''>      </span><span style='background: #AEF1AE'>getWriter(feature).delete(feature)
+</span>126 <span style=''></span><span style='background: #AEF1AE'>      statUpdater.remove(feature)</span><span style=''>
+</span>127 <span style=''>    } finally {
+</span>128 <span style=''>      </span><span style='background: #AEF1AE'>deleteTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)</span><span style=''>
+</span>129 <span style=''>    }
+</span>130 <span style=''>  }
+</span>131 <span style=''>
+</span>132 <span style=''>  // returns a temporary id - we will replace it just before write
+</span>133 <span style=''>  protected def nextFeatureId: String = </span><span style='background: #AEF1AE'>GeoMesaFeatureWriter.tempFeatureIds.getAndIncrement().toString</span><span style=''>
+</span>134 <span style=''>
+</span>135 <span style=''>  @throws[Exception]
+</span>136 <span style=''>  private def throwWriteErrors(e: Throwable, feature: SimpleFeature): Unit = {
+</span>137 <span style=''>    lazy val msg = s&quot;Error indexing feature '${feature.getID}:${DataUtilities.encodeFeature(feature, false)}'&quot;
+</span>138 <span style=''>    e match {
+</span>139 <span style=''>      case _: WriteException =&gt; </span><span style='background: #AEF1AE'>throw e</span><span style=''>
+</span>140 <span style=''>      case _: IllegalArgumentException =&gt; </span><span style='background: #AEF1AE'>throw new IllegalArgumentException(msg, e)</span><span style=''>
+</span>141 <span style=''>      case _ =&gt; </span><span style='background: #F0ADAD'>throw new RuntimeException(msg, e)</span><span style=''>
+</span>142 <span style=''>    }
+</span>143 <span style=''>  }
+</span>144 <span style=''>
+</span>145 <span style=''>  private def propagateExceptions(errors: Seq[Throwable]): Unit = {
+</span>146 <span style=''>    val all = </span><span style='background: #F0ADAD'>new RuntimeException(s&quot;Error writing features:&quot;)</span><span style=''>
+</span>147 <span style=''>    </span><span style='background: #F0ADAD'>errors.foreach(all.addSuppressed)</span><span style=''>
+</span>148 <span style=''>    </span><span style='background: #F0ADAD'>throw all</span><span style=''>
+</span>149 <span style=''>  }
+</span>150 <span style=''>}
+</span>151 <span style=''>
+</span>152 <span style=''>object GeoMesaFeatureWriter extends LazyLogging {
+</span>153 <span style=''>
+</span>154 <span style=''>  private val tempFeatureIds = </span><span style='background: #AEF1AE'>new AtomicLong(0)</span><span style=''>
+</span>155 <span style=''>
+</span>156 <span style=''>  private val idGenerator: FeatureIdGenerator = {
+</span>157 <span style=''>    import org.locationtech.geomesa.index.conf.FeatureProperties.FEATURE_ID_GENERATOR
+</span>158 <span style=''>    try {
+</span>159 <span style=''>      </span><span style='background: #AEF1AE'>logger.debug(s&quot;Using feature id generator '${FEATURE_ID_GENERATOR.get}'&quot;)
+</span>160 <span style=''></span><span style='background: #AEF1AE'>      Class.forName(FEATURE_ID_GENERATOR.get).newInstance().asInstanceOf[FeatureIdGenerator]</span><span style=''>
+</span>161 <span style=''>    } catch {
+</span>162 <span style=''>      case e: Throwable </span><span style='background: #F0ADAD'>=&gt;
+</span>163 <span style=''></span><span style='background: #F0ADAD'>        logger.error(s&quot;Could not load feature id generator class '${FEATURE_ID_GENERATOR.get}'&quot;, e)
+</span>164 <span style=''></span><span style='background: #F0ADAD'>        new Z3FeatureIdGenerator</span><span style=''>
+</span>165 <span style=''>    }
+</span>166 <span style=''>  }
+</span>167 <span style=''>
+</span>168 <span style=''>  /**
+</span>169 <span style=''>   * Create a feature writer
+</span>170 <span style=''>   *
+</span>171 <span style=''>   * @param ds datastore
+</span>172 <span style=''>   * @param sft simple feature type
+</span>173 <span style=''>   * @param indices indices to write
+</span>174 <span style=''>   * @param filter filter for selecting features for updating writes, or None for appending writes
+</span>175 <span style=''>   * @param atomic enforce atomic writes
+</span>176 <span style=''>   * @tparam DS datastore type
+</span>177 <span style=''>   * @return feature writer
+</span>178 <span style=''>   */
+</span>179 <span style=''>  def apply[DS &lt;: GeoMesaDataStore[DS]](
+</span>180 <span style=''>      ds: DS,
+</span>181 <span style=''>      sft: SimpleFeatureType,
+</span>182 <span style=''>      indices: Seq[GeoMesaFeatureIndex[_, _]],
+</span>183 <span style=''>      filter: Option[Filter],
+</span>184 <span style=''>      atomic: Boolean): GeoMesaFeatureWriter[DS] = {
+</span>185 <span style=''>    if (</span><span style='background: #AEF1AE'>TablePartition.partitioned(sft)</span><span style=''>) {
+</span>186 <span style=''>      </span><span style='background: #AEF1AE'>filter match {
+</span>187 <span style=''></span><span style='background: #AEF1AE'>        case None =&gt; new PartitionFeatureWriter(ds, sft, indices, atomic) with GeoMesaAppendFeatureWriter[DS]
+</span>188 <span style=''></span><span style='background: #AEF1AE'>        case Some(f) =&gt;
+</span>189 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>new PartitionFeatureWriter(ds, sft, indices, atomic) with GeoMesaModifyFeatureWriter[DS] {
+</span>190 <span style=''></span><span style='background: #F0ADAD'>            override def filter: Filter = f
+</span>191 <span style=''></span><span style='background: #F0ADAD'>          }</span><span style='background: #AEF1AE'>
+</span>192 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>193 <span style=''>    } else {
+</span>194 <span style=''>      </span><span style='background: #AEF1AE'>filter match {
+</span>195 <span style=''></span><span style='background: #AEF1AE'>        case None =&gt; new TableFeatureWriter(ds, sft, indices, atomic) with GeoMesaAppendFeatureWriter[DS]
+</span>196 <span style=''></span><span style='background: #AEF1AE'>        case Some(f) =&gt;
+</span>197 <span style=''></span><span style='background: #AEF1AE'>          new TableFeatureWriter(ds, sft, indices, atomic) with GeoMesaModifyFeatureWriter[DS] {
+</span>198 <span style=''></span><span style='background: #AEF1AE'>            override def filter: Filter = f
+</span>199 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>200 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>201 <span style=''>    }
+</span>202 <span style=''>  }
+</span>203 <span style=''>
+</span>204 <span style=''>  /**
+</span>205 <span style=''>   * Sets the feature ID on the feature. If the user has requested a specific ID, that will be used,
+</span>206 <span style=''>   * otherwise one will be generated. If possible, the original feature will be modified and returned.
+</span>207 <span style=''>   */
+</span>208 <span style=''>  def featureWithFid(feature: SimpleFeature): SimpleFeature = {
+</span>209 <span style=''>    val provided = </span><span style='background: #AEF1AE'>feature.getUserData.get(Hints.PROVIDED_FID)</span><span style=''>
+</span>210 <span style=''>    if (</span><span style='background: #AEF1AE'>provided != null</span><span style=''>) {
+</span>211 <span style=''>      </span><span style='background: #F0ADAD'>withFid(feature, provided.toString)</span><span style=''>
+</span>212 <span style=''>    } else </span><span style='background: #AEF1AE'>if (feature.getUserData.get(Hints.USE_PROVIDED_FID) != java.lang.Boolean.TRUE) {
+</span>213 <span style=''></span><span style='background: #AEF1AE'>      </span><span style='background: #F0ADAD'>withFid(feature, idGenerator.createId(feature.getFeatureType, feature))</span><span style='background: #AEF1AE'>
+</span>214 <span style=''></span><span style='background: #AEF1AE'>    } else {
+</span>215 <span style=''></span><span style='background: #AEF1AE'>      feature
+</span>216 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>217 <span style=''>  }
+</span>218 <span style=''>
+</span>219 <span style=''>  /**
+</span>220 <span style=''>   * Sets the feature ID on the feature. If the user has requested a specific ID, that will be used,
+</span>221 <span style=''>   * otherwise one will be generated. The original feature will be modified and returned.
+</span>222 <span style=''>   *
+</span>223 <span style=''>   * @param feature feature
+</span>224 <span style=''>   * @return
+</span>225 <span style=''>   */
+</span>226 <span style=''>  def featureWithFid(feature: FastSettableFeature): FastSettableFeature = {
+</span>227 <span style=''>    val provided = </span><span style='background: #AEF1AE'>feature.getUserData.get(Hints.PROVIDED_FID)</span><span style=''>
+</span>228 <span style=''>    if (</span><span style='background: #AEF1AE'>provided != null</span><span style=''>) {
+</span>229 <span style=''>      </span><span style='background: #AEF1AE'>feature.setId(provided.toString)</span><span style=''>
+</span>230 <span style=''>    } else </span><span style='background: #AEF1AE'>if (feature.getUserData.get(Hints.USE_PROVIDED_FID) != java.lang.Boolean.TRUE) {
+</span>231 <span style=''></span><span style='background: #AEF1AE'>      feature.setId(idGenerator.createId(feature.getFeatureType, feature))
+</span>232 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>233 <span style=''>    feature
+</span>234 <span style=''>  }
+</span>235 <span style=''>
+</span>236 <span style=''>  private def withFid(feature: SimpleFeature, fid: String): SimpleFeature = {
+</span>237 <span style=''>    feature match {
+</span>238 <span style=''>      case f: ScalaSimpleFeature </span><span style='background: #F0ADAD'>=&gt; f.setId(fid); f</span><span style=''>
+</span>239 <span style=''>      case _ =&gt;
+</span>240 <span style=''>        </span><span style='background: #F0ADAD'>feature.getIdentifier match {
+</span>241 <span style=''></span><span style='background: #F0ADAD'>          case f: FeatureIdImpl =&gt; f.setID(fid); feature
+</span>242 <span style=''></span><span style='background: #F0ADAD'>          case f =&gt;
+</span>243 <span style=''></span><span style='background: #F0ADAD'>            logger.warn(s&quot;Unknown FeatureID implementation found, rebuilding feature: $f '${f.getClass.getName}'&quot;)
+</span>244 <span style=''></span><span style='background: #F0ADAD'>            val copy = ScalaSimpleFeature.copy(feature)
+</span>245 <span style=''></span><span style='background: #F0ADAD'>            copy.setId(fid)
+</span>246 <span style=''></span><span style='background: #F0ADAD'>            copy
+</span>247 <span style=''></span><span style='background: #F0ADAD'>        }</span><span style=''>
+</span>248 <span style=''>    }
+</span>249 <span style=''>  }
+</span>250 <span style=''>
+</span>251 <span style=''>  /**
+</span>252 <span style=''>   * Gets a timer
+</span>253 <span style=''>   *
+</span>254 <span style=''>   * @param ds datastore
+</span>255 <span style=''>   * @param sft sft
+</span>256 <span style=''>   * @param operation operation tag
+</span>257 <span style=''>   * @tparam DS datastore type
+</span>258 <span style=''>   * @return
+</span>259 <span style=''>   */
+</span>260 <span style=''>  private def writeTimer[DS &lt;: GeoMesaDataStore[DS]](ds: DS, sft: SimpleFeatureType, operation: String): Timer = {
+</span>261 <span style=''>    </span><span style='background: #AEF1AE'>Timer.builder(&quot;geomesa.write&quot;)
+</span>262 <span style=''></span><span style='background: #AEF1AE'>      .tags(ds.tags(sft.getTypeName).and(&quot;op&quot;, operation))
+</span>263 <span style=''></span><span style='background: #AEF1AE'>      .description(&quot;Time spent writing features&quot;)
+</span>264 <span style=''></span><span style='background: #AEF1AE'>      .register(Metrics.globalRegistry)</span><span style=''>
+</span>265 <span style=''>  }
+</span>266 <span style=''>
+</span>267 <span style=''>  /**
+</span>268 <span style=''>   * Marker class to allow specific exceptions to bubble up
+</span>269 <span style=''>   *
+</span>270 <span style=''>   * @param msg error message
+</span>271 <span style=''>   * @param cause cause (may be null)
+</span>272 <span style=''>   */
+</span>273 <span style=''>  class WriteException(msg: String, cause: Throwable) extends RuntimeException(msg, cause) {
+</span>274 <span style=''>    def this(msg: String) = </span><span style='background: #AEF1AE'>this(msg, null)</span><span style=''>
+</span>275 <span style=''>  }
+</span>276 <span style=''>
+</span>277 <span style=''>  /**
+</span>278 <span style=''>    * Writes to a single table per index
+</span>279 <span style=''>    */
+</span>280 <span style=''>  private abstract class TableFeatureWriter[DS &lt;: GeoMesaDataStore[DS]](
+</span>281 <span style=''>      val ds: DS,
+</span>282 <span style=''>      val sft: SimpleFeatureType,
+</span>283 <span style=''>      val indices: Seq[GeoMesaFeatureIndex[_, _]],
+</span>284 <span style=''>      val atomic: Boolean
+</span>285 <span style=''>    ) extends GeoMesaFeatureWriter[DS] {
+</span>286 <span style=''>
+</span>287 <span style=''>    private val writer = </span><span style='background: #AEF1AE'>ds.adapter.createWriter(sft, indices, None, atomic)</span><span style=''>
+</span>288 <span style=''>
+</span>289 <span style=''>    override protected def getWriter(feature: SimpleFeature): IndexWriter = </span><span style='background: #AEF1AE'>writer</span><span style=''>
+</span>290 <span style=''>
+</span>291 <span style=''>    override protected def flushables(): Seq[Flushable] = </span><span style='background: #AEF1AE'>Seq(writer, statUpdater)</span><span style=''>
+</span>292 <span style=''>    override protected def closeables(): Seq[Closeable] = </span><span style='background: #AEF1AE'>Seq(writer, statUpdater)</span><span style=''>
+</span>293 <span style=''>  }
+</span>294 <span style=''>
+</span>295 <span style=''>  /**
+</span>296 <span style=''>    * Support for writing to partitioned tables
+</span>297 <span style=''>    *
+</span>298 <span style=''>    */
+</span>299 <span style=''>  private abstract class PartitionFeatureWriter[DS &lt;: GeoMesaDataStore[DS]](
+</span>300 <span style=''>      val ds: DS,
+</span>301 <span style=''>      val sft: SimpleFeatureType,
+</span>302 <span style=''>      val indices: Seq[GeoMesaFeatureIndex[_, _]],
+</span>303 <span style=''>      val atomic: Boolean
+</span>304 <span style=''>    ) extends GeoMesaFeatureWriter[DS] {
+</span>305 <span style=''>
+</span>306 <span style=''>    import scala.collection.JavaConverters._
+</span>307 <span style=''>
+</span>308 <span style=''>    private val partition = </span><span style='background: #AEF1AE'>TablePartition(ds, sft).getOrElse {
+</span>309 <span style=''></span><span style='background: #AEF1AE'>      </span><span style='background: #F0ADAD'>throw new IllegalStateException(&quot;Creating a partitioned writer for a non-partitioned schema&quot;)</span><span style='background: #AEF1AE'>
+</span>310 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>311 <span style=''>
+</span>312 <span style=''>    private val cache = </span><span style='background: #AEF1AE'>new java.util.HashMap[String, IndexWriter]()</span><span style=''>
+</span>313 <span style=''>    private val view = </span><span style='background: #AEF1AE'>cache.asScala</span><span style=''>
+</span>314 <span style=''>
+</span>315 <span style=''>    override protected def getWriter(feature: SimpleFeature): IndexWriter = {
+</span>316 <span style=''>      val p = </span><span style='background: #AEF1AE'>partition.partition(feature)</span><span style=''>
+</span>317 <span style=''>      var writer = </span><span style='background: #AEF1AE'>cache.get(p)</span><span style=''>
+</span>318 <span style=''>      if (</span><span style='background: #AEF1AE'>writer == null</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>319 <span style=''></span><span style='background: #AEF1AE'>        // reconfigure the partition each time - this should be idempotent, and block
+</span>320 <span style=''></span><span style='background: #AEF1AE'>        // until it is fully created (which may happen in some other thread)
+</span>321 <span style=''></span><span style='background: #AEF1AE'>        def createOne(index: GeoMesaFeatureIndex[_, _]): Unit =
+</span>322 <span style=''></span><span style='background: #AEF1AE'>          ds.adapter.createTable(index, Some(p), index.getSplits(Some(p)))
+</span>323 <span style=''></span><span style='background: #AEF1AE'>        indices.toList.map(i =&gt; CachedThreadPool.submit(() =&gt; createOne(i))).foreach(_.get)
+</span>324 <span style=''></span><span style='background: #AEF1AE'>        writer = ds.adapter.createWriter(sft, indices, Some(p), atomic)
+</span>325 <span style=''></span><span style='background: #AEF1AE'>        cache.put(p, writer)
+</span>326 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>327 <span style=''>      writer
+</span>328 <span style=''>    }
+</span>329 <span style=''>
+</span>330 <span style=''>    override protected def flushables(): Seq[Flushable] = </span><span style='background: #F0ADAD'>view.values.toSeq :+ statUpdater</span><span style=''>
+</span>331 <span style=''>    override protected def closeables(): Seq[Closeable] = </span><span style='background: #AEF1AE'>view.values.toSeq :+ statUpdater</span><span style=''>
+</span>332 <span style=''>  }
+</span>333 <span style=''>
+</span>334 <span style=''>  /**
+</span>335 <span style=''>    * Appends new features - can't modify or delete existing features
+</span>336 <span style=''>    */
+</span>337 <span style=''>  private trait GeoMesaAppendFeatureWriter[DS &lt;: GeoMesaDataStore[DS]] extends GeoMesaFeatureWriter[DS] {
+</span>338 <span style=''>
+</span>339 <span style=''>    private var currentFeature: ScalaSimpleFeature = _
+</span>340 <span style=''>
+</span>341 <span style=''>    override def hasNext: Boolean = </span><span style='background: #F0ADAD'>false</span><span style=''> // per geotools spec, always return false
+</span>342 <span style=''>
+</span>343 <span style=''>    override def next(): FastSettableFeature = {
+</span>344 <span style=''>      </span><span style='background: #AEF1AE'>currentFeature = new ScalaSimpleFeature(sft, nextFeatureId)</span><span style=''>
+</span>345 <span style=''>      </span><span style='background: #AEF1AE'>currentFeature</span><span style=''>
+</span>346 <span style=''>    }
+</span>347 <span style=''>
+</span>348 <span style=''>    override def write(): Unit = {
+</span>349 <span style=''>      if (</span><span style='background: #AEF1AE'>currentFeature == null</span><span style=''>) {
+</span>350 <span style=''>        </span><span style='background: #F0ADAD'>throw new IllegalStateException(&quot;next() must be called before write()&quot;)</span><span style=''>
+</span>351 <span style=''>      }
+</span>352 <span style=''>      </span><span style='background: #AEF1AE'>appendFeature(currentFeature)</span><span style=''>
+</span>353 <span style=''>      </span><span style='background: #AEF1AE'>currentFeature = null</span><span style=''>
+</span>354 <span style=''>    }
+</span>355 <span style=''>
+</span>356 <span style=''>    override def remove(): Unit =
+</span>357 <span style=''>      </span><span style='background: #F0ADAD'>throw new UnsupportedOperationException(&quot;Use getFeatureWriter instead of getFeatureWriterAppend&quot;)</span><span style=''>
+</span>358 <span style=''>  }
+</span>359 <span style=''>
+</span>360 <span style=''>  /**
+</span>361 <span style=''>    * Modifies or deletes existing features. Per the data store api, does not allow appending new features.
+</span>362 <span style=''>    */
+</span>363 <span style=''>  private trait GeoMesaModifyFeatureWriter[DS &lt;: GeoMesaDataStore[DS]] extends GeoMesaFeatureWriter[DS] {
+</span>364 <span style=''>
+</span>365 <span style=''>    import org.locationtech.geomesa.security.SecureSimpleFeature
+</span>366 <span style=''>
+</span>367 <span style=''>    def filter: Filter
+</span>368 <span style=''>
+</span>369 <span style=''>    private val reader = </span><span style='background: #AEF1AE'>ds.getFeatureReader(new Query(sft.getTypeName, filter), Transaction.AUTO_COMMIT)</span><span style=''>
+</span>370 <span style=''>
+</span>371 <span style=''>    // feature returned from reader
+</span>372 <span style=''>    private var original: SimpleFeature = _
+</span>373 <span style=''>
+</span>374 <span style=''>    // feature that caller will modify
+</span>375 <span style=''>    private var live: FastSettableFeature = _
+</span>376 <span style=''>
+</span>377 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>reader.hasNext</span><span style=''>
+</span>378 <span style=''>
+</span>379 <span style=''>    override def next(): FastSettableFeature = {
+</span>380 <span style=''>      </span><span style='background: #AEF1AE'>original = reader.next()</span><span style=''>
+</span>381 <span style=''>      // set the use provided FID hint - allows user to update fid if desired,
+</span>382 <span style=''>      // but if not we'll use the existing one
+</span>383 <span style=''>      </span><span style='background: #AEF1AE'>original.getUserData.put(Hints.USE_PROVIDED_FID, java.lang.Boolean.TRUE)</span><span style=''>
+</span>384 <span style=''>      </span><span style='background: #AEF1AE'>live = ScalaSimpleFeature.copy(sft, original)</span><span style=''> // this copies user data as well
+</span>385 <span style=''>      </span><span style='background: #AEF1AE'>live</span><span style=''>
+</span>386 <span style=''>    }
+</span>387 <span style=''>
+</span>388 <span style=''>    override def write(): Unit = {
+</span>389 <span style=''>      if (</span><span style='background: #AEF1AE'>original == null</span><span style=''>) {
+</span>390 <span style=''>        </span><span style='background: #F0ADAD'>throw new IllegalStateException(&quot;next() must be called before write()&quot;)</span><span style=''>
+</span>391 <span style=''>      }
+</span>392 <span style=''>      // update the feature id based on hints before we compare for changes
+</span>393 <span style=''>      </span><span style='background: #AEF1AE'>live = GeoMesaFeatureWriter.featureWithFid(live)</span><span style=''>
+</span>394 <span style=''>      // only write if feature has actually changed...
+</span>395 <span style=''>      // comparison of feature ID and attributes - doesn't consider concrete class used
+</span>396 <span style=''>      if (</span><span style='background: #AEF1AE'>!ScalaSimpleFeature.equalIdAndAttributes(live, original) || live.visibility != original.visibility</span><span style=''>) {
+</span>397 <span style=''>        </span><span style='background: #AEF1AE'>updateFeature(live, original)</span><span style=''>
+</span>398 <span style=''>      }
+</span>399 <span style=''>      </span><span style='background: #AEF1AE'>original = null</span><span style=''>
+</span>400 <span style=''>      </span><span style='background: #AEF1AE'>live = null</span><span style=''>
+</span>401 <span style=''>    }
+</span>402 <span style=''>
+</span>403 <span style=''>    override def remove(): Unit = {
+</span>404 <span style=''>      if (</span><span style='background: #AEF1AE'>original == null</span><span style=''>) {
+</span>405 <span style=''>        </span><span style='background: #F0ADAD'>throw new IllegalStateException(&quot;next() must be called before remove()&quot;)</span><span style=''>
+</span>406 <span style=''>      }
+</span>407 <span style=''>      </span><span style='background: #AEF1AE'>removeFeature(original)</span><span style=''>
+</span>408 <span style=''>      </span><span style='background: #AEF1AE'>original = null</span><span style=''>
+</span>409 <span style=''>      </span><span style='background: #AEF1AE'>live = null</span><span style=''>
+</span>410 <span style=''>    }
+</span>411 <span style=''>
+</span>412 <span style=''>    abstract override protected def closeables(): Seq[Closeable] = </span><span style='background: #AEF1AE'>super.closeables() :+ reader</span><span style=''>
+</span>413 <span style=''>  }
+</span>414 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          35473
+        </td>
+        <td>
+          2159
+          -
+          2161
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          35474
+        </td>
+        <td>
+          2163
+          -
+          2166
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          35475
+        </td>
+        <td>
+          2168
+          -
+          2176
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;append&quot;
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          35476
+        </td>
+        <td>
+          2127
+          -
+          2177
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.writeTimer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.writeTimer[DS](GeoMesaFeatureWriter.this.ds, GeoMesaFeatureWriter.this.sft, &quot;append&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          35477
+        </td>
+        <td>
+          2238
+          -
+          2240
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          35478
+        </td>
+        <td>
+          2242
+          -
+          2245
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          35479
+        </td>
+        <td>
+          2247
+          -
+          2255
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;update&quot;
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          35480
+        </td>
+        <td>
+          2206
+          -
+          2256
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.writeTimer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.writeTimer[DS](GeoMesaFeatureWriter.this.ds, GeoMesaFeatureWriter.this.sft, &quot;update&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          35481
+        </td>
+        <td>
+          2317
+          -
+          2319
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          35482
+        </td>
+        <td>
+          2321
+          -
+          2324
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          35483
+        </td>
+        <td>
+          2326
+          -
+          2334
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;delete&quot;
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          35484
+        </td>
+        <td>
+          2285
+          -
+          2335
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.writeTimer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.writeTimer[DS](GeoMesaFeatureWriter.this.ds, GeoMesaFeatureWriter.this.sft, &quot;delete&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          35485
+        </td>
+        <td>
+          2395
+          -
+          2397
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          35486
+        </td>
+        <td>
+          2399
+          -
+          2402
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          35487
+        </td>
+        <td>
+          2404
+          -
+          2411
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;flush&quot;
+        </td>
+      </tr><tr>
+        <td>
+          47
+        </td>
+        <td>
+          35488
+        </td>
+        <td>
+          2363
+          -
+          2412
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.writeTimer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.writeTimer[DS](GeoMesaFeatureWriter.this.ds, GeoMesaFeatureWriter.this.sft, &quot;flush&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          49
+        </td>
+        <td>
+          35489
+        </td>
+        <td>
+          2481
+          -
+          2484
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          49
+        </td>
+        <td>
+          35490
+        </td>
+        <td>
+          2457
+          -
+          2485
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.stats.GeoMesaStats.GeoMesaStatWriter.updater
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.ds.stats.writer.updater(GeoMesaFeatureWriter.this.sft)
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          35491
+        </td>
+        <td>
+          2538
+          -
+          2541
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          35492
+        </td>
+        <td>
+          2592
+          -
+          2609
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.System.nanoTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime()
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          35503
+        </td>
+        <td>
+          2626
+          -
+          2749
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val errors: Seq[Throwable] = GeoMesaFeatureWriter.this.flushables().flatMap[Throwable, Seq[Throwable]](((x$1: java.io.Flushable) =&gt; scala.this.Option.option2Iterable[Throwable](org.locationtech.geomesa.utils.io.`package`.FlushQuietly.apply[java.io.Flushable](x$1)(io.this.IsFlushable.flushableIsFlushable))))(collection.this.Seq.canBuildFrom[Throwable]);
+  if (errors.nonEmpty)
+    GeoMesaFeatureWriter.this.propagateExceptions(errors)
+  else
+    ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          35493
+        </td>
+        <td>
+          2672
+          -
+          2672
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsFlushableImplicits.flushableIsFlushable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsFlushable.flushableIsFlushable
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          35494
+        </td>
+        <td>
+          2660
+          -
+          2675
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.FlushQuietly.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.FlushQuietly.apply[java.io.Flushable](x$1)(io.this.IsFlushable.flushableIsFlushable)
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          35495
+        </td>
+        <td>
+          2660
+          -
+          2675
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Option.option2Iterable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Option.option2Iterable[Throwable](org.locationtech.geomesa.utils.io.`package`.FlushQuietly.apply[java.io.Flushable](x$1)(io.this.IsFlushable.flushableIsFlushable))
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          35496
+        </td>
+        <td>
+          2659
+          -
+          2659
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[Throwable]
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          35497
+        </td>
+        <td>
+          2639
+          -
+          2676
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.flushables().flatMap[Throwable, Seq[Throwable]](((x$1: java.io.Flushable) =&gt; scala.this.Option.option2Iterable[Throwable](org.locationtech.geomesa.utils.io.`package`.FlushQuietly.apply[java.io.Flushable](x$1)(io.this.IsFlushable.flushableIsFlushable))))(collection.this.Seq.canBuildFrom[Throwable])
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          35498
+        </td>
+        <td>
+          2687
+          -
+          2702
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.nonEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          errors.nonEmpty
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          35501
+        </td>
+        <td>
+          2683
+          -
+          2683
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          35502
+        </td>
+        <td>
+          2683
+          -
+          2683
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          35499
+        </td>
+        <td>
+          2714
+          -
+          2741
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.propagateExceptions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaFeatureWriter.this.propagateExceptions(errors)
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          35500
+        </td>
+        <td>
+          2714
+          -
+          2741
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.propagateExceptions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaFeatureWriter.this.propagateExceptions(errors)
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          35504
+        </td>
+        <td>
+          2790
+          -
+          2815
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime().-(start)
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          35505
+        </td>
+        <td>
+          2817
+          -
+          2837
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          NANOSECONDS
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          35506
+        </td>
+        <td>
+          2772
+          -
+          2838
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.flushTimer.record(java.lang.System.nanoTime().-(start), NANOSECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          35507
+        </td>
+        <td>
+          2772
+          -
+          2838
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.flushTimer.record(java.lang.System.nanoTime().-(start), NANOSECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          35508
+        </td>
+        <td>
+          2899
+          -
+          2916
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.System.nanoTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime()
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          35519
+        </td>
+        <td>
+          2933
+          -
+          3056
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val errors: Seq[Throwable] = GeoMesaFeatureWriter.this.closeables().flatMap[Throwable, Seq[Throwable]](((x$2: java.io.Closeable) =&gt; scala.this.Option.option2Iterable[Throwable](org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[java.io.Closeable](x$2)(io.this.IsCloseable.closeableIsCloseable))))(collection.this.Seq.canBuildFrom[Throwable]);
+  if (errors.nonEmpty)
+    GeoMesaFeatureWriter.this.propagateExceptions(errors)
+  else
+    ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          35509
+        </td>
+        <td>
+          2979
+          -
+          2979
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          35510
+        </td>
+        <td>
+          2967
+          -
+          2982
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.CloseQuietly.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[java.io.Closeable](x$2)(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          35511
+        </td>
+        <td>
+          2967
+          -
+          2982
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Option.option2Iterable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Option.option2Iterable[Throwable](org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[java.io.Closeable](x$2)(io.this.IsCloseable.closeableIsCloseable))
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          35512
+        </td>
+        <td>
+          2966
+          -
+          2966
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[Throwable]
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          35513
+        </td>
+        <td>
+          2946
+          -
+          2983
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.closeables().flatMap[Throwable, Seq[Throwable]](((x$2: java.io.Closeable) =&gt; scala.this.Option.option2Iterable[Throwable](org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[java.io.Closeable](x$2)(io.this.IsCloseable.closeableIsCloseable))))(collection.this.Seq.canBuildFrom[Throwable])
+        </td>
+      </tr><tr>
+        <td>
+          69
+        </td>
+        <td>
+          35514
+        </td>
+        <td>
+          2994
+          -
+          3009
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.nonEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          errors.nonEmpty
+        </td>
+      </tr><tr>
+        <td>
+          69
+        </td>
+        <td>
+          35517
+        </td>
+        <td>
+          2990
+          -
+          2990
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          69
+        </td>
+        <td>
+          35518
+        </td>
+        <td>
+          2990
+          -
+          2990
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          35515
+        </td>
+        <td>
+          3021
+          -
+          3048
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.propagateExceptions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaFeatureWriter.this.propagateExceptions(errors)
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          35516
+        </td>
+        <td>
+          3021
+          -
+          3048
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.propagateExceptions
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaFeatureWriter.this.propagateExceptions(errors)
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          35520
+        </td>
+        <td>
+          3153
+          -
+          3178
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime().-(start)
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          35521
+        </td>
+        <td>
+          3180
+          -
+          3200
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          NANOSECONDS
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          35522
+        </td>
+        <td>
+          3135
+          -
+          3201
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.flushTimer.record(java.lang.System.nanoTime().-(start), NANOSECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          35523
+        </td>
+        <td>
+          3135
+          -
+          3201
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.flushTimer.record(java.lang.System.nanoTime().-(start), NANOSECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          35524
+        </td>
+        <td>
+          3387
+          -
+          3404
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.System.nanoTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime()
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          35538
+        </td>
+        <td>
+          3522
+          -
+          4091
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val writable: org.locationtech.geomesa.features.FastSettableFeature = GeoMesaFeatureWriter.featureWithFid(update);
+  try {
+    val writer: org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter = GeoMesaFeatureWriter.this.getWriter(writable);
+    val remover: org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter = GeoMesaFeatureWriter.this.getWriter(previous);
+    if (writer.eq(remover))
+      writer.update(writable, previous)
+    else
+      {
+        remover.delete(previous);
+        writer.append(writable)
+      }
+  } catch {
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; GeoMesaFeatureWriter.this.throwWriteErrors(e, writable)
+  };
+  GeoMesaFeatureWriter.this.statUpdater.add(writable)
+}
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          35525
+        </td>
+        <td>
+          3537
+          -
+          3580
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.featureWithFid
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.featureWithFid(update)
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          35534
+        </td>
+        <td>
+          3601
+          -
+          3977
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val writer: org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter = GeoMesaFeatureWriter.this.getWriter(writable);
+  val remover: org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter = GeoMesaFeatureWriter.this.getWriter(previous);
+  if (writer.eq(remover))
+    writer.update(writable, previous)
+  else
+    {
+      remover.delete(previous);
+      writer.append(writable)
+    }
+}
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          35526
+        </td>
+        <td>
+          3614
+          -
+          3633
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.getWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.getWriter(writable)
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          35527
+        </td>
+        <td>
+          3656
+          -
+          3675
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.getWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.getWriter(previous)
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          35528
+        </td>
+        <td>
+          3688
+          -
+          3706
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.eq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.eq(remover)
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          35529
+        </td>
+        <td>
+          3848
+          -
+          3881
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter.update
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.update(writable, previous)
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          35530
+        </td>
+        <td>
+          3848
+          -
+          3881
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter.update
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.update(writable, previous)
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          35533
+        </td>
+        <td>
+          3897
+          -
+          3977
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  remover.delete(previous);
+  writer.append(writable)
+}
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          35531
+        </td>
+        <td>
+          3909
+          -
+          3933
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          remover.delete(previous)
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          35532
+        </td>
+        <td>
+          3944
+          -
+          3967
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter.append
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          writer.append(writable)
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          35535
+        </td>
+        <td>
+          4022
+          -
+          4051
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.throwWriteErrors
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.throwWriteErrors(e, writable)
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          35536
+        </td>
+        <td>
+          4022
+          -
+          4051
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.throwWriteErrors
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.throwWriteErrors(e, writable)
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          35537
+        </td>
+        <td>
+          4066
+          -
+          4091
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.stats.GeoMesaStats.StatUpdater.add
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.statUpdater.add(writable)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          35539
+        </td>
+        <td>
+          4133
+          -
+          4158
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime().-(start)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          35540
+        </td>
+        <td>
+          4160
+          -
+          4180
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          NANOSECONDS
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          35541
+        </td>
+        <td>
+          4114
+          -
+          4181
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.updateTimer.record(java.lang.System.nanoTime().-(start), NANOSECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          35542
+        </td>
+        <td>
+          4114
+          -
+          4181
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.updateTimer.record(java.lang.System.nanoTime().-(start), NANOSECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          35543
+        </td>
+        <td>
+          4279
+          -
+          4296
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.System.nanoTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime()
+        </td>
+      </tr><tr>
+        <td>
+          106
+        </td>
+        <td>
+          35550
+        </td>
+        <td>
+          4414
+          -
+          4770
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val writable: org.locationtech.geomesa.features.FastSettableFeature = GeoMesaFeatureWriter.featureWithFid(feature);
+  try {
+    GeoMesaFeatureWriter.this.getWriter(writable).append(writable)
+  } catch {
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; GeoMesaFeatureWriter.this.throwWriteErrors(e, writable)
+  };
+  GeoMesaFeatureWriter.this.statUpdater.add(writable)
+}
+        </td>
+      </tr><tr>
+        <td>
+          108
+        </td>
+        <td>
+          35544
+        </td>
+        <td>
+          4429
+          -
+          4473
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.featureWithFid
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.featureWithFid(feature)
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          35545
+        </td>
+        <td>
+          4620
+          -
+          4656
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter.append
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.getWriter(writable).append(writable)
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          35546
+        </td>
+        <td>
+          4620
+          -
+          4656
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter.append
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.getWriter(writable).append(writable)
+        </td>
+      </tr><tr>
+        <td>
+          113
+        </td>
+        <td>
+          35547
+        </td>
+        <td>
+          4701
+          -
+          4730
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.throwWriteErrors
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.throwWriteErrors(e, writable)
+        </td>
+      </tr><tr>
+        <td>
+          113
+        </td>
+        <td>
+          35548
+        </td>
+        <td>
+          4701
+          -
+          4730
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.throwWriteErrors
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.throwWriteErrors(e, writable)
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          35549
+        </td>
+        <td>
+          4745
+          -
+          4770
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.stats.GeoMesaStats.StatUpdater.add
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.statUpdater.add(writable)
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          35551
+        </td>
+        <td>
+          4812
+          -
+          4837
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime().-(start)
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          35552
+        </td>
+        <td>
+          4839
+          -
+          4859
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          NANOSECONDS
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          35553
+        </td>
+        <td>
+          4793
+          -
+          4860
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.appendTimer.record(java.lang.System.nanoTime().-(start), NANOSECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          35554
+        </td>
+        <td>
+          4793
+          -
+          4860
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.appendTimer.record(java.lang.System.nanoTime().-(start), NANOSECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          35555
+        </td>
+        <td>
+          4952
+          -
+          4969
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.System.nanoTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime()
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          35558
+        </td>
+        <td>
+          5087
+          -
+          5155
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  GeoMesaFeatureWriter.this.getWriter(feature).delete(feature);
+  GeoMesaFeatureWriter.this.statUpdater.remove(feature)
+}
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          35556
+        </td>
+        <td>
+          5087
+          -
+          5121
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.getWriter(feature).delete(feature)
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          35557
+        </td>
+        <td>
+          5128
+          -
+          5155
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.stats.GeoMesaStats.StatUpdater.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.statUpdater.remove(feature)
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          35559
+        </td>
+        <td>
+          5197
+          -
+          5222
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime().-(start)
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          35560
+        </td>
+        <td>
+          5224
+          -
+          5244
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          NANOSECONDS
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          35561
+        </td>
+        <td>
+          5178
+          -
+          5245
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.deleteTimer.record(java.lang.System.nanoTime().-(start), NANOSECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          35562
+        </td>
+        <td>
+          5178
+          -
+          5245
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.deleteTimer.record(java.lang.System.nanoTime().-(start), NANOSECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          35563
+        </td>
+        <td>
+          5364
+          -
+          5426
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Any.toString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.tempFeatureIds.getAndIncrement().toString()
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          35564
+        </td>
+        <td>
+          5685
+          -
+          5692
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw e
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          35565
+        </td>
+        <td>
+          5685
+          -
+          5692
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw e
+        </td>
+      </tr><tr>
+        <td>
+          140
+        </td>
+        <td>
+          35566
+        </td>
+        <td>
+          5735
+          -
+          5777
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw new scala.`package`.IllegalArgumentException(msg, e)
+        </td>
+      </tr><tr>
+        <td>
+          140
+        </td>
+        <td>
+          35567
+        </td>
+        <td>
+          5735
+          -
+          5777
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw new scala.`package`.IllegalArgumentException(msg, e)
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          35568
+        </td>
+        <td>
+          5794
+          -
+          5828
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.RuntimeException(msg, e)
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          35569
+        </td>
+        <td>
+          5794
+          -
+          5828
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.RuntimeException(msg, e)
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          35570
+        </td>
+        <td>
+          5943
+          -
+          5969
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.StringContext.apply(&quot;Error writing features:&quot;).s()
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          35571
+        </td>
+        <td>
+          5922
+          -
+          5970
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.RuntimeException.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new scala.`package`.RuntimeException(scala.StringContext.apply(&quot;Error writing features:&quot;).s())
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          35572
+        </td>
+        <td>
+          5990
+          -
+          6007
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Throwable.addSuppressed
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          all.addSuppressed(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          35573
+        </td>
+        <td>
+          5975
+          -
+          6008
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          errors.foreach[Unit]({
+  ((x$1: Throwable) =&gt; all.addSuppressed(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          148
+        </td>
+        <td>
+          35574
+        </td>
+        <td>
+          6013
+          -
+          6022
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw all
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          35575
+        </td>
+        <td>
+          6112
+          -
+          6129
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicLong(0L)
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          35578
+        </td>
+        <td>
+          6283
+          -
+          6449
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  (if (GeoMesaFeatureWriter.this.logger.underlying.isDebugEnabled())
+    GeoMesaFeatureWriter.this.logger.underlying.debug(&quot;Using feature id generator \'{}\'&quot;, (org.locationtech.geomesa.index.conf.FeatureProperties.FEATURE_ID_GENERATOR.get: AnyRef))
+  else
+    (): Unit);
+  java.lang.Class.forName(org.locationtech.geomesa.index.conf.FeatureProperties.FEATURE_ID_GENERATOR.get).newInstance().asInstanceOf[org.locationtech.geomesa.utils.uuid.FeatureIdGenerator]
+}
+        </td>
+      </tr><tr>
+        <td>
+          160
+        </td>
+        <td>
+          35576
+        </td>
+        <td>
+          6377
+          -
+          6401
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.index.conf.FeatureProperties.FEATURE_ID_GENERATOR.get
+        </td>
+      </tr><tr>
+        <td>
+          160
+        </td>
+        <td>
+          35577
+        </td>
+        <td>
+          6363
+          -
+          6449
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Any.asInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.Class.forName(org.locationtech.geomesa.index.conf.FeatureProperties.FEATURE_ID_GENERATOR.get).newInstance().asInstanceOf[org.locationtech.geomesa.utils.uuid.FeatureIdGenerator]
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          35580
+        </td>
+        <td>
+          6488
+          -
+          6623
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (GeoMesaFeatureWriter.this.logger.underlying.isErrorEnabled())
+    GeoMesaFeatureWriter.this.logger.underlying.error(scala.StringContext.apply(&quot;Could not load feature id generator class \'&quot;, &quot;\'&quot;).s(org.locationtech.geomesa.index.conf.FeatureProperties.FEATURE_ID_GENERATOR.get), e)
+  else
+    (): Unit);
+  new org.locationtech.geomesa.utils.uuid.Z3FeatureIdGenerator()
+}
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          35579
+        </td>
+        <td>
+          6599
+          -
+          6623
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.uuid.Z3FeatureIdGenerator.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.locationtech.geomesa.utils.uuid.Z3FeatureIdGenerator()
+        </td>
+      </tr><tr>
+        <td>
+          185
+        </td>
+        <td>
+          35581
+        </td>
+        <td>
+          7201
+          -
+          7232
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.conf.partition.TablePartition.partitioned
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.index.conf.partition.TablePartition.partitioned(sft)
+        </td>
+      </tr><tr>
+        <td>
+          186
+        </td>
+        <td>
+          35586
+        </td>
+        <td>
+          7242
+          -
+          7555
+        </td>
+        <td>
+          Match
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          filter match {
+  case scala.None =&gt; {
+    final class $anon extends org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter[DS] {
+      def &lt;init&gt;(): &lt;$anon: org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter[DS]&gt; = {
+        $anon.super.&lt;init&gt;(ds, sft, indices, atomic);
+        ()
+      }
+    };
+    new $anon()
+  }
+  case (value: org.geotools.api.filter.Filter)Some[org.geotools.api.filter.Filter]((f @ _)) =&gt; {
+    final class $anon extends org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter[DS] {
+      def &lt;init&gt;(): &lt;$anon: org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter[DS]&gt; = {
+        $anon.super.&lt;init&gt;(ds, sft, indices, atomic);
+        ()
+      };
+      override def filter: org.geotools.api.filter.Filter = f
+    };
+    new $anon()
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          187
+        </td>
+        <td>
+          35582
+        </td>
+        <td>
+          7278
+          -
+          7281
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.$anon.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new $anon()
+        </td>
+      </tr><tr>
+        <td>
+          187
+        </td>
+        <td>
+          35583
+        </td>
+        <td>
+          7278
+          -
+          7366
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  final class $anon extends org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter[DS] {
+    def &lt;init&gt;(): &lt;$anon: org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter[DS]&gt; = {
+      $anon.super.&lt;init&gt;(ds, sft, indices, atomic);
+      ()
+    }
+  };
+  new $anon()
+}
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          35584
+        </td>
+        <td>
+          7401
+          -
+          7404
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.$anon.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new $anon()
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          35585
+        </td>
+        <td>
+          7401
+          -
+          7547
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  final class $anon extends org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter[DS] {
+    def &lt;init&gt;(): &lt;$anon: org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter[DS]&gt; = {
+      $anon.super.&lt;init&gt;(ds, sft, indices, atomic);
+      ()
+    };
+    override def filter: org.geotools.api.filter.Filter = f
+  };
+  new $anon()
+}
+        </td>
+      </tr><tr>
+        <td>
+          194
+        </td>
+        <td>
+          35591
+        </td>
+        <td>
+          7575
+          -
+          7880
+        </td>
+        <td>
+          Match
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          filter match {
+  case scala.None =&gt; {
+    final class $anon extends org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter[DS] {
+      def &lt;init&gt;(): &lt;$anon: org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter[DS]&gt; = {
+        $anon.super.&lt;init&gt;(ds, sft, indices, atomic);
+        ()
+      }
+    };
+    new $anon()
+  }
+  case (value: org.geotools.api.filter.Filter)Some[org.geotools.api.filter.Filter]((f @ _)) =&gt; {
+    final class $anon extends org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter[DS] {
+      def &lt;init&gt;(): &lt;$anon: org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter[DS]&gt; = {
+        $anon.super.&lt;init&gt;(ds, sft, indices, atomic);
+        ()
+      };
+      override def filter: org.geotools.api.filter.Filter = f
+    };
+    new $anon()
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          195
+        </td>
+        <td>
+          35587
+        </td>
+        <td>
+          7611
+          -
+          7614
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.$anon.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new $anon()
+        </td>
+      </tr><tr>
+        <td>
+          195
+        </td>
+        <td>
+          35588
+        </td>
+        <td>
+          7611
+          -
+          7695
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  final class $anon extends org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter[DS] {
+    def &lt;init&gt;(): &lt;$anon: org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter[DS]&gt; = {
+      $anon.super.&lt;init&gt;(ds, sft, indices, atomic);
+      ()
+    }
+  };
+  new $anon()
+}
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          35589
+        </td>
+        <td>
+          7730
+          -
+          7733
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.$anon.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new $anon()
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          35590
+        </td>
+        <td>
+          7730
+          -
+          7872
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  final class $anon extends org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter[DS] {
+    def &lt;init&gt;(): &lt;$anon: org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter[DS] with org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter[DS]&gt; = {
+      $anon.super.&lt;init&gt;(ds, sft, indices, atomic);
+      ()
+    };
+    override def filter: org.geotools.api.filter.Filter = f
+  };
+  new $anon()
+}
+        </td>
+      </tr><tr>
+        <td>
+          209
+        </td>
+        <td>
+          35592
+        </td>
+        <td>
+          8215
+          -
+          8233
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.util.factory.Hints.PROVIDED_FID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.util.factory.Hints.PROVIDED_FID
+        </td>
+      </tr><tr>
+        <td>
+          209
+        </td>
+        <td>
+          35593
+        </td>
+        <td>
+          8191
+          -
+          8234
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getUserData().get(org.geotools.util.factory.Hints.PROVIDED_FID)
+        </td>
+      </tr><tr>
+        <td>
+          210
+        </td>
+        <td>
+          35594
+        </td>
+        <td>
+          8243
+          -
+          8259
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          provided.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          35595
+        </td>
+        <td>
+          8286
+          -
+          8303
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.toString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          provided.toString()
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          35596
+        </td>
+        <td>
+          8269
+          -
+          8304
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.withFid
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaFeatureWriter.this.withFid(feature, provided.toString())
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          35597
+        </td>
+        <td>
+          8269
+          -
+          8304
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.withFid
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaFeatureWriter.this.withFid(feature, provided.toString())
+        </td>
+      </tr><tr>
+        <td>
+          212
+        </td>
+        <td>
+          35598
+        </td>
+        <td>
+          8344
+          -
+          8366
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+      </tr><tr>
+        <td>
+          212
+        </td>
+        <td>
+          35599
+        </td>
+        <td>
+          8371
+          -
+          8393
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.lang.Boolean.TRUE
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.Boolean.TRUE
+        </td>
+      </tr><tr>
+        <td>
+          212
+        </td>
+        <td>
+          35600
+        </td>
+        <td>
+          8320
+          -
+          8393
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getUserData().get(org.geotools.util.factory.Hints.USE_PROVIDED_FID).!=(java.lang.Boolean.TRUE)
+        </td>
+      </tr><tr>
+        <td>
+          212
+        </td>
+        <td>
+          35606
+        </td>
+        <td>
+          8316
+          -
+          8507
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (feature.getUserData().get(org.geotools.util.factory.Hints.USE_PROVIDED_FID).!=(java.lang.Boolean.TRUE))
+  GeoMesaFeatureWriter.this.withFid(feature, GeoMesaFeatureWriter.this.idGenerator.createId(feature.getFeatureType(), feature))
+else
+  feature
+        </td>
+      </tr><tr>
+        <td>
+          213
+        </td>
+        <td>
+          35601
+        </td>
+        <td>
+          8441
+          -
+          8463
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getFeatureType
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          feature.getFeatureType()
+        </td>
+      </tr><tr>
+        <td>
+          213
+        </td>
+        <td>
+          35602
+        </td>
+        <td>
+          8420
+          -
+          8473
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.uuid.FeatureIdGenerator.createId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaFeatureWriter.this.idGenerator.createId(feature.getFeatureType(), feature)
+        </td>
+      </tr><tr>
+        <td>
+          213
+        </td>
+        <td>
+          35603
+        </td>
+        <td>
+          8403
+          -
+          8474
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.withFid
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaFeatureWriter.this.withFid(feature, GeoMesaFeatureWriter.this.idGenerator.createId(feature.getFeatureType(), feature))
+        </td>
+      </tr><tr>
+        <td>
+          213
+        </td>
+        <td>
+          35604
+        </td>
+        <td>
+          8403
+          -
+          8474
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.withFid
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          GeoMesaFeatureWriter.this.withFid(feature, GeoMesaFeatureWriter.this.idGenerator.createId(feature.getFeatureType(), feature))
+        </td>
+      </tr><tr>
+        <td>
+          215
+        </td>
+        <td>
+          35605
+        </td>
+        <td>
+          8494
+          -
+          8501
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.feature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          35607
+        </td>
+        <td>
+          8881
+          -
+          8899
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.util.factory.Hints.PROVIDED_FID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.util.factory.Hints.PROVIDED_FID
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          35608
+        </td>
+        <td>
+          8857
+          -
+          8900
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getUserData().get(org.geotools.util.factory.Hints.PROVIDED_FID)
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          35609
+        </td>
+        <td>
+          8909
+          -
+          8925
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          provided.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          229
+        </td>
+        <td>
+          35610
+        </td>
+        <td>
+          8949
+          -
+          8966
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.toString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          provided.toString()
+        </td>
+      </tr><tr>
+        <td>
+          229
+        </td>
+        <td>
+          35611
+        </td>
+        <td>
+          8935
+          -
+          8967
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.FastSettableFeature.setId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.setId(provided.toString())
+        </td>
+      </tr><tr>
+        <td>
+          229
+        </td>
+        <td>
+          35612
+        </td>
+        <td>
+          8935
+          -
+          8967
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.features.FastSettableFeature.setId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.setId(provided.toString())
+        </td>
+      </tr><tr>
+        <td>
+          230
+        </td>
+        <td>
+          35613
+        </td>
+        <td>
+          9007
+          -
+          9029
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+      </tr><tr>
+        <td>
+          230
+        </td>
+        <td>
+          35614
+        </td>
+        <td>
+          9034
+          -
+          9056
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.lang.Boolean.TRUE
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.Boolean.TRUE
+        </td>
+      </tr><tr>
+        <td>
+          230
+        </td>
+        <td>
+          35615
+        </td>
+        <td>
+          8983
+          -
+          9056
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getUserData().get(org.geotools.util.factory.Hints.USE_PROVIDED_FID).!=(java.lang.Boolean.TRUE)
+        </td>
+      </tr><tr>
+        <td>
+          230
+        </td>
+        <td>
+          35620
+        </td>
+        <td>
+          8979
+          -
+          8979
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          230
+        </td>
+        <td>
+          35621
+        </td>
+        <td>
+          8979
+          -
+          8979
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          230
+        </td>
+        <td>
+          35622
+        </td>
+        <td>
+          8979
+          -
+          9140
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (feature.getUserData().get(org.geotools.util.factory.Hints.USE_PROVIDED_FID).!=(java.lang.Boolean.TRUE))
+  feature.setId(GeoMesaFeatureWriter.this.idGenerator.createId(feature.getFeatureType(), feature))
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          231
+        </td>
+        <td>
+          35616
+        </td>
+        <td>
+          9101
+          -
+          9123
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getFeatureType
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getFeatureType()
+        </td>
+      </tr><tr>
+        <td>
+          231
+        </td>
+        <td>
+          35617
+        </td>
+        <td>
+          9080
+          -
+          9133
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.uuid.FeatureIdGenerator.createId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.this.idGenerator.createId(feature.getFeatureType(), feature)
+        </td>
+      </tr><tr>
+        <td>
+          231
+        </td>
+        <td>
+          35618
+        </td>
+        <td>
+          9066
+          -
+          9134
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.FastSettableFeature.setId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.setId(GeoMesaFeatureWriter.this.idGenerator.createId(feature.getFeatureType(), feature))
+        </td>
+      </tr><tr>
+        <td>
+          231
+        </td>
+        <td>
+          35619
+        </td>
+        <td>
+          9066
+          -
+          9134
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.features.FastSettableFeature.setId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.setId(GeoMesaFeatureWriter.this.idGenerator.createId(feature.getFeatureType(), feature))
+        </td>
+      </tr><tr>
+        <td>
+          238
+        </td>
+        <td>
+          35623
+        </td>
+        <td>
+          9292
+          -
+          9304
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.AbstractSimpleFeature.AbstractMutableSimpleFeature.setId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          f.setId(fid)
+        </td>
+      </tr><tr>
+        <td>
+          238
+        </td>
+        <td>
+          35624
+        </td>
+        <td>
+          9289
+          -
+          9307
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  f.setId(fid);
+  f
+}
+        </td>
+      </tr><tr>
+        <td>
+          240
+        </td>
+        <td>
+          35625
+        </td>
+        <td>
+          9332
+          -
+          9353
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.Feature.getIdentifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          feature.getIdentifier()
+        </td>
+      </tr><tr>
+        <td>
+          240
+        </td>
+        <td>
+          35631
+        </td>
+        <td>
+          9332
+          -
+          9664
+        </td>
+        <td>
+          Match
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          feature.getIdentifier() match {
+  case (f @ (_: org.geotools.filter.identity.FeatureIdImpl)) =&gt; {
+    f.setID(fid);
+    feature
+  }
+  case (f @ _) =&gt; {
+    (if (GeoMesaFeatureWriter.this.logger.underlying.isWarnEnabled())
+      GeoMesaFeatureWriter.this.logger.underlying.warn(&quot;Unknown FeatureID implementation found, rebuilding feature: {} \'{}\'&quot;, (scala.Array.apply[AnyRef]((f: AnyRef), (f.getClass().getName(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+    else
+      (): Unit);
+    val copy: org.locationtech.geomesa.features.ScalaSimpleFeature = org.locationtech.geomesa.features.ScalaSimpleFeature.copy(feature);
+    copy.setId(fid);
+    copy
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          35626
+        </td>
+        <td>
+          9397
+          -
+          9409
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.filter.identity.FeatureIdImpl.setID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          f.setID(fid)
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          35627
+        </td>
+        <td>
+          9394
+          -
+          9418
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  f.setID(fid);
+  feature
+}
+        </td>
+      </tr><tr>
+        <td>
+          242
+        </td>
+        <td>
+          35630
+        </td>
+        <td>
+          9436
+          -
+          9654
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (GeoMesaFeatureWriter.this.logger.underlying.isWarnEnabled())
+    GeoMesaFeatureWriter.this.logger.underlying.warn(&quot;Unknown FeatureID implementation found, rebuilding feature: {} \'{}\'&quot;, (scala.Array.apply[AnyRef]((f: AnyRef), (f.getClass().getName(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  val copy: org.locationtech.geomesa.features.ScalaSimpleFeature = org.locationtech.geomesa.features.ScalaSimpleFeature.copy(feature);
+  copy.setId(fid);
+  copy
+}
+        </td>
+      </tr><tr>
+        <td>
+          244
+        </td>
+        <td>
+          35628
+        </td>
+        <td>
+          9577
+          -
+          9609
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.ScalaSimpleFeature.copy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.features.ScalaSimpleFeature.copy(feature)
+        </td>
+      </tr><tr>
+        <td>
+          245
+        </td>
+        <td>
+          35629
+        </td>
+        <td>
+          9622
+          -
+          9637
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.AbstractSimpleFeature.AbstractMutableSimpleFeature.setId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          copy.setId(fid)
+        </td>
+      </tr><tr>
+        <td>
+          261
+        </td>
+        <td>
+          35632
+        </td>
+        <td>
+          9969
+          -
+          9984
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;geomesa.write&quot;
+        </td>
+      </tr><tr>
+        <td>
+          262
+        </td>
+        <td>
+          35633
+        </td>
+        <td>
+          9998
+          -
+          10043
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Tags.and
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ds.tags(sft.getTypeName()).and(&quot;op&quot;, operation)
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          35634
+        </td>
+        <td>
+          10064
+          -
+          10093
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;Time spent writing features&quot;
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          35635
+        </td>
+        <td>
+          10111
+          -
+          10133
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          io.micrometer.core.instrument.Metrics.globalRegistry
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.micrometer.core.instrument.Metrics.globalRegistry
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          35636
+        </td>
+        <td>
+          9955
+          -
+          10134
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.Timer.Builder.register
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.micrometer.core.instrument.Timer.builder(&quot;geomesa.write&quot;).tags(ds.tags(sft.getTypeName()).and(&quot;op&quot;, operation)).description(&quot;Time spent writing features&quot;).register(io.micrometer.core.instrument.Metrics.globalRegistry)
+        </td>
+      </tr><tr>
+        <td>
+          274
+        </td>
+        <td>
+          35637
+        </td>
+        <td>
+          10406
+          -
+          10421
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.WriteException.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          WriteException.this.&lt;init&gt;(msg, null)
+        </td>
+      </tr><tr>
+        <td>
+          274
+        </td>
+        <td>
+          35638
+        </td>
+        <td>
+          10406
+          -
+          10406
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          287
+        </td>
+        <td>
+          35639
+        </td>
+        <td>
+          10774
+          -
+          10777
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TableFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          287
+        </td>
+        <td>
+          35640
+        </td>
+        <td>
+          10779
+          -
+          10786
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter.indices
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TableFeatureWriter.this.indices
+        </td>
+      </tr><tr>
+        <td>
+          287
+        </td>
+        <td>
+          35641
+        </td>
+        <td>
+          10788
+          -
+          10792
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          287
+        </td>
+        <td>
+          35642
+        </td>
+        <td>
+          10794
+          -
+          10800
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter.atomic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TableFeatureWriter.this.atomic
+        </td>
+      </tr><tr>
+        <td>
+          287
+        </td>
+        <td>
+          35643
+        </td>
+        <td>
+          10750
+          -
+          10801
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexAdapter.createWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TableFeatureWriter.this.ds.adapter.createWriter(TableFeatureWriter.this.sft, TableFeatureWriter.this.indices, scala.None, TableFeatureWriter.this.atomic)
+        </td>
+      </tr><tr>
+        <td>
+          289
+        </td>
+        <td>
+          35644
+        </td>
+        <td>
+          10879
+          -
+          10885
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter.writer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TableFeatureWriter.this.writer
+        </td>
+      </tr><tr>
+        <td>
+          291
+        </td>
+        <td>
+          35645
+        </td>
+        <td>
+          10949
+          -
+          10955
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter.writer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TableFeatureWriter.this.writer
+        </td>
+      </tr><tr>
+        <td>
+          291
+        </td>
+        <td>
+          35646
+        </td>
+        <td>
+          10957
+          -
+          10968
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.statUpdater
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TableFeatureWriter.this.statUpdater
+        </td>
+      </tr><tr>
+        <td>
+          291
+        </td>
+        <td>
+          35647
+        </td>
+        <td>
+          10945
+          -
+          10969
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[java.io.Closeable with java.io.Flushable](TableFeatureWriter.this.writer, TableFeatureWriter.this.statUpdater)
+        </td>
+      </tr><tr>
+        <td>
+          292
+        </td>
+        <td>
+          35648
+        </td>
+        <td>
+          11032
+          -
+          11038
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.TableFeatureWriter.writer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TableFeatureWriter.this.writer
+        </td>
+      </tr><tr>
+        <td>
+          292
+        </td>
+        <td>
+          35649
+        </td>
+        <td>
+          11040
+          -
+          11051
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.statUpdater
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TableFeatureWriter.this.statUpdater
+        </td>
+      </tr><tr>
+        <td>
+          292
+        </td>
+        <td>
+          35650
+        </td>
+        <td>
+          11028
+          -
+          11052
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[java.io.Closeable with java.io.Flushable](TableFeatureWriter.this.writer, TableFeatureWriter.this.statUpdater)
+        </td>
+      </tr><tr>
+        <td>
+          308
+        </td>
+        <td>
+          35651
+        </td>
+        <td>
+          11462
+          -
+          11464
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          308
+        </td>
+        <td>
+          35652
+        </td>
+        <td>
+          11466
+          -
+          11469
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          308
+        </td>
+        <td>
+          35654
+        </td>
+        <td>
+          11447
+          -
+          11588
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.index.conf.partition.TablePartition.apply(PartitionFeatureWriter.this.ds, PartitionFeatureWriter.this.sft).getOrElse[org.locationtech.geomesa.index.conf.partition.TablePartition](throw new java.lang.IllegalStateException(&quot;Creating a partitioned writer for a non-partitioned schema&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          309
+        </td>
+        <td>
+          35653
+        </td>
+        <td>
+          11489
+          -
+          11582
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(&quot;Creating a partitioned writer for a non-partitioned schema&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          312
+        </td>
+        <td>
+          35655
+        </td>
+        <td>
+          11614
+          -
+          11658
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.HashMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.HashMap[String,org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter]()
+        </td>
+      </tr><tr>
+        <td>
+          313
+        </td>
+        <td>
+          35656
+        </td>
+        <td>
+          11682
+          -
+          11687
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter.cache
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.cache
+        </td>
+      </tr><tr>
+        <td>
+          313
+        </td>
+        <td>
+          35657
+        </td>
+        <td>
+          11682
+          -
+          11695
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsScala.asScala
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.mapAsScalaMapConverter[String, org.locationtech.geomesa.index.api.IndexAdapter.IndexWriter](PartitionFeatureWriter.this.cache).asScala
+        </td>
+      </tr><tr>
+        <td>
+          316
+        </td>
+        <td>
+          35658
+        </td>
+        <td>
+          11789
+          -
+          11817
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.conf.partition.TablePartition.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.partition.partition(feature)
+        </td>
+      </tr><tr>
+        <td>
+          317
+        </td>
+        <td>
+          35659
+        </td>
+        <td>
+          11837
+          -
+          11849
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.HashMap.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.cache.get(p)
+        </td>
+      </tr><tr>
+        <td>
+          318
+        </td>
+        <td>
+          35660
+        </td>
+        <td>
+          11860
+          -
+          11874
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          318
+        </td>
+        <td>
+          35676
+        </td>
+        <td>
+          11876
+          -
+          12380
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  def createOne(index: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[_, _]): Unit = PartitionFeatureWriter.this.ds.adapter.createTable(index, scala.Some.apply[String](p), index.getSplits(scala.Some.apply[String](p)));
+  PartitionFeatureWriter.this.indices.toList.map[java.util.concurrent.Future[_], List[java.util.concurrent.Future[_]]](((i: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[_, _]) =&gt; org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit((() =&gt; createOne(i)))))(immutable.this.List.canBuildFrom[java.util.concurrent.Future[_]]).foreach[Any](((x$3: java.util.concurrent.Future[_]) =&gt; x$3.get()));
+  writer = PartitionFeatureWriter.this.ds.adapter.createWriter(PartitionFeatureWriter.this.sft, PartitionFeatureWriter.this.indices, scala.Some.apply[String](p), PartitionFeatureWriter.this.atomic);
+  PartitionFeatureWriter.this.cache.put(p, writer)
+}
+        </td>
+      </tr><tr>
+        <td>
+          318
+        </td>
+        <td>
+          35677
+        </td>
+        <td>
+          11856
+          -
+          11856
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          318
+        </td>
+        <td>
+          35678
+        </td>
+        <td>
+          11856
+          -
+          11856
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          322
+        </td>
+        <td>
+          35661
+        </td>
+        <td>
+          12145
+          -
+          12152
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[String](p)
+        </td>
+      </tr><tr>
+        <td>
+          322
+        </td>
+        <td>
+          35662
+        </td>
+        <td>
+          12170
+          -
+          12177
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[String](p)
+        </td>
+      </tr><tr>
+        <td>
+          322
+        </td>
+        <td>
+          35663
+        </td>
+        <td>
+          12154
+          -
+          12178
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.getSplits
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          index.getSplits(scala.Some.apply[String](p))
+        </td>
+      </tr><tr>
+        <td>
+          322
+        </td>
+        <td>
+          35664
+        </td>
+        <td>
+          12115
+          -
+          12179
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexAdapter.createTable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.ds.adapter.createTable(index, scala.Some.apply[String](p), index.getSplits(scala.Some.apply[String](p)))
+        </td>
+      </tr><tr>
+        <td>
+          323
+        </td>
+        <td>
+          35665
+        </td>
+        <td>
+          12242
+          -
+          12254
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter.createOne
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          createOne(i)
+        </td>
+      </tr><tr>
+        <td>
+          323
+        </td>
+        <td>
+          35666
+        </td>
+        <td>
+          12212
+          -
+          12255
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit((() =&gt; createOne(i)))
+        </td>
+      </tr><tr>
+        <td>
+          323
+        </td>
+        <td>
+          35667
+        </td>
+        <td>
+          12206
+          -
+          12206
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.immutable.List.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          immutable.this.List.canBuildFrom[java.util.concurrent.Future[_]]
+        </td>
+      </tr><tr>
+        <td>
+          323
+        </td>
+        <td>
+          35668
+        </td>
+        <td>
+          12265
+          -
+          12270
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$3.get()
+        </td>
+      </tr><tr>
+        <td>
+          323
+        </td>
+        <td>
+          35669
+        </td>
+        <td>
+          12188
+          -
+          12271
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.immutable.List.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.indices.toList.map[java.util.concurrent.Future[_], List[java.util.concurrent.Future[_]]](((i: org.locationtech.geomesa.index.api.GeoMesaFeatureIndex[_, _]) =&gt; org.locationtech.geomesa.utils.concurrent.CachedThreadPool.submit((() =&gt; createOne(i)))))(immutable.this.List.canBuildFrom[java.util.concurrent.Future[_]]).foreach[Any](((x$3: java.util.concurrent.Future[_]) =&gt; x$3.get()))
+        </td>
+      </tr><tr>
+        <td>
+          324
+        </td>
+        <td>
+          35670
+        </td>
+        <td>
+          12313
+          -
+          12316
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          324
+        </td>
+        <td>
+          35671
+        </td>
+        <td>
+          12318
+          -
+          12325
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter.indices
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.indices
+        </td>
+      </tr><tr>
+        <td>
+          324
+        </td>
+        <td>
+          35672
+        </td>
+        <td>
+          12327
+          -
+          12334
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[String](p)
+        </td>
+      </tr><tr>
+        <td>
+          324
+        </td>
+        <td>
+          35673
+        </td>
+        <td>
+          12336
+          -
+          12342
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.PartitionFeatureWriter.atomic
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.atomic
+        </td>
+      </tr><tr>
+        <td>
+          324
+        </td>
+        <td>
+          35674
+        </td>
+        <td>
+          12289
+          -
+          12343
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.api.IndexAdapter.createWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.ds.adapter.createWriter(PartitionFeatureWriter.this.sft, PartitionFeatureWriter.this.indices, scala.Some.apply[String](p), PartitionFeatureWriter.this.atomic)
+        </td>
+      </tr><tr>
+        <td>
+          325
+        </td>
+        <td>
+          35675
+        </td>
+        <td>
+          12352
+          -
+          12372
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.HashMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.cache.put(p, writer)
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          35679
+        </td>
+        <td>
+          12480
+          -
+          12491
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.statUpdater
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionFeatureWriter.this.statUpdater
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          35680
+        </td>
+        <td>
+          12477
+          -
+          12477
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          collection.this.Seq.canBuildFrom[java.io.Closeable with java.io.Flushable]
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          35681
+        </td>
+        <td>
+          12459
+          -
+          12491
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.SeqLike.:+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionFeatureWriter.this.view.values.toSeq.:+[java.io.Closeable with java.io.Flushable, Seq[java.io.Flushable]](PartitionFeatureWriter.this.statUpdater)(collection.this.Seq.canBuildFrom[java.io.Closeable with java.io.Flushable])
+        </td>
+      </tr><tr>
+        <td>
+          331
+        </td>
+        <td>
+          35682
+        </td>
+        <td>
+          12571
+          -
+          12582
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.statUpdater
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.statUpdater
+        </td>
+      </tr><tr>
+        <td>
+          331
+        </td>
+        <td>
+          35683
+        </td>
+        <td>
+          12568
+          -
+          12568
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[java.io.Closeable with java.io.Flushable]
+        </td>
+      </tr><tr>
+        <td>
+          331
+        </td>
+        <td>
+          35684
+        </td>
+        <td>
+          12550
+          -
+          12582
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.SeqLike.:+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionFeatureWriter.this.view.values.toSeq.:+[java.io.Closeable with java.io.Flushable, Seq[java.io.Closeable]](PartitionFeatureWriter.this.statUpdater)(collection.this.Seq.canBuildFrom[java.io.Closeable with java.io.Flushable])
+        </td>
+      </tr><tr>
+        <td>
+          341
+        </td>
+        <td>
+          35685
+        </td>
+        <td>
+          12870
+          -
+          12875
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          344
+        </td>
+        <td>
+          35686
+        </td>
+        <td>
+          13014
+          -
+          13017
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaAppendFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          344
+        </td>
+        <td>
+          35687
+        </td>
+        <td>
+          13019
+          -
+          13032
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.nextFeatureId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaAppendFeatureWriter.this.nextFeatureId
+        </td>
+      </tr><tr>
+        <td>
+          344
+        </td>
+        <td>
+          35688
+        </td>
+        <td>
+          12991
+          -
+          13033
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.ScalaSimpleFeature.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.features.ScalaSimpleFeature(GeoMesaAppendFeatureWriter.this.sft, GeoMesaAppendFeatureWriter.this.nextFeatureId, features.this.ScalaSimpleFeature.&lt;init&gt;$default$3, features.this.ScalaSimpleFeature.&lt;init&gt;$default$4)
+        </td>
+      </tr><tr>
+        <td>
+          344
+        </td>
+        <td>
+          35689
+        </td>
+        <td>
+          12974
+          -
+          13033
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter.currentFeature_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaAppendFeatureWriter.this.currentFeature_=(new org.locationtech.geomesa.features.ScalaSimpleFeature(GeoMesaAppendFeatureWriter.this.sft, GeoMesaAppendFeatureWriter.this.nextFeatureId, features.this.ScalaSimpleFeature.&lt;init&gt;$default$3, features.this.ScalaSimpleFeature.&lt;init&gt;$default$4))
+        </td>
+      </tr><tr>
+        <td>
+          345
+        </td>
+        <td>
+          35690
+        </td>
+        <td>
+          13040
+          -
+          13054
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter.currentFeature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaAppendFeatureWriter.this.currentFeature
+        </td>
+      </tr><tr>
+        <td>
+          349
+        </td>
+        <td>
+          35691
+        </td>
+        <td>
+          13107
+          -
+          13129
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaAppendFeatureWriter.this.currentFeature.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          349
+        </td>
+        <td>
+          35694
+        </td>
+        <td>
+          13103
+          -
+          13103
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          349
+        </td>
+        <td>
+          35695
+        </td>
+        <td>
+          13103
+          -
+          13103
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          350
+        </td>
+        <td>
+          35692
+        </td>
+        <td>
+          13141
+          -
+          13212
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(&quot;next() must be called before write()&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          350
+        </td>
+        <td>
+          35693
+        </td>
+        <td>
+          13141
+          -
+          13212
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(&quot;next() must be called before write()&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          352
+        </td>
+        <td>
+          35696
+        </td>
+        <td>
+          13241
+          -
+          13255
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter.currentFeature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaAppendFeatureWriter.this.currentFeature
+        </td>
+      </tr><tr>
+        <td>
+          352
+        </td>
+        <td>
+          35697
+        </td>
+        <td>
+          13227
+          -
+          13256
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.appendFeature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaAppendFeatureWriter.this.appendFeature(GeoMesaAppendFeatureWriter.this.currentFeature)
+        </td>
+      </tr><tr>
+        <td>
+          353
+        </td>
+        <td>
+          35698
+        </td>
+        <td>
+          13263
+          -
+          13284
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaAppendFeatureWriter.currentFeature_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaAppendFeatureWriter.this.currentFeature_=(null)
+        </td>
+      </tr><tr>
+        <td>
+          357
+        </td>
+        <td>
+          35699
+        </td>
+        <td>
+          13332
+          -
+          13429
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.UnsupportedOperationException(&quot;Use getFeatureWriter instead of getFeatureWriterAppend&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          369
+        </td>
+        <td>
+          35700
+        </td>
+        <td>
+          13808
+          -
+          13823
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          369
+        </td>
+        <td>
+          35701
+        </td>
+        <td>
+          13825
+          -
+          13831
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.filter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.filter
+        </td>
+      </tr><tr>
+        <td>
+          369
+        </td>
+        <td>
+          35702
+        </td>
+        <td>
+          13798
+          -
+          13832
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.Query.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.geotools.api.data.Query(GeoMesaModifyFeatureWriter.this.sft.getTypeName(), GeoMesaModifyFeatureWriter.this.filter)
+        </td>
+      </tr><tr>
+        <td>
+          369
+        </td>
+        <td>
+          35703
+        </td>
+        <td>
+          13834
+          -
+          13857
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+      </tr><tr>
+        <td>
+          369
+        </td>
+        <td>
+          35704
+        </td>
+        <td>
+          13778
+          -
+          13858
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.MetadataBackedDataStore.getFeatureReader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.ds.getFeatureReader(new org.geotools.api.data.Query(GeoMesaModifyFeatureWriter.this.sft.getTypeName(), GeoMesaModifyFeatureWriter.this.filter), org.geotools.api.data.Transaction.AUTO_COMMIT)
+        </td>
+      </tr><tr>
+        <td>
+          377
+        </td>
+        <td>
+          35705
+        </td>
+        <td>
+          14063
+          -
+          14077
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureReader.hasNext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.reader.hasNext()
+        </td>
+      </tr><tr>
+        <td>
+          380
+        </td>
+        <td>
+          35706
+        </td>
+        <td>
+          14145
+          -
+          14158
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureReader.next
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.reader.next()
+        </td>
+      </tr><tr>
+        <td>
+          380
+        </td>
+        <td>
+          35707
+        </td>
+        <td>
+          14134
+          -
+          14158
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.original_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original_=(GeoMesaModifyFeatureWriter.this.reader.next())
+        </td>
+      </tr><tr>
+        <td>
+          383
+        </td>
+        <td>
+          35708
+        </td>
+        <td>
+          14316
+          -
+          14338
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+      </tr><tr>
+        <td>
+          383
+        </td>
+        <td>
+          35709
+        </td>
+        <td>
+          14340
+          -
+          14362
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.lang.Boolean.TRUE
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.Boolean.TRUE
+        </td>
+      </tr><tr>
+        <td>
+          383
+        </td>
+        <td>
+          35710
+        </td>
+        <td>
+          14291
+          -
+          14363
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original.getUserData().put(org.geotools.util.factory.Hints.USE_PROVIDED_FID, java.lang.Boolean.TRUE)
+        </td>
+      </tr><tr>
+        <td>
+          384
+        </td>
+        <td>
+          35711
+        </td>
+        <td>
+          14401
+          -
+          14404
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          384
+        </td>
+        <td>
+          35712
+        </td>
+        <td>
+          14406
+          -
+          14414
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.original
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original
+        </td>
+      </tr><tr>
+        <td>
+          384
+        </td>
+        <td>
+          35713
+        </td>
+        <td>
+          14377
+          -
+          14415
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.ScalaSimpleFeature.copy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.features.ScalaSimpleFeature.copy(GeoMesaModifyFeatureWriter.this.sft, GeoMesaModifyFeatureWriter.this.original)
+        </td>
+      </tr><tr>
+        <td>
+          384
+        </td>
+        <td>
+          35714
+        </td>
+        <td>
+          14370
+          -
+          14415
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.live_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.live_=(org.locationtech.geomesa.features.ScalaSimpleFeature.copy(GeoMesaModifyFeatureWriter.this.sft, GeoMesaModifyFeatureWriter.this.original))
+        </td>
+      </tr><tr>
+        <td>
+          385
+        </td>
+        <td>
+          35715
+        </td>
+        <td>
+          14455
+          -
+          14459
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.live
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.live
+        </td>
+      </tr><tr>
+        <td>
+          389
+        </td>
+        <td>
+          35716
+        </td>
+        <td>
+          14512
+          -
+          14528
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          389
+        </td>
+        <td>
+          35719
+        </td>
+        <td>
+          14508
+          -
+          14508
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          389
+        </td>
+        <td>
+          35720
+        </td>
+        <td>
+          14508
+          -
+          14508
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          390
+        </td>
+        <td>
+          35717
+        </td>
+        <td>
+          14540
+          -
+          14611
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(&quot;next() must be called before write()&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          390
+        </td>
+        <td>
+          35718
+        </td>
+        <td>
+          14540
+          -
+          14611
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(&quot;next() must be called before write()&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          393
+        </td>
+        <td>
+          35721
+        </td>
+        <td>
+          14745
+          -
+          14749
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.live
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.live
+        </td>
+      </tr><tr>
+        <td>
+          393
+        </td>
+        <td>
+          35722
+        </td>
+        <td>
+          14709
+          -
+          14750
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.featureWithFid
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaFeatureWriter.featureWithFid(GeoMesaModifyFeatureWriter.this.live)
+        </td>
+      </tr><tr>
+        <td>
+          393
+        </td>
+        <td>
+          35723
+        </td>
+        <td>
+          14702
+          -
+          14750
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.live_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.live_=(GeoMesaFeatureWriter.featureWithFid(GeoMesaModifyFeatureWriter.this.live))
+        </td>
+      </tr><tr>
+        <td>
+          396
+        </td>
+        <td>
+          35724
+        </td>
+        <td>
+          14945
+          -
+          14949
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.live
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.live
+        </td>
+      </tr><tr>
+        <td>
+          396
+        </td>
+        <td>
+          35725
+        </td>
+        <td>
+          14951
+          -
+          14959
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.original
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original
+        </td>
+      </tr><tr>
+        <td>
+          396
+        </td>
+        <td>
+          35726
+        </td>
+        <td>
+          14964
+          -
+          14968
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.live
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.live
+        </td>
+      </tr><tr>
+        <td>
+          396
+        </td>
+        <td>
+          35727
+        </td>
+        <td>
+          14983
+          -
+          14991
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.original
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original
+        </td>
+      </tr><tr>
+        <td>
+          396
+        </td>
+        <td>
+          35728
+        </td>
+        <td>
+          14983
+          -
+          15002
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.security.SecureSimpleFeature.visibility
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.security.`package`.SecureSimpleFeature(GeoMesaModifyFeatureWriter.this.original).visibility
+        </td>
+      </tr><tr>
+        <td>
+          396
+        </td>
+        <td>
+          35729
+        </td>
+        <td>
+          14964
+          -
+          15002
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.security.`package`.SecureSimpleFeature(GeoMesaModifyFeatureWriter.this.live).visibility.!=(org.locationtech.geomesa.security.`package`.SecureSimpleFeature(GeoMesaModifyFeatureWriter.this.original).visibility)
+        </td>
+      </tr><tr>
+        <td>
+          396
+        </td>
+        <td>
+          35730
+        </td>
+        <td>
+          14904
+          -
+          15002
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.features.ScalaSimpleFeature.equalIdAndAttributes(GeoMesaModifyFeatureWriter.this.live, GeoMesaModifyFeatureWriter.this.original).unary_!.||(org.locationtech.geomesa.security.`package`.SecureSimpleFeature(GeoMesaModifyFeatureWriter.this.live).visibility.!=(org.locationtech.geomesa.security.`package`.SecureSimpleFeature(GeoMesaModifyFeatureWriter.this.original).visibility))
+        </td>
+      </tr><tr>
+        <td>
+          396
+        </td>
+        <td>
+          35735
+        </td>
+        <td>
+          14900
+          -
+          14900
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          396
+        </td>
+        <td>
+          35736
+        </td>
+        <td>
+          14900
+          -
+          14900
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          397
+        </td>
+        <td>
+          35731
+        </td>
+        <td>
+          15028
+          -
+          15032
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.live
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.live
+        </td>
+      </tr><tr>
+        <td>
+          397
+        </td>
+        <td>
+          35732
+        </td>
+        <td>
+          15034
+          -
+          15042
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.original
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original
+        </td>
+      </tr><tr>
+        <td>
+          397
+        </td>
+        <td>
+          35733
+        </td>
+        <td>
+          15014
+          -
+          15043
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.updateFeature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.updateFeature(GeoMesaModifyFeatureWriter.this.live, GeoMesaModifyFeatureWriter.this.original)
+        </td>
+      </tr><tr>
+        <td>
+          397
+        </td>
+        <td>
+          35734
+        </td>
+        <td>
+          15014
+          -
+          15043
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.updateFeature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.updateFeature(GeoMesaModifyFeatureWriter.this.live, GeoMesaModifyFeatureWriter.this.original)
+        </td>
+      </tr><tr>
+        <td>
+          399
+        </td>
+        <td>
+          35737
+        </td>
+        <td>
+          15058
+          -
+          15073
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.original_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original_=(null)
+        </td>
+      </tr><tr>
+        <td>
+          400
+        </td>
+        <td>
+          35738
+        </td>
+        <td>
+          15080
+          -
+          15091
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.live_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.live_=(null)
+        </td>
+      </tr><tr>
+        <td>
+          404
+        </td>
+        <td>
+          35739
+        </td>
+        <td>
+          15145
+          -
+          15161
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          404
+        </td>
+        <td>
+          35742
+        </td>
+        <td>
+          15141
+          -
+          15141
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          404
+        </td>
+        <td>
+          35743
+        </td>
+        <td>
+          15141
+          -
+          15141
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          405
+        </td>
+        <td>
+          35740
+        </td>
+        <td>
+          15173
+          -
+          15245
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(&quot;next() must be called before remove()&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          405
+        </td>
+        <td>
+          35741
+        </td>
+        <td>
+          15173
+          -
+          15245
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(&quot;next() must be called before remove()&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          407
+        </td>
+        <td>
+          35744
+        </td>
+        <td>
+          15274
+          -
+          15282
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.original
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original
+        </td>
+      </tr><tr>
+        <td>
+          407
+        </td>
+        <td>
+          35745
+        </td>
+        <td>
+          15260
+          -
+          15283
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.removeFeature
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.removeFeature(GeoMesaModifyFeatureWriter.this.original)
+        </td>
+      </tr><tr>
+        <td>
+          408
+        </td>
+        <td>
+          35746
+        </td>
+        <td>
+          15290
+          -
+          15305
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.original_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.original_=(null)
+        </td>
+      </tr><tr>
+        <td>
+          409
+        </td>
+        <td>
+          35747
+        </td>
+        <td>
+          15312
+          -
+          15323
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.live_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.live_=(null)
+        </td>
+      </tr><tr>
+        <td>
+          412
+        </td>
+        <td>
+          35748
+        </td>
+        <td>
+          15420
+          -
+          15426
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter.GeoMesaModifyFeatureWriter.reader
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.this.reader
+        </td>
+      </tr><tr>
+        <td>
+          412
+        </td>
+        <td>
+          35749
+        </td>
+        <td>
+          15417
+          -
+          15417
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[java.io.Closeable]
+        </td>
+      </tr><tr>
+        <td>
+          412
+        </td>
+        <td>
+          35750
+        </td>
+        <td>
+          15398
+          -
+          15426
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.SeqLike.:+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          GeoMesaModifyFeatureWriter.super.closeables().:+[java.io.Closeable, Seq[java.io.Closeable]](GeoMesaModifyFeatureWriter.this.reader)(collection.this.Seq.canBuildFrom[java.io.Closeable])
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>

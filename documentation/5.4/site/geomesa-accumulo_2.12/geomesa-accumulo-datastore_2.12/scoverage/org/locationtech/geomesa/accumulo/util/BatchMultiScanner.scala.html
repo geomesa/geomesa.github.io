@@ -1,0 +1,2438 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/accumulo/util/BatchMultiScanner.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.accumulo.util
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.LazyLogging
+</span>12 <span style=''>import org.apache.accumulo.core.client.{AccumuloClient, ScannerBase}
+</span>13 <span style=''>import org.apache.accumulo.core.data.{Key, Value}
+</span>14 <span style=''>import org.apache.accumulo.core.security.Authorizations
+</span>15 <span style=''>import org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.{BatchScanPlan, JoinFunction}
+</span>16 <span style=''>import org.locationtech.geomesa.index.utils.ThreadManagement.Timeout
+</span>17 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
+</span>18 <span style=''>
+</span>19 <span style=''>import java.util.Map.Entry
+</span>20 <span style=''>import java.util.concurrent.atomic.AtomicBoolean
+</span>21 <span style=''>import java.util.concurrent.{Executors, Future, LinkedBlockingQueue, TimeUnit}
+</span>22 <span style=''>
+</span>23 <span style=''>/**
+</span>24 <span style=''> * Runs a join scan against two tables
+</span>25 <span style=''> *
+</span>26 <span style=''> * @param connector connector
+</span>27 <span style=''> * @param in input scan
+</span>28 <span style=''> * @param join join scan
+</span>29 <span style=''> * @param joinFunction maps results of input scan to ranges for join scan
+</span>30 <span style=''> * @param auths scan authorizations
+</span>31 <span style=''> * @param partitionParallelScans parallelize scans against partitioned tables (vs execute sequentially)
+</span>32 <span style=''> * @param timeout query timeout
+</span>33 <span style=''> * @param numThreads threads
+</span>34 <span style=''> * @param batchSize batch size
+</span>35 <span style=''> */
+</span>36 <span style=''>class BatchMultiScanner(
+</span>37 <span style=''>    connector: AccumuloClient,
+</span>38 <span style=''>    in: ScannerBase,
+</span>39 <span style=''>    join: BatchScanPlan,
+</span>40 <span style=''>    joinFunction: JoinFunction,
+</span>41 <span style=''>    auths: Authorizations,
+</span>42 <span style=''>    partitionParallelScans: Boolean,
+</span>43 <span style=''>    timeout: Option[Timeout],
+</span>44 <span style=''>    numThreads: Int = 12,
+</span>45 <span style=''>    batchSize: Int = 32768
+</span>46 <span style=''>  ) extends CloseableIterator[java.util.Map.Entry[Key, Value]] with LazyLogging {
+</span>47 <span style=''>
+</span>48 <span style=''>  import scala.collection.JavaConverters._
+</span>49 <span style=''>
+</span>50 <span style=''>  </span><span style='background: #AEF1AE'>require(batchSize &gt; 0, f&quot;Illegal batchSize ($batchSize%d). Value must be &gt; 0&quot;)</span><span style=''>
+</span>51 <span style=''>  </span><span style='background: #AEF1AE'>require(numThreads &gt; 0, f&quot;Illegal numThreads ($numThreads%d). Value must be &gt; 0&quot;)</span><span style=''>
+</span>52 <span style=''>  logger.trace(f&quot;Creating BatchMultiScanner with batchSize $batchSize%d and numThreads $numThreads%d&quot;)
+</span>53 <span style=''>
+</span>54 <span style=''>  private val executor = </span><span style='background: #AEF1AE'>Executors.newFixedThreadPool(numThreads)</span><span style=''>
+</span>55 <span style=''>
+</span>56 <span style=''>  private val inQ  = </span><span style='background: #AEF1AE'>new LinkedBlockingQueue[Entry[Key, Value]](batchSize)</span><span style=''>
+</span>57 <span style=''>  private val outQ = </span><span style='background: #AEF1AE'>new LinkedBlockingQueue[Entry[Key, Value]](batchSize)</span><span style=''>
+</span>58 <span style=''>
+</span>59 <span style=''>  private val inDone  = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
+</span>60 <span style=''>  private val outDone = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
+</span>61 <span style=''>
+</span>62 <span style=''>  private var prefetch: Entry[Key, Value] = _
+</span>63 <span style=''>
+</span>64 <span style=''>  private def prefetchIfNull(): Unit = {
+</span>65 <span style=''>    // loop while we might have another and we haven't set prefetch
+</span>66 <span style=''>    while (</span><span style='background: #AEF1AE'>prefetch == null &amp;&amp; (!outDone.get || outQ.size &gt; 0)</span><span style=''>) {
+</span>67 <span style=''>      </span><span style='background: #AEF1AE'>prefetch = outQ.poll(5, TimeUnit.MILLISECONDS)</span><span style=''>
+</span>68 <span style=''>    }
+</span>69 <span style=''>  }
+</span>70 <span style=''>
+</span>71 <span style=''>  // must attempt a prefetch since we don't know whether or not the outQ
+</span>72 <span style=''>  // will actually be filled with an item (filters may not match and the
+</span>73 <span style=''>  // in scanner may never return a range)
+</span>74 <span style=''>  override def hasNext(): Boolean = {
+</span>75 <span style=''>    </span><span style='background: #AEF1AE'>prefetchIfNull()</span><span style=''>
+</span>76 <span style=''>    </span><span style='background: #AEF1AE'>prefetch != null</span><span style=''>
+</span>77 <span style=''>  }
+</span>78 <span style=''>
+</span>79 <span style=''>  override def next(): Entry[Key, Value] = {
+</span>80 <span style=''>    </span><span style='background: #AEF1AE'>prefetchIfNull()</span><span style=''>
+</span>81 <span style=''>    val ret = </span><span style='background: #AEF1AE'>prefetch</span><span style=''>
+</span>82 <span style=''>    </span><span style='background: #AEF1AE'>prefetch = null</span><span style=''>
+</span>83 <span style=''>    ret
+</span>84 <span style=''>  }
+</span>85 <span style=''>
+</span>86 <span style=''>  </span><span style='background: #AEF1AE'>executor.submit(new Runnable {
+</span>87 <span style=''></span><span style='background: #AEF1AE'>    override def run(): Unit = {
+</span>88 <span style=''></span><span style='background: #AEF1AE'>      try {
+</span>89 <span style=''></span><span style='background: #AEF1AE'>        in.asScala.foreach(inQ.put)
+</span>90 <span style=''></span><span style='background: #AEF1AE'>      } finally {
+</span>91 <span style=''></span><span style='background: #AEF1AE'>        inDone.set(true)
+</span>92 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>93 <span style=''></span><span style='background: #AEF1AE'>    }
+</span>94 <span style=''></span><span style='background: #AEF1AE'>  })</span><span style=''>
+</span>95 <span style=''>
+</span>96 <span style=''>  </span><span style='background: #AEF1AE'>executor.submit(new Runnable {
+</span>97 <span style=''></span><span style='background: #AEF1AE'>    override def run(): Unit = {
+</span>98 <span style=''></span><span style='background: #AEF1AE'>      try {
+</span>99 <span style=''></span><span style='background: #AEF1AE'>        val tasks = collection.mutable.ListBuffer.empty[Future[_]]
+</span>100 <span style=''></span><span style='background: #AEF1AE'>        while (!inDone.get || inQ.size() &gt; 0) {
+</span>101 <span style=''></span><span style='background: #AEF1AE'>          val entry = inQ.poll(5, TimeUnit.MILLISECONDS)
+</span>102 <span style=''></span><span style='background: #AEF1AE'>          if (entry != null) {
+</span>103 <span style=''></span><span style='background: #AEF1AE'>            val entries = collection.mutable.ListBuffer(entry)
+</span>104 <span style=''></span><span style='background: #AEF1AE'>            inQ.drainTo(entries.asJava)
+</span>105 <span style=''></span><span style='background: #AEF1AE'>            val task = executor.submit(new Runnable {
+</span>106 <span style=''></span><span style='background: #AEF1AE'>              override def run(): Unit = {
+</span>107 <span style=''></span><span style='background: #AEF1AE'>                val iterator = join.copy(ranges = entries.map(joinFunction).toSeq).scan(connector, auths, partitionParallelScans, timeout)
+</span>108 <span style=''></span><span style='background: #AEF1AE'>                try {
+</span>109 <span style=''></span><span style='background: #AEF1AE'>                  iterator.foreach(outQ.put)
+</span>110 <span style=''></span><span style='background: #AEF1AE'>                } finally {
+</span>111 <span style=''></span><span style='background: #AEF1AE'>                  iterator.close()
+</span>112 <span style=''></span><span style='background: #AEF1AE'>                }
+</span>113 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>114 <span style=''></span><span style='background: #AEF1AE'>            })
+</span>115 <span style=''></span><span style='background: #AEF1AE'>            tasks.append(task)
+</span>116 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>117 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>118 <span style=''></span><span style='background: #AEF1AE'>        tasks.foreach(_.get)
+</span>119 <span style=''></span><span style='background: #AEF1AE'>      } catch {
+</span>120 <span style=''></span><span style='background: #AEF1AE'>        case _: InterruptedException </span><span style='background: #F0ADAD'>=&gt;</span><span style='background: #AEF1AE'>
+</span>121 <span style=''></span><span style='background: #AEF1AE'>      } finally {
+</span>122 <span style=''></span><span style='background: #AEF1AE'>        executor.shutdown()
+</span>123 <span style=''></span><span style='background: #AEF1AE'>        outDone.set(true)
+</span>124 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>125 <span style=''></span><span style='background: #AEF1AE'>    }
+</span>126 <span style=''></span><span style='background: #AEF1AE'>  })</span><span style=''>
+</span>127 <span style=''>
+</span>128 <span style=''>  override def close(): Unit = {
+</span>129 <span style=''>    if (</span><span style='background: #AEF1AE'>!executor.isShutdown</span><span style=''>) {
+</span>130 <span style=''>      </span><span style='background: #F0ADAD'>executor.shutdownNow()</span><span style=''>
+</span>131 <span style=''>    }
+</span>132 <span style=''>    </span><span style='background: #AEF1AE'>in.close()</span><span style=''>
+</span>133 <span style=''>  }
+</span>134 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          3052
+        </td>
+        <td>
+          1976
+          -
+          1989
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.batchSize.&gt;(0)
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          3053
+        </td>
+        <td>
+          1968
+          -
+          2046
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(BatchMultiScanner.this.batchSize.&gt;(0), ({
+  val arg$macro$1: Int = BatchMultiScanner.this.batchSize;
+  new scala.collection.immutable.StringOps(&quot;Illegal batchSize (%d). Value must be &gt; 0&quot;).format(arg$macro$1)
+}: String))
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          3054
+        </td>
+        <td>
+          2057
+          -
+          2071
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.numThreads.&gt;(0)
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          3055
+        </td>
+        <td>
+          2049
+          -
+          2130
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(BatchMultiScanner.this.numThreads.&gt;(0), ({
+  val arg$macro$2: Int = BatchMultiScanner.this.numThreads;
+  new scala.collection.immutable.StringOps(&quot;Illegal numThreads (%d). Value must be &gt; 0&quot;).format(arg$macro$2)
+}: String))
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          3056
+        </td>
+        <td>
+          2289
+          -
+          2299
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.numThreads
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.numThreads
+        </td>
+      </tr><tr>
+        <td>
+          54
+        </td>
+        <td>
+          3057
+        </td>
+        <td>
+          2260
+          -
+          2300
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Executors.newFixedThreadPool
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.concurrent.Executors.newFixedThreadPool(BatchMultiScanner.this.numThreads)
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          3058
+        </td>
+        <td>
+          2366
+          -
+          2375
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.batchSize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.batchSize
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          3059
+        </td>
+        <td>
+          2323
+          -
+          2376
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.LinkedBlockingQueue.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.LinkedBlockingQueue[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](BatchMultiScanner.this.batchSize)
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          3060
+        </td>
+        <td>
+          2441
+          -
+          2450
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.batchSize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.batchSize
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          3061
+        </td>
+        <td>
+          2398
+          -
+          2451
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.LinkedBlockingQueue.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.LinkedBlockingQueue[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](BatchMultiScanner.this.batchSize)
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          3062
+        </td>
+        <td>
+          2477
+          -
+          2501
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicBoolean(false)
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          3063
+        </td>
+        <td>
+          2526
+          -
+          2550
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.atomic.AtomicBoolean(false)
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          3064
+        </td>
+        <td>
+          2731
+          -
+          2735
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          3065
+        </td>
+        <td>
+          2756
+          -
+          2769
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.outQ.size().&gt;(0)
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          3066
+        </td>
+        <td>
+          2740
+          -
+          2769
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.outDone.get().unary_!.||(BatchMultiScanner.this.outQ.size().&gt;(0))
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          3067
+        </td>
+        <td>
+          2719
+          -
+          2770
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.prefetch.==(null).&amp;&amp;(BatchMultiScanner.this.outDone.get().unary_!.||(BatchMultiScanner.this.outQ.size().&gt;(0)))
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          3071
+        </td>
+        <td>
+          2780
+          -
+          2826
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  BatchMultiScanner.this.prefetch_=(BatchMultiScanner.this.outQ.poll(5L, MILLISECONDS));
+  while$1()
+}
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          3072
+        </td>
+        <td>
+          2712
+          -
+          2712
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          3073
+        </td>
+        <td>
+          2712
+          -
+          2712
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          3068
+        </td>
+        <td>
+          2791
+          -
+          2826
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.LinkedBlockingQueue.poll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.outQ.poll(5L, MILLISECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          3069
+        </td>
+        <td>
+          2780
+          -
+          2826
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.prefetch_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.prefetch_=(BatchMultiScanner.this.outQ.poll(5L, MILLISECONDS))
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          3070
+        </td>
+        <td>
+          2789
+          -
+          2789
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.while$1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$1()
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          3074
+        </td>
+        <td>
+          3068
+          -
+          3084
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.prefetchIfNull
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.prefetchIfNull()
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          3075
+        </td>
+        <td>
+          3089
+          -
+          3105
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.prefetch.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          3076
+        </td>
+        <td>
+          3160
+          -
+          3176
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.prefetchIfNull
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.prefetchIfNull()
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          3077
+        </td>
+        <td>
+          3191
+          -
+          3199
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.prefetch
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.prefetch
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          3078
+        </td>
+        <td>
+          3204
+          -
+          3219
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.prefetch_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.prefetch_=(null)
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          3085
+        </td>
+        <td>
+          3251
+          -
+          3254
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.$anon.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new $anon()
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          3086
+        </td>
+        <td>
+          3235
+          -
+          3408
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ExecutorService.submit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.executor.submit({
+  final class $anon extends Object with Runnable {
+    def &lt;init&gt;(): &lt;$anon: Runnable&gt; = {
+      $anon.super.&lt;init&gt;();
+      ()
+    };
+    override def run(): Unit = try {
+      scala.collection.JavaConverters.iterableAsScalaIterableConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](BatchMultiScanner.this.in).asScala.foreach[Unit]({
+        ((x$1: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; BatchMultiScanner.this.inQ.put(x$1))
+      })
+    } finally BatchMultiScanner.this.inDone.set(true)
+  };
+  new $anon()
+})
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          3079
+        </td>
+        <td>
+          3319
+          -
+          3321
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.in
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.in
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          3080
+        </td>
+        <td>
+          3338
+          -
+          3345
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.LinkedBlockingQueue.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.inQ.put(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          3081
+        </td>
+        <td>
+          3319
+          -
+          3346
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.iterableAsScalaIterableConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](BatchMultiScanner.this.in).asScala.foreach[Unit]({
+  ((x$1: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; BatchMultiScanner.this.inQ.put(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          3082
+        </td>
+        <td>
+          3319
+          -
+          3346
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.iterableAsScalaIterableConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](BatchMultiScanner.this.in).asScala.foreach[Unit]({
+  ((x$1: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; BatchMultiScanner.this.inQ.put(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          3083
+        </td>
+        <td>
+          3373
+          -
+          3389
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.set
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.inDone.set(true)
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          3084
+        </td>
+        <td>
+          3373
+          -
+          3389
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.set
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.inDone.set(true)
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          3127
+        </td>
+        <td>
+          3428
+          -
+          3431
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.$anon.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new $anon()
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          3128
+        </td>
+        <td>
+          3412
+          -
+          4437
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ExecutorService.submit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.executor.submit({
+  final class $anon extends Object with Runnable {
+    def &lt;init&gt;(): &lt;$anon: Runnable&gt; = {
+      $anon.super.&lt;init&gt;();
+      ()
+    };
+    override def run(): Unit = try {
+      val tasks: scala.collection.mutable.ListBuffer[java.util.concurrent.Future[_]] = scala.collection.mutable.ListBuffer.empty[java.util.concurrent.Future[_]];
+      while$2(){
+        if (BatchMultiScanner.this.inDone.get().unary_!.||(BatchMultiScanner.this.inQ.size().&gt;(0)))
+          {
+            {
+              val entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value] = BatchMultiScanner.this.inQ.poll(5L, MILLISECONDS);
+              if (entry.!=(null))
+                {
+                  val entries: scala.collection.mutable.ListBuffer[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] = scala.collection.mutable.ListBuffer.apply[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entry);
+                  BatchMultiScanner.this.inQ.drainTo(scala.collection.JavaConverters.bufferAsJavaListConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entries).asJava);
+                  val task: java.util.concurrent.Future[_] = BatchMultiScanner.this.executor.submit({
+                    final class $anon extends Object with Runnable {
+                      def &lt;init&gt;(): &lt;$anon: Runnable&gt; = {
+                        $anon.super.&lt;init&gt;();
+                        ()
+                      };
+                      override def run(): Unit = {
+                        val iterator: org.locationtech.geomesa.utils.collection.CloseableIterator[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] = {
+  &lt;artifact&gt; val x$1: Seq[org.apache.accumulo.core.data.Range] @scala.reflect.internal.annotations.uncheckedBounds = entries.map[org.apache.accumulo.core.data.Range, scala.collection.mutable.ListBuffer[org.apache.accumulo.core.data.Range]](BatchMultiScanner.this.joinFunction)(mutable.this.ListBuffer.canBuildFrom[org.apache.accumulo.core.data.Range]).toSeq;
+  &lt;artifact&gt; val x$2: org.locationtech.geomesa.index.api.FilterStrategy = BatchMultiScanner.this.join.copy$default$1;
+  &lt;artifact&gt; val x$3: Seq[String] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$2;
+  &lt;artifact&gt; val x$4: Seq[org.apache.accumulo.core.client.IteratorSetting] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$4;
+  &lt;artifact&gt; val x$5: Option[org.apache.hadoop.io.Text] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$5;
+  &lt;artifact&gt; val x$6: org.locationtech.geomesa.index.api.QueryPlan.ResultsToFeatures[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$6;
+  &lt;artifact&gt; val x$7: Option[org.locationtech.geomesa.index.api.QueryPlan.FeatureReducer] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$7;
+  &lt;artifact&gt; val x$8: Option[Seq[(String, Boolean)]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$8;
+  &lt;artifact&gt; val x$9: Option[Int] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$9;
+  &lt;artifact&gt; val x$10: Option[org.locationtech.geomesa.index.utils.Reprojection.QueryReferenceSystems] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$10;
+  &lt;artifact&gt; val x$11: Int = BatchMultiScanner.this.join.copy$default$11;
+  BatchMultiScanner.this.join.copy(x$2, x$3, x$1, x$4, x$5, x$6, x$7, x$8, x$9, x$10, x$11)
+}.scan(BatchMultiScanner.this.connector, BatchMultiScanner.this.auths, BatchMultiScanner.this.partitionParallelScans, BatchMultiScanner.this.timeout);
+                        try {
+                          iterator.foreach[Unit]({
+                            ((x$1: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; BatchMultiScanner.this.outQ.put(x$1))
+                          })
+                        } finally iterator.close()
+                      }
+                    };
+                    new $anon()
+                  });
+                  tasks.append(task)
+                }
+              else
+                ()
+            };
+            while$2()
+          }
+        else
+          ()
+      };
+      tasks.foreach[Any](((x$1: java.util.concurrent.Future[_]) =&gt; x$1.get()))
+    } catch {
+      case (_: InterruptedException) =&gt; ()
+    } finally {
+      BatchMultiScanner.this.executor.shutdown();
+      BatchMultiScanner.this.outDone.set(true)
+    }
+  };
+  new $anon()
+})
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          3121
+        </td>
+        <td>
+          3496
+          -
+          4290
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val tasks: scala.collection.mutable.ListBuffer[java.util.concurrent.Future[_]] = scala.collection.mutable.ListBuffer.empty[java.util.concurrent.Future[_]];
+  while$2(){
+    if (BatchMultiScanner.this.inDone.get().unary_!.||(BatchMultiScanner.this.inQ.size().&gt;(0)))
+      {
+        {
+          val entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value] = BatchMultiScanner.this.inQ.poll(5L, MILLISECONDS);
+          if (entry.!=(null))
+            {
+              val entries: scala.collection.mutable.ListBuffer[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] = scala.collection.mutable.ListBuffer.apply[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entry);
+              BatchMultiScanner.this.inQ.drainTo(scala.collection.JavaConverters.bufferAsJavaListConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entries).asJava);
+              val task: java.util.concurrent.Future[_] = BatchMultiScanner.this.executor.submit({
+                final class $anon extends Object with Runnable {
+                  def &lt;init&gt;(): &lt;$anon: Runnable&gt; = {
+                    $anon.super.&lt;init&gt;();
+                    ()
+                  };
+                  override def run(): Unit = {
+                    val iterator: org.locationtech.geomesa.utils.collection.CloseableIterator[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] = {
+  &lt;artifact&gt; val x$1: Seq[org.apache.accumulo.core.data.Range] @scala.reflect.internal.annotations.uncheckedBounds = entries.map[org.apache.accumulo.core.data.Range, scala.collection.mutable.ListBuffer[org.apache.accumulo.core.data.Range]](BatchMultiScanner.this.joinFunction)(mutable.this.ListBuffer.canBuildFrom[org.apache.accumulo.core.data.Range]).toSeq;
+  &lt;artifact&gt; val x$2: org.locationtech.geomesa.index.api.FilterStrategy = BatchMultiScanner.this.join.copy$default$1;
+  &lt;artifact&gt; val x$3: Seq[String] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$2;
+  &lt;artifact&gt; val x$4: Seq[org.apache.accumulo.core.client.IteratorSetting] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$4;
+  &lt;artifact&gt; val x$5: Option[org.apache.hadoop.io.Text] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$5;
+  &lt;artifact&gt; val x$6: org.locationtech.geomesa.index.api.QueryPlan.ResultsToFeatures[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$6;
+  &lt;artifact&gt; val x$7: Option[org.locationtech.geomesa.index.api.QueryPlan.FeatureReducer] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$7;
+  &lt;artifact&gt; val x$8: Option[Seq[(String, Boolean)]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$8;
+  &lt;artifact&gt; val x$9: Option[Int] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$9;
+  &lt;artifact&gt; val x$10: Option[org.locationtech.geomesa.index.utils.Reprojection.QueryReferenceSystems] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$10;
+  &lt;artifact&gt; val x$11: Int = BatchMultiScanner.this.join.copy$default$11;
+  BatchMultiScanner.this.join.copy(x$2, x$3, x$1, x$4, x$5, x$6, x$7, x$8, x$9, x$10, x$11)
+}.scan(BatchMultiScanner.this.connector, BatchMultiScanner.this.auths, BatchMultiScanner.this.partitionParallelScans, BatchMultiScanner.this.timeout);
+                    try {
+                      iterator.foreach[Unit]({
+                        ((x$1: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; BatchMultiScanner.this.outQ.put(x$1))
+                      })
+                    } finally iterator.close()
+                  }
+                };
+                new $anon()
+              });
+              tasks.append(task)
+            }
+          else
+            ()
+        };
+        while$2()
+      }
+    else
+      ()
+  };
+  tasks.foreach[Any](((x$1: java.util.concurrent.Future[_]) =&gt; x$1.get()))
+}
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          3087
+        </td>
+        <td>
+          3508
+          -
+          3554
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.ListBuffer.empty[java.util.concurrent.Future[_]]
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          3088
+        </td>
+        <td>
+          3585
+          -
+          3599
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.inQ.size().&gt;(0)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          3089
+        </td>
+        <td>
+          3570
+          -
+          3599
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.inDone.get().unary_!.||(BatchMultiScanner.this.inQ.size().&gt;(0))
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          3115
+        </td>
+        <td>
+          3601
+          -
+          3601
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.$anon.while$2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$2()
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          3116
+        </td>
+        <td>
+          3601
+          -
+          4261
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    val entry: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value] = BatchMultiScanner.this.inQ.poll(5L, MILLISECONDS);
+    if (entry.!=(null))
+      {
+        val entries: scala.collection.mutable.ListBuffer[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] = scala.collection.mutable.ListBuffer.apply[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entry);
+        BatchMultiScanner.this.inQ.drainTo(scala.collection.JavaConverters.bufferAsJavaListConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entries).asJava);
+        val task: java.util.concurrent.Future[_] = BatchMultiScanner.this.executor.submit({
+          final class $anon extends Object with Runnable {
+            def &lt;init&gt;(): &lt;$anon: Runnable&gt; = {
+              $anon.super.&lt;init&gt;();
+              ()
+            };
+            override def run(): Unit = {
+              val iterator: org.locationtech.geomesa.utils.collection.CloseableIterator[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] = {
+  &lt;artifact&gt; val x$1: Seq[org.apache.accumulo.core.data.Range] @scala.reflect.internal.annotations.uncheckedBounds = entries.map[org.apache.accumulo.core.data.Range, scala.collection.mutable.ListBuffer[org.apache.accumulo.core.data.Range]](BatchMultiScanner.this.joinFunction)(mutable.this.ListBuffer.canBuildFrom[org.apache.accumulo.core.data.Range]).toSeq;
+  &lt;artifact&gt; val x$2: org.locationtech.geomesa.index.api.FilterStrategy = BatchMultiScanner.this.join.copy$default$1;
+  &lt;artifact&gt; val x$3: Seq[String] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$2;
+  &lt;artifact&gt; val x$4: Seq[org.apache.accumulo.core.client.IteratorSetting] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$4;
+  &lt;artifact&gt; val x$5: Option[org.apache.hadoop.io.Text] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$5;
+  &lt;artifact&gt; val x$6: org.locationtech.geomesa.index.api.QueryPlan.ResultsToFeatures[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$6;
+  &lt;artifact&gt; val x$7: Option[org.locationtech.geomesa.index.api.QueryPlan.FeatureReducer] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$7;
+  &lt;artifact&gt; val x$8: Option[Seq[(String, Boolean)]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$8;
+  &lt;artifact&gt; val x$9: Option[Int] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$9;
+  &lt;artifact&gt; val x$10: Option[org.locationtech.geomesa.index.utils.Reprojection.QueryReferenceSystems] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$10;
+  &lt;artifact&gt; val x$11: Int = BatchMultiScanner.this.join.copy$default$11;
+  BatchMultiScanner.this.join.copy(x$2, x$3, x$1, x$4, x$5, x$6, x$7, x$8, x$9, x$10, x$11)
+}.scan(BatchMultiScanner.this.connector, BatchMultiScanner.this.auths, BatchMultiScanner.this.partitionParallelScans, BatchMultiScanner.this.timeout);
+              try {
+                iterator.foreach[Unit]({
+                  ((x$1: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; BatchMultiScanner.this.outQ.put(x$1))
+                })
+              } finally iterator.close()
+            }
+          };
+          new $anon()
+        });
+        tasks.append(task)
+      }
+    else
+      ()
+  };
+  while$2()
+}
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          3117
+        </td>
+        <td>
+          3563
+          -
+          3563
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          3118
+        </td>
+        <td>
+          3563
+          -
+          3563
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          3090
+        </td>
+        <td>
+          3625
+          -
+          3659
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.LinkedBlockingQueue.poll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.inQ.poll(5L, MILLISECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          3091
+        </td>
+        <td>
+          3674
+          -
+          3687
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          entry.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          3112
+        </td>
+        <td>
+          3689
+          -
+          4251
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val entries: scala.collection.mutable.ListBuffer[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] = scala.collection.mutable.ListBuffer.apply[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entry);
+  BatchMultiScanner.this.inQ.drainTo(scala.collection.JavaConverters.bufferAsJavaListConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entries).asJava);
+  val task: java.util.concurrent.Future[_] = BatchMultiScanner.this.executor.submit({
+    final class $anon extends Object with Runnable {
+      def &lt;init&gt;(): &lt;$anon: Runnable&gt; = {
+        $anon.super.&lt;init&gt;();
+        ()
+      };
+      override def run(): Unit = {
+        val iterator: org.locationtech.geomesa.utils.collection.CloseableIterator[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] = {
+  &lt;artifact&gt; val x$1: Seq[org.apache.accumulo.core.data.Range] @scala.reflect.internal.annotations.uncheckedBounds = entries.map[org.apache.accumulo.core.data.Range, scala.collection.mutable.ListBuffer[org.apache.accumulo.core.data.Range]](BatchMultiScanner.this.joinFunction)(mutable.this.ListBuffer.canBuildFrom[org.apache.accumulo.core.data.Range]).toSeq;
+  &lt;artifact&gt; val x$2: org.locationtech.geomesa.index.api.FilterStrategy = BatchMultiScanner.this.join.copy$default$1;
+  &lt;artifact&gt; val x$3: Seq[String] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$2;
+  &lt;artifact&gt; val x$4: Seq[org.apache.accumulo.core.client.IteratorSetting] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$4;
+  &lt;artifact&gt; val x$5: Option[org.apache.hadoop.io.Text] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$5;
+  &lt;artifact&gt; val x$6: org.locationtech.geomesa.index.api.QueryPlan.ResultsToFeatures[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$6;
+  &lt;artifact&gt; val x$7: Option[org.locationtech.geomesa.index.api.QueryPlan.FeatureReducer] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$7;
+  &lt;artifact&gt; val x$8: Option[Seq[(String, Boolean)]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$8;
+  &lt;artifact&gt; val x$9: Option[Int] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$9;
+  &lt;artifact&gt; val x$10: Option[org.locationtech.geomesa.index.utils.Reprojection.QueryReferenceSystems] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$10;
+  &lt;artifact&gt; val x$11: Int = BatchMultiScanner.this.join.copy$default$11;
+  BatchMultiScanner.this.join.copy(x$2, x$3, x$1, x$4, x$5, x$6, x$7, x$8, x$9, x$10, x$11)
+}.scan(BatchMultiScanner.this.connector, BatchMultiScanner.this.auths, BatchMultiScanner.this.partitionParallelScans, BatchMultiScanner.this.timeout);
+        try {
+          iterator.foreach[Unit]({
+            ((x$1: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; BatchMultiScanner.this.outQ.put(x$1))
+          })
+        } finally iterator.close()
+      }
+    };
+    new $anon()
+  });
+  tasks.append(task)
+}
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          3113
+        </td>
+        <td>
+          3670
+          -
+          3670
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          3114
+        </td>
+        <td>
+          3670
+          -
+          3670
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          3092
+        </td>
+        <td>
+          3717
+          -
+          3753
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.ListBuffer.apply[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entry)
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          3093
+        </td>
+        <td>
+          3778
+          -
+          3792
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.bufferAsJavaListConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entries).asJava
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          3094
+        </td>
+        <td>
+          3766
+          -
+          3793
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.LinkedBlockingQueue.drainTo
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.inQ.drainTo(scala.collection.JavaConverters.bufferAsJavaListConverter[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]](entries).asJava)
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          3109
+        </td>
+        <td>
+          3833
+          -
+          3836
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.$anon.$anon.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new $anon()
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          3110
+        </td>
+        <td>
+          3817
+          -
+          4208
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ExecutorService.submit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.executor.submit({
+  final class $anon extends Object with Runnable {
+    def &lt;init&gt;(): &lt;$anon: Runnable&gt; = {
+      $anon.super.&lt;init&gt;();
+      ()
+    };
+    override def run(): Unit = {
+      val iterator: org.locationtech.geomesa.utils.collection.CloseableIterator[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] = {
+  &lt;artifact&gt; val x$1: Seq[org.apache.accumulo.core.data.Range] @scala.reflect.internal.annotations.uncheckedBounds = entries.map[org.apache.accumulo.core.data.Range, scala.collection.mutable.ListBuffer[org.apache.accumulo.core.data.Range]](BatchMultiScanner.this.joinFunction)(mutable.this.ListBuffer.canBuildFrom[org.apache.accumulo.core.data.Range]).toSeq;
+  &lt;artifact&gt; val x$2: org.locationtech.geomesa.index.api.FilterStrategy = BatchMultiScanner.this.join.copy$default$1;
+  &lt;artifact&gt; val x$3: Seq[String] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$2;
+  &lt;artifact&gt; val x$4: Seq[org.apache.accumulo.core.client.IteratorSetting] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$4;
+  &lt;artifact&gt; val x$5: Option[org.apache.hadoop.io.Text] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$5;
+  &lt;artifact&gt; val x$6: org.locationtech.geomesa.index.api.QueryPlan.ResultsToFeatures[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$6;
+  &lt;artifact&gt; val x$7: Option[org.locationtech.geomesa.index.api.QueryPlan.FeatureReducer] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$7;
+  &lt;artifact&gt; val x$8: Option[Seq[(String, Boolean)]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$8;
+  &lt;artifact&gt; val x$9: Option[Int] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$9;
+  &lt;artifact&gt; val x$10: Option[org.locationtech.geomesa.index.utils.Reprojection.QueryReferenceSystems] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$10;
+  &lt;artifact&gt; val x$11: Int = BatchMultiScanner.this.join.copy$default$11;
+  BatchMultiScanner.this.join.copy(x$2, x$3, x$1, x$4, x$5, x$6, x$7, x$8, x$9, x$10, x$11)
+}.scan(BatchMultiScanner.this.connector, BatchMultiScanner.this.auths, BatchMultiScanner.this.partitionParallelScans, BatchMultiScanner.this.timeout);
+      try {
+        iterator.foreach[Unit]({
+          ((x$1: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; BatchMultiScanner.this.outQ.put(x$1))
+        })
+      } finally iterator.close()
+    }
+  };
+  new $anon()
+})
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          3095
+        </td>
+        <td>
+          3953
+          -
+          3965
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.joinFunction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.joinFunction
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          3096
+        </td>
+        <td>
+          3952
+          -
+          3952
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.mutable.ListBuffer.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutable.this.ListBuffer.canBuildFrom[org.apache.accumulo.core.data.Range]
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          3097
+        </td>
+        <td>
+          3941
+          -
+          3972
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.mutable.ListBuffer.toSeq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          entries.map[org.apache.accumulo.core.data.Range, scala.collection.mutable.ListBuffer[org.apache.accumulo.core.data.Range]](BatchMultiScanner.this.joinFunction)(mutable.this.ListBuffer.canBuildFrom[org.apache.accumulo.core.data.Range]).toSeq
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          3098
+        </td>
+        <td>
+          3922
+          -
+          3973
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.BatchScanPlan.copy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.join.copy(x$2, x$3, x$1, x$4, x$5, x$6, x$7, x$8, x$9, x$10, x$11)
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          3099
+        </td>
+        <td>
+          3979
+          -
+          3988
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.connector
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.connector
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          3100
+        </td>
+        <td>
+          3990
+          -
+          3995
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.auths
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.auths
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          3101
+        </td>
+        <td>
+          3997
+          -
+          4019
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.partitionParallelScans
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.partitionParallelScans
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          3102
+        </td>
+        <td>
+          4021
+          -
+          4028
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.util.BatchMultiScanner.timeout
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.timeout
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          3103
+        </td>
+        <td>
+          3922
+          -
+          4029
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.BatchScanPlan.scan
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  &lt;artifact&gt; val x$1: Seq[org.apache.accumulo.core.data.Range] @scala.reflect.internal.annotations.uncheckedBounds = entries.map[org.apache.accumulo.core.data.Range, scala.collection.mutable.ListBuffer[org.apache.accumulo.core.data.Range]](BatchMultiScanner.this.joinFunction)(mutable.this.ListBuffer.canBuildFrom[org.apache.accumulo.core.data.Range]).toSeq;
+  &lt;artifact&gt; val x$2: org.locationtech.geomesa.index.api.FilterStrategy = BatchMultiScanner.this.join.copy$default$1;
+  &lt;artifact&gt; val x$3: Seq[String] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$2;
+  &lt;artifact&gt; val x$4: Seq[org.apache.accumulo.core.client.IteratorSetting] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$4;
+  &lt;artifact&gt; val x$5: Option[org.apache.hadoop.io.Text] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$5;
+  &lt;artifact&gt; val x$6: org.locationtech.geomesa.index.api.QueryPlan.ResultsToFeatures[java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$6;
+  &lt;artifact&gt; val x$7: Option[org.locationtech.geomesa.index.api.QueryPlan.FeatureReducer] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$7;
+  &lt;artifact&gt; val x$8: Option[Seq[(String, Boolean)]] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$8;
+  &lt;artifact&gt; val x$9: Option[Int] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$9;
+  &lt;artifact&gt; val x$10: Option[org.locationtech.geomesa.index.utils.Reprojection.QueryReferenceSystems] @scala.reflect.internal.annotations.uncheckedBounds = BatchMultiScanner.this.join.copy$default$10;
+  &lt;artifact&gt; val x$11: Int = BatchMultiScanner.this.join.copy$default$11;
+  BatchMultiScanner.this.join.copy(x$2, x$3, x$1, x$4, x$5, x$6, x$7, x$8, x$9, x$10, x$11)
+}.scan(BatchMultiScanner.this.connector, BatchMultiScanner.this.auths, BatchMultiScanner.this.partitionParallelScans, BatchMultiScanner.this.timeout)
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          3104
+        </td>
+        <td>
+          4087
+          -
+          4095
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.LinkedBlockingQueue.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.outQ.put(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          3105
+        </td>
+        <td>
+          4070
+          -
+          4096
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          iterator.foreach[Unit]({
+  ((x$1: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; BatchMultiScanner.this.outQ.put(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          3106
+        </td>
+        <td>
+          4070
+          -
+          4096
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.Iterator.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          iterator.foreach[Unit]({
+  ((x$1: java.util.Map.Entry[org.apache.accumulo.core.data.Key,org.apache.accumulo.core.data.Value]) =&gt; BatchMultiScanner.this.outQ.put(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          3107
+        </td>
+        <td>
+          4143
+          -
+          4159
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.Closeable.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          iterator.close()
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          3108
+        </td>
+        <td>
+          4143
+          -
+          4159
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.io.Closeable.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          iterator.close()
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          3111
+        </td>
+        <td>
+          4221
+          -
+          4239
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.BufferLike.append
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tasks.append(task)
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          3119
+        </td>
+        <td>
+          4284
+          -
+          4289
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1.get()
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          3120
+        </td>
+        <td>
+          4270
+          -
+          4290
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.TraversableForwarder.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tasks.foreach[Any](((x$1: java.util.concurrent.Future[_]) =&gt; x$1.get()))
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          3122
+        </td>
+        <td>
+          4344
+          -
+          4346
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          3123
+        </td>
+        <td>
+          4344
+          -
+          4346
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          3126
+        </td>
+        <td>
+          4363
+          -
+          4426
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  BatchMultiScanner.this.executor.shutdown();
+  BatchMultiScanner.this.outDone.set(true)
+}
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          3124
+        </td>
+        <td>
+          4373
+          -
+          4392
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ExecutorService.shutdown
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.executor.shutdown()
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          3125
+        </td>
+        <td>
+          4401
+          -
+          4418
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicBoolean.set
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.outDone.set(true)
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          3129
+        </td>
+        <td>
+          4480
+          -
+          4500
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.executor.isShutdown().unary_!
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          3132
+        </td>
+        <td>
+          4476
+          -
+          4476
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          3133
+        </td>
+        <td>
+          4476
+          -
+          4476
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          3130
+        </td>
+        <td>
+          4510
+          -
+          4532
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ExecutorService.shutdownNow
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          BatchMultiScanner.this.executor.shutdownNow()
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          3131
+        </td>
+        <td>
+          4510
+          -
+          4532
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.concurrent.ExecutorService.shutdownNow
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          BatchMultiScanner.this.executor.shutdownNow()
+        </td>
+      </tr><tr>
+        <td>
+          132
+        </td>
+        <td>
+          3134
+        </td>
+        <td>
+          4543
+          -
+          4553
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.accumulo.core.client.ScannerBase.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchMultiScanner.this.in.close()
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>

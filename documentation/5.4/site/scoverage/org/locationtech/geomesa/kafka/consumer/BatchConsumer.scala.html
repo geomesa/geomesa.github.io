@@ -1,0 +1,2913 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/kafka/consumer/BatchConsumer.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.kafka.consumer
+</span>10 <span style=''>
+</span>11 <span style=''>import org.apache.kafka.clients.consumer.{Consumer, ConsumerRecord}
+</span>12 <span style=''>import org.apache.kafka.common.errors.{InterruptException, WakeupException}
+</span>13 <span style=''>import org.locationtech.geomesa.kafka.consumer.BatchConsumer.BatchResult
+</span>14 <span style=''>import org.locationtech.geomesa.kafka.consumer.ThreadedConsumer.{ConsumerErrorHandler, LogOffsetCommitCallback}
+</span>15 <span style=''>import org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions
+</span>16 <span style=''>
+</span>17 <span style=''>import java.time.Duration
+</span>18 <span style=''>import java.util.Collections
+</span>19 <span style=''>import java.util.concurrent._
+</span>20 <span style=''>import scala.util.control.NonFatal
+</span>21 <span style=''>
+</span>22 <span style=''>/**
+</span>23 <span style=''> * Consumer that will process messages in batch, with guaranteed at-least-once processing
+</span>24 <span style=''> *
+</span>25 <span style=''> * @param consumers consumers
+</span>26 <span style=''> * @param frequency poll frequency
+</span>27 <span style=''> */
+</span>28 <span style=''>abstract class BatchConsumer(consumers: Seq[Consumer[Array[Byte], Array[Byte]]], frequency: Duration)
+</span>29 <span style=''>    extends BaseThreadedConsumer(consumers) {
+</span>30 <span style=''>
+</span>31 <span style=''>  import BatchResult.BatchResult
+</span>32 <span style=''>
+</span>33 <span style=''>  import scala.collection.JavaConverters._
+</span>34 <span style=''>
+</span>35 <span style=''>  private val messages =
+</span>36 <span style=''>    </span><span style='background: #AEF1AE'>Collections.newSetFromMap(
+</span>37 <span style=''></span><span style='background: #AEF1AE'>      new ConcurrentHashMap[ConsumerRecord[Array[Byte], Array[Byte]], java.lang.Boolean]()).asScala</span><span style=''>
+</span>38 <span style=''>
+</span>39 <span style=''>  private val barrier = </span><span style='background: #AEF1AE'>new CyclicBarrier(consumers.length, new ConsumerCoordinator())</span><span style=''>
+</span>40 <span style=''>  private val callback = </span><span style='background: #AEF1AE'>new LogOffsetCommitCallback(logger)</span><span style=''>
+</span>41 <span style=''>
+</span>42 <span style=''>  override protected def createConsumerRunnable(
+</span>43 <span style=''>      id: String,
+</span>44 <span style=''>      consumer: Consumer[Array[Byte], Array[Byte]],
+</span>45 <span style=''>      handler: ConsumerErrorHandler): Runnable = {
+</span>46 <span style=''>    </span><span style='background: #AEF1AE'>new ConsumerRunnable(id, consumer, handler)</span><span style=''>
+</span>47 <span style=''>  }
+</span>48 <span style=''>
+</span>49 <span style=''>  /**
+</span>50 <span style=''>   * Consume a batch of records.
+</span>51 <span style=''>   *
+</span>52 <span style=''>   * The response from this method will determine the continued processing of messages. If `Commit`
+</span>53 <span style=''>   * is returned, the batch is considered complete and won't be presented again. If `Continue` is
+</span>54 <span style=''>   * returned, the batch will be presented again in the future, and more messages will be read off the topic
+</span>55 <span style=''>   * in the meantime. If `Pause` is returned, the batch will be presented again in the future, but
+</span>56 <span style=''>   * no more messages will be read off the topic in the meantime.
+</span>57 <span style=''>   *
+</span>58 <span style=''>   * This method should return in a reasonable amount of time. If too much time is spent processing
+</span>59 <span style=''>   * messages, consumers may be considered inactive and be dropped from processing. See
+</span>60 <span style=''>   * https://kafka.apache.org/26/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html
+</span>61 <span style=''>   *
+</span>62 <span style=''>   * Note: if there is an error committing the batch or something else goes wrong, some messages may
+</span>63 <span style=''>   * be repeated in a subsequent call, regardless of the response from this method
+</span>64 <span style=''>   *
+</span>65 <span style=''>   * @param records records
+</span>66 <span style=''>   * @return commit, continue, or pause
+</span>67 <span style=''>   */
+</span>68 <span style=''>  protected def consume(records: Seq[ConsumerRecord[Array[Byte], Array[Byte]]]): BatchResult
+</span>69 <span style=''>
+</span>70 <span style=''>  /**
+</span>71 <span style=''>   * Invokes a callback on a batch of messages and commits offsets
+</span>72 <span style=''>   */
+</span>73 <span style=''>  class ConsumerCoordinator extends Runnable {
+</span>74 <span style=''>
+</span>75 <span style=''>    private var paused = </span><span style='background: #AEF1AE'>false</span><span style=''>
+</span>76 <span style=''>
+</span>77 <span style=''>    override def run(): Unit = {
+</span>78 <span style=''>      if (</span><span style='background: #AEF1AE'>messages.nonEmpty</span><span style=''>) {
+</span>79 <span style=''>        </span><span style='background: #AEF1AE'>try {
+</span>80 <span style=''></span><span style='background: #AEF1AE'>          consume(messages.toSeq.sortBy(_.offset)) match {
+</span>81 <span style=''></span><span style='background: #AEF1AE'>            case BatchResult.Commit   =&gt; resume(); commit(); messages.clear()
+</span>82 <span style=''></span><span style='background: #AEF1AE'>            case BatchResult.Continue =&gt; resume()
+</span>83 <span style=''></span><span style='background: #AEF1AE'>            case BatchResult.Pause    =&gt; </span><span style='background: #F0ADAD'>pause()</span><span style='background: #AEF1AE'>
+</span>84 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>85 <span style=''></span><span style='background: #AEF1AE'>        } catch {
+</span>86 <span style=''></span><span style='background: #AEF1AE'>          case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.error(&quot;Error processing message batch:&quot;, e)</span><span style='background: #AEF1AE'>
+</span>87 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>88 <span style=''>      }
+</span>89 <span style=''>    }
+</span>90 <span style=''>
+</span>91 <span style=''>    private def commit(): Unit ={
+</span>92 <span style=''>      </span><span style='background: #AEF1AE'>consumers.foreach { c =&gt;
+</span>93 <span style=''></span><span style='background: #AEF1AE'>        try { c.commitAsync(callback) } catch {
+</span>94 <span style=''></span><span style='background: #AEF1AE'>          case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.error(&quot;Error committing offsets:&quot;, e)</span><span style='background: #AEF1AE'>
+</span>95 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>96 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>97 <span style=''>    }
+</span>98 <span style=''>
+</span>99 <span style=''>    private def pause(): Unit = {
+</span>100 <span style=''>      if (</span><span style='background: #F0ADAD'>!paused</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>101 <span style=''></span><span style='background: #F0ADAD'>        consumers.foreach { c =&gt;
+</span>102 <span style=''></span><span style='background: #F0ADAD'>          try { c.pause(c.assignment()) } catch {
+</span>103 <span style=''></span><span style='background: #F0ADAD'>            case NonFatal(e) =&gt; logger.error(&quot;Error pausing consumer:&quot;, e)
+</span>104 <span style=''></span><span style='background: #F0ADAD'>          }
+</span>105 <span style=''></span><span style='background: #F0ADAD'>        }
+</span>106 <span style=''></span><span style='background: #F0ADAD'>        paused = true
+</span>107 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
+</span>108 <span style=''>    }
+</span>109 <span style=''>
+</span>110 <span style=''>    private def resume(): Unit = {
+</span>111 <span style=''>      if (</span><span style='background: #AEF1AE'>paused</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>112 <span style=''></span><span style='background: #F0ADAD'>        consumers.foreach { c =&gt;
+</span>113 <span style=''></span><span style='background: #F0ADAD'>          try { c.resume(c.assignment()) } catch {
+</span>114 <span style=''></span><span style='background: #F0ADAD'>            case NonFatal(e) =&gt; logger.error(&quot;Error resuming consumer:&quot;, e)
+</span>115 <span style=''></span><span style='background: #F0ADAD'>          }
+</span>116 <span style=''></span><span style='background: #F0ADAD'>        }
+</span>117 <span style=''></span><span style='background: #F0ADAD'>        paused = false
+</span>118 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
+</span>119 <span style=''>    }
+</span>120 <span style=''>  }
+</span>121 <span style=''>
+</span>122 <span style=''>  class ConsumerRunnable(id: String, consumer: Consumer[Array[Byte], Array[Byte]], handler: ConsumerErrorHandler)
+</span>123 <span style=''>      extends Runnable {
+</span>124 <span style=''>
+</span>125 <span style=''>    override def run(): Unit = {
+</span>126 <span style=''>      try {
+</span>127 <span style=''>        </span><span style='background: #AEF1AE'>var interrupted = false
+</span>128 <span style=''></span><span style='background: #AEF1AE'>        while (isOpen &amp;&amp; !interrupted) {
+</span>129 <span style=''></span><span style='background: #AEF1AE'>          try {
+</span>130 <span style=''></span><span style='background: #AEF1AE'>            val result = KafkaConsumerVersions.poll(consumer, frequency)
+</span>131 <span style=''></span><span style='background: #AEF1AE'>            lazy val topics = result.partitions.asScala.map(tp =&gt; s&quot;[${tp.topic}:${tp.partition}]&quot;).mkString(&quot;,&quot;)
+</span>132 <span style=''></span><span style='background: #AEF1AE'>            logger.debug(s&quot;Consumer [$id] poll received ${result.count()} records for $topics&quot;)
+</span>133 <span style=''></span><span style='background: #AEF1AE'>            if (!result.isEmpty) {
+</span>134 <span style=''></span><span style='background: #AEF1AE'>              val records = result.iterator()
+</span>135 <span style=''></span><span style='background: #AEF1AE'>              while (records.hasNext) {
+</span>136 <span style=''></span><span style='background: #AEF1AE'>                messages += records.next()
+</span>137 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>138 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Consumer [$id] finished processing ${result.count()} records from topic $topics&quot;)
+</span>139 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>140 <span style=''></span><span style='background: #AEF1AE'>          } catch {
+</span>141 <span style=''></span><span style='background: #AEF1AE'>            case _: WakeupException | _: InterruptException | _: InterruptedException =&gt; </span><span style='background: #F0ADAD'>interrupted = true</span><span style='background: #AEF1AE'>
+</span>142 <span style=''></span><span style='background: #AEF1AE'>            case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>if (!handler.handle(id, e)) { interrupted = true }</span><span style='background: #AEF1AE'>
+</span>143 <span style=''></span><span style='background: #AEF1AE'>          } finally {
+</span>144 <span style=''></span><span style='background: #AEF1AE'>            if (!interrupted) {
+</span>145 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Consumer [$id] waiting on barrier&quot;)
+</span>146 <span style=''></span><span style='background: #AEF1AE'>              try { barrier.await() } catch {
+</span>147 <span style=''></span><span style='background: #AEF1AE'>                case _: BrokenBarrierException | _: InterruptedException =&gt; </span><span style='background: #F0ADAD'>interrupted = true</span><span style='background: #AEF1AE'>
+</span>148 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>149 <span style=''></span><span style='background: #AEF1AE'>              logger.trace(s&quot;Consumer [$id] passed barrier&quot;)
+</span>150 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>151 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>152 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>153 <span style=''>      } finally {
+</span>154 <span style=''>        </span><span style='background: #AEF1AE'>try { consumer.close() } catch {
+</span>155 <span style=''></span><span style='background: #AEF1AE'>          case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.warn(s&quot;Error calling close on consumer: &quot;, e)</span><span style='background: #AEF1AE'>
+</span>156 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>157 <span style=''>      }
+</span>158 <span style=''>    }
+</span>159 <span style=''>  }
+</span>160 <span style=''>}
+</span>161 <span style=''>
+</span>162 <span style=''>object BatchConsumer {
+</span>163 <span style=''>  object BatchResult extends Enumeration {
+</span>164 <span style=''>    type BatchResult = Value
+</span>165 <span style=''>    val Commit, Continue, Pause = </span><span style='background: #AEF1AE'>Value</span><span style=''>
+</span>166 <span style=''>  }
+</span>167 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          36
+        </td>
+        <td>
+          94440
+        </td>
+        <td>
+          1459
+          -
+          1577
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collections.newSetFromMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Collections.newSetFromMap[org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]](new java.util.concurrent.ConcurrentHashMap[org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]],Boolean]())
+        </td>
+      </tr><tr>
+        <td>
+          37
+        </td>
+        <td>
+          94439
+        </td>
+        <td>
+          1492
+          -
+          1576
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.ConcurrentHashMap[org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]],Boolean]()
+        </td>
+      </tr><tr>
+        <td>
+          37
+        </td>
+        <td>
+          94441
+        </td>
+        <td>
+          1459
+          -
+          1585
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsScala.asScala
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaSetConverter[org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]](java.util.Collections.newSetFromMap[org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]](new java.util.concurrent.ConcurrentHashMap[org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]],Boolean]())).asScala
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          94443
+        </td>
+        <td>
+          1647
+          -
+          1672
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerCoordinator.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new BatchConsumer.this.ConsumerCoordinator()
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          94442
+        </td>
+        <td>
+          1629
+          -
+          1645
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SeqLike.length
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.consumers.length
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          94444
+        </td>
+        <td>
+          1611
+          -
+          1673
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.CyclicBarrier.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.CyclicBarrier(BatchConsumer.this.consumers.length, new BatchConsumer.this.ConsumerCoordinator())
+        </td>
+      </tr><tr>
+        <td>
+          40
+        </td>
+        <td>
+          94445
+        </td>
+        <td>
+          1699
+          -
+          1734
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.ThreadedConsumer.LogOffsetCommitCallback.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.kafka.consumer.ThreadedConsumer.LogOffsetCommitCallback(BatchConsumer.this.logger)
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          94446
+        </td>
+        <td>
+          1910
+          -
+          1953
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerRunnable.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new BatchConsumer.this.ConsumerRunnable(id, consumer, handler)
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          94447
+        </td>
+        <td>
+          3276
+          -
+          3281
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          94448
+        </td>
+        <td>
+          3326
+          -
+          3343
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.nonEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.messages.nonEmpty
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          94465
+        </td>
+        <td>
+          3322
+          -
+          3322
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          94464
+        </td>
+        <td>
+          3322
+          -
+          3322
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          94463
+        </td>
+        <td>
+          3355
+          -
+          3717
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  BatchConsumer.this.consume(BatchConsumer.this.messages.toSeq.sortBy[Long](((x$1: org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]) =&gt; x$1.offset()))(math.this.Ordering.Long)) match {
+    case org.locationtech.geomesa.kafka.consumer.BatchConsumer.BatchResult.Commit =&gt; {
+      ConsumerCoordinator.this.resume();
+      ConsumerCoordinator.this.commit();
+      BatchConsumer.this.messages.clear()
+    }
+    case org.locationtech.geomesa.kafka.consumer.BatchConsumer.BatchResult.Continue =&gt; ConsumerCoordinator.this.resume()
+    case org.locationtech.geomesa.kafka.consumer.BatchConsumer.BatchResult.Pause =&gt; ConsumerCoordinator.this.pause()
+  }
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (BatchConsumer.this.logger.underlying.isErrorEnabled())
+    BatchConsumer.this.logger.underlying.error(&quot;Error processing message batch:&quot;, e)
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          94449
+        </td>
+        <td>
+          3401
+          -
+          3409
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecord.offset
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1.offset()
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          94451
+        </td>
+        <td>
+          3379
+          -
+          3410
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.SeqLike.sortBy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.messages.toSeq.sortBy[Long](((x$1: org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]) =&gt; x$1.offset()))(math.this.Ordering.Long)
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          94450
+        </td>
+        <td>
+          3400
+          -
+          3400
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.math.Ordering.Long
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          math.this.Ordering.Long
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          94452
+        </td>
+        <td>
+          3371
+          -
+          3411
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.consume
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.consume(BatchConsumer.this.messages.toSeq.sortBy[Long](((x$1: org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]) =&gt; x$1.offset()))(math.this.Ordering.Long))
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          94461
+        </td>
+        <td>
+          3371
+          -
+          3608
+        </td>
+        <td>
+          Match
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.consume(BatchConsumer.this.messages.toSeq.sortBy[Long](((x$1: org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]) =&gt; x$1.offset()))(math.this.Ordering.Long)) match {
+  case org.locationtech.geomesa.kafka.consumer.BatchConsumer.BatchResult.Commit =&gt; {
+    ConsumerCoordinator.this.resume();
+    ConsumerCoordinator.this.commit();
+    BatchConsumer.this.messages.clear()
+  }
+  case org.locationtech.geomesa.kafka.consumer.BatchConsumer.BatchResult.Continue =&gt; ConsumerCoordinator.this.resume()
+  case org.locationtech.geomesa.kafka.consumer.BatchConsumer.BatchResult.Pause =&gt; ConsumerCoordinator.this.pause()
+}
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          94453
+        </td>
+        <td>
+          3461
+          -
+          3469
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerCoordinator.resume
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ConsumerCoordinator.this.resume()
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          94455
+        </td>
+        <td>
+          3481
+          -
+          3497
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.SetLike.clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.messages.clear()
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          94454
+        </td>
+        <td>
+          3471
+          -
+          3479
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerCoordinator.commit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ConsumerCoordinator.this.commit()
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          94456
+        </td>
+        <td>
+          3458
+          -
+          3497
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  ConsumerCoordinator.this.resume();
+  ConsumerCoordinator.this.commit();
+  BatchConsumer.this.messages.clear()
+}
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          94457
+        </td>
+        <td>
+          3539
+          -
+          3547
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerCoordinator.resume
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ConsumerCoordinator.this.resume()
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          94458
+        </td>
+        <td>
+          3539
+          -
+          3547
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerCoordinator.resume
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ConsumerCoordinator.this.resume()
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          94459
+        </td>
+        <td>
+          3589
+          -
+          3596
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerCoordinator.pause
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ConsumerCoordinator.this.pause()
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          94460
+        </td>
+        <td>
+          3589
+          -
+          3596
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerCoordinator.pause
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ConsumerCoordinator.this.pause()
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          94462
+        </td>
+        <td>
+          3657
+          -
+          3707
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (BatchConsumer.this.logger.underlying.isErrorEnabled())
+  BatchConsumer.this.logger.underlying.error(&quot;Error processing message batch:&quot;, e)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          94470
+        </td>
+        <td>
+          3773
+          -
+          3938
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.consumers.foreach[Unit](((c: org.apache.kafka.clients.consumer.Consumer[Array[Byte],Array[Byte]]) =&gt; try {
+  c.commitAsync(BatchConsumer.this.callback)
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (BatchConsumer.this.logger.underlying.isErrorEnabled())
+    BatchConsumer.this.logger.underlying.error(&quot;Error committing offsets:&quot;, e)
+  else
+    (): Unit)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          94467
+        </td>
+        <td>
+          3812
+          -
+          3835
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.commitAsync
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          c.commitAsync(BatchConsumer.this.callback)
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          94466
+        </td>
+        <td>
+          3826
+          -
+          3834
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.callback
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.callback
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          94468
+        </td>
+        <td>
+          3812
+          -
+          3835
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.commitAsync
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          c.commitAsync(BatchConsumer.this.callback)
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          94469
+        </td>
+        <td>
+          3876
+          -
+          3920
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (BatchConsumer.this.logger.underlying.isErrorEnabled())
+  BatchConsumer.this.logger.underlying.error(&quot;Error committing offsets:&quot;, e)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          94471
+        </td>
+        <td>
+          3990
+          -
+          3997
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ConsumerCoordinator.this.paused.unary_!
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          94479
+        </td>
+        <td>
+          3986
+          -
+          3986
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          94478
+        </td>
+        <td>
+          3999
+          -
+          4210
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  BatchConsumer.this.consumers.foreach[Unit](((c: org.apache.kafka.clients.consumer.Consumer[Array[Byte],Array[Byte]]) =&gt; try {
+    c.pause(c.assignment())
+  } catch {
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (BatchConsumer.this.logger.underlying.isErrorEnabled())
+      BatchConsumer.this.logger.underlying.error(&quot;Error pausing consumer:&quot;, e)
+    else
+      (): Unit)
+  }));
+  ConsumerCoordinator.this.paused_=(true)
+}
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          94480
+        </td>
+        <td>
+          3986
+          -
+          3986
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          94476
+        </td>
+        <td>
+          4009
+          -
+          4180
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          BatchConsumer.this.consumers.foreach[Unit](((c: org.apache.kafka.clients.consumer.Consumer[Array[Byte],Array[Byte]]) =&gt; try {
+  c.pause(c.assignment())
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (BatchConsumer.this.logger.underlying.isErrorEnabled())
+    BatchConsumer.this.logger.underlying.error(&quot;Error pausing consumer:&quot;, e)
+  else
+    (): Unit)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          94473
+        </td>
+        <td>
+          4050
+          -
+          4073
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.pause
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          c.pause(c.assignment())
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          94472
+        </td>
+        <td>
+          4058
+          -
+          4072
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.assignment
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          c.assignment()
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          94474
+        </td>
+        <td>
+          4050
+          -
+          4073
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.pause
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          c.pause(c.assignment())
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          94475
+        </td>
+        <td>
+          4116
+          -
+          4158
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (BatchConsumer.this.logger.underlying.isErrorEnabled())
+  BatchConsumer.this.logger.underlying.error(&quot;Error pausing consumer:&quot;, e)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          106
+        </td>
+        <td>
+          94477
+        </td>
+        <td>
+          4189
+          -
+          4202
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerCoordinator.paused_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ConsumerCoordinator.this.paused_=(true)
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          94481
+        </td>
+        <td>
+          4263
+          -
+          4269
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerCoordinator.paused
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ConsumerCoordinator.this.paused
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          94489
+        </td>
+        <td>
+          4259
+          -
+          4259
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          94488
+        </td>
+        <td>
+          4271
+          -
+          4485
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  BatchConsumer.this.consumers.foreach[Unit](((c: org.apache.kafka.clients.consumer.Consumer[Array[Byte],Array[Byte]]) =&gt; try {
+    c.resume(c.assignment())
+  } catch {
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (BatchConsumer.this.logger.underlying.isErrorEnabled())
+      BatchConsumer.this.logger.underlying.error(&quot;Error resuming consumer:&quot;, e)
+    else
+      (): Unit)
+  }));
+  ConsumerCoordinator.this.paused_=(false)
+}
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          94490
+        </td>
+        <td>
+          4259
+          -
+          4259
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          94486
+        </td>
+        <td>
+          4281
+          -
+          4454
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          BatchConsumer.this.consumers.foreach[Unit](((c: org.apache.kafka.clients.consumer.Consumer[Array[Byte],Array[Byte]]) =&gt; try {
+  c.resume(c.assignment())
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (BatchConsumer.this.logger.underlying.isErrorEnabled())
+    BatchConsumer.this.logger.underlying.error(&quot;Error resuming consumer:&quot;, e)
+  else
+    (): Unit)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          113
+        </td>
+        <td>
+          94483
+        </td>
+        <td>
+          4322
+          -
+          4346
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.resume
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          c.resume(c.assignment())
+        </td>
+      </tr><tr>
+        <td>
+          113
+        </td>
+        <td>
+          94482
+        </td>
+        <td>
+          4331
+          -
+          4345
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.assignment
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          c.assignment()
+        </td>
+      </tr><tr>
+        <td>
+          113
+        </td>
+        <td>
+          94484
+        </td>
+        <td>
+          4322
+          -
+          4346
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.resume
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          c.resume(c.assignment())
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          94485
+        </td>
+        <td>
+          4389
+          -
+          4432
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (BatchConsumer.this.logger.underlying.isErrorEnabled())
+  BatchConsumer.this.logger.underlying.error(&quot;Error resuming consumer:&quot;, e)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          94487
+        </td>
+        <td>
+          4463
+          -
+          4477
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerCoordinator.paused_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ConsumerCoordinator.this.paused_=(false)
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          94532
+        </td>
+        <td>
+          4690
+          -
+          5942
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  var interrupted: Boolean = false;
+  while$2(){
+    if (BatchConsumer.this.isOpen.&amp;&amp;(interrupted.unary_!))
+      {
+        try {
+          val result: org.apache.kafka.clients.consumer.ConsumerRecords[Array[Byte],Array[Byte]] = org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.poll[Array[Byte], Array[Byte]](ConsumerRunnable.this.consumer, BatchConsumer.this.frequency);
+          &lt;stable&gt; &lt;accessor&gt; lazy val topics: String = scala.collection.JavaConverters.asScalaSetConverter[org.apache.kafka.common.TopicPartition](result.partitions()).asScala.map[String, scala.collection.mutable.Set[String]](((tp: org.apache.kafka.common.TopicPartition) =&gt; scala.StringContext.apply(&quot;[&quot;, &quot;:&quot;, &quot;]&quot;).s(tp.topic(), tp.partition())))(mutable.this.Set.canBuildFrom[String]).mkString(&quot;,&quot;);
+          (if (BatchConsumer.this.logger.underlying.isDebugEnabled())
+            BatchConsumer.this.logger.underlying.debug(&quot;Consumer [{}] poll received {} records for {}&quot;, (ConsumerRunnable.this.id: AnyRef), result.count().asInstanceOf[AnyRef], (topics: AnyRef))
+          else
+            (): Unit);
+          if (result.isEmpty().unary_!)
+            {
+              val records: java.util.Iterator[org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]] = result.iterator();
+              while$1(){
+                if (records.hasNext())
+                  {
+                    BatchConsumer.this.messages.+=(records.next());
+                    while$1()
+                  }
+                else
+                  ()
+              };
+              (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+                BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] finished processing {} records from topic {}&quot;, (ConsumerRunnable.this.id: AnyRef), result.count().asInstanceOf[AnyRef], (topics: AnyRef))
+              else
+                (): Unit)
+            }
+          else
+            ()
+        } catch {
+          case ((_: org.apache.kafka.common.errors.WakeupException)| (_: org.apache.kafka.common.errors.InterruptException)| (_: InterruptedException)) =&gt; interrupted = true
+          case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; if (ConsumerRunnable.this.handler.handle(ConsumerRunnable.this.id, e).unary_!)
+            interrupted = true
+          else
+            ()
+        } finally if (interrupted.unary_!)
+          {
+            (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+              BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] waiting on barrier&quot;, (ConsumerRunnable.this.id: AnyRef))
+            else
+              (): Unit);
+            try {
+              BatchConsumer.this.barrier.await()
+            } catch {
+              case ((_: java.util.concurrent.BrokenBarrierException)| (_: InterruptedException)) =&gt; interrupted = true
+            };
+            (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+              BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] passed barrier&quot;, (ConsumerRunnable.this.id: AnyRef))
+            else
+              (): Unit)
+          }
+        else
+          ();
+        while$2()
+      }
+    else
+      ()
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          94491
+        </td>
+        <td>
+          4708
+          -
+          4713
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          94493
+        </td>
+        <td>
+          4729
+          -
+          4751
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.isOpen.&amp;&amp;(interrupted.unary_!)
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          94492
+        </td>
+        <td>
+          4739
+          -
+          4751
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          interrupted.unary_!
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          94529
+        </td>
+        <td>
+          4765
+          -
+          5932
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  try {
+    val result: org.apache.kafka.clients.consumer.ConsumerRecords[Array[Byte],Array[Byte]] = org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.poll[Array[Byte], Array[Byte]](ConsumerRunnable.this.consumer, BatchConsumer.this.frequency);
+    &lt;stable&gt; &lt;accessor&gt; lazy val topics: String = scala.collection.JavaConverters.asScalaSetConverter[org.apache.kafka.common.TopicPartition](result.partitions()).asScala.map[String, scala.collection.mutable.Set[String]](((tp: org.apache.kafka.common.TopicPartition) =&gt; scala.StringContext.apply(&quot;[&quot;, &quot;:&quot;, &quot;]&quot;).s(tp.topic(), tp.partition())))(mutable.this.Set.canBuildFrom[String]).mkString(&quot;,&quot;);
+    (if (BatchConsumer.this.logger.underlying.isDebugEnabled())
+      BatchConsumer.this.logger.underlying.debug(&quot;Consumer [{}] poll received {} records for {}&quot;, (ConsumerRunnable.this.id: AnyRef), result.count().asInstanceOf[AnyRef], (topics: AnyRef))
+    else
+      (): Unit);
+    if (result.isEmpty().unary_!)
+      {
+        val records: java.util.Iterator[org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]] = result.iterator();
+        while$1(){
+          if (records.hasNext())
+            {
+              BatchConsumer.this.messages.+=(records.next());
+              while$1()
+            }
+          else
+            ()
+        };
+        (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+          BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] finished processing {} records from topic {}&quot;, (ConsumerRunnable.this.id: AnyRef), result.count().asInstanceOf[AnyRef], (topics: AnyRef))
+        else
+          (): Unit)
+      }
+    else
+      ()
+  } catch {
+    case ((_: org.apache.kafka.common.errors.WakeupException)| (_: org.apache.kafka.common.errors.InterruptException)| (_: InterruptedException)) =&gt; interrupted = true
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; if (ConsumerRunnable.this.handler.handle(ConsumerRunnable.this.id, e).unary_!)
+      interrupted = true
+    else
+      ()
+  } finally if (interrupted.unary_!)
+    {
+      (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+        BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] waiting on barrier&quot;, (ConsumerRunnable.this.id: AnyRef))
+      else
+        (): Unit);
+      try {
+        BatchConsumer.this.barrier.await()
+      } catch {
+        case ((_: java.util.concurrent.BrokenBarrierException)| (_: InterruptedException)) =&gt; interrupted = true
+      };
+      (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+        BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] passed barrier&quot;, (ConsumerRunnable.this.id: AnyRef))
+      else
+        (): Unit)
+    }
+  else
+    ();
+  while$2()
+}
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          94531
+        </td>
+        <td>
+          4722
+          -
+          4722
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          94530
+        </td>
+        <td>
+          4722
+          -
+          4722
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          94509
+        </td>
+        <td>
+          4783
+          -
+          5358
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val result: org.apache.kafka.clients.consumer.ConsumerRecords[Array[Byte],Array[Byte]] = org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.poll[Array[Byte], Array[Byte]](ConsumerRunnable.this.consumer, BatchConsumer.this.frequency);
+  &lt;stable&gt; &lt;accessor&gt; lazy val topics: String = scala.collection.JavaConverters.asScalaSetConverter[org.apache.kafka.common.TopicPartition](result.partitions()).asScala.map[String, scala.collection.mutable.Set[String]](((tp: org.apache.kafka.common.TopicPartition) =&gt; scala.StringContext.apply(&quot;[&quot;, &quot;:&quot;, &quot;]&quot;).s(tp.topic(), tp.partition())))(mutable.this.Set.canBuildFrom[String]).mkString(&quot;,&quot;);
+  (if (BatchConsumer.this.logger.underlying.isDebugEnabled())
+    BatchConsumer.this.logger.underlying.debug(&quot;Consumer [{}] poll received {} records for {}&quot;, (ConsumerRunnable.this.id: AnyRef), result.count().asInstanceOf[AnyRef], (topics: AnyRef))
+  else
+    (): Unit);
+  if (result.isEmpty().unary_!)
+    {
+      val records: java.util.Iterator[org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]] = result.iterator();
+      while$1(){
+        if (records.hasNext())
+          {
+            BatchConsumer.this.messages.+=(records.next());
+            while$1()
+          }
+        else
+          ()
+      };
+      (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+        BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] finished processing {} records from topic {}&quot;, (ConsumerRunnable.this.id: AnyRef), result.count().asInstanceOf[AnyRef], (topics: AnyRef))
+      else
+        (): Unit)
+    }
+  else
+    ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          94528
+        </td>
+        <td>
+          4765
+          -
+          4765
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerRunnable.while$2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$2()
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          94495
+        </td>
+        <td>
+          4833
+          -
+          4842
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.frequency
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.frequency
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          94494
+        </td>
+        <td>
+          4823
+          -
+          4831
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerRunnable.consumer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ConsumerRunnable.this.consumer
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          94496
+        </td>
+        <td>
+          4796
+          -
+          4843
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.poll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions.poll[Array[Byte], Array[Byte]](ConsumerRunnable.this.consumer, BatchConsumer.this.frequency)
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          94497
+        </td>
+        <td>
+          5070
+          -
+          5085
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          result.isEmpty().unary_!
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          94507
+        </td>
+        <td>
+          5066
+          -
+          5066
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          94506
+        </td>
+        <td>
+          5087
+          -
+          5358
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val records: java.util.Iterator[org.apache.kafka.clients.consumer.ConsumerRecord[Array[Byte],Array[Byte]]] = result.iterator();
+  while$1(){
+    if (records.hasNext())
+      {
+        BatchConsumer.this.messages.+=(records.next());
+        while$1()
+      }
+    else
+      ()
+  };
+  (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+    BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] finished processing {} records from topic {}&quot;, (ConsumerRunnable.this.id: AnyRef), result.count().asInstanceOf[AnyRef], (topics: AnyRef))
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          94508
+        </td>
+        <td>
+          5066
+          -
+          5066
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          94498
+        </td>
+        <td>
+          5117
+          -
+          5134
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.ConsumerRecords.iterator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          result.iterator()
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          94499
+        </td>
+        <td>
+          5156
+          -
+          5171
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Iterator.hasNext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          records.hasNext()
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          94503
+        </td>
+        <td>
+          5191
+          -
+          5217
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  BatchConsumer.this.messages.+=(records.next());
+  while$1()
+}
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          94505
+        </td>
+        <td>
+          5149
+          -
+          5149
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          94504
+        </td>
+        <td>
+          5149
+          -
+          5149
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          94501
+        </td>
+        <td>
+          5191
+          -
+          5217
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.SetLike.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.messages.+=(records.next())
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          94500
+        </td>
+        <td>
+          5203
+          -
+          5217
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Iterator.next
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          records.next()
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          94502
+        </td>
+        <td>
+          5200
+          -
+          5200
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerRunnable.while$1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$1()
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          94511
+        </td>
+        <td>
+          5468
+          -
+          5486
+        </td>
+        <td>
+          Assign
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          interrupted = true
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          94510
+        </td>
+        <td>
+          5482
+          -
+          5486
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          94513
+        </td>
+        <td>
+          5523
+          -
+          5545
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ConsumerRunnable.this.handler.handle(ConsumerRunnable.this.id, e).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          94512
+        </td>
+        <td>
+          5539
+          -
+          5541
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.kafka.consumer.BatchConsumer.ConsumerRunnable.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ConsumerRunnable.this.id
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          94515
+        </td>
+        <td>
+          5549
+          -
+          5567
+        </td>
+        <td>
+          Assign
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          interrupted = true
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          94514
+        </td>
+        <td>
+          5563
+          -
+          5567
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          94517
+        </td>
+        <td>
+          5519
+          -
+          5519
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          94516
+        </td>
+        <td>
+          5519
+          -
+          5519
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          94518
+        </td>
+        <td>
+          5519
+          -
+          5569
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          if (ConsumerRunnable.this.handler.handle(ConsumerRunnable.this.id, e).unary_!)
+  interrupted = true
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          94519
+        </td>
+        <td>
+          5608
+          -
+          5620
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          interrupted.unary_!
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          94525
+        </td>
+        <td>
+          5604
+          -
+          5604
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          94524
+        </td>
+        <td>
+          5622
+          -
+          5920
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+    BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] waiting on barrier&quot;, (ConsumerRunnable.this.id: AnyRef))
+  else
+    (): Unit);
+  try {
+    BatchConsumer.this.barrier.await()
+  } catch {
+    case ((_: java.util.concurrent.BrokenBarrierException)| (_: InterruptedException)) =&gt; interrupted = true
+  };
+  (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+    BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] passed barrier&quot;, (ConsumerRunnable.this.id: AnyRef))
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          94527
+        </td>
+        <td>
+          5604
+          -
+          5920
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (interrupted.unary_!)
+  {
+    (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+      BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] waiting on barrier&quot;, (ConsumerRunnable.this.id: AnyRef))
+    else
+      (): Unit);
+    try {
+      BatchConsumer.this.barrier.await()
+    } catch {
+      case ((_: java.util.concurrent.BrokenBarrierException)| (_: InterruptedException)) =&gt; interrupted = true
+    };
+    (if (BatchConsumer.this.logger.underlying.isTraceEnabled())
+      BatchConsumer.this.logger.underlying.trace(&quot;Consumer [{}] passed barrier&quot;, (ConsumerRunnable.this.id: AnyRef))
+    else
+      (): Unit)
+  }
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          94526
+        </td>
+        <td>
+          5604
+          -
+          5604
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          94521
+        </td>
+        <td>
+          5709
+          -
+          5724
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.concurrent.CyclicBarrier.await
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.barrier.await()
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          94520
+        </td>
+        <td>
+          5709
+          -
+          5724
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.CyclicBarrier.await
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchConsumer.this.barrier.await()
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          94523
+        </td>
+        <td>
+          5811
+          -
+          5829
+        </td>
+        <td>
+          Assign
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          interrupted = true
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          94522
+        </td>
+        <td>
+          5825
+          -
+          5829
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          94533
+        </td>
+        <td>
+          5975
+          -
+          5991
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ConsumerRunnable.this.consumer.close()
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          94534
+        </td>
+        <td>
+          5975
+          -
+          5991
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.kafka.clients.consumer.Consumer.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ConsumerRunnable.this.consumer.close()
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          94536
+        </td>
+        <td>
+          5969
+          -
+          6094
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  ConsumerRunnable.this.consumer.close()
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (BatchConsumer.this.logger.underlying.isWarnEnabled())
+    BatchConsumer.this.logger.underlying.warn(scala.StringContext.apply(&quot;Error calling close on consumer: &quot;).s(), e)
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          94535
+        </td>
+        <td>
+          6032
+          -
+          6084
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (BatchConsumer.this.logger.underlying.isWarnEnabled())
+  BatchConsumer.this.logger.underlying.warn(scala.StringContext.apply(&quot;Error calling close on consumer: &quot;).s(), e)
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          94537
+        </td>
+        <td>
+          6245
+          -
+          6245
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Enumeration.Value
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchResult.this.Value
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          94539
+        </td>
+        <td>
+          6245
+          -
+          6250
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Enumeration.Value
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchResult.this.Value
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          94538
+        </td>
+        <td>
+          6245
+          -
+          6245
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Enumeration.Value
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          BatchResult.this.Value
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>

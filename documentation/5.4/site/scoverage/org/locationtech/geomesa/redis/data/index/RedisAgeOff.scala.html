@@ -1,0 +1,6849 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/redis/data/index/RedisAgeOff.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.redis.data.index
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.StrictLogging
+</span>12 <span style=''>import org.geotools.api.data.Transaction
+</span>13 <span style=''>import org.geotools.api.feature.simple.SimpleFeatureType
+</span>14 <span style=''>import org.geotools.api.filter.identity.Identifier
+</span>15 <span style=''>import org.locationtech.geomesa.filter.FilterHelper
+</span>16 <span style=''>import org.locationtech.geomesa.redis.data.index.RedisAgeOff.{AgeOffExecutor, AgeOffWriter}
+</span>17 <span style=''>import org.locationtech.geomesa.redis.data.util.RedisLocking
+</span>18 <span style=''>import org.locationtech.geomesa.redis.data.{CloseableJedisCommands, RedisDataStore, RedisSystemProperties}
+</span>19 <span style=''>import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
+</span>20 <span style=''>import org.locationtech.geomesa.utils.io.WithClose
+</span>21 <span style=''>import redis.clients.jedis.{Jedis, UnifiedJedis}
+</span>22 <span style=''>import redis.clients.jedis.params.ZAddParams
+</span>23 <span style=''>import redis.clients.jedis.util.Pool
+</span>24 <span style=''>
+</span>25 <span style=''>import java.io.{Closeable, Flushable}
+</span>26 <span style=''>import java.nio.charset.StandardCharsets
+</span>27 <span style=''>import java.util.Collections
+</span>28 <span style=''>import java.util.concurrent.{Executors, ScheduledFuture, TimeUnit}
+</span>29 <span style=''>import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+</span>30 <span style=''>import scala.concurrent.duration.Duration
+</span>31 <span style=''>import scala.util.control.NonFatal
+</span>32 <span style=''>
+</span>33 <span style=''>/**
+</span>34 <span style=''>  * Tracks and deletes features based on a time-to-live.
+</span>35 <span style=''>  *
+</span>36 <span style=''>  * TTLs are stored in a separate sorted set for each feature type, with the score of the set being the
+</span>37 <span style=''>  * system time in millis when the feature should be expired. We do a two-step process to expire features:
+</span>38 <span style=''>  *
+</span>39 <span style=''>  * 1. Scan and remove the TTL set by score range, which will return all the feature IDs for expired features
+</span>40 <span style=''>  * 2. Remove the features from the index tables based on the feature ID
+</span>41 <span style=''>  *
+</span>42 <span style=''>  * @param ds data store
+</span>43 <span style=''>  */
+</span>44 <span style=''>class RedisAgeOff(ds: RedisDataStore) extends Closeable {
+</span>45 <span style=''>
+</span>46 <span style=''>  import RedisAgeOff.key
+</span>47 <span style=''>  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+</span>48 <span style=''>
+</span>49 <span style=''>  private val executor = </span><span style='background: #AEF1AE'>RedisSystemProperties.AgeOffInterval.toDuration.collect {
+</span>50 <span style=''></span><span style='background: #AEF1AE'>    case i if i.isFinite =&gt; new AgeOffExecutor(ds, i)
+</span>51 <span style=''></span><span style='background: #AEF1AE'>  }</span><span style=''>
+</span>52 <span style=''>
+</span>53 <span style=''>  /**
+</span>54 <span style=''>    * Start the age-off for a feature type
+</span>55 <span style=''>    *
+</span>56 <span style=''>    * @param sft simple feature type
+</span>57 <span style=''>    */
+</span>58 <span style=''>  def add(sft: SimpleFeatureType): Unit = {
+</span>59 <span style=''>    if (</span><span style='background: #AEF1AE'>sft.isFeatureExpirationEnabled</span><span style=''>) {
+</span>60 <span style=''>      </span><span style='background: #AEF1AE'>executor.foreach(_.schedule(sft.getTypeName))</span><span style=''>
+</span>61 <span style=''>    }
+</span>62 <span style=''>  }
+</span>63 <span style=''>
+</span>64 <span style=''>  /**
+</span>65 <span style=''>    * Update the age-off for a modified feature type
+</span>66 <span style=''>    *
+</span>67 <span style=''>    * @param sft modified simple feature type
+</span>68 <span style=''>    * @param previous previous simple feature type
+</span>69 <span style=''>    */
+</span>70 <span style=''>  def update(sft: SimpleFeatureType, previous: SimpleFeatureType): Unit = {
+</span>71 <span style=''>    if (</span><span style='background: #F0ADAD'>previous.isFeatureExpirationEnabled</span><span style=''>) {
+</span>72 <span style=''>      </span><span style='background: #F0ADAD'>if (!sft.isFeatureExpirationEnabled) {
+</span>73 <span style=''></span><span style='background: #F0ADAD'>        remove(previous)
+</span>74 <span style=''></span><span style='background: #F0ADAD'>      } else if (sft.getTypeName != previous.getTypeName) {
+</span>75 <span style=''></span><span style='background: #F0ADAD'>        executor.foreach(_.cancel(previous.getTypeName))
+</span>76 <span style=''></span><span style='background: #F0ADAD'>        // rename the ttl table to match the new type name
+</span>77 <span style=''></span><span style='background: #F0ADAD'>        WithClose(ds.connection.getResource)(_.renamenx(key(ds, previous.getTypeName), key(ds, sft.getTypeName)))
+</span>78 <span style=''></span><span style='background: #F0ADAD'>        executor.foreach(_.schedule(sft.getTypeName))
+</span>79 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
+</span>80 <span style=''>    } else </span><span style='background: #F0ADAD'>if (sft.isFeatureExpirationEnabled) {
+</span>81 <span style=''></span><span style='background: #F0ADAD'>      executor.foreach(_.schedule(sft.getTypeName))
+</span>82 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''>
+</span>83 <span style=''>  }
+</span>84 <span style=''>
+</span>85 <span style=''>  /**
+</span>86 <span style=''>    * Remove the age-off for a feature type
+</span>87 <span style=''>    *
+</span>88 <span style=''>    * @param sft simple feature type
+</span>89 <span style=''>    */
+</span>90 <span style=''>  def remove(sft: SimpleFeatureType): Unit = {
+</span>91 <span style=''>    if (</span><span style='background: #AEF1AE'>sft.isFeatureExpirationEnabled</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>92 <span style=''></span><span style='background: #AEF1AE'>      executor.foreach(_.cancel(sft.getTypeName))
+</span>93 <span style=''></span><span style='background: #AEF1AE'>      WithClose(ds.connection.getResource)(_.del(key(ds, sft.getTypeName)))
+</span>94 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>95 <span style=''>  }
+</span>96 <span style=''>
+</span>97 <span style=''>  /**
+</span>98 <span style=''>    * Gets a writer to track ttl for features
+</span>99 <span style=''>    *
+</span>100 <span style=''>    * @param sft simple feature type
+</span>101 <span style=''>    * @return
+</span>102 <span style=''>    */
+</span>103 <span style=''>  def writer(sft: SimpleFeatureType): Option[AgeOffWriter] = {
+</span>104 <span style=''>    if (</span><span style='background: #AEF1AE'>sft.isFeatureExpirationEnabled</span><span style=''>) {
+</span>105 <span style=''>      </span><span style='background: #AEF1AE'>Some(new AgeOffWriter(ds.connection, key(ds, sft.getTypeName)))</span><span style=''>
+</span>106 <span style=''>    } else {
+</span>107 <span style=''>      </span><span style='background: #AEF1AE'>None</span><span style=''>
+</span>108 <span style=''>    }
+</span>109 <span style=''>  }
+</span>110 <span style=''>
+</span>111 <span style=''>  override def close(): Unit = </span><span style='background: #AEF1AE'>executor.foreach(_.close())</span><span style=''>
+</span>112 <span style=''>}
+</span>113 <span style=''>
+</span>114 <span style=''>object RedisAgeOff extends StrictLogging {
+</span>115 <span style=''>
+</span>116 <span style=''>  import redis.clients.jedis.resps.{Tuple =&gt; JedisTuple}
+</span>117 <span style=''>
+</span>118 <span style=''>  val TtlUserDataKey = </span><span style='background: #AEF1AE'>&quot;t&quot;</span><span style=''> // the user data is cleared, so no chance of key collision - save space with a short key
+</span>119 <span style=''>
+</span>120 <span style=''>  val AgeOffLockTimeout: SystemProperty = </span><span style='background: #AEF1AE'>SystemProperty(&quot;geomesa.redis.age.off.lock.timeout&quot;, &quot;1 second&quot;)</span><span style=''>
+</span>121 <span style=''>
+</span>122 <span style=''>  /**
+</span>123 <span style=''>    * Initialize the age-off for the data store
+</span>124 <span style=''>    *
+</span>125 <span style=''>    * @param ds data store
+</span>126 <span style=''>    */
+</span>127 <span style=''>  def init(ds: RedisDataStore): Unit = </span><span style='background: #AEF1AE'>ds.getTypeNames.foreach(n =&gt; </span><span style='background: #F0ADAD'>ds.aging.add(ds.getSchema(n))</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>128 <span style=''>
+</span>129 <span style=''>  /**
+</span>130 <span style=''>    * Key of the Redis SortedSet containing the ttl for the given feature type
+</span>131 <span style=''>    *
+</span>132 <span style=''>    * @param ds data store
+</span>133 <span style=''>    * @param typeName simple feature type name
+</span>134 <span style=''>    * @return
+</span>135 <span style=''>    */
+</span>136 <span style=''>  private def key(ds: RedisDataStore, typeName: String): Array[Byte] =
+</span>137 <span style=''>    </span><span style='background: #AEF1AE'>s&quot;${ds.config.catalog}_${typeName}_ttl&quot;.getBytes(StandardCharsets.UTF_8)</span><span style=''>
+</span>138 <span style=''>
+</span>139 <span style=''>  /**
+</span>140 <span style=''>    * Writes time-to-lives for new features
+</span>141 <span style=''>    *
+</span>142 <span style=''>    * @param connection jedis connection
+</span>143 <span style=''>    * @param table ttl table for the feature type
+</span>144 <span style=''>    */
+</span>145 <span style=''>  class AgeOffWriter(connection: Pool[_ &lt;: CloseableJedisCommands], table: Array[Byte]) extends Closeable with Flushable {
+</span>146 <span style=''>
+</span>147 <span style=''>    private val writes = </span><span style='background: #AEF1AE'>new java.util.HashMap[Array[Byte], java.lang.Double]</span><span style=''>
+</span>148 <span style=''>    private val deletes = </span><span style='background: #AEF1AE'>ArrayBuffer.empty[Array[Byte]]</span><span style=''>
+</span>149 <span style=''>
+</span>150 <span style=''>    // note: the regular feature ids have the length pre-pended as a 2-byte short, so use the raw id instead
+</span>151 <span style=''>    def write(feature: RedisWritableFeature): Unit = </span><span style='background: #AEF1AE'>writes.put(feature.rawId, feature.ttl)</span><span style=''>
+</span>152 <span style=''>    def delete(feature: RedisWritableFeature): Unit = </span><span style='background: #AEF1AE'>deletes += feature.rawId</span><span style=''>
+</span>153 <span style=''>
+</span>154 <span style=''>    override def flush(): Unit = {
+</span>155 <span style=''>      if (</span><span style='background: #AEF1AE'>!writes.isEmpty || deletes.nonEmpty</span><span style=''>) {
+</span>156 <span style=''>        </span><span style='background: #AEF1AE'>try {
+</span>157 <span style=''></span><span style='background: #AEF1AE'>          WithClose(connection.getResource) { jedis =&gt;
+</span>158 <span style=''></span><span style='background: #AEF1AE'>            if (deletes.nonEmpty) {
+</span>159 <span style=''></span><span style='background: #AEF1AE'>              jedis.zrem(table, deletes.toSeq: _*)
+</span>160 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>161 <span style=''></span><span style='background: #AEF1AE'>            if (!writes.isEmpty) {
+</span>162 <span style=''></span><span style='background: #AEF1AE'>              jedis.zadd(table, writes)
+</span>163 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>164 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>165 <span style=''></span><span style='background: #AEF1AE'>        } finally {
+</span>166 <span style=''></span><span style='background: #AEF1AE'>          writes.clear()
+</span>167 <span style=''></span><span style='background: #AEF1AE'>          deletes.clear()
+</span>168 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>169 <span style=''>      }
+</span>170 <span style=''>    }
+</span>171 <span style=''>
+</span>172 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>flush()</span><span style=''>
+</span>173 <span style=''>  }
+</span>174 <span style=''>
+</span>175 <span style=''>  /**
+</span>176 <span style=''>    * Class for tracking scheduled expiration tasks
+</span>177 <span style=''>    *
+</span>178 <span style=''>    * @param ds data store
+</span>179 <span style=''>    * @param frequency run frequency
+</span>180 <span style=''>    */
+</span>181 <span style=''>  private class AgeOffExecutor(ds: RedisDataStore, frequency: Duration) extends Closeable {
+</span>182 <span style=''>
+</span>183 <span style=''>    // expiration tasks, keyed by feature type name
+</span>184 <span style=''>    // note: synchronize access to ensure thread safety
+</span>185 <span style=''>    private val tasks = </span><span style='background: #AEF1AE'>scala.collection.mutable.Map.empty[String, ScheduledFuture[_]]</span><span style=''>
+</span>186 <span style=''>    private val rate = </span><span style='background: #AEF1AE'>frequency.toMillis</span><span style=''>
+</span>187 <span style=''>    private val es = </span><span style='background: #AEF1AE'>Executors.newScheduledThreadPool(3)</span><span style=''>
+</span>188 <span style=''>
+</span>189 <span style=''>    /**
+</span>190 <span style=''>      * Schedule the removal of features for the feature type
+</span>191 <span style=''>      *
+</span>192 <span style=''>      * @param typeName simple feature type name
+</span>193 <span style=''>      */
+</span>194 <span style=''>    def schedule(typeName: String): Unit = {
+</span>195 <span style=''>      // schedule with a short initial delay to quickly remove any features that may
+</span>196 <span style=''>      // have expired since the last time there was an active datastore running
+</span>197 <span style=''>      val future = </span><span style='background: #AEF1AE'>es.scheduleAtFixedRate(new AgeOffRunner(ds, typeName), 5000L, rate, TimeUnit.MILLISECONDS)</span><span style=''>
+</span>198 <span style=''>      </span><span style='background: #AEF1AE'>synchronized {
+</span>199 <span style=''></span><span style='background: #AEF1AE'>        tasks.put(typeName, future).foreach(</span><span style='background: #F0ADAD'>_.cancel(false)</span><span style='background: #AEF1AE'>)
+</span>200 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>201 <span style=''>    }
+</span>202 <span style=''>
+</span>203 <span style=''>    /**
+</span>204 <span style=''>      * Cancel any scheduled tasks for the feature type
+</span>205 <span style=''>      *
+</span>206 <span style=''>      * @param typeName simple feature type name
+</span>207 <span style=''>      */
+</span>208 <span style=''>    def cancel(typeName: String): Unit = {
+</span>209 <span style=''>      </span><span style='background: #AEF1AE'>synchronized {
+</span>210 <span style=''></span><span style='background: #AEF1AE'>        tasks.remove(typeName).foreach(_.cancel(false))
+</span>211 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>212 <span style=''>    }
+</span>213 <span style=''>
+</span>214 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>es.shutdown()</span><span style=''>
+</span>215 <span style=''>  }
+</span>216 <span style=''>
+</span>217 <span style=''>  /**
+</span>218 <span style=''>    * Runnable class to check and remove expired features
+</span>219 <span style=''>    *
+</span>220 <span style=''>    * @param ds data store
+</span>221 <span style=''>    * @param typeName simple feature type name to check
+</span>222 <span style=''>    */
+</span>223 <span style=''>  private class AgeOffRunner(ds: RedisDataStore, typeName: String) extends Runnable with RedisLocking {
+</span>224 <span style=''>
+</span>225 <span style=''>    import scala.collection.JavaConverters._
+</span>226 <span style=''>
+</span>227 <span style=''>    private val table = </span><span style='background: #AEF1AE'>key(ds, typeName)</span><span style=''>
+</span>228 <span style=''>    private val lockPath = </span><span style='background: #AEF1AE'>s&quot;/org.locationtech.geomesa.redis.${ds.config.catalog}.ttl.$typeName&quot;</span><span style=''>
+</span>229 <span style=''>
+</span>230 <span style=''>    private val timeout = </span><span style='background: #AEF1AE'>AgeOffLockTimeout.toDuration.map(_.toMillis).getOrElse {
+</span>231 <span style=''></span><span style='background: #AEF1AE'>      // note: should always be valid due to the default
+</span>232 <span style=''></span><span style='background: #AEF1AE'>      </span><span style='background: #F0ADAD'>throw new IllegalStateException(&quot;Invalid age-off lock timeout&quot;)</span><span style='background: #AEF1AE'>
+</span>233 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>234 <span style=''>
+</span>235 <span style=''>    override def connection: Pool[_ &lt;: CloseableJedisCommands] = </span><span style='background: #AEF1AE'>ds.connection</span><span style=''>
+</span>236 <span style=''>
+</span>237 <span style=''>    override def run(): Unit = {
+</span>238 <span style=''>      val timestamp = </span><span style='background: #AEF1AE'>System.currentTimeMillis()</span><span style=''>
+</span>239 <span style=''>      logger.debug(s&quot;Age-off for schema '$typeName' starting with timestamp $timestamp&quot;)
+</span>240 <span style=''>
+</span>241 <span style=''>      val ids = </span><span style='background: #AEF1AE'>removeExpiredIds(timestamp)</span><span style=''>
+</span>242 <span style=''>      if (</span><span style='background: #AEF1AE'>!ids.isEmpty</span><span style=''>) {
+</span>243 <span style=''>        </span><span style='background: #AEF1AE'>removeExpiredFeatures(ids, timestamp)</span><span style=''>
+</span>244 <span style=''>      }
+</span>245 <span style=''>    }
+</span>246 <span style=''>
+</span>247 <span style=''>    /**
+</span>248 <span style=''>      * Queries and removes expired ids and ttls
+</span>249 <span style=''>      *
+</span>250 <span style=''>      * @param timestamp expiration time
+</span>251 <span style=''>      * @return
+</span>252 <span style=''>      */
+</span>253 <span style=''>    private def removeExpiredIds(timestamp: Long): java.util.List[JedisTuple] = {
+</span>254 <span style=''>      def exec: java.util.List[JedisTuple] = {
+</span>255 <span style=''>        </span><span style='background: #AEF1AE'>WithClose(ds.connection.getResource) { jedis =&gt;
+</span>256 <span style=''></span><span style='background: #AEF1AE'>          // Use Lua script to atomically get and remove expired entries
+</span>257 <span style=''></span><span style='background: #AEF1AE'>          val script = &quot;&quot;&quot;
+</span>258 <span style=''></span><span style='background: #AEF1AE'>            local scores = redis.call('zrangebyscore', KEYS[1], 0, ARGV[1], 'WITHSCORES')
+</span>259 <span style=''></span><span style='background: #AEF1AE'>            if #scores &gt; 0 then
+</span>260 <span style=''></span><span style='background: #AEF1AE'>              redis.call('zremrangebyscore', KEYS[1], 0, ARGV[1])
+</span>261 <span style=''></span><span style='background: #AEF1AE'>            end
+</span>262 <span style=''></span><span style='background: #AEF1AE'>            return scores
+</span>263 <span style=''></span><span style='background: #AEF1AE'>          &quot;&quot;&quot;
+</span>264 <span style=''></span><span style='background: #AEF1AE'>          val result = jedis.eval(script.getBytes(StandardCharsets.UTF_8), 1, table, timestamp.toString.getBytes(StandardCharsets.UTF_8))
+</span>265 <span style=''></span><span style='background: #AEF1AE'>          // Convert the result to a List[JedisTuple]
+</span>266 <span style=''></span><span style='background: #AEF1AE'>          result match {
+</span>267 <span style=''></span><span style='background: #AEF1AE'>            case list: java.util.List[_] if list.size() &gt; 0 =&gt;
+</span>268 <span style=''></span><span style='background: #AEF1AE'>              val tuples = new java.util.ArrayList[JedisTuple](list.size() / 2)
+</span>269 <span style=''></span><span style='background: #AEF1AE'>              var i = 0
+</span>270 <span style=''></span><span style='background: #AEF1AE'>              while (i &lt; list.size()) {
+</span>271 <span style=''></span><span style='background: #AEF1AE'>                val member = list.get(i).asInstanceOf[Array[Byte]]
+</span>272 <span style=''></span><span style='background: #AEF1AE'>                val score = list.get(i + 1) match {
+</span>273 <span style=''></span><span style='background: #AEF1AE'>                  case s: String =&gt; </span><span style='background: #F0ADAD'>s.toDouble</span><span style='background: #AEF1AE'>
+</span>274 <span style=''></span><span style='background: #AEF1AE'>                  case b: Array[Byte] =&gt; new String(b, StandardCharsets.UTF_8).toDouble
+</span>275 <span style=''></span><span style='background: #AEF1AE'>                  case _ =&gt; </span><span style='background: #F0ADAD'>throw new IllegalStateException(s&quot;Unexpected score type: ${list.get(i + 1).getClass}&quot;)</span><span style='background: #AEF1AE'>
+</span>276 <span style=''></span><span style='background: #AEF1AE'>                }
+</span>277 <span style=''></span><span style='background: #AEF1AE'>                tuples.add(new JedisTuple(member, score))
+</span>278 <span style=''></span><span style='background: #AEF1AE'>                i += 2
+</span>279 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>280 <span style=''></span><span style='background: #AEF1AE'>              tuples
+</span>281 <span style=''></span><span style='background: #AEF1AE'>            case _ =&gt; Collections.emptyList[JedisTuple]()
+</span>282 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>283 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>284 <span style=''>      }
+</span>285 <span style=''>
+</span>286 <span style=''>      def noLock: java.util.List[JedisTuple] = {
+</span>287 <span style=''>        logger.debug(s&quot;Could not acquire distributed lock for schema '$typeName' after ${timeout}ms&quot;)
+</span>288 <span style=''>        </span><span style='background: #F0ADAD'>Collections.emptyList[JedisTuple]()</span><span style=''>
+</span>289 <span style=''>      }
+</span>290 <span style=''>
+</span>291 <span style=''>      // acquire a lock so that we're not repeating work in multiple data store instances
+</span>292 <span style=''>      val ids = try { </span><span style='background: #AEF1AE'>withLock(lockPath, timeout, exec, noLock)</span><span style=''> } catch {
+</span>293 <span style=''>        case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt;
+</span>294 <span style=''></span><span style='background: #F0ADAD'>          logger.error(&quot;Error executing ttl script:&quot;, e)
+</span>295 <span style=''></span><span style='background: #F0ADAD'>          Collections.emptyList[JedisTuple]()</span><span style=''>
+</span>296 <span style=''>      }
+</span>297 <span style=''>
+</span>298 <span style=''>      logger.debug(s&quot;Age-off for schema '$typeName' found ${ids.size} features for expiration&quot;)
+</span>299 <span style=''>
+</span>300 <span style=''>      ids
+</span>301 <span style=''>    }
+</span>302 <span style=''>
+</span>303 <span style=''>    /**
+</span>304 <span style=''>      * Removes expired features from the data store
+</span>305 <span style=''>      *
+</span>306 <span style=''>      * @param ids expired ids and ttls
+</span>307 <span style=''>      * @param timestamp expiration time
+</span>308 <span style=''>      */
+</span>309 <span style=''>    private def removeExpiredFeatures(ids: java.util.List[JedisTuple], timestamp: Long): Unit = {
+</span>310 <span style=''>      try {
+</span>311 <span style=''>        </span><span style='background: #AEF1AE'>val fids = new java.util.HashSet[Identifier](ids.size)
+</span>312 <span style=''></span><span style='background: #AEF1AE'>        ids.asScala.foreach(id =&gt; fids.add(FilterHelper.ff.featureId(id.getElement)))
+</span>313 <span style=''></span><span style='background: #AEF1AE'>
+</span>314 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(s&quot;Age-off for schema '$typeName' found the following features: $fids&quot;)
+</span>315 <span style=''></span><span style='background: #AEF1AE'>        val trace = logger.underlying.isTraceEnabled
+</span>316 <span style=''></span><span style='background: #AEF1AE'>        lazy val results = ListBuffer.empty[String]
+</span>317 <span style=''></span><span style='background: #AEF1AE'>
+</span>318 <span style=''></span><span style='background: #AEF1AE'>        var i = 0
+</span>319 <span style=''></span><span style='background: #AEF1AE'>        WithClose(ds.getFeatureWriter(typeName, FilterHelper.ff.id(fids), Transaction.AUTO_COMMIT)) { writer =&gt;
+</span>320 <span style=''></span><span style='background: #AEF1AE'>          while (writer.hasNext) {
+</span>321 <span style=''></span><span style='background: #AEF1AE'>            val sf = writer.next()
+</span>322 <span style=''></span><span style='background: #AEF1AE'>            // verify that the feature hasn't been updated since we fetched the expired ids
+</span>323 <span style=''></span><span style='background: #AEF1AE'>            // note: if the feature is updated between our call to `next` and `remove`, the
+</span>324 <span style=''></span><span style='background: #AEF1AE'>            // member keys won't match and our deletion will not affect anything, as desired
+</span>325 <span style=''></span><span style='background: #AEF1AE'>            val ttl = sf.getUserData.get(TtlUserDataKey)
+</span>326 <span style=''></span><span style='background: #AEF1AE'>            if (ttl != null &amp;&amp; ttl.asInstanceOf[Long] &lt;= timestamp) {
+</span>327 <span style=''></span><span style='background: #AEF1AE'>              writer.remove()
+</span>328 <span style=''></span><span style='background: #AEF1AE'>              i += 1
+</span>329 <span style=''></span><span style='background: #AEF1AE'>              if (trace) {
+</span>330 <span style=''></span><span style='background: #AEF1AE'>                </span><span style='background: #F0ADAD'>results += sf.getID</span><span style='background: #AEF1AE'>
+</span>331 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>332 <span style=''></span><span style='background: #AEF1AE'>            } else {
+</span>333 <span style=''></span><span style='background: #AEF1AE'>              </span><span style='background: #F0ADAD'>logger.debug(s&quot;Age-off for schema '$typeName' ignoring updated feature: ${sf.getID}&quot;)</span><span style='background: #AEF1AE'>
+</span>334 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>335 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>336 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>337 <span style=''></span><span style='background: #AEF1AE'>        logger.debug(s&quot;Age-off for schema '$typeName' removed $i features&quot;)
+</span>338 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(s&quot;Age-off for schema '$typeName' removed the following features: [${results.mkString(&quot;, &quot;)}]&quot;)</span><span style=''>
+</span>339 <span style=''>      } catch {
+</span>340 <span style=''>        case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt;
+</span>341 <span style=''></span><span style='background: #F0ADAD'>          logger.error(s&quot;Error executing age-off for schema '$typeName':&quot;, e)
+</span>342 <span style=''></span><span style='background: #F0ADAD'>          // try to re-insert the keys, otherwise they might never expire
+</span>343 <span style=''></span><span style='background: #F0ADAD'>          reinsertFailedIds(ids)</span><span style=''>
+</span>344 <span style=''>      }
+</span>345 <span style=''>    }
+</span>346 <span style=''>
+</span>347 <span style=''>    /**
+</span>348 <span style=''>      * Reinserts ids for features that were not deleted from the data store
+</span>349 <span style=''>      *
+</span>350 <span style=''>      * @param ids expired ids and ttls
+</span>351 <span style=''>      */
+</span>352 <span style=''>    private def reinsertFailedIds(ids: java.util.List[JedisTuple]): Unit = {
+</span>353 <span style=''>      try {
+</span>354 <span style=''>        </span><span style='background: #F0ADAD'>logger.debug(s&quot;Age-off for schema '$typeName' re-inserting ttls&quot;)
+</span>355 <span style=''></span><span style='background: #F0ADAD'>        val reinserts = new java.util.HashMap[Array[Byte], java.lang.Double](ids.size)
+</span>356 <span style=''></span><span style='background: #F0ADAD'>        ids.asScala.foreach(id =&gt; reinserts.put(id.getBinaryElement, id.getScore))
+</span>357 <span style=''></span><span style='background: #F0ADAD'>        // use nx so that if a feature update has come through we don't overwrite the new ttl
+</span>358 <span style=''></span><span style='background: #F0ADAD'>        WithClose(ds.connection.getResource)(_.zadd(table, reinserts, new ZAddParams().nx()))</span><span style=''>
+</span>359 <span style=''>      } catch {
+</span>360 <span style=''>        case NonFatal(e) =&gt;
+</span>361 <span style=''>          </span><span style='background: #F0ADAD'>logger.error(s&quot;Error re-inserting ttls for schema '$typeName'. The following features &quot; +
+</span>362 <span style=''></span><span style='background: #F0ADAD'>              s&quot;may never expire: [${ids.asScala.map(_.getElement).mkString(&quot;, &quot;)}]&quot;, e)</span><span style=''>
+</span>363 <span style=''>      }
+</span>364 <span style=''>    }
+</span>365 <span style=''>  }
+</span>366 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          49
+        </td>
+        <td>
+          100779
+        </td>
+        <td>
+          2359
+          -
+          2359
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.$anonfun.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new $anonfun()
+        </td>
+      </tr><tr>
+        <td>
+          49
+        </td>
+        <td>
+          100780
+        </td>
+        <td>
+          2303
+          -
+          2418
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.collect
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.redis.data.`package`.RedisSystemProperties.AgeOffInterval.toDuration.collect[org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor](({
+  @SerialVersionUID(value = 0) final &lt;synthetic&gt; class $anonfun extends scala.runtime.AbstractPartialFunction[scala.concurrent.duration.Duration,org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor] with Serializable {
+    def &lt;init&gt;(): &lt;$anon: scala.concurrent.duration.Duration =&gt; org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor&gt; = {
+      $anonfun.super.&lt;init&gt;();
+      ()
+    };
+    final override def applyOrElse[A1 &lt;: scala.concurrent.duration.Duration, B1 &gt;: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor](x1: A1, default: A1 =&gt; B1): B1 = ((x1.asInstanceOf[scala.concurrent.duration.Duration]: scala.concurrent.duration.Duration): scala.concurrent.duration.Duration @unchecked) match {
+      case (i @ _) if i.isFinite() =&gt; new org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor(RedisAgeOff.this.ds, i)
+      case (defaultCase$ @ _) =&gt; default.apply(x1)
+    };
+    final def isDefinedAt(x1: scala.concurrent.duration.Duration): Boolean = ((x1.asInstanceOf[scala.concurrent.duration.Duration]: scala.concurrent.duration.Duration): scala.concurrent.duration.Duration @unchecked) match {
+      case (i @ _) if i.isFinite() =&gt; true
+      case (defaultCase$ @ _) =&gt; false
+    }
+  };
+  new $anonfun()
+}: PartialFunction[scala.concurrent.duration.Duration,org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor]))
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          100775
+        </td>
+        <td>
+          2375
+          -
+          2385
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.concurrent.duration.Duration.isFinite
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.isFinite()
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          100777
+        </td>
+        <td>
+          2389
+          -
+          2414
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor(RedisAgeOff.this.ds, i)
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          100776
+        </td>
+        <td>
+          2408
+          -
+          2410
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          100778
+        </td>
+        <td>
+          2389
+          -
+          2414
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor(RedisAgeOff.this.ds, i)
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          100781
+        </td>
+        <td>
+          2571
+          -
+          2601
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType.isFeatureExpirationEnabled
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(sft).isFeatureExpirationEnabled
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          100787
+        </td>
+        <td>
+          2567
+          -
+          2567
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          100786
+        </td>
+        <td>
+          2567
+          -
+          2567
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          100783
+        </td>
+        <td>
+          2628
+          -
+          2655
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor.schedule
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1.schedule(sft.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          100782
+        </td>
+        <td>
+          2639
+          -
+          2654
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          100785
+        </td>
+        <td>
+          2611
+          -
+          2656
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.executor.foreach[Unit](((x$1: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$1.schedule(sft.getTypeName())))
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          100784
+        </td>
+        <td>
+          2611
+          -
+          2656
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.executor.foreach[Unit](((x$1: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$1.schedule(sft.getTypeName())))
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          100788
+        </td>
+        <td>
+          2921
+          -
+          2956
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType.isFeatureExpirationEnabled
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(previous).isFeatureExpirationEnabled
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          100789
+        </td>
+        <td>
+          2970
+          -
+          3001
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(sft).isFeatureExpirationEnabled.unary_!
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          100814
+        </td>
+        <td>
+          2966
+          -
+          3381
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          if (org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(sft).isFeatureExpirationEnabled.unary_!)
+  RedisAgeOff.this.remove(previous)
+else
+  if (sft.getTypeName().!=(previous.getTypeName()))
+    {
+      RedisAgeOff.this.executor.foreach[Unit](((x$2: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$2.cancel(previous.getTypeName())));
+      org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, Long](RedisAgeOff.this.ds.connection.getResource())(((x$3: _$1) =&gt; x$3.renamenx(RedisAgeOff.key(RedisAgeOff.this.ds, previous.getTypeName()), RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName()))))(io.this.IsCloseable.closeableIsCloseable);
+      RedisAgeOff.this.executor.foreach[Unit](((x$4: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$4.schedule(sft.getTypeName())))
+    }
+  else
+    ()
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          100791
+        </td>
+        <td>
+          3013
+          -
+          3029
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.this.remove(previous)
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          100790
+        </td>
+        <td>
+          3013
+          -
+          3029
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.this.remove(previous)
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          100793
+        </td>
+        <td>
+          3047
+          -
+          3086
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          sft.getTypeName().!=(previous.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          100792
+        </td>
+        <td>
+          3066
+          -
+          3086
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          previous.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          100811
+        </td>
+        <td>
+          3043
+          -
+          3043
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          100810
+        </td>
+        <td>
+          3088
+          -
+          3381
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  RedisAgeOff.this.executor.foreach[Unit](((x$2: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$2.cancel(previous.getTypeName())));
+  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, Long](RedisAgeOff.this.ds.connection.getResource())(((x$3: _$1) =&gt; x$3.renamenx(RedisAgeOff.key(RedisAgeOff.this.ds, previous.getTypeName()), RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName()))))(io.this.IsCloseable.closeableIsCloseable);
+  RedisAgeOff.this.executor.foreach[Unit](((x$4: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$4.schedule(sft.getTypeName())))
+}
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          100813
+        </td>
+        <td>
+          3043
+          -
+          3381
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          if (sft.getTypeName().!=(previous.getTypeName()))
+  {
+    RedisAgeOff.this.executor.foreach[Unit](((x$2: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$2.cancel(previous.getTypeName())));
+    org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, Long](RedisAgeOff.this.ds.connection.getResource())(((x$3: _$1) =&gt; x$3.renamenx(RedisAgeOff.key(RedisAgeOff.this.ds, previous.getTypeName()), RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName()))))(io.this.IsCloseable.closeableIsCloseable);
+    RedisAgeOff.this.executor.foreach[Unit](((x$4: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$4.schedule(sft.getTypeName())))
+  }
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          100812
+        </td>
+        <td>
+          3043
+          -
+          3043
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          100795
+        </td>
+        <td>
+          3115
+          -
+          3145
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor.cancel
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$2.cancel(previous.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          100794
+        </td>
+        <td>
+          3124
+          -
+          3144
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          previous.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          100796
+        </td>
+        <td>
+          3098
+          -
+          3146
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.this.executor.foreach[Unit](((x$2: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$2.cancel(previous.getTypeName())))
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          100797
+        </td>
+        <td>
+          3224
+          -
+          3249
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.util.Pool.getResource
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.this.ds.connection.getResource()
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          100799
+        </td>
+        <td>
+          3270
+          -
+          3290
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          previous.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          100798
+        </td>
+        <td>
+          3266
+          -
+          3268
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          100801
+        </td>
+        <td>
+          3297
+          -
+          3299
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          100800
+        </td>
+        <td>
+          3262
+          -
+          3291
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.key(RedisAgeOff.this.ds, previous.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          100803
+        </td>
+        <td>
+          3293
+          -
+          3317
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          100802
+        </td>
+        <td>
+          3301
+          -
+          3316
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          100805
+        </td>
+        <td>
+          3250
+          -
+          3250
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          100804
+        </td>
+        <td>
+          3251
+          -
+          3318
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.commands.KeyBinaryCommands.renamenx
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$3.renamenx(RedisAgeOff.key(RedisAgeOff.this.ds, previous.getTypeName()), RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName()))
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          100806
+        </td>
+        <td>
+          3214
+          -
+          3319
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, Long](RedisAgeOff.this.ds.connection.getResource())(((x$3: _$1) =&gt; x$3.renamenx(RedisAgeOff.key(RedisAgeOff.this.ds, previous.getTypeName()), RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName()))))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          100807
+        </td>
+        <td>
+          3356
+          -
+          3371
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          100809
+        </td>
+        <td>
+          3328
+          -
+          3373
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.this.executor.foreach[Unit](((x$4: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$4.schedule(sft.getTypeName())))
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          100808
+        </td>
+        <td>
+          3345
+          -
+          3372
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor.schedule
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$4.schedule(sft.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          100815
+        </td>
+        <td>
+          3397
+          -
+          3427
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType.isFeatureExpirationEnabled
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(sft).isFeatureExpirationEnabled
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          100821
+        </td>
+        <td>
+          3393
+          -
+          3393
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          100820
+        </td>
+        <td>
+          3393
+          -
+          3393
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          100822
+        </td>
+        <td>
+          3393
+          -
+          3488
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          if (org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(sft).isFeatureExpirationEnabled)
+  RedisAgeOff.this.executor.foreach[Unit](((x$5: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$5.schedule(sft.getTypeName())))
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          100817
+        </td>
+        <td>
+          3454
+          -
+          3481
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor.schedule
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$5.schedule(sft.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          100816
+        </td>
+        <td>
+          3465
+          -
+          3480
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          100819
+        </td>
+        <td>
+          3437
+          -
+          3482
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.this.executor.foreach[Unit](((x$5: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$5.schedule(sft.getTypeName())))
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          100818
+        </td>
+        <td>
+          3437
+          -
+          3482
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          RedisAgeOff.this.executor.foreach[Unit](((x$5: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$5.schedule(sft.getTypeName())))
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          100823
+        </td>
+        <td>
+          3649
+          -
+          3679
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType.isFeatureExpirationEnabled
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(sft).isFeatureExpirationEnabled
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          100835
+        </td>
+        <td>
+          3681
+          -
+          3814
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  RedisAgeOff.this.executor.foreach[Unit](((x$6: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$6.cancel(sft.getTypeName())));
+  {
+    org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, Long](RedisAgeOff.this.ds.connection.getResource())(((x$7: _$1) =&gt; x$7.del(RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName()))))(io.this.IsCloseable.closeableIsCloseable);
+    ()
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          100837
+        </td>
+        <td>
+          3645
+          -
+          3645
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          100836
+        </td>
+        <td>
+          3645
+          -
+          3645
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          100825
+        </td>
+        <td>
+          3706
+          -
+          3731
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor.cancel
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$6.cancel(sft.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          100824
+        </td>
+        <td>
+          3715
+          -
+          3730
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          100826
+        </td>
+        <td>
+          3689
+          -
+          3732
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.executor.foreach[Unit](((x$6: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$6.cancel(sft.getTypeName())))
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          100827
+        </td>
+        <td>
+          3749
+          -
+          3774
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.util.Pool.getResource
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.ds.connection.getResource()
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          100829
+        </td>
+        <td>
+          3790
+          -
+          3805
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          100828
+        </td>
+        <td>
+          3786
+          -
+          3788
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          100831
+        </td>
+        <td>
+          3776
+          -
+          3807
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.commands.KeyBinaryCommands.del
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$7.del(RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName()))
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          100830
+        </td>
+        <td>
+          3782
+          -
+          3806
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          100833
+        </td>
+        <td>
+          3739
+          -
+          3808
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, Long](RedisAgeOff.this.ds.connection.getResource())(((x$7: _$1) =&gt; x$7.del(RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName()))))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          100832
+        </td>
+        <td>
+          3775
+          -
+          3775
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          100834
+        </td>
+        <td>
+          3775
+          -
+          3775
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          100838
+        </td>
+        <td>
+          4007
+          -
+          4037
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType.isFeatureExpirationEnabled
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(sft).isFeatureExpirationEnabled
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          100839
+        </td>
+        <td>
+          4069
+          -
+          4082
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.RedisDataStore.connection
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.ds.connection
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          100841
+        </td>
+        <td>
+          4092
+          -
+          4107
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          100840
+        </td>
+        <td>
+          4088
+          -
+          4090
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          100843
+        </td>
+        <td>
+          4052
+          -
+          4109
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffWriter.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffWriter(RedisAgeOff.this.ds.connection, RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName()))
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          100842
+        </td>
+        <td>
+          4084
+          -
+          4108
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          100845
+        </td>
+        <td>
+          4047
+          -
+          4110
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffWriter](new org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffWriter(RedisAgeOff.this.ds.connection, RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName())))
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          100844
+        </td>
+        <td>
+          4047
+          -
+          4110
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffWriter](new org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffWriter(RedisAgeOff.this.ds.connection, RedisAgeOff.key(RedisAgeOff.this.ds, sft.getTypeName())))
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          100847
+        </td>
+        <td>
+          4130
+          -
+          4134
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          100846
+        </td>
+        <td>
+          4130
+          -
+          4134
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          100849
+        </td>
+        <td>
+          4177
+          -
+          4204
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.executor.foreach[Unit](((x$8: org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor) =&gt; x$8.close()))
+        </td>
+      </tr><tr>
+        <td>
+          111
+        </td>
+        <td>
+          100848
+        </td>
+        <td>
+          4194
+          -
+          4203
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$8.close()
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          100850
+        </td>
+        <td>
+          4333
+          -
+          4336
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;t&quot;
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          100851
+        </td>
+        <td>
+          4469
+          -
+          4533
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.apply(&quot;geomesa.redis.age.off.lock.timeout&quot;, &quot;1 second&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          100853
+        </td>
+        <td>
+          4710
+          -
+          4725
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.GeoMesaDataStore.getSchema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ds.getSchema(n)
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          100852
+        </td>
+        <td>
+          4668
+          -
+          4683
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.MetadataBackedDataStore.getTypeNames
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ds.getTypeNames()
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          100855
+        </td>
+        <td>
+          4668
+          -
+          4727
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IndexedSeqOptimized.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.refArrayOps[String](ds.getTypeNames()).foreach[Unit](((n: String) =&gt; ds.aging.add(ds.getSchema(n))))
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          100854
+        </td>
+        <td>
+          4697
+          -
+          4726
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.add
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ds.aging.add(ds.getSchema(n))
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          100857
+        </td>
+        <td>
+          5012
+          -
+          5014
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;_&quot;
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          100856
+        </td>
+        <td>
+          4992
+          -
+          4993
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          100859
+        </td>
+        <td>
+          4994
+          -
+          5011
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.RedisDataStoreFactory.RedisDataStoreConfig.catalog
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ds.config.catalog
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          100858
+        </td>
+        <td>
+          5024
+          -
+          5029
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;_ttl&quot;
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          100861
+        </td>
+        <td>
+          4990
+          -
+          5062
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.getBytes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;_&quot;, &quot;_ttl&quot;).s(ds.config.catalog, typeName).getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          100860
+        </td>
+        <td>
+          5039
+          -
+          5061
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          100862
+        </td>
+        <td>
+          5367
+          -
+          5419
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.HashMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.HashMap[Array[Byte],Double]()
+        </td>
+      </tr><tr>
+        <td>
+          148
+        </td>
+        <td>
+          100863
+        </td>
+        <td>
+          5446
+          -
+          5476
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.ArrayBuffer.empty[Array[Byte]]
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          100865
+        </td>
+        <td>
+          5640
+          -
+          5678
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.HashMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.writes.put(feature.rawId, scala.Predef.double2Double(feature.ttl))
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          100864
+        </td>
+        <td>
+          5666
+          -
+          5677
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Predef.double2Double
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.double2Double(feature.ttl)
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          100866
+        </td>
+        <td>
+          5650
+          -
+          5650
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          100867
+        </td>
+        <td>
+          5733
+          -
+          5757
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.deletes.+=(feature.rawId)
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          100868
+        </td>
+        <td>
+          5741
+          -
+          5741
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          100869
+        </td>
+        <td>
+          5823
+          -
+          5839
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.nonEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.deletes.nonEmpty
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          100870
+        </td>
+        <td>
+          5804
+          -
+          5839
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.writes.isEmpty().unary_!.||(AgeOffWriter.this.deletes.nonEmpty)
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          100895
+        </td>
+        <td>
+          5800
+          -
+          5800
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          100894
+        </td>
+        <td>
+          5800
+          -
+          5800
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          100893
+        </td>
+        <td>
+          5851
+          -
+          6194
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, AnyVal](AgeOffWriter.this.connection.getResource())(((jedis: _$1) =&gt; {
+    if (AgeOffWriter.this.deletes.nonEmpty)
+      jedis.zrem(AgeOffWriter.this.table, (AgeOffWriter.this.deletes.toSeq: _*))
+    else
+      ();
+    if (AgeOffWriter.this.writes.isEmpty().unary_!)
+      jedis.zadd(AgeOffWriter.this.table, AgeOffWriter.this.writes)
+    else
+      ()
+  }))(io.this.IsCloseable.closeableIsCloseable);
+  ()
+} finally {
+  AgeOffWriter.this.writes.clear();
+  AgeOffWriter.this.deletes.clear()
+}
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          100871
+        </td>
+        <td>
+          5877
+          -
+          5899
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.util.Pool.getResource
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.connection.getResource()
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          100887
+        </td>
+        <td>
+          5867
+          -
+          6113
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, AnyVal](AgeOffWriter.this.connection.getResource())(((jedis: _$1) =&gt; {
+  if (AgeOffWriter.this.deletes.nonEmpty)
+    jedis.zrem(AgeOffWriter.this.table, (AgeOffWriter.this.deletes.toSeq: _*))
+  else
+    ();
+  if (AgeOffWriter.this.writes.isEmpty().unary_!)
+    jedis.zadd(AgeOffWriter.this.table, AgeOffWriter.this.writes)
+  else
+    ()
+}))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          100886
+        </td>
+        <td>
+          5901
+          -
+          5901
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          100889
+        </td>
+        <td>
+          5867
+          -
+          6113
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, AnyVal](AgeOffWriter.this.connection.getResource())(((jedis: _$1) =&gt; {
+    if (AgeOffWriter.this.deletes.nonEmpty)
+      jedis.zrem(AgeOffWriter.this.table, (AgeOffWriter.this.deletes.toSeq: _*))
+    else
+      ();
+    if (AgeOffWriter.this.writes.isEmpty().unary_!)
+      jedis.zadd(AgeOffWriter.this.table, AgeOffWriter.this.writes)
+    else
+      ()
+  }))(io.this.IsCloseable.closeableIsCloseable);
+  ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          100888
+        </td>
+        <td>
+          5901
+          -
+          5901
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          100872
+        </td>
+        <td>
+          5928
+          -
+          5944
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.nonEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.deletes.nonEmpty
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          100877
+        </td>
+        <td>
+          5924
+          -
+          5924
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          100878
+        </td>
+        <td>
+          5924
+          -
+          5924
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          100873
+        </td>
+        <td>
+          5973
+          -
+          5978
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffWriter.table
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.table
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          100875
+        </td>
+        <td>
+          5962
+          -
+          5998
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.commands.SortedSetBinaryCommands.zrem
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          jedis.zrem(AgeOffWriter.this.table, (AgeOffWriter.this.deletes.toSeq: _*))
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          100874
+        </td>
+        <td>
+          5980
+          -
+          5993
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SeqLike.toSeq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.deletes.toSeq
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          100876
+        </td>
+        <td>
+          5962
+          -
+          5998
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          redis.clients.jedis.commands.SortedSetBinaryCommands.zrem
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          jedis.zrem(AgeOffWriter.this.table, (AgeOffWriter.this.deletes.toSeq: _*))
+        </td>
+      </tr><tr>
+        <td>
+          161
+        </td>
+        <td>
+          100879
+        </td>
+        <td>
+          6029
+          -
+          6044
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.writes.isEmpty().unary_!
+        </td>
+      </tr><tr>
+        <td>
+          161
+        </td>
+        <td>
+          100885
+        </td>
+        <td>
+          6025
+          -
+          6025
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          161
+        </td>
+        <td>
+          100884
+        </td>
+        <td>
+          6025
+          -
+          6025
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          100881
+        </td>
+        <td>
+          6080
+          -
+          6086
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffWriter.writes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.writes
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          100880
+        </td>
+        <td>
+          6073
+          -
+          6078
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffWriter.table
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.table
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          100883
+        </td>
+        <td>
+          6062
+          -
+          6087
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          redis.clients.jedis.commands.SortedSetBinaryCommands.zadd
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          jedis.zadd(AgeOffWriter.this.table, AgeOffWriter.this.writes)
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          100882
+        </td>
+        <td>
+          6062
+          -
+          6087
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.commands.SortedSetBinaryCommands.zadd
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          jedis.zadd(AgeOffWriter.this.table, AgeOffWriter.this.writes)
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          100892
+        </td>
+        <td>
+          6132
+          -
+          6194
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  AgeOffWriter.this.writes.clear();
+  AgeOffWriter.this.deletes.clear()
+}
+        </td>
+      </tr><tr>
+        <td>
+          166
+        </td>
+        <td>
+          100890
+        </td>
+        <td>
+          6144
+          -
+          6158
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.HashMap.clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.writes.clear()
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          100891
+        </td>
+        <td>
+          6169
+          -
+          6184
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.deletes.clear()
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          100896
+        </td>
+        <td>
+          6243
+          -
+          6250
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffWriter.flush
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffWriter.this.flush()
+        </td>
+      </tr><tr>
+        <td>
+          185
+        </td>
+        <td>
+          100897
+        </td>
+        <td>
+          6616
+          -
+          6678
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.mutable.Map.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.Map.empty[String, java.util.concurrent.ScheduledFuture[_]]
+        </td>
+      </tr><tr>
+        <td>
+          186
+        </td>
+        <td>
+          100898
+        </td>
+        <td>
+          6702
+          -
+          6720
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.concurrent.duration.Duration.toMillis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffExecutor.this.frequency.toMillis
+        </td>
+      </tr><tr>
+        <td>
+          187
+        </td>
+        <td>
+          100899
+        </td>
+        <td>
+          6742
+          -
+          6777
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Executors.newScheduledThreadPool
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.concurrent.Executors.newScheduledThreadPool(3)
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          100901
+        </td>
+        <td>
+          7167
+          -
+          7197
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new RedisAgeOff.this.AgeOffRunner(AgeOffExecutor.this.ds, typeName)
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          100900
+        </td>
+        <td>
+          7184
+          -
+          7186
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffExecutor.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          100903
+        </td>
+        <td>
+          7206
+          -
+          7210
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffExecutor.rate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffExecutor.this.rate
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          100902
+        </td>
+        <td>
+          7199
+          -
+          7204
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          5000L
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          100905
+        </td>
+        <td>
+          7144
+          -
+          7234
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ScheduledExecutorService.scheduleAtFixedRate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffExecutor.this.es.scheduleAtFixedRate(new RedisAgeOff.this.AgeOffRunner(AgeOffExecutor.this.ds, typeName), 5000L, AgeOffExecutor.this.rate, MILLISECONDS)
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          100904
+        </td>
+        <td>
+          7212
+          -
+          7233
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MILLISECONDS
+        </td>
+      </tr><tr>
+        <td>
+          198
+        </td>
+        <td>
+          100908
+        </td>
+        <td>
+          7241
+          -
+          7324
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.synchronized
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffExecutor.this.synchronized[Unit](AgeOffExecutor.this.tasks.put(typeName, future).foreach[Boolean](((x$9: java.util.concurrent.ScheduledFuture[_]) =&gt; x$9.cancel(false))))
+        </td>
+      </tr><tr>
+        <td>
+          199
+        </td>
+        <td>
+          100907
+        </td>
+        <td>
+          7264
+          -
+          7316
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffExecutor.this.tasks.put(typeName, future).foreach[Boolean](((x$9: java.util.concurrent.ScheduledFuture[_]) =&gt; x$9.cancel(false)))
+        </td>
+      </tr><tr>
+        <td>
+          199
+        </td>
+        <td>
+          100906
+        </td>
+        <td>
+          7300
+          -
+          7315
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.cancel
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$9.cancel(false)
+        </td>
+      </tr><tr>
+        <td>
+          209
+        </td>
+        <td>
+          100911
+        </td>
+        <td>
+          7511
+          -
+          7589
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.synchronized
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffExecutor.this.synchronized[Unit](AgeOffExecutor.this.tasks.remove(typeName).foreach[Boolean](((x$10: java.util.concurrent.ScheduledFuture[_]) =&gt; x$10.cancel(false))))
+        </td>
+      </tr><tr>
+        <td>
+          210
+        </td>
+        <td>
+          100909
+        </td>
+        <td>
+          7565
+          -
+          7580
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.cancel
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$10.cancel(false)
+        </td>
+      </tr><tr>
+        <td>
+          210
+        </td>
+        <td>
+          100910
+        </td>
+        <td>
+          7534
+          -
+          7581
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffExecutor.this.tasks.remove(typeName).foreach[Boolean](((x$10: java.util.concurrent.ScheduledFuture[_]) =&gt; x$10.cancel(false)))
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          100912
+        </td>
+        <td>
+          7630
+          -
+          7643
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ExecutorService.shutdown
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffExecutor.this.es.shutdown()
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          100913
+        </td>
+        <td>
+          7988
+          -
+          7990
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.ds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.ds
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          100915
+        </td>
+        <td>
+          7984
+          -
+          8001
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.key
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.key(AgeOffRunner.this.ds, AgeOffRunner.this.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          227
+        </td>
+        <td>
+          100914
+        </td>
+        <td>
+          7992
+          -
+          8000
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.typeName
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          100917
+        </td>
+        <td>
+          8083
+          -
+          8089
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.ttl.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          100916
+        </td>
+        <td>
+          8031
+          -
+          8064
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;/org.locationtech.geomesa.redis.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          100919
+        </td>
+        <td>
+          8065
+          -
+          8082
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.RedisDataStoreFactory.RedisDataStoreConfig.catalog
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.ds.config.catalog
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          100918
+        </td>
+        <td>
+          8097
+          -
+          8098
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          100921
+        </td>
+        <td>
+          8029
+          -
+          8098
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;/org.locationtech.geomesa.redis.&quot;, &quot;.ttl.&quot;, &quot;&quot;).s(AgeOffRunner.this.ds.config.catalog, AgeOffRunner.this.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          100920
+        </td>
+        <td>
+          8089
+          -
+          8097
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.typeName
+        </td>
+      </tr><tr>
+        <td>
+          230
+        </td>
+        <td>
+          100922
+        </td>
+        <td>
+          8159
+          -
+          8169
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.concurrent.duration.Duration.toMillis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$11.toMillis
+        </td>
+      </tr><tr>
+        <td>
+          230
+        </td>
+        <td>
+          100924
+        </td>
+        <td>
+          8126
+          -
+          8315
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.AgeOffLockTimeout.toDuration.map[Long](((x$11: scala.concurrent.duration.Duration) =&gt; x$11.toMillis)).getOrElse[Long](throw new java.lang.IllegalStateException(&quot;Invalid age-off lock timeout&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          232
+        </td>
+        <td>
+          100923
+        </td>
+        <td>
+          8246
+          -
+          8309
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(&quot;Invalid age-off lock timeout&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          235
+        </td>
+        <td>
+          100925
+        </td>
+        <td>
+          8382
+          -
+          8395
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.RedisDataStore.connection
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.ds.connection
+        </td>
+      </tr><tr>
+        <td>
+          238
+        </td>
+        <td>
+          100926
+        </td>
+        <td>
+          8452
+          -
+          8478
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.System.currentTimeMillis
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.currentTimeMillis()
+        </td>
+      </tr><tr>
+        <td>
+          241
+        </td>
+        <td>
+          100927
+        </td>
+        <td>
+          8585
+          -
+          8612
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.removeExpiredIds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.removeExpiredIds(timestamp)
+        </td>
+      </tr><tr>
+        <td>
+          242
+        </td>
+        <td>
+          100928
+        </td>
+        <td>
+          8623
+          -
+          8635
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ids.isEmpty().unary_!
+        </td>
+      </tr><tr>
+        <td>
+          242
+        </td>
+        <td>
+          100931
+        </td>
+        <td>
+          8619
+          -
+          8619
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          242
+        </td>
+        <td>
+          100932
+        </td>
+        <td>
+          8619
+          -
+          8619
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          243
+        </td>
+        <td>
+          100929
+        </td>
+        <td>
+          8647
+          -
+          8684
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.removeExpiredFeatures
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.removeExpiredFeatures(ids, timestamp)
+        </td>
+      </tr><tr>
+        <td>
+          243
+        </td>
+        <td>
+          100930
+        </td>
+        <td>
+          8647
+          -
+          8684
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.removeExpiredFeatures
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.removeExpiredFeatures(ids, timestamp)
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          100933
+        </td>
+        <td>
+          8978
+          -
+          9003
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.util.Pool.getResource
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.ds.connection.getResource()
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          100971
+        </td>
+        <td>
+          8968
+          -
+          10368
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, java.util.List[redis.clients.jedis.resps.Tuple]](AgeOffRunner.this.ds.connection.getResource())(((jedis: _$1) =&gt; {
+  val script: String = &quot;\n            local scores = redis.call(\'zrangebyscore\', KEYS[1], 0, ARGV[1], \'WITHSCORES\')\n            if #scores &gt; 0 then\n              redis.call(\'zremrangebyscore\', KEYS[1], 0, ARGV[1])\n            end\n            return scores\n          &quot;;
+  val result: Object = jedis.eval(script.getBytes(java.nio.charset.StandardCharsets.UTF_8), 1, AgeOffRunner.this.table, timestamp.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+  result match {
+    case (list @ (_: java.util.List[_])) if list.size().&gt;(0) =&gt; {
+      val tuples: java.util.ArrayList[redis.clients.jedis.resps.Tuple] = new java.util.ArrayList[redis.clients.jedis.resps.Tuple](list.size()./(2));
+      var i: Int = 0;
+      while$1(){
+        if (i.&lt;(list.size()))
+          {
+            {
+              val member: Array[Byte] = list.get(i).asInstanceOf[Array[Byte]];
+              val score: Double = list.get(i.+(1)) match {
+                case (s @ (_: String)) =&gt; scala.Predef.augmentString(s).toDouble
+                case (b @ (_: Array[Byte])) =&gt; scala.Predef.augmentString(new scala.Predef.String(b, java.nio.charset.StandardCharsets.UTF_8)).toDouble
+                case _ =&gt; throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;Unexpected score type: &quot;, &quot;&quot;).s(list.get(i.+(1)).getClass()))
+              };
+              tuples.add(new redis.clients.jedis.resps.Tuple(member, scala.Predef.double2Double(score)));
+              i = i.+(2)
+            };
+            while$1()
+          }
+        else
+          ()
+      };
+      tuples
+    }
+    case _ =&gt; java.util.Collections.emptyList[redis.clients.jedis.resps.Tuple]()
+  }
+}))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          100970
+        </td>
+        <td>
+          9005
+          -
+          9005
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          257
+        </td>
+        <td>
+          100934
+        </td>
+        <td>
+          9112
+          -
+          9359
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\n            local scores = redis.call(\'zrangebyscore\', KEYS[1], 0, ARGV[1], \'WITHSCORES\')\n            if #scores &gt; 0 then\n              redis.call(\'zremrangebyscore\', KEYS[1], 0, ARGV[1])\n            end\n            return scores\n          &quot;
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          100935
+        </td>
+        <td>
+          9410
+          -
+          9432
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          100937
+        </td>
+        <td>
+          9435
+          -
+          9436
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          100936
+        </td>
+        <td>
+          9394
+          -
+          9433
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.getBytes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          script.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          100939
+        </td>
+        <td>
+          9473
+          -
+          9495
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          100938
+        </td>
+        <td>
+          9438
+          -
+          9443
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.table
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.table
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          100941
+        </td>
+        <td>
+          9383
+          -
+          9497
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.commands.ScriptingKeyBinaryCommands.eval
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          jedis.eval(script.getBytes(java.nio.charset.StandardCharsets.UTF_8), 1, AgeOffRunner.this.table, timestamp.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          100940
+        </td>
+        <td>
+          9445
+          -
+          9496
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.getBytes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          timestamp.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        </td>
+      </tr><tr>
+        <td>
+          267
+        </td>
+        <td>
+          100942
+        </td>
+        <td>
+          9621
+          -
+          9636
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          list.size().&gt;(0)
+        </td>
+      </tr><tr>
+        <td>
+          267
+        </td>
+        <td>
+          100967
+        </td>
+        <td>
+          9637
+          -
+          10288
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val tuples: java.util.ArrayList[redis.clients.jedis.resps.Tuple] = new java.util.ArrayList[redis.clients.jedis.resps.Tuple](list.size()./(2));
+  var i: Int = 0;
+  while$1(){
+    if (i.&lt;(list.size()))
+      {
+        {
+          val member: Array[Byte] = list.get(i).asInstanceOf[Array[Byte]];
+          val score: Double = list.get(i.+(1)) match {
+            case (s @ (_: String)) =&gt; scala.Predef.augmentString(s).toDouble
+            case (b @ (_: Array[Byte])) =&gt; scala.Predef.augmentString(new scala.Predef.String(b, java.nio.charset.StandardCharsets.UTF_8)).toDouble
+            case _ =&gt; throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;Unexpected score type: &quot;, &quot;&quot;).s(list.get(i.+(1)).getClass()))
+          };
+          tuples.add(new redis.clients.jedis.resps.Tuple(member, scala.Predef.double2Double(score)));
+          i = i.+(2)
+        };
+        while$1()
+      }
+    else
+      ()
+  };
+  tuples
+}
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          100943
+        </td>
+        <td>
+          9703
+          -
+          9718
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int./
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          list.size()./(2)
+        </td>
+      </tr><tr>
+        <td>
+          268
+        </td>
+        <td>
+          100944
+        </td>
+        <td>
+          9667
+          -
+          9719
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.ArrayList.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.ArrayList[redis.clients.jedis.resps.Tuple](list.size()./(2))
+        </td>
+      </tr><tr>
+        <td>
+          269
+        </td>
+        <td>
+          100945
+        </td>
+        <td>
+          9742
+          -
+          9743
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          270
+        </td>
+        <td>
+          100947
+        </td>
+        <td>
+          9765
+          -
+          9780
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.&lt;(list.size())
+        </td>
+      </tr><tr>
+        <td>
+          270
+        </td>
+        <td>
+          100946
+        </td>
+        <td>
+          9769
+          -
+          9780
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.List.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          list.size()
+        </td>
+      </tr><tr>
+        <td>
+          270
+        </td>
+        <td>
+          100963
+        </td>
+        <td>
+          9782
+          -
+          9782
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.while$1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$1()
+        </td>
+      </tr><tr>
+        <td>
+          270
+        </td>
+        <td>
+          100965
+        </td>
+        <td>
+          9758
+          -
+          9758
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          270
+        </td>
+        <td>
+          100964
+        </td>
+        <td>
+          9782
+          -
+          10267
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    val member: Array[Byte] = list.get(i).asInstanceOf[Array[Byte]];
+    val score: Double = list.get(i.+(1)) match {
+      case (s @ (_: String)) =&gt; scala.Predef.augmentString(s).toDouble
+      case (b @ (_: Array[Byte])) =&gt; scala.Predef.augmentString(new scala.Predef.String(b, java.nio.charset.StandardCharsets.UTF_8)).toDouble
+      case _ =&gt; throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;Unexpected score type: &quot;, &quot;&quot;).s(list.get(i.+(1)).getClass()))
+    };
+    tuples.add(new redis.clients.jedis.resps.Tuple(member, scala.Predef.double2Double(score)));
+    i = i.+(2)
+  };
+  while$1()
+}
+        </td>
+      </tr><tr>
+        <td>
+          270
+        </td>
+        <td>
+          100966
+        </td>
+        <td>
+          9758
+          -
+          9758
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          271
+        </td>
+        <td>
+          100948
+        </td>
+        <td>
+          9813
+          -
+          9850
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Any.asInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          list.get(i).asInstanceOf[Array[Byte]]
+        </td>
+      </tr><tr>
+        <td>
+          272
+        </td>
+        <td>
+          100949
+        </td>
+        <td>
+          9888
+          -
+          9893
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          272
+        </td>
+        <td>
+          100950
+        </td>
+        <td>
+          9879
+          -
+          9894
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.List.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          list.get(i.+(1))
+        </td>
+      </tr><tr>
+        <td>
+          273
+        </td>
+        <td>
+          100951
+        </td>
+        <td>
+          9939
+          -
+          9949
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.toDouble
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.augmentString(s).toDouble
+        </td>
+      </tr><tr>
+        <td>
+          273
+        </td>
+        <td>
+          100952
+        </td>
+        <td>
+          9939
+          -
+          9949
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.toDouble
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.augmentString(s).toDouble
+        </td>
+      </tr><tr>
+        <td>
+          274
+        </td>
+        <td>
+          100953
+        </td>
+        <td>
+          10005
+          -
+          10027
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.nio.charset.StandardCharsets.UTF_8
+        </td>
+      </tr><tr>
+        <td>
+          274
+        </td>
+        <td>
+          100955
+        </td>
+        <td>
+          9991
+          -
+          10037
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.toDouble
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.augmentString(new scala.Predef.String(b, java.nio.charset.StandardCharsets.UTF_8)).toDouble
+        </td>
+      </tr><tr>
+        <td>
+          274
+        </td>
+        <td>
+          100954
+        </td>
+        <td>
+          9991
+          -
+          10028
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new scala.Predef.String(b, java.nio.charset.StandardCharsets.UTF_8)
+        </td>
+      </tr><tr>
+        <td>
+          274
+        </td>
+        <td>
+          100956
+        </td>
+        <td>
+          9991
+          -
+          10037
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.toDouble
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.augmentString(new scala.Predef.String(b, java.nio.charset.StandardCharsets.UTF_8)).toDouble
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          100957
+        </td>
+        <td>
+          10066
+          -
+          10152
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;Unexpected score type: &quot;, &quot;&quot;).s(list.get(i.+(1)).getClass()))
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          100958
+        </td>
+        <td>
+          10066
+          -
+          10152
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;Unexpected score type: &quot;, &quot;&quot;).s(list.get(i.+(1)).getClass()))
+        </td>
+      </tr><tr>
+        <td>
+          277
+        </td>
+        <td>
+          100959
+        </td>
+        <td>
+          10221
+          -
+          10226
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Predef.double2Double
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.double2Double(score)
+        </td>
+      </tr><tr>
+        <td>
+          277
+        </td>
+        <td>
+          100961
+        </td>
+        <td>
+          10187
+          -
+          10228
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.ArrayList.add
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tuples.add(new redis.clients.jedis.resps.Tuple(member, scala.Predef.double2Double(score)))
+        </td>
+      </tr><tr>
+        <td>
+          277
+        </td>
+        <td>
+          100960
+        </td>
+        <td>
+          10198
+          -
+          10227
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.resps.Tuple.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new redis.clients.jedis.resps.Tuple(member, scala.Predef.double2Double(score))
+        </td>
+      </tr><tr>
+        <td>
+          278
+        </td>
+        <td>
+          100962
+        </td>
+        <td>
+          10245
+          -
+          10251
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.+(2)
+        </td>
+      </tr><tr>
+        <td>
+          281
+        </td>
+        <td>
+          100969
+        </td>
+        <td>
+          10311
+          -
+          10346
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.Collections.emptyList
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Collections.emptyList[redis.clients.jedis.resps.Tuple]()
+        </td>
+      </tr><tr>
+        <td>
+          281
+        </td>
+        <td>
+          100968
+        </td>
+        <td>
+          10311
+          -
+          10346
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collections.emptyList
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Collections.emptyList[redis.clients.jedis.resps.Tuple]()
+        </td>
+      </tr><tr>
+        <td>
+          288
+        </td>
+        <td>
+          100972
+        </td>
+        <td>
+          10537
+          -
+          10572
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collections.emptyList
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          java.util.Collections.emptyList[redis.clients.jedis.resps.Tuple]()
+        </td>
+      </tr><tr>
+        <td>
+          292
+        </td>
+        <td>
+          100973
+        </td>
+        <td>
+          10703
+          -
+          10711
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.lockPath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.lockPath
+        </td>
+      </tr><tr>
+        <td>
+          292
+        </td>
+        <td>
+          100975
+        </td>
+        <td>
+          10694
+          -
+          10735
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.DistributedLocking.withLock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.withLock[java.util.List[redis.clients.jedis.resps.Tuple]](AgeOffRunner.this.lockPath, AgeOffRunner.this.timeout, exec, noLock)
+        </td>
+      </tr><tr>
+        <td>
+          292
+        </td>
+        <td>
+          100974
+        </td>
+        <td>
+          10713
+          -
+          10720
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.timeout
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.timeout
+        </td>
+      </tr><tr>
+        <td>
+          292
+        </td>
+        <td>
+          100976
+        </td>
+        <td>
+          10694
+          -
+          10735
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.DistributedLocking.withLock
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.withLock[java.util.List[redis.clients.jedis.resps.Tuple]](AgeOffRunner.this.lockPath, AgeOffRunner.this.timeout, exec, noLock)
+        </td>
+      </tr><tr>
+        <td>
+          293
+        </td>
+        <td>
+          100978
+        </td>
+        <td>
+          10771
+          -
+          10876
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (RedisAgeOff.this.logger.underlying.isErrorEnabled())
+    RedisAgeOff.this.logger.underlying.error(&quot;Error executing ttl script:&quot;, e)
+  else
+    (): Unit);
+  java.util.Collections.emptyList[redis.clients.jedis.resps.Tuple]()
+}
+        </td>
+      </tr><tr>
+        <td>
+          295
+        </td>
+        <td>
+          100977
+        </td>
+        <td>
+          10841
+          -
+          10876
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collections.emptyList
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          java.util.Collections.emptyList[redis.clients.jedis.resps.Tuple]()
+        </td>
+      </tr><tr>
+        <td>
+          310
+        </td>
+        <td>
+          101013
+        </td>
+        <td>
+          11277
+          -
+          12699
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val fids: java.util.HashSet[org.geotools.api.filter.identity.Identifier] = new java.util.HashSet[org.geotools.api.filter.identity.Identifier](ids.size());
+  scala.collection.JavaConverters.asScalaBufferConverter[redis.clients.jedis.resps.Tuple](ids).asScala.foreach[Boolean](((id: redis.clients.jedis.resps.Tuple) =&gt; fids.add(org.locationtech.geomesa.filter.FilterHelper.ff.featureId(id.getElement()))));
+  (if (RedisAgeOff.this.logger.underlying.isTraceEnabled())
+    RedisAgeOff.this.logger.underlying.trace(&quot;Age-off for schema \'{}\' found the following features: {}&quot;, (scala.Array.apply[AnyRef]((AgeOffRunner.this.typeName: AnyRef), (fids: AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  val trace: Boolean = RedisAgeOff.this.logger.underlying.isTraceEnabled();
+  &lt;stable&gt; &lt;accessor&gt; lazy val results: scala.collection.mutable.ListBuffer[String] = scala.collection.mutable.ListBuffer.empty[String];
+  var i: Int = 0;
+  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.locationtech.geomesa.index.FlushableFeatureWriter, Unit](AgeOffRunner.this.ds.getFeatureWriter(AgeOffRunner.this.typeName, org.locationtech.geomesa.filter.FilterHelper.ff.id(fids), org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.locationtech.geomesa.index.FlushableFeatureWriter) =&gt; while$2(){
+    if (writer.hasNext())
+      {
+        {
+          val sf: org.geotools.api.feature.simple.SimpleFeature = writer.next();
+          val ttl: Object = sf.getUserData().get(RedisAgeOff.this.TtlUserDataKey);
+          if (ttl.!=(null).&amp;&amp;(ttl.asInstanceOf[Long].&lt;=(timestamp)))
+            {
+              writer.remove();
+              i = i.+(1);
+              if (trace)
+                results.+=(sf.getID())
+              else
+                ()
+            }
+          else
+            (if (RedisAgeOff.this.logger.underlying.isDebugEnabled())
+              RedisAgeOff.this.logger.underlying.debug(&quot;Age-off for schema \'{}\' ignoring updated feature: {}&quot;, (scala.Array.apply[AnyRef]((AgeOffRunner.this.typeName: AnyRef), (sf.getID(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+            else
+              (): Unit)
+        };
+        while$2()
+      }
+    else
+      ()
+  }))(io.this.IsCloseable.closeableIsCloseable);
+  (if (RedisAgeOff.this.logger.underlying.isDebugEnabled())
+    RedisAgeOff.this.logger.underlying.debug(&quot;Age-off for schema \'{}\' removed {} features&quot;, (scala.Array.apply[AnyRef]((AgeOffRunner.this.typeName: AnyRef), i.asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  (if (RedisAgeOff.this.logger.underlying.isTraceEnabled())
+    RedisAgeOff.this.logger.underlying.trace(&quot;Age-off for schema \'{}\' removed the following features: [{}]&quot;, (scala.Array.apply[AnyRef]((AgeOffRunner.this.typeName: AnyRef), (results.mkString(&quot;, &quot;): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          311
+        </td>
+        <td>
+          100979
+        </td>
+        <td>
+          11322
+          -
+          11330
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.List.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ids.size()
+        </td>
+      </tr><tr>
+        <td>
+          311
+        </td>
+        <td>
+          100980
+        </td>
+        <td>
+          11288
+          -
+          11331
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.HashSet.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.HashSet[org.geotools.api.filter.identity.Identifier](ids.size())
+        </td>
+      </tr><tr>
+        <td>
+          312
+        </td>
+        <td>
+          100981
+        </td>
+        <td>
+          11401
+          -
+          11414
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.resps.Tuple.getElement
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          id.getElement()
+        </td>
+      </tr><tr>
+        <td>
+          312
+        </td>
+        <td>
+          100983
+        </td>
+        <td>
+          11366
+          -
+          11416
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.HashSet.add
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          fids.add(org.locationtech.geomesa.filter.FilterHelper.ff.featureId(id.getElement()))
+        </td>
+      </tr><tr>
+        <td>
+          312
+        </td>
+        <td>
+          100982
+        </td>
+        <td>
+          11375
+          -
+          11415
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.featureId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.featureId(id.getElement())
+        </td>
+      </tr><tr>
+        <td>
+          312
+        </td>
+        <td>
+          100984
+        </td>
+        <td>
+          11340
+          -
+          11417
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaBufferConverter[redis.clients.jedis.resps.Tuple](ids).asScala.foreach[Boolean](((id: redis.clients.jedis.resps.Tuple) =&gt; fids.add(org.locationtech.geomesa.filter.FilterHelper.ff.featureId(id.getElement()))))
+        </td>
+      </tr><tr>
+        <td>
+          315
+        </td>
+        <td>
+          100985
+        </td>
+        <td>
+          11531
+          -
+          11563
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.slf4j.Logger.isTraceEnabled
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.logger.underlying.isTraceEnabled()
+        </td>
+      </tr><tr>
+        <td>
+          318
+        </td>
+        <td>
+          100986
+        </td>
+        <td>
+          11633
+          -
+          11634
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          100987
+        </td>
+        <td>
+          11673
+          -
+          11681
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.typeName
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          100989
+        </td>
+        <td>
+          11709
+          -
+          11732
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          100988
+        </td>
+        <td>
+          11683
+          -
+          11707
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.id
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.id(fids)
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          100990
+        </td>
+        <td>
+          11653
+          -
+          11733
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.geotools.MetadataBackedDataStore.getFeatureWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          AgeOffRunner.this.ds.getFeatureWriter(AgeOffRunner.this.typeName, org.locationtech.geomesa.filter.FilterHelper.ff.id(fids), org.geotools.api.data.Transaction.AUTO_COMMIT)
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          101011
+        </td>
+        <td>
+          11735
+          -
+          11735
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          319
+        </td>
+        <td>
+          101012
+        </td>
+        <td>
+          11643
+          -
+          12507
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.locationtech.geomesa.index.FlushableFeatureWriter, Unit](AgeOffRunner.this.ds.getFeatureWriter(AgeOffRunner.this.typeName, org.locationtech.geomesa.filter.FilterHelper.ff.id(fids), org.geotools.api.data.Transaction.AUTO_COMMIT))(((writer: org.locationtech.geomesa.index.FlushableFeatureWriter) =&gt; while$2(){
+  if (writer.hasNext())
+    {
+      {
+        val sf: org.geotools.api.feature.simple.SimpleFeature = writer.next();
+        val ttl: Object = sf.getUserData().get(RedisAgeOff.this.TtlUserDataKey);
+        if (ttl.!=(null).&amp;&amp;(ttl.asInstanceOf[Long].&lt;=(timestamp)))
+          {
+            writer.remove();
+            i = i.+(1);
+            if (trace)
+              results.+=(sf.getID())
+            else
+              ()
+          }
+        else
+          (if (RedisAgeOff.this.logger.underlying.isDebugEnabled())
+            RedisAgeOff.this.logger.underlying.debug(&quot;Age-off for schema \'{}\' ignoring updated feature: {}&quot;, (scala.Array.apply[AnyRef]((AgeOffRunner.this.typeName: AnyRef), (sf.getID(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+          else
+            (): Unit)
+      };
+      while$2()
+    }
+  else
+    ()
+}))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          320
+        </td>
+        <td>
+          100991
+        </td>
+        <td>
+          11764
+          -
+          11778
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureWriter.hasNext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.hasNext()
+        </td>
+      </tr><tr>
+        <td>
+          320
+        </td>
+        <td>
+          101007
+        </td>
+        <td>
+          11780
+          -
+          11780
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.while$2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$2()
+        </td>
+      </tr><tr>
+        <td>
+          320
+        </td>
+        <td>
+          101009
+        </td>
+        <td>
+          11757
+          -
+          11757
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          320
+        </td>
+        <td>
+          101008
+        </td>
+        <td>
+          11780
+          -
+          12497
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    val sf: org.geotools.api.feature.simple.SimpleFeature = writer.next();
+    val ttl: Object = sf.getUserData().get(RedisAgeOff.this.TtlUserDataKey);
+    if (ttl.!=(null).&amp;&amp;(ttl.asInstanceOf[Long].&lt;=(timestamp)))
+      {
+        writer.remove();
+        i = i.+(1);
+        if (trace)
+          results.+=(sf.getID())
+        else
+          ()
+      }
+    else
+      (if (RedisAgeOff.this.logger.underlying.isDebugEnabled())
+        RedisAgeOff.this.logger.underlying.debug(&quot;Age-off for schema \'{}\' ignoring updated feature: {}&quot;, (scala.Array.apply[AnyRef]((AgeOffRunner.this.typeName: AnyRef), (sf.getID(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+      else
+        (): Unit)
+  };
+  while$2()
+}
+        </td>
+      </tr><tr>
+        <td>
+          320
+        </td>
+        <td>
+          101010
+        </td>
+        <td>
+          11757
+          -
+          11757
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          321
+        </td>
+        <td>
+          100992
+        </td>
+        <td>
+          11803
+          -
+          11816
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureWriter.next
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.next()
+        </td>
+      </tr><tr>
+        <td>
+          325
+        </td>
+        <td>
+          100993
+        </td>
+        <td>
+          12135
+          -
+          12149
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.TtlUserDataKey
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RedisAgeOff.this.TtlUserDataKey
+        </td>
+      </tr><tr>
+        <td>
+          325
+        </td>
+        <td>
+          100994
+        </td>
+        <td>
+          12116
+          -
+          12150
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sf.getUserData().get(RedisAgeOff.this.TtlUserDataKey)
+        </td>
+      </tr><tr>
+        <td>
+          326
+        </td>
+        <td>
+          100995
+        </td>
+        <td>
+          12174
+          -
+          12178
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          326
+        </td>
+        <td>
+          100997
+        </td>
+        <td>
+          12167
+          -
+          12217
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ttl.!=(null).&amp;&amp;(ttl.asInstanceOf[Long].&lt;=(timestamp))
+        </td>
+      </tr><tr>
+        <td>
+          326
+        </td>
+        <td>
+          100996
+        </td>
+        <td>
+          12182
+          -
+          12217
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ttl.asInstanceOf[Long].&lt;=(timestamp)
+        </td>
+      </tr><tr>
+        <td>
+          326
+        </td>
+        <td>
+          101005
+        </td>
+        <td>
+          12219
+          -
+          12364
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  writer.remove();
+  i = i.+(1);
+  if (trace)
+    results.+=(sf.getID())
+  else
+    ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          327
+        </td>
+        <td>
+          100998
+        </td>
+        <td>
+          12235
+          -
+          12250
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.FeatureWriter.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.remove()
+        </td>
+      </tr><tr>
+        <td>
+          328
+        </td>
+        <td>
+          100999
+        </td>
+        <td>
+          12265
+          -
+          12271
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          329
+        </td>
+        <td>
+          101003
+        </td>
+        <td>
+          12286
+          -
+          12286
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          329
+        </td>
+        <td>
+          101004
+        </td>
+        <td>
+          12286
+          -
+          12286
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          101001
+        </td>
+        <td>
+          12315
+          -
+          12334
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ListBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          results.+=(sf.getID())
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          101000
+        </td>
+        <td>
+          12326
+          -
+          12334
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          sf.getID()
+        </td>
+      </tr><tr>
+        <td>
+          330
+        </td>
+        <td>
+          101002
+        </td>
+        <td>
+          12315
+          -
+          12334
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.mutable.ListBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          results.+=(sf.getID())
+        </td>
+      </tr><tr>
+        <td>
+          333
+        </td>
+        <td>
+          101006
+        </td>
+        <td>
+          12386
+          -
+          12471
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (RedisAgeOff.this.logger.underlying.isDebugEnabled())
+  RedisAgeOff.this.logger.underlying.debug(&quot;Age-off for schema \'{}\' ignoring updated feature: {}&quot;, (scala.Array.apply[AnyRef]((AgeOffRunner.this.typeName: AnyRef), (sf.getID(): AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+else
+  (): Unit)
+        </td>
+      </tr><tr>
+        <td>
+          340
+        </td>
+        <td>
+          101015
+        </td>
+        <td>
+          12741
+          -
+          12928
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (RedisAgeOff.this.logger.underlying.isErrorEnabled())
+    RedisAgeOff.this.logger.underlying.error(scala.StringContext.apply(&quot;Error executing age-off for schema \'&quot;, &quot;\':&quot;).s(AgeOffRunner.this.typeName), e)
+  else
+    (): Unit);
+  AgeOffRunner.this.reinsertFailedIds(ids)
+}
+        </td>
+      </tr><tr>
+        <td>
+          343
+        </td>
+        <td>
+          101014
+        </td>
+        <td>
+          12906
+          -
+          12928
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.reinsertFailedIds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AgeOffRunner.this.reinsertFailedIds(ids)
+        </td>
+      </tr><tr>
+        <td>
+          353
+        </td>
+        <td>
+          101030
+        </td>
+        <td>
+          13183
+          -
+          13606
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (RedisAgeOff.this.logger.underlying.isDebugEnabled())
+    RedisAgeOff.this.logger.underlying.debug(&quot;Age-off for schema \'{}\' re-inserting ttls&quot;, (AgeOffRunner.this.typeName: AnyRef))
+  else
+    (): Unit);
+  val reinserts: java.util.HashMap[Array[Byte],Double] = new java.util.HashMap[Array[Byte],Double](ids.size());
+  scala.collection.JavaConverters.asScalaBufferConverter[redis.clients.jedis.resps.Tuple](ids).asScala.foreach[Double](((id: redis.clients.jedis.resps.Tuple) =&gt; reinserts.put(id.getBinaryElement(), scala.Predef.double2Double(id.getScore()))));
+  {
+    org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, Long](AgeOffRunner.this.ds.connection.getResource())(((x$12: _$1) =&gt; x$12.zadd(AgeOffRunner.this.table, reinserts, new redis.clients.jedis.params.ZAddParams().nx())))(io.this.IsCloseable.closeableIsCloseable);
+    ()
+  }
+}
+        </td>
+      </tr><tr>
+        <td>
+          355
+        </td>
+        <td>
+          101017
+        </td>
+        <td>
+          13273
+          -
+          13335
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.HashMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new java.util.HashMap[Array[Byte],Double](ids.size())
+        </td>
+      </tr><tr>
+        <td>
+          355
+        </td>
+        <td>
+          101016
+        </td>
+        <td>
+          13326
+          -
+          13334
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.List.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ids.size()
+        </td>
+      </tr><tr>
+        <td>
+          356
+        </td>
+        <td>
+          101019
+        </td>
+        <td>
+          13405
+          -
+          13416
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.resps.Tuple.getScore
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          id.getScore()
+        </td>
+      </tr><tr>
+        <td>
+          356
+        </td>
+        <td>
+          101018
+        </td>
+        <td>
+          13384
+          -
+          13403
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.resps.Tuple.getBinaryElement
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          id.getBinaryElement()
+        </td>
+      </tr><tr>
+        <td>
+          356
+        </td>
+        <td>
+          101021
+        </td>
+        <td>
+          13370
+          -
+          13417
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.HashMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          reinserts.put(id.getBinaryElement(), scala.Predef.double2Double(id.getScore()))
+        </td>
+      </tr><tr>
+        <td>
+          356
+        </td>
+        <td>
+          101020
+        </td>
+        <td>
+          13405
+          -
+          13416
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Predef.double2Double
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.double2Double(id.getScore())
+        </td>
+      </tr><tr>
+        <td>
+          356
+        </td>
+        <td>
+          101022
+        </td>
+        <td>
+          13344
+          -
+          13418
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.collection.JavaConverters.asScalaBufferConverter[redis.clients.jedis.resps.Tuple](ids).asScala.foreach[Double](((id: redis.clients.jedis.resps.Tuple) =&gt; reinserts.put(id.getBinaryElement(), scala.Predef.double2Double(id.getScore()))))
+        </td>
+      </tr><tr>
+        <td>
+          358
+        </td>
+        <td>
+          101023
+        </td>
+        <td>
+          13531
+          -
+          13556
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.util.Pool.getResource
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AgeOffRunner.this.ds.connection.getResource()
+        </td>
+      </tr><tr>
+        <td>
+          358
+        </td>
+        <td>
+          101025
+        </td>
+        <td>
+          13583
+          -
+          13604
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.params.ZAddParams.nx
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new redis.clients.jedis.params.ZAddParams().nx()
+        </td>
+      </tr><tr>
+        <td>
+          358
+        </td>
+        <td>
+          101024
+        </td>
+        <td>
+          13565
+          -
+          13570
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.redis.data.index.RedisAgeOff.AgeOffRunner.table
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          AgeOffRunner.this.table
+        </td>
+      </tr><tr>
+        <td>
+          358
+        </td>
+        <td>
+          101027
+        </td>
+        <td>
+          13557
+          -
+          13557
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          358
+        </td>
+        <td>
+          101026
+        </td>
+        <td>
+          13558
+          -
+          13605
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          redis.clients.jedis.commands.SortedSetBinaryCommands.zadd
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$12.zadd(AgeOffRunner.this.table, reinserts, new redis.clients.jedis.params.ZAddParams().nx())
+        </td>
+      </tr><tr>
+        <td>
+          358
+        </td>
+        <td>
+          101029
+        </td>
+        <td>
+          13557
+          -
+          13557
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          358
+        </td>
+        <td>
+          101028
+        </td>
+        <td>
+          13521
+          -
+          13606
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[_$1, Long](AgeOffRunner.this.ds.connection.getResource())(((x$12: _$1) =&gt; x$12.zadd(AgeOffRunner.this.table, reinserts, new redis.clients.jedis.params.ZAddParams().nx())))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          361
+        </td>
+        <td>
+          101031
+        </td>
+        <td>
+          13661
+          -
+          13839
+        </td>
+        <td>
+          Typed
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          (if (RedisAgeOff.this.logger.underlying.isErrorEnabled())
+  RedisAgeOff.this.logger.underlying.error(scala.StringContext.apply(&quot;Error re-inserting ttls for schema \'&quot;, &quot;\'. The following features &quot;).s(AgeOffRunner.this.typeName).+(scala.StringContext.apply(&quot;may never expire: [&quot;, &quot;]&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[redis.clients.jedis.resps.Tuple](ids).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$13: redis.clients.jedis.resps.Tuple) =&gt; x$13.getElement()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;))), e)
+else
+  (): Unit)
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>
