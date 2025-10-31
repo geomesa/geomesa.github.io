@@ -35,387 +35,421 @@
 </span>11 <span style=''>import com.codahale.metrics.Counter
 </span>12 <span style=''>import com.typesafe.config.Config
 </span>13 <span style=''>import com.typesafe.scalalogging.LazyLogging
-</span>14 <span style=''>import io.micrometer.core.instrument.{Metrics, Timer}
+</span>14 <span style=''>import io.micrometer.core.instrument.{DistributionSummary, Metrics, Tag, Timer}
 </span>15 <span style=''>import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
 </span>16 <span style=''>import org.geotools.util.factory.Hints
 </span>17 <span style=''>import org.locationtech.geomesa.convert.EvaluationContext.{EvaluationError, StatefulEvaluationContext, Stats}
 </span>18 <span style=''>import org.locationtech.geomesa.convert.Modes.{ErrorMode, ParseMode}
 </span>19 <span style=''>import org.locationtech.geomesa.convert.{EnrichmentCache, EvaluationContext}
-</span>20 <span style=''>import org.locationtech.geomesa.convert2.AbstractConverter.{BasicField, addDependencies, topologicalOrder}
+</span>20 <span style=''>import org.locationtech.geomesa.convert2.AbstractConverter.{BasicField, LatencyMetrics, addDependencies, topologicalOrder}
 </span>21 <span style=''>import org.locationtech.geomesa.convert2.metrics.ConverterMetrics
 </span>22 <span style=''>import org.locationtech.geomesa.convert2.transforms.Expression
 </span>23 <span style=''>import org.locationtech.geomesa.convert2.validators.{IdValidatorFactory, SimpleFeatureValidator}
 </span>24 <span style=''>import org.locationtech.geomesa.features.ScalaSimpleFeature
-</span>25 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
-</span>26 <span style=''>import org.locationtech.geomesa.utils.io.CloseWithLogging
-</span>27 <span style=''>import org.locationtech.geomesa.utils.metrics.{LatencyMetrics, MetricsTags}
+</span>25 <span style=''>import org.locationtech.geomesa.metrics.micrometer.utils.{GaugeUtils, TagUtils}
+</span>26 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
+</span>27 <span style=''>import org.locationtech.geomesa.utils.io.CloseWithLogging
 </span>28 <span style=''>
 </span>29 <span style=''>import java.io.{IOException, InputStream}
 </span>30 <span style=''>import java.nio.charset.{Charset, StandardCharsets}
 </span>31 <span style=''>import java.time.Duration
-</span>32 <span style=''>import java.util.concurrent.TimeUnit
-</span>33 <span style=''>import scala.collection.mutable.{ArrayBuffer, ListBuffer}
-</span>34 <span style=''>
-</span>35 <span style=''>/**
-</span>36 <span style=''>  * Abstract converter implementation. Typically paired with an AbstractConverterFactory. If so, needs to have
-</span>37 <span style=''>  * a default constructor consisting of (targetSft, config, fields, options), so that the AbstractConverterFactory
-</span>38 <span style=''>  * can instantiate it via reflection.
-</span>39 <span style=''>  *
-</span>40 <span style=''>  * Subclasses need to implement `read` to parse the underlying input stream into raw values that will be
-</span>41 <span style=''>  * transformed to simple features.
-</span>42 <span style=''>  *
-</span>43 <span style=''>  * @param sft simple feature type
-</span>44 <span style=''>  * @param config converter config
-</span>45 <span style=''>  * @param fields converter fields
-</span>46 <span style=''>  * @param options converter options
-</span>47 <span style=''>  * @tparam T intermediate parsed values binding
-</span>48 <span style=''>  * @tparam C config binding
-</span>49 <span style=''>  * @tparam F field binding
-</span>50 <span style=''>  * @tparam O options binding
-</span>51 <span style=''>  */
-</span>52 <span style=''>abstract class AbstractConverter[T, C &lt;: ConverterConfig, F &lt;: Field, O &lt;: ConverterOptions]
-</span>53 <span style=''>  (val sft: SimpleFeatureType, val config: C, val fields: Seq[F], val options: O)
-</span>54 <span style=''>    extends SimpleFeatureConverter with ParsingConverter[T] with LazyLogging {
-</span>55 <span style=''>
-</span>56 <span style=''>  import AbstractConverter.{IdFieldName, UserDataFieldPrefix}
-</span>57 <span style=''>  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
-</span>58 <span style=''>
-</span>59 <span style=''>  import scala.collection.JavaConverters._
-</span>60 <span style=''>
-</span>61 <span style=''>  if (</span><span style='background: #AEF1AE'>fields.exists(f =&gt; f.name == IdFieldName || f.name.startsWith(UserDataFieldPrefix))</span><span style=''>) {
-</span>62 <span style=''>    </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(
-</span>63 <span style=''></span><span style='background: #F0ADAD'>      s&quot;Field name(s) conflict with reserved values $IdFieldName and/or $UserDataFieldPrefix&quot;)</span><span style=''>
-</span>64 <span style=''>  }
-</span>65 <span style=''>
-</span>66 <span style=''>  private val requiredFields: Array[Field] = {
-</span>67 <span style=''>    val fieldNameMap = </span><span style='background: #AEF1AE'>fields.map(f =&gt; f.name -&gt; f.asInstanceOf[Field]).toMap</span><span style=''>
-</span>68 <span style=''>    val dag = </span><span style='background: #AEF1AE'>scala.collection.mutable.Map.empty[Field, Set[Field]]</span><span style=''>
-</span>69 <span style=''>
-</span>70 <span style=''>    // compute only the input fields that we need to deal with to populate the simple feature
-</span>71 <span style=''>    </span><span style='background: #AEF1AE'>sft.getAttributeDescriptors.asScala.foreach { ad =&gt;
-</span>72 <span style=''></span><span style='background: #AEF1AE'>      fieldNameMap.get(ad.getLocalName).foreach(addDependencies(_, fieldNameMap, dag))
-</span>73 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>74 <span style=''>
-</span>75 <span style=''>    // add id field and user data
-</span>76 <span style=''>    </span><span style='background: #AEF1AE'>config.idField.foreach { expression =&gt;
-</span>77 <span style=''></span><span style='background: #AEF1AE'>      addDependencies(BasicField(IdFieldName, Some(expression)), fieldNameMap, dag)
-</span>78 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>79 <span style=''>    </span><span style='background: #AEF1AE'>config.userData.foreach { case (key, expression) =&gt;
-</span>80 <span style=''></span><span style='background: #AEF1AE'>      addDependencies(BasicField(UserDataFieldPrefix + key, Some(expression)), fieldNameMap, dag)
-</span>81 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>82 <span style=''>
-</span>83 <span style=''>    // use a topological ordering to ensure that dependencies are evaluated before the fields that require them
-</span>84 <span style=''>    val ordered = </span><span style='background: #AEF1AE'>topologicalOrder(dag)</span><span style=''>
-</span>85 <span style=''>
-</span>86 <span style=''>    // log warnings for missing/unused fields
-</span>87 <span style=''>    val used = </span><span style='background: #AEF1AE'>ordered.map(_.name)</span><span style=''>
-</span>88 <span style=''>    val undefined = </span><span style='background: #AEF1AE'>sft.getAttributeDescriptors.asScala.map(_.getLocalName).diff(used)</span><span style=''>
-</span>89 <span style=''>    if (</span><span style='background: #AEF1AE'>undefined.nonEmpty</span><span style=''>) {
-</span>90 <span style=''>      </span><span style='background: #AEF1AE'>logger.warn(
-</span>91 <span style=''></span><span style='background: #AEF1AE'>        s&quot;'${sft.getTypeName}' converter did not define fields for some attributes: ${undefined.mkString(&quot;, &quot;)}&quot;)</span><span style=''>
-</span>92 <span style=''>    }
-</span>93 <span style=''>    val unused = </span><span style='background: #AEF1AE'>fields.map(_.name).diff(used)</span><span style=''>
-</span>94 <span style=''>    if (</span><span style='background: #AEF1AE'>unused.nonEmpty</span><span style=''>) {
-</span>95 <span style=''>      </span><span style='background: #AEF1AE'>logger.warn(s&quot;'${sft.getTypeName}' converter defined unused fields: ${unused.mkString(&quot;, &quot;)}&quot;)</span><span style=''>
-</span>96 <span style=''>    }
-</span>97 <span style=''>
-</span>98 <span style=''>    ordered
-</span>99 <span style=''>  }
-</span>100 <span style=''>
-</span>101 <span style=''>  private val attributeIndices: Array[(Int, Int)] = {
-</span>102 <span style=''>    val builder = </span><span style='background: #AEF1AE'>Array.newBuilder[(Int, Int)]</span><span style=''>
-</span>103 <span style=''>    </span><span style='background: #AEF1AE'>builder.sizeHint(sft.getAttributeCount)</span><span style=''>
-</span>104 <span style=''>    var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
-</span>105 <span style=''>    while (</span><span style='background: #AEF1AE'>i &lt; sft.getAttributeCount</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>106 <span style=''></span><span style='background: #AEF1AE'>      val d = sft.getDescriptor(i)
-</span>107 <span style=''></span><span style='background: #AEF1AE'>      // note: missing fields are already checked and logged in requiredFields
-</span>108 <span style=''></span><span style='background: #AEF1AE'>      val j = requiredFields.indexWhere(_.name == d.getLocalName)
-</span>109 <span style=''></span><span style='background: #AEF1AE'>      if (j != -1) {
-</span>110 <span style=''></span><span style='background: #AEF1AE'>        builder += i -&gt; j
-</span>111 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>112 <span style=''></span><span style='background: #AEF1AE'>      i += 1
-</span>113 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>114 <span style=''>    </span><span style='background: #AEF1AE'>builder.result()</span><span style=''>
-</span>115 <span style=''>  }
-</span>116 <span style=''>
+</span>32 <span style=''>import java.util.Date
+</span>33 <span style=''>import java.util.concurrent.TimeUnit
+</span>34 <span style=''>import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+</span>35 <span style=''>
+</span>36 <span style=''>/**
+</span>37 <span style=''>  * Abstract converter implementation. Typically paired with an AbstractConverterFactory. If so, needs to have
+</span>38 <span style=''>  * a default constructor consisting of (targetSft, config, fields, options), so that the AbstractConverterFactory
+</span>39 <span style=''>  * can instantiate it via reflection.
+</span>40 <span style=''>  *
+</span>41 <span style=''>  * Subclasses need to implement `read` to parse the underlying input stream into raw values that will be
+</span>42 <span style=''>  * transformed to simple features.
+</span>43 <span style=''>  *
+</span>44 <span style=''>  * @param sft simple feature type
+</span>45 <span style=''>  * @param config converter config
+</span>46 <span style=''>  * @param fields converter fields
+</span>47 <span style=''>  * @param options converter options
+</span>48 <span style=''>  * @tparam T intermediate parsed values binding
+</span>49 <span style=''>  * @tparam C config binding
+</span>50 <span style=''>  * @tparam F field binding
+</span>51 <span style=''>  * @tparam O options binding
+</span>52 <span style=''>  */
+</span>53 <span style=''>abstract class AbstractConverter[T, C &lt;: ConverterConfig, F &lt;: Field, O &lt;: ConverterOptions]
+</span>54 <span style=''>  (val sft: SimpleFeatureType, val config: C, val fields: Seq[F], val options: O)
+</span>55 <span style=''>    extends SimpleFeatureConverter with ParsingConverter[T] with LazyLogging {
+</span>56 <span style=''>
+</span>57 <span style=''>  import AbstractConverter.{IdFieldName, UserDataFieldPrefix}
+</span>58 <span style=''>  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+</span>59 <span style=''>
+</span>60 <span style=''>  import scala.collection.JavaConverters._
+</span>61 <span style=''>
+</span>62 <span style=''>  if (</span><span style='background: #AEF1AE'>fields.exists(f =&gt; f.name == IdFieldName || f.name.startsWith(UserDataFieldPrefix))</span><span style=''>) {
+</span>63 <span style=''>    </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(
+</span>64 <span style=''></span><span style='background: #F0ADAD'>      s&quot;Field name(s) conflict with reserved values $IdFieldName and/or $UserDataFieldPrefix&quot;)</span><span style=''>
+</span>65 <span style=''>  }
+</span>66 <span style=''>
+</span>67 <span style=''>  private val requiredFields: Array[Field] = {
+</span>68 <span style=''>    val fieldNameMap = </span><span style='background: #AEF1AE'>fields.map(f =&gt; f.name -&gt; f.asInstanceOf[Field]).toMap</span><span style=''>
+</span>69 <span style=''>    val dag = </span><span style='background: #AEF1AE'>scala.collection.mutable.Map.empty[Field, Set[Field]]</span><span style=''>
+</span>70 <span style=''>
+</span>71 <span style=''>    // compute only the input fields that we need to deal with to populate the simple feature
+</span>72 <span style=''>    </span><span style='background: #AEF1AE'>sft.getAttributeDescriptors.asScala.foreach { ad =&gt;
+</span>73 <span style=''></span><span style='background: #AEF1AE'>      fieldNameMap.get(ad.getLocalName).foreach(addDependencies(_, fieldNameMap, dag))
+</span>74 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>75 <span style=''>
+</span>76 <span style=''>    // add id field and user data
+</span>77 <span style=''>    </span><span style='background: #AEF1AE'>config.idField.foreach { expression =&gt;
+</span>78 <span style=''></span><span style='background: #AEF1AE'>      addDependencies(BasicField(IdFieldName, Some(expression)), fieldNameMap, dag)
+</span>79 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>80 <span style=''>    </span><span style='background: #AEF1AE'>config.userData.foreach { case (key, expression) =&gt;
+</span>81 <span style=''></span><span style='background: #AEF1AE'>      addDependencies(BasicField(UserDataFieldPrefix + key, Some(expression)), fieldNameMap, dag)
+</span>82 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>83 <span style=''>
+</span>84 <span style=''>    // use a topological ordering to ensure that dependencies are evaluated before the fields that require them
+</span>85 <span style=''>    val ordered = </span><span style='background: #AEF1AE'>topologicalOrder(dag)</span><span style=''>
+</span>86 <span style=''>
+</span>87 <span style=''>    // log warnings for missing/unused fields
+</span>88 <span style=''>    val used = </span><span style='background: #AEF1AE'>ordered.map(_.name)</span><span style=''>
+</span>89 <span style=''>    val undefined = </span><span style='background: #AEF1AE'>sft.getAttributeDescriptors.asScala.map(_.getLocalName).diff(used)</span><span style=''>
+</span>90 <span style=''>    if (</span><span style='background: #AEF1AE'>undefined.nonEmpty</span><span style=''>) {
+</span>91 <span style=''>      </span><span style='background: #AEF1AE'>logger.warn(
+</span>92 <span style=''></span><span style='background: #AEF1AE'>        s&quot;'${sft.getTypeName}' converter did not define fields for some attributes: ${undefined.mkString(&quot;, &quot;)}&quot;)</span><span style=''>
+</span>93 <span style=''>    }
+</span>94 <span style=''>    val unused = </span><span style='background: #AEF1AE'>fields.map(_.name).diff(used)</span><span style=''>
+</span>95 <span style=''>    if (</span><span style='background: #AEF1AE'>unused.nonEmpty</span><span style=''>) {
+</span>96 <span style=''>      </span><span style='background: #AEF1AE'>logger.warn(s&quot;'${sft.getTypeName}' converter defined unused fields: ${unused.mkString(&quot;, &quot;)}&quot;)</span><span style=''>
+</span>97 <span style=''>    }
+</span>98 <span style=''>
+</span>99 <span style=''>    ordered
+</span>100 <span style=''>  }
+</span>101 <span style=''>
+</span>102 <span style=''>  private val attributeIndices: Array[(Int, Int)] = {
+</span>103 <span style=''>    val builder = </span><span style='background: #AEF1AE'>Array.newBuilder[(Int, Int)]</span><span style=''>
+</span>104 <span style=''>    </span><span style='background: #AEF1AE'>builder.sizeHint(sft.getAttributeCount)</span><span style=''>
+</span>105 <span style=''>    var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
+</span>106 <span style=''>    while (</span><span style='background: #AEF1AE'>i &lt; sft.getAttributeCount</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>107 <span style=''></span><span style='background: #AEF1AE'>      val d = sft.getDescriptor(i)
+</span>108 <span style=''></span><span style='background: #AEF1AE'>      // note: missing fields are already checked and logged in requiredFields
+</span>109 <span style=''></span><span style='background: #AEF1AE'>      val j = requiredFields.indexWhere(_.name == d.getLocalName)
+</span>110 <span style=''></span><span style='background: #AEF1AE'>      if (j != -1) {
+</span>111 <span style=''></span><span style='background: #AEF1AE'>        builder += i -&gt; j
+</span>112 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>113 <span style=''></span><span style='background: #AEF1AE'>      i += 1
+</span>114 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>115 <span style=''>    </span><span style='background: #AEF1AE'>builder.result()</span><span style=''>
+</span>116 <span style=''>  }
 </span>117 <span style=''>
-</span>118 <span style=''>  private val idIndex: Int = </span><span style='background: #AEF1AE'>requiredFields.indexWhere(_.name == IdFieldName)</span><span style=''>
-</span>119 <span style=''>
-</span>120 <span style=''>  private val userDataIndices: Array[(String, Int)] = {
-</span>121 <span style=''>    val builder = </span><span style='background: #AEF1AE'>Array.newBuilder[(String, Int)]</span><span style=''>
-</span>122 <span style=''>    </span><span style='background: #AEF1AE'>builder.sizeHint(requiredFields.count(_.name.startsWith(UserDataFieldPrefix)))</span><span style=''>
-</span>123 <span style=''>    var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
-</span>124 <span style=''>    while (</span><span style='background: #AEF1AE'>i &lt; requiredFields.length</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>125 <span style=''></span><span style='background: #AEF1AE'>      if (requiredFields(i).name.startsWith(UserDataFieldPrefix)) {
-</span>126 <span style=''></span><span style='background: #AEF1AE'>        builder += requiredFields(i).name.substring(UserDataFieldPrefix.length) -&gt; i
-</span>127 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>128 <span style=''></span><span style='background: #AEF1AE'>      i += 1
-</span>129 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>130 <span style=''>    </span><span style='background: #AEF1AE'>builder.result</span><span style=''>
-</span>131 <span style=''>  }
-</span>132 <span style=''>
-</span>133 <span style=''>  // deprecated converter metrics
-</span>134 <span style=''>  private val metrics = </span><span style='background: #AEF1AE'>ConverterMetrics(sft, options.reporters)</span><span style=''>
-</span>135 <span style=''>
-</span>136 <span style=''>  private val tags = </span><span style='background: #AEF1AE'>config</span><span style=''> match {
-</span>137 <span style=''>    case ConverterName(name) =&gt; </span><span style='background: #AEF1AE'>MetricsTags.typeNameTag(sft).and(ConverterMetrics.converterNameTag(name))</span><span style=''>
-</span>138 <span style=''>    case _                   =&gt; </span><span style='background: #AEF1AE'>MetricsTags.typeNameTag(sft)</span><span style=''>
-</span>139 <span style=''>  }
-</span>140 <span style=''>
-</span>141 <span style=''>  private val validators =
-</span>142 <span style=''>    </span><span style='background: #AEF1AE'>SimpleFeatureValidator(sft, (if (idIndex != -1) { Seq(IdValidatorFactory.Name) } else { Seq.empty }) ++ options.validators, tags)</span><span style=''>
-</span>143 <span style=''>
-</span>144 <span style=''>  private val caches = </span><span style='background: #AEF1AE'>config.caches.map { case (k, v) =&gt; (k, EnrichmentCache(v)) }</span><span style=''>
-</span>145 <span style=''>
-</span>146 <span style=''>  private val parseTimer =
-</span>147 <span style=''>    </span><span style='background: #AEF1AE'>Timer.builder(ConverterMetrics.name(&quot;parse&quot;))
-</span>148 <span style=''></span><span style='background: #AEF1AE'>      .tags(tags)
-</span>149 <span style=''></span><span style='background: #AEF1AE'>      .publishPercentileHistogram()
-</span>150 <span style=''></span><span style='background: #AEF1AE'>      .minimumExpectedValue(Duration.ofNanos(1))
-</span>151 <span style=''></span><span style='background: #AEF1AE'>      .maximumExpectedValue(Duration.ofMillis(10))
-</span>152 <span style=''></span><span style='background: #AEF1AE'>      .register(Metrics.globalRegistry)</span><span style=''>
-</span>153 <span style=''>
-</span>154 <span style=''>  private val convertTimer =
-</span>155 <span style=''>    </span><span style='background: #AEF1AE'>Timer.builder(ConverterMetrics.name(&quot;convert&quot;))
-</span>156 <span style=''></span><span style='background: #AEF1AE'>      .tags(tags)
-</span>157 <span style=''></span><span style='background: #AEF1AE'>      .publishPercentileHistogram()
-</span>158 <span style=''></span><span style='background: #AEF1AE'>      .minimumExpectedValue(Duration.ofNanos(1))
-</span>159 <span style=''></span><span style='background: #AEF1AE'>      .maximumExpectedValue(Duration.ofMillis(2))
-</span>160 <span style=''></span><span style='background: #AEF1AE'>      .register(Metrics.globalRegistry)</span><span style=''>
-</span>161 <span style=''>
-</span>162 <span style=''>  private val latency = </span><span style='background: #AEF1AE'>sft.getDtgIndex.map(i =&gt; new LatencyMetrics(i, ConverterMetrics.MetricsNamePrefix.get, tags))</span><span style=''>
-</span>163 <span style=''>
-</span>164 <span style=''>  override def targetSft: SimpleFeatureType = </span><span style='background: #AEF1AE'>sft</span><span style=''>
-</span>165 <span style=''>
-</span>166 <span style=''>  override def createEvaluationContext(globalParams: Map[String, Any]): EvaluationContext =
-</span>167 <span style=''>    </span><span style='background: #AEF1AE'>new StatefulEvaluationContext(requiredFields, globalParams.asInstanceOf[Map[String, AnyRef]], caches, metrics, Stats(tags))</span><span style=''>
-</span>168 <span style=''>
-</span>169 <span style=''>  override def createEvaluationContext(globalParams: Map[String, Any], success: Counter, failure: Counter): EvaluationContext = {
-</span>170 <span style=''>    val stats = </span><span style='background: #F0ADAD'>Stats.wrap(success, failure, tags)</span><span style=''>
-</span>171 <span style=''>    </span><span style='background: #F0ADAD'>new StatefulEvaluationContext(requiredFields, globalParams.asInstanceOf[Map[String, AnyRef]], caches, metrics, stats)</span><span style=''>
-</span>172 <span style=''>  }
-</span>173 <span style=''>
-</span>174 <span style=''>  override def process(is: InputStream, ec: EvaluationContext): CloseableIterator[SimpleFeature] = {
-</span>175 <span style=''>    val converted = </span><span style='background: #AEF1AE'>convert(new ErrorHandlingIterator(parse(is, ec), options.errorMode, ec, parseTimer), ec)</span><span style=''>
-</span>176 <span style=''>    </span><span style='background: #AEF1AE'>options.parseMode</span><span style=''> match {
-</span>177 <span style=''>      case ParseMode.Incremental =&gt; </span><span style='background: #AEF1AE'>converted</span><span style=''>
-</span>178 <span style=''>      case ParseMode.Batch =&gt; </span><span style='background: #AEF1AE'>CloseableIterator((new ListBuffer() ++= converted).iterator, converted.close())</span><span style=''>
-</span>179 <span style=''>    }
-</span>180 <span style=''>  }
-</span>181 <span style=''>
-</span>182 <span style=''>  override def convert(values: CloseableIterator[T], ec: EvaluationContext): CloseableIterator[SimpleFeature] = {
-</span>183 <span style=''>    </span><span style='background: #AEF1AE'>this.values(values, ec).flatMap { raw =&gt;
-</span>184 <span style=''></span><span style='background: #AEF1AE'>      val start = System.nanoTime()
-</span>185 <span style=''></span><span style='background: #AEF1AE'>      try { convert(raw.asInstanceOf[Array[AnyRef]], ec) } finally {
-</span>186 <span style=''></span><span style='background: #AEF1AE'>        convertTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)
-</span>187 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>188 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>189 <span style=''>  }
-</span>190 <span style=''>
-</span>191 <span style=''>  /**
-</span>192 <span style=''>    * Parse objects out of the input stream. This should be lazily evaluated, so that any exceptions occur
-</span>193 <span style=''>    * in the call to `hasNext` (and not during the iterator creation), which lets us handle them appropriately
-</span>194 <span style=''>    * in `ErrorHandlingIterator`. If there is any sense of 'lines', they should be indicated with
-</span>195 <span style=''>    * `ec.counter.incLineCount`
-</span>196 <span style=''>    *
-</span>197 <span style=''>    * @param is input
-</span>198 <span style=''>    * @param ec evaluation context
-</span>199 <span style=''>    * @return raw extracted values, one iterator entry per simple feature
-</span>200 <span style=''>    */
-</span>201 <span style=''>  protected def parse(is: InputStream, ec: EvaluationContext): CloseableIterator[T]
-</span>202 <span style=''>
-</span>203 <span style=''>  /**
-</span>204 <span style=''>    * Convert parsed values into the raw array used for reading fields. If line counting was not handled
-</span>205 <span style=''>    * in `parse` (due to no sense of 'lines' in the input), then the line count should be incremented here
-</span>206 <span style=''>    * instead
-</span>207 <span style=''>    *
-</span>208 <span style=''>    * @param parsed parsed values
-</span>209 <span style=''>    * @param ec evaluation context
-</span>210 <span style=''>    * @return
-</span>211 <span style=''>    */
-</span>212 <span style=''>  protected def values(parsed: CloseableIterator[T], ec: EvaluationContext): CloseableIterator[Array[Any]]
-</span>213 <span style=''>
-</span>214 <span style=''>  /**
-</span>215 <span style=''>    * Convert input values into a simple feature with attributes.
-</span>216 <span style=''>    *
-</span>217 <span style=''>    * This method returns a CloseableIterator to simplify flatMapping over inputs, but it will always
-</span>218 <span style=''>    * return either 0 or 1 feature.
-</span>219 <span style=''>    *
-</span>220 <span style=''>    * @param rawValues raw input values
-</span>221 <span style=''>    * @param ec evaluation context
-</span>222 <span style=''>    * @return
-</span>223 <span style=''>    */
-</span>224 <span style=''>  private def convert(rawValues: Array[AnyRef], ec: EvaluationContext): CloseableIterator[SimpleFeature] = {
-</span>225 <span style=''>    val result = </span><span style='background: #AEF1AE'>ec.evaluate(rawValues).right.flatMap { values =&gt;
-</span>226 <span style=''></span><span style='background: #AEF1AE'>      val sf = new ScalaSimpleFeature(sft, &quot;&quot;)
-</span>227 <span style=''></span><span style='background: #AEF1AE'>
-</span>228 <span style=''></span><span style='background: #AEF1AE'>      attributeIndices.foreach { case (i, j) =&gt;
-</span>229 <span style=''></span><span style='background: #AEF1AE'>        sf.setAttributeNoConvert(i, values(j))
-</span>230 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>231 <span style=''></span><span style='background: #AEF1AE'>      // if no id builder, empty feature id will be replaced with an auto-gen one
-</span>232 <span style=''></span><span style='background: #AEF1AE'>      if (idIndex != -1) {
-</span>233 <span style=''></span><span style='background: #AEF1AE'>        values(idIndex) match {
-</span>234 <span style=''></span><span style='background: #AEF1AE'>          case id: String =&gt;
-</span>235 <span style=''></span><span style='background: #AEF1AE'>            sf.setId(id)
-</span>236 <span style=''></span><span style='background: #AEF1AE'>            sf.getUserData.put(Hints.USE_PROVIDED_FID, java.lang.Boolean.TRUE)
-</span>237 <span style=''></span><span style='background: #AEF1AE'>
-</span>238 <span style=''></span><span style='background: #AEF1AE'>          case null </span><span style='background: #F0ADAD'>=&gt;</span><span style='background: #AEF1AE'> // no-op
-</span>239 <span style=''></span><span style='background: #AEF1AE'>
-</span>240 <span style=''></span><span style='background: #AEF1AE'>          case id =&gt;
-</span>241 <span style=''></span><span style='background: #AEF1AE'>            // the missing feature id will be caught by the validator
-</span>242 <span style=''></span><span style='background: #AEF1AE'>            </span><span style='background: #F0ADAD'>logger.warn(s&quot;Ignoring non-string feature ID: $id&quot;)</span><span style='background: #AEF1AE'>
-</span>243 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>244 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>245 <span style=''></span><span style='background: #AEF1AE'>      userDataIndices.foreach { case (k, j) =&gt;
-</span>246 <span style=''></span><span style='background: #AEF1AE'>        sf.getUserData.put(k, values(j))
-</span>247 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>248 <span style=''></span><span style='background: #AEF1AE'>      val error = validators.validate(sf)
-</span>249 <span style=''></span><span style='background: #AEF1AE'>      if (error == null) {
-</span>250 <span style=''></span><span style='background: #AEF1AE'>        Right(sf)
-</span>251 <span style=''></span><span style='background: #AEF1AE'>      } else {
-</span>252 <span style=''></span><span style='background: #AEF1AE'>        Left(EvaluationError(null, ec.line, new IOException(s&quot;Validation error: $error&quot;)))
-</span>253 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>254 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>255 <span style=''>
-</span>256 <span style=''>    result match {
-</span>257 <span style=''>      case Right(feature) </span><span style='background: #AEF1AE'>=&gt;
-</span>258 <span style=''></span><span style='background: #AEF1AE'>        ec.stats.success()
-</span>259 <span style=''></span><span style='background: #AEF1AE'>        latency.foreach(_.apply(feature))
-</span>260 <span style=''></span><span style='background: #AEF1AE'>        CloseableIterator.single(feature)</span><span style=''>
-</span>261 <span style=''>
-</span>262 <span style=''>      case Left(error) </span><span style='background: #AEF1AE'>=&gt;
-</span>263 <span style=''></span><span style='background: #AEF1AE'>        ec.stats.failure()
-</span>264 <span style=''></span><span style='background: #AEF1AE'>        def msg(verbose: Boolean): String = errorMessage(error, rawValues, verbose)
-</span>265 <span style=''></span><span style='background: #AEF1AE'>        options.errorMode match {
-</span>266 <span style=''></span><span style='background: #AEF1AE'>          case ErrorMode.LogErrors if logger.underlying.isDebugEnabled =&gt; </span><span style='background: #F0ADAD'>logger.debug(msg(verbose = true), error.e)</span><span style='background: #AEF1AE'>
-</span>267 <span style=''></span><span style='background: #AEF1AE'>          case ErrorMode.LogErrors if logger.underlying.isInfoEnabled =&gt; </span><span style='background: #F0ADAD'>logger.info(msg(verbose = false))</span><span style='background: #AEF1AE'>
-</span>268 <span style=''></span><span style='background: #AEF1AE'>          case ErrorMode.ReturnErrors =&gt; ec.errors.add(error.copy(e = new IOException(msg(verbose = true), error.e)))
-</span>269 <span style=''></span><span style='background: #AEF1AE'>          case ErrorMode.RaiseErrors =&gt; throw new IOException(msg(verbose = true), error.e)
-</span>270 <span style=''></span><span style='background: #AEF1AE'>          case _ =&gt; // no-op
-</span>271 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>272 <span style=''></span><span style='background: #AEF1AE'>        CloseableIterator.empty</span><span style=''>
-</span>273 <span style=''>    }
-</span>274 <span style=''>  }
-</span>275 <span style=''>
-</span>276 <span style=''>  private def errorMessage(e: EvaluationError, input: Array[AnyRef], verbose: Boolean): String = {
-</span>277 <span style=''>    val field = if (</span><span style='background: #AEF1AE'>e.field == null</span><span style=''>) { </span><span style='background: #AEF1AE'>&quot;SimpleFeature&quot;</span><span style=''> } else { </span><span style='background: #AEF1AE'>s&quot;field '${e.field}'&quot;</span><span style=''> }
-</span>278 <span style=''>    val terse = </span><span style='background: #AEF1AE'>s&quot;Failed to evaluate $field on line ${e.line}&quot;</span><span style=''>
-</span>279 <span style=''>    if (</span><span style='background: #AEF1AE'>!verbose</span><span style=''>) { </span><span style='background: #F0ADAD'>terse</span><span style=''> } else {
-</span>280 <span style=''>      // head is the whole record
-</span>281 <span style=''>      </span><span style='background: #AEF1AE'>s&quot;$terse using values:\n${input.headOption.orNull}\n[${input.drop(1).mkString(&quot;, &quot;)}]&quot;</span><span style=''>
-</span>282 <span style=''>    }
-</span>283 <span style=''>  }
-</span>284 <span style=''>
-</span>285 <span style=''>  override def close(): Unit = {
-</span>286 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(caches.values)</span><span style=''>
-</span>287 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(metrics)</span><span style=''>
-</span>288 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(validators)</span><span style=''>
-</span>289 <span style=''>  }
-</span>290 <span style=''>}
-</span>291 <span style=''>
-</span>292 <span style=''>object AbstractConverter {
-</span>293 <span style=''>
-</span>294 <span style=''>  type Dag = scala.collection.mutable.Map[Field, Set[Field]]
-</span>295 <span style=''>
-</span>296 <span style=''>  private val IdFieldName         = </span><span style='background: #AEF1AE'>&quot;__AbstractConverter_id_field&quot;</span><span style=''>
-</span>297 <span style=''>  private val UserDataFieldPrefix = </span><span style='background: #AEF1AE'>&quot;__AbstractConverter_user_data_&quot;</span><span style=''>
-</span>298 <span style=''>
-</span>299 <span style=''>  /**
-</span>300 <span style=''>    * Basic field implementation, useful if a converter doesn't have custom fields
-</span>301 <span style=''>    *
-</span>302 <span style=''>    * @param name field name
-</span>303 <span style=''>    * @param transforms transforms
-</span>304 <span style=''>    */
-</span>305 <span style=''>  case class BasicField(name: String, transforms: Option[Expression]) extends Field {
-</span>306 <span style=''>    override val fieldArg: Option[Array[AnyRef] =&gt; AnyRef] = </span><span style='background: #AEF1AE'>None</span><span style=''>
-</span>307 <span style=''>  }
-</span>308 <span style=''>
-</span>309 <span style=''>  /**
-</span>310 <span style=''>   * Basic converter config implementation, useful if a converter doesn't have additional configuration
-</span>311 <span style=''>   *
-</span>312 <span style=''>   * @param `type` converter type
-</span>313 <span style=''>   * @param converterName converter name, for metrics
-</span>314 <span style=''>   * @param idField id expression
-</span>315 <span style=''>   * @param caches caches
-</span>316 <span style=''>   * @param userData user data expressions
-</span>317 <span style=''>   */
-</span>318 <span style=''>  case class BasicConfig(
-</span>319 <span style=''>      `type`: String,
-</span>320 <span style=''>      converterName: Option[String],
-</span>321 <span style=''>      idField: Option[Expression],
-</span>322 <span style=''>      caches: Map[String, Config],
-</span>323 <span style=''>      userData: Map[String, Expression]
-</span>324 <span style=''>    ) extends ConverterConfig with ConverterName
-</span>325 <span style=''>
-</span>326 <span style=''>  object BasicConfig {
-</span>327 <span style=''>    // apply method for back-compatibility
-</span>328 <span style=''>    @deprecated(&quot;Use method with `converterName`&quot;)
-</span>329 <span style=''>    def apply(`type`: String, idField: Option[Expression], caches: Map[String, Config], userData: Map[String, Expression]): BasicConfig =
-</span>330 <span style=''>      </span><span style='background: #F0ADAD'>BasicConfig(`type`, None, idField, caches, userData)</span><span style=''>
-</span>331 <span style=''>  }
-</span>332 <span style=''>
-</span>333 <span style=''>  /**
-</span>334 <span style=''>    * Basic converter options implementation, useful if a converter doesn't have additional options
-</span>335 <span style=''>    *
-</span>336 <span style=''>    * @param validators validator
-</span>337 <span style=''>    * @param reporters metric reporters
-</span>338 <span style=''>    * @param parseMode parse mode
-</span>339 <span style=''>    * @param errorMode error mode
-</span>340 <span style=''>    * @param encoding file/stream encoding
-</span>341 <span style=''>    */
-</span>342 <span style=''>  case class BasicOptions(
-</span>343 <span style=''>      validators: Seq[String],
-</span>344 <span style=''>      reporters: Seq[Config],
-</span>345 <span style=''>      parseMode: ParseMode,
-</span>346 <span style=''>      errorMode: ErrorMode,
-</span>347 <span style=''>      encoding: Charset
-</span>348 <span style=''>    ) extends ConverterOptions
-</span>349 <span style=''>
-</span>350 <span style=''>  object BasicOptions {
-</span>351 <span style=''>    // keep as a function to pick up system property changes
-</span>352 <span style=''>    def default: BasicOptions = {
-</span>353 <span style=''>      val validators = </span><span style='background: #AEF1AE'>SimpleFeatureValidator.default</span><span style=''>
-</span>354 <span style=''>      </span><span style='background: #AEF1AE'>BasicOptions(validators, Seq.empty, ParseMode.Default, ErrorMode(), StandardCharsets.UTF_8)</span><span style=''>
-</span>355 <span style=''>    }
-</span>356 <span style=''>  }
-</span>357 <span style=''>
-</span>358 <span style=''>  /**
-</span>359 <span style=''>    * Add the dependencies of a field to a graph
-</span>360 <span style=''>    *
-</span>361 <span style=''>    * @param field field to add
-</span>362 <span style=''>    * @param fieldMap field lookup map
-</span>363 <span style=''>    * @param dag graph
-</span>364 <span style=''>    */
-</span>365 <span style=''>  private def addDependencies[F &lt;: Field](field: Field, fieldMap: Map[String, F], dag: Dag): Unit = {
-</span>366 <span style=''>    if (</span><span style='background: #AEF1AE'>!dag.contains(field)</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>367 <span style=''></span><span style='background: #AEF1AE'>      val deps = field.transforms.toSeq.flatMap(_.dependencies(Set(field), fieldMap)).toSet
-</span>368 <span style=''></span><span style='background: #AEF1AE'>      dag.put(field, deps)
-</span>369 <span style=''></span><span style='background: #AEF1AE'>      deps.foreach(addDependencies(_, fieldMap, dag))
-</span>370 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>371 <span style=''>  }
-</span>372 <span style=''>
-</span>373 <span style=''>  /**
-</span>374 <span style=''>    * Returns vertices in topological order.
-</span>375 <span style=''>    *
-</span>376 <span style=''>    * Note: will cause an infinite loop if there are circular dependencies
-</span>377 <span style=''>    *
-</span>378 <span style=''>    * @param dag graph
-</span>379 <span style=''>    * @return ordered vertices
-</span>380 <span style=''>    */
-</span>381 <span style=''>  private def topologicalOrder(dag: Dag): Array[Field] = {
-</span>382 <span style=''>    val res = </span><span style='background: #AEF1AE'>ArrayBuffer.empty[Field]</span><span style=''>
-</span>383 <span style=''>    val remaining = </span><span style='background: #AEF1AE'>new scala.collection.mutable.Queue[Field]() ++ dag.keys</span><span style=''>
-</span>384 <span style=''>    while (</span><span style='background: #AEF1AE'>remaining.nonEmpty</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>385 <span style=''></span><span style='background: #AEF1AE'>      val next = remaining.dequeue()
-</span>386 <span style=''></span><span style='background: #AEF1AE'>      if (dag(next).forall(res.contains)) {
-</span>387 <span style=''></span><span style='background: #AEF1AE'>        res.append(next)
-</span>388 <span style=''></span><span style='background: #AEF1AE'>      } else {
-</span>389 <span style=''></span><span style='background: #AEF1AE'>        remaining.enqueue(next) // put at the back of the queue
-</span>390 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>391 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>392 <span style=''>    </span><span style='background: #AEF1AE'>res.toArray</span><span style=''>
-</span>393 <span style=''>  }
-</span>394 <span style=''>}
+</span>118 <span style=''>
+</span>119 <span style=''>  private val idIndex: Int = </span><span style='background: #AEF1AE'>requiredFields.indexWhere(_.name == IdFieldName)</span><span style=''>
+</span>120 <span style=''>
+</span>121 <span style=''>  private val userDataIndices: Array[(String, Int)] = {
+</span>122 <span style=''>    val builder = </span><span style='background: #AEF1AE'>Array.newBuilder[(String, Int)]</span><span style=''>
+</span>123 <span style=''>    </span><span style='background: #AEF1AE'>builder.sizeHint(requiredFields.count(_.name.startsWith(UserDataFieldPrefix)))</span><span style=''>
+</span>124 <span style=''>    var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
+</span>125 <span style=''>    while (</span><span style='background: #AEF1AE'>i &lt; requiredFields.length</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>126 <span style=''></span><span style='background: #AEF1AE'>      if (requiredFields(i).name.startsWith(UserDataFieldPrefix)) {
+</span>127 <span style=''></span><span style='background: #AEF1AE'>        builder += requiredFields(i).name.substring(UserDataFieldPrefix.length) -&gt; i
+</span>128 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>129 <span style=''></span><span style='background: #AEF1AE'>      i += 1
+</span>130 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>131 <span style=''>    </span><span style='background: #AEF1AE'>builder.result</span><span style=''>
+</span>132 <span style=''>  }
+</span>133 <span style=''>
+</span>134 <span style=''>  // deprecated converter metrics
+</span>135 <span style=''>  private val metrics = </span><span style='background: #AEF1AE'>ConverterMetrics(sft, options.reporters)</span><span style=''>
+</span>136 <span style=''>
+</span>137 <span style=''>  private val tags = </span><span style='background: #AEF1AE'>config</span><span style=''> match {
+</span>138 <span style=''>    case ConverterName(name) =&gt; </span><span style='background: #AEF1AE'>TagUtils.typeNameTag(sft.getTypeName).and(ConverterMetrics.converterNameTag(name))</span><span style=''>
+</span>139 <span style=''>    case _                   =&gt; </span><span style='background: #AEF1AE'>TagUtils.typeNameTag(sft.getTypeName)</span><span style=''>
+</span>140 <span style=''>  }
+</span>141 <span style=''>
+</span>142 <span style=''>  private val validators =
+</span>143 <span style=''>    </span><span style='background: #AEF1AE'>SimpleFeatureValidator(sft, (if (idIndex != -1) { Seq(IdValidatorFactory.Name) } else { Seq.empty }) ++ options.validators, tags)</span><span style=''>
+</span>144 <span style=''>
+</span>145 <span style=''>  private val caches = </span><span style='background: #AEF1AE'>config.caches.map { case (k, v) =&gt; (k, EnrichmentCache(v)) }</span><span style=''>
+</span>146 <span style=''>
+</span>147 <span style=''>  private val parseTimer =
+</span>148 <span style=''>    </span><span style='background: #AEF1AE'>Timer.builder(ConverterMetrics.name(&quot;parse&quot;))
+</span>149 <span style=''></span><span style='background: #AEF1AE'>      .tags(tags)
+</span>150 <span style=''></span><span style='background: #AEF1AE'>      .publishPercentileHistogram()
+</span>151 <span style=''></span><span style='background: #AEF1AE'>      .minimumExpectedValue(Duration.ofNanos(1))
+</span>152 <span style=''></span><span style='background: #AEF1AE'>      .maximumExpectedValue(Duration.ofMillis(10))
+</span>153 <span style=''></span><span style='background: #AEF1AE'>      .register(Metrics.globalRegistry)</span><span style=''>
+</span>154 <span style=''>
+</span>155 <span style=''>  private val convertTimer =
+</span>156 <span style=''>    </span><span style='background: #AEF1AE'>Timer.builder(ConverterMetrics.name(&quot;convert&quot;))
+</span>157 <span style=''></span><span style='background: #AEF1AE'>      .tags(tags)
+</span>158 <span style=''></span><span style='background: #AEF1AE'>      .publishPercentileHistogram()
+</span>159 <span style=''></span><span style='background: #AEF1AE'>      .minimumExpectedValue(Duration.ofNanos(1))
+</span>160 <span style=''></span><span style='background: #AEF1AE'>      .maximumExpectedValue(Duration.ofMillis(2))
+</span>161 <span style=''></span><span style='background: #AEF1AE'>      .register(Metrics.globalRegistry)</span><span style=''>
+</span>162 <span style=''>
+</span>163 <span style=''>  private val latency = </span><span style='background: #AEF1AE'>sft.getDtgIndex.map(i =&gt; new LatencyMetrics(i, tags))</span><span style=''>
+</span>164 <span style=''>
+</span>165 <span style=''>  override def targetSft: SimpleFeatureType = </span><span style='background: #AEF1AE'>sft</span><span style=''>
+</span>166 <span style=''>
+</span>167 <span style=''>  override def createEvaluationContext(globalParams: Map[String, Any]): EvaluationContext =
+</span>168 <span style=''>    </span><span style='background: #AEF1AE'>new StatefulEvaluationContext(requiredFields, globalParams.asInstanceOf[Map[String, AnyRef]], caches, metrics, Stats(tags))</span><span style=''>
+</span>169 <span style=''>
+</span>170 <span style=''>  override def createEvaluationContext(globalParams: Map[String, Any], success: Counter, failure: Counter): EvaluationContext = {
+</span>171 <span style=''>    val stats = </span><span style='background: #F0ADAD'>Stats.wrap(success, failure, tags)</span><span style=''>
+</span>172 <span style=''>    </span><span style='background: #F0ADAD'>new StatefulEvaluationContext(requiredFields, globalParams.asInstanceOf[Map[String, AnyRef]], caches, metrics, stats)</span><span style=''>
+</span>173 <span style=''>  }
+</span>174 <span style=''>
+</span>175 <span style=''>  override def process(is: InputStream, ec: EvaluationContext): CloseableIterator[SimpleFeature] = {
+</span>176 <span style=''>    val converted = </span><span style='background: #AEF1AE'>convert(new ErrorHandlingIterator(parse(is, ec), options.errorMode, ec, parseTimer), ec)</span><span style=''>
+</span>177 <span style=''>    </span><span style='background: #AEF1AE'>options.parseMode</span><span style=''> match {
+</span>178 <span style=''>      case ParseMode.Incremental =&gt; </span><span style='background: #AEF1AE'>converted</span><span style=''>
+</span>179 <span style=''>      case ParseMode.Batch =&gt; </span><span style='background: #AEF1AE'>CloseableIterator((new ListBuffer() ++= converted).iterator, converted.close())</span><span style=''>
+</span>180 <span style=''>    }
+</span>181 <span style=''>  }
+</span>182 <span style=''>
+</span>183 <span style=''>  override def convert(values: CloseableIterator[T], ec: EvaluationContext): CloseableIterator[SimpleFeature] = {
+</span>184 <span style=''>    </span><span style='background: #AEF1AE'>this.values(values, ec).flatMap { raw =&gt;
+</span>185 <span style=''></span><span style='background: #AEF1AE'>      val start = System.nanoTime()
+</span>186 <span style=''></span><span style='background: #AEF1AE'>      try { convert(raw.asInstanceOf[Array[AnyRef]], ec) } finally {
+</span>187 <span style=''></span><span style='background: #AEF1AE'>        convertTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)
+</span>188 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>189 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>190 <span style=''>  }
+</span>191 <span style=''>
+</span>192 <span style=''>  /**
+</span>193 <span style=''>    * Parse objects out of the input stream. This should be lazily evaluated, so that any exceptions occur
+</span>194 <span style=''>    * in the call to `hasNext` (and not during the iterator creation), which lets us handle them appropriately
+</span>195 <span style=''>    * in `ErrorHandlingIterator`. If there is any sense of 'lines', they should be indicated with
+</span>196 <span style=''>    * `ec.counter.incLineCount`
+</span>197 <span style=''>    *
+</span>198 <span style=''>    * @param is input
+</span>199 <span style=''>    * @param ec evaluation context
+</span>200 <span style=''>    * @return raw extracted values, one iterator entry per simple feature
+</span>201 <span style=''>    */
+</span>202 <span style=''>  protected def parse(is: InputStream, ec: EvaluationContext): CloseableIterator[T]
+</span>203 <span style=''>
+</span>204 <span style=''>  /**
+</span>205 <span style=''>    * Convert parsed values into the raw array used for reading fields. If line counting was not handled
+</span>206 <span style=''>    * in `parse` (due to no sense of 'lines' in the input), then the line count should be incremented here
+</span>207 <span style=''>    * instead
+</span>208 <span style=''>    *
+</span>209 <span style=''>    * @param parsed parsed values
+</span>210 <span style=''>    * @param ec evaluation context
+</span>211 <span style=''>    * @return
+</span>212 <span style=''>    */
+</span>213 <span style=''>  protected def values(parsed: CloseableIterator[T], ec: EvaluationContext): CloseableIterator[Array[Any]]
+</span>214 <span style=''>
+</span>215 <span style=''>  /**
+</span>216 <span style=''>    * Convert input values into a simple feature with attributes.
+</span>217 <span style=''>    *
+</span>218 <span style=''>    * This method returns a CloseableIterator to simplify flatMapping over inputs, but it will always
+</span>219 <span style=''>    * return either 0 or 1 feature.
+</span>220 <span style=''>    *
+</span>221 <span style=''>    * @param rawValues raw input values
+</span>222 <span style=''>    * @param ec evaluation context
+</span>223 <span style=''>    * @return
+</span>224 <span style=''>    */
+</span>225 <span style=''>  private def convert(rawValues: Array[AnyRef], ec: EvaluationContext): CloseableIterator[SimpleFeature] = {
+</span>226 <span style=''>    val result = </span><span style='background: #AEF1AE'>ec.evaluate(rawValues).right.flatMap { values =&gt;
+</span>227 <span style=''></span><span style='background: #AEF1AE'>      val sf = new ScalaSimpleFeature(sft, &quot;&quot;)
+</span>228 <span style=''></span><span style='background: #AEF1AE'>
+</span>229 <span style=''></span><span style='background: #AEF1AE'>      attributeIndices.foreach { case (i, j) =&gt;
+</span>230 <span style=''></span><span style='background: #AEF1AE'>        sf.setAttributeNoConvert(i, values(j))
+</span>231 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>232 <span style=''></span><span style='background: #AEF1AE'>      // if no id builder, empty feature id will be replaced with an auto-gen one
+</span>233 <span style=''></span><span style='background: #AEF1AE'>      if (idIndex != -1) {
+</span>234 <span style=''></span><span style='background: #AEF1AE'>        values(idIndex) match {
+</span>235 <span style=''></span><span style='background: #AEF1AE'>          case id: String =&gt;
+</span>236 <span style=''></span><span style='background: #AEF1AE'>            sf.setId(id)
+</span>237 <span style=''></span><span style='background: #AEF1AE'>            sf.getUserData.put(Hints.USE_PROVIDED_FID, java.lang.Boolean.TRUE)
+</span>238 <span style=''></span><span style='background: #AEF1AE'>
+</span>239 <span style=''></span><span style='background: #AEF1AE'>          case null </span><span style='background: #F0ADAD'>=&gt;</span><span style='background: #AEF1AE'> // no-op
+</span>240 <span style=''></span><span style='background: #AEF1AE'>
+</span>241 <span style=''></span><span style='background: #AEF1AE'>          case id =&gt;
+</span>242 <span style=''></span><span style='background: #AEF1AE'>            // the missing feature id will be caught by the validator
+</span>243 <span style=''></span><span style='background: #AEF1AE'>            </span><span style='background: #F0ADAD'>logger.warn(s&quot;Ignoring non-string feature ID: $id&quot;)</span><span style='background: #AEF1AE'>
+</span>244 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>245 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>246 <span style=''></span><span style='background: #AEF1AE'>      userDataIndices.foreach { case (k, j) =&gt;
+</span>247 <span style=''></span><span style='background: #AEF1AE'>        sf.getUserData.put(k, values(j))
+</span>248 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>249 <span style=''></span><span style='background: #AEF1AE'>      val error = validators.validate(sf)
+</span>250 <span style=''></span><span style='background: #AEF1AE'>      if (error == null) {
+</span>251 <span style=''></span><span style='background: #AEF1AE'>        Right(sf)
+</span>252 <span style=''></span><span style='background: #AEF1AE'>      } else {
+</span>253 <span style=''></span><span style='background: #AEF1AE'>        Left(EvaluationError(null, ec.line, new IOException(s&quot;Validation error: $error&quot;)))
+</span>254 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>255 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>256 <span style=''>
+</span>257 <span style=''>    result match {
+</span>258 <span style=''>      case Right(feature) </span><span style='background: #AEF1AE'>=&gt;
+</span>259 <span style=''></span><span style='background: #AEF1AE'>        ec.stats.success()
+</span>260 <span style=''></span><span style='background: #AEF1AE'>        latency.foreach(_.apply(feature))
+</span>261 <span style=''></span><span style='background: #AEF1AE'>        CloseableIterator.single(feature)</span><span style=''>
+</span>262 <span style=''>
+</span>263 <span style=''>      case Left(error) </span><span style='background: #AEF1AE'>=&gt;
+</span>264 <span style=''></span><span style='background: #AEF1AE'>        ec.stats.failure()
+</span>265 <span style=''></span><span style='background: #AEF1AE'>        def msg(verbose: Boolean): String = errorMessage(error, rawValues, verbose)
+</span>266 <span style=''></span><span style='background: #AEF1AE'>        options.errorMode match {
+</span>267 <span style=''></span><span style='background: #AEF1AE'>          case ErrorMode.LogErrors if logger.underlying.isDebugEnabled =&gt; </span><span style='background: #F0ADAD'>logger.debug(msg(verbose = true), error.e)</span><span style='background: #AEF1AE'>
+</span>268 <span style=''></span><span style='background: #AEF1AE'>          case ErrorMode.LogErrors if logger.underlying.isInfoEnabled =&gt; </span><span style='background: #F0ADAD'>logger.info(msg(verbose = false))</span><span style='background: #AEF1AE'>
+</span>269 <span style=''></span><span style='background: #AEF1AE'>          case ErrorMode.ReturnErrors =&gt; ec.errors.add(error.copy(e = new IOException(msg(verbose = true), error.e)))
+</span>270 <span style=''></span><span style='background: #AEF1AE'>          case ErrorMode.RaiseErrors =&gt; throw new IOException(msg(verbose = true), error.e)
+</span>271 <span style=''></span><span style='background: #AEF1AE'>          case _ =&gt; // no-op
+</span>272 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>273 <span style=''></span><span style='background: #AEF1AE'>        CloseableIterator.empty</span><span style=''>
+</span>274 <span style=''>    }
+</span>275 <span style=''>  }
+</span>276 <span style=''>
+</span>277 <span style=''>  private def errorMessage(e: EvaluationError, input: Array[AnyRef], verbose: Boolean): String = {
+</span>278 <span style=''>    val field = if (</span><span style='background: #AEF1AE'>e.field == null</span><span style=''>) { </span><span style='background: #AEF1AE'>&quot;SimpleFeature&quot;</span><span style=''> } else { </span><span style='background: #AEF1AE'>s&quot;field '${e.field}'&quot;</span><span style=''> }
+</span>279 <span style=''>    val terse = </span><span style='background: #AEF1AE'>s&quot;Failed to evaluate $field on line ${e.line}&quot;</span><span style=''>
+</span>280 <span style=''>    if (</span><span style='background: #AEF1AE'>!verbose</span><span style=''>) { </span><span style='background: #F0ADAD'>terse</span><span style=''> } else {
+</span>281 <span style=''>      // head is the whole record
+</span>282 <span style=''>      </span><span style='background: #AEF1AE'>s&quot;$terse using values:\n${input.headOption.orNull}\n[${input.drop(1).mkString(&quot;, &quot;)}]&quot;</span><span style=''>
+</span>283 <span style=''>    }
+</span>284 <span style=''>  }
+</span>285 <span style=''>
+</span>286 <span style=''>  override def close(): Unit = {
+</span>287 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(caches.values)</span><span style=''>
+</span>288 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(metrics)</span><span style=''>
+</span>289 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging(validators)</span><span style=''>
+</span>290 <span style=''>  }
+</span>291 <span style=''>}
+</span>292 <span style=''>
+</span>293 <span style=''>object AbstractConverter {
+</span>294 <span style=''>
+</span>295 <span style=''>  type Dag = scala.collection.mutable.Map[Field, Set[Field]]
+</span>296 <span style=''>
+</span>297 <span style=''>  private val IdFieldName         = </span><span style='background: #AEF1AE'>&quot;__AbstractConverter_id_field&quot;</span><span style=''>
+</span>298 <span style=''>  private val UserDataFieldPrefix = </span><span style='background: #AEF1AE'>&quot;__AbstractConverter_user_data_&quot;</span><span style=''>
+</span>299 <span style=''>
+</span>300 <span style=''>  /**
+</span>301 <span style=''>    * Basic field implementation, useful if a converter doesn't have custom fields
+</span>302 <span style=''>    *
+</span>303 <span style=''>    * @param name field name
+</span>304 <span style=''>    * @param transforms transforms
+</span>305 <span style=''>    */
+</span>306 <span style=''>  case class BasicField(name: String, transforms: Option[Expression]) extends Field {
+</span>307 <span style=''>    override val fieldArg: Option[Array[AnyRef] =&gt; AnyRef] = </span><span style='background: #AEF1AE'>None</span><span style=''>
+</span>308 <span style=''>  }
+</span>309 <span style=''>
+</span>310 <span style=''>  /**
+</span>311 <span style=''>   * Basic converter config implementation, useful if a converter doesn't have additional configuration
+</span>312 <span style=''>   *
+</span>313 <span style=''>   * @param `type` converter type
+</span>314 <span style=''>   * @param converterName converter name, for metrics
+</span>315 <span style=''>   * @param idField id expression
+</span>316 <span style=''>   * @param caches caches
+</span>317 <span style=''>   * @param userData user data expressions
+</span>318 <span style=''>   */
+</span>319 <span style=''>  case class BasicConfig(
+</span>320 <span style=''>      `type`: String,
+</span>321 <span style=''>      converterName: Option[String],
+</span>322 <span style=''>      idField: Option[Expression],
+</span>323 <span style=''>      caches: Map[String, Config],
+</span>324 <span style=''>      userData: Map[String, Expression]
+</span>325 <span style=''>    ) extends ConverterConfig with ConverterName
+</span>326 <span style=''>
+</span>327 <span style=''>  object BasicConfig {
+</span>328 <span style=''>    // apply method for back-compatibility
+</span>329 <span style=''>    @deprecated(&quot;Use method with `converterName`&quot;)
+</span>330 <span style=''>    def apply(`type`: String, idField: Option[Expression], caches: Map[String, Config], userData: Map[String, Expression]): BasicConfig =
+</span>331 <span style=''>      </span><span style='background: #F0ADAD'>BasicConfig(`type`, None, idField, caches, userData)</span><span style=''>
+</span>332 <span style=''>  }
+</span>333 <span style=''>
+</span>334 <span style=''>  /**
+</span>335 <span style=''>    * Basic converter options implementation, useful if a converter doesn't have additional options
+</span>336 <span style=''>    *
+</span>337 <span style=''>    * @param validators validator
+</span>338 <span style=''>    * @param reporters metric reporters
+</span>339 <span style=''>    * @param parseMode parse mode
+</span>340 <span style=''>    * @param errorMode error mode
+</span>341 <span style=''>    * @param encoding file/stream encoding
+</span>342 <span style=''>    */
+</span>343 <span style=''>  case class BasicOptions(
+</span>344 <span style=''>      validators: Seq[String],
+</span>345 <span style=''>      reporters: Seq[Config],
+</span>346 <span style=''>      parseMode: ParseMode,
+</span>347 <span style=''>      errorMode: ErrorMode,
+</span>348 <span style=''>      encoding: Charset
+</span>349 <span style=''>    ) extends ConverterOptions
+</span>350 <span style=''>
+</span>351 <span style=''>  object BasicOptions {
+</span>352 <span style=''>    // keep as a function to pick up system property changes
+</span>353 <span style=''>    def default: BasicOptions = {
+</span>354 <span style=''>      val validators = </span><span style='background: #AEF1AE'>SimpleFeatureValidator.default</span><span style=''>
+</span>355 <span style=''>      </span><span style='background: #AEF1AE'>BasicOptions(validators, Seq.empty, ParseMode.Default, ErrorMode(), StandardCharsets.UTF_8)</span><span style=''>
+</span>356 <span style=''>    }
+</span>357 <span style=''>  }
+</span>358 <span style=''>
+</span>359 <span style=''>  /**
+</span>360 <span style=''>   * Latency metrics tracker
+</span>361 <span style=''>   *
+</span>362 <span style=''>   * @param dtgIndex index of the date attribute to track in the feature type
+</span>363 <span style=''>   * @param tags metrics tags
+</span>364 <span style=''>   */
+</span>365 <span style=''>  private class LatencyMetrics(dtgIndex: Int, tags: java.lang.Iterable[Tag]) {
+</span>366 <span style=''>
+</span>367 <span style=''>    private val date = </span><span style='background: #AEF1AE'>GaugeUtils.timeGauge(ConverterMetrics.name(&quot;dtg.latest&quot;), tags)</span><span style=''>
+</span>368 <span style=''>
+</span>369 <span style=''>    private val latency =
+</span>370 <span style=''>      </span><span style='background: #AEF1AE'>DistributionSummary.builder(ConverterMetrics.name(&quot;dtg.latency&quot;))
+</span>371 <span style=''></span><span style='background: #AEF1AE'>        .tags(tags)
+</span>372 <span style=''></span><span style='background: #AEF1AE'>        .publishPercentileHistogram()
+</span>373 <span style=''></span><span style='background: #AEF1AE'>        .baseUnit(&quot;milliseconds&quot;)
+</span>374 <span style=''></span><span style='background: #AEF1AE'>        .minimumExpectedValue(1d)
+</span>375 <span style=''></span><span style='background: #AEF1AE'>        .maximumExpectedValue(Duration.ofDays(1).toMillis.toDouble)
+</span>376 <span style=''></span><span style='background: #AEF1AE'>        .register(Metrics.globalRegistry)</span><span style=''>
+</span>377 <span style=''>
+</span>378 <span style=''>    /**
+</span>379 <span style=''>     * Record latency for a feature
+</span>380 <span style=''>     *
+</span>381 <span style=''>     * @param feature feature
+</span>382 <span style=''>     */
+</span>383 <span style=''>    def apply(feature: SimpleFeature): Unit = {
+</span>384 <span style=''>      val dtg = </span><span style='background: #AEF1AE'>feature.getAttribute(dtgIndex).asInstanceOf[Date]</span><span style=''>
+</span>385 <span style=''>      if (</span><span style='background: #AEF1AE'>dtg != null</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>386 <span style=''></span><span style='background: #AEF1AE'>        date.set(dtg.getTime)
+</span>387 <span style=''></span><span style='background: #AEF1AE'>        latency.record(System.currentTimeMillis() - dtg.getTime)
+</span>388 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>389 <span style=''>    }
+</span>390 <span style=''>  }
+</span>391 <span style=''>
+</span>392 <span style=''>  /**
+</span>393 <span style=''>    * Add the dependencies of a field to a graph
+</span>394 <span style=''>    *
+</span>395 <span style=''>    * @param field field to add
+</span>396 <span style=''>    * @param fieldMap field lookup map
+</span>397 <span style=''>    * @param dag graph
+</span>398 <span style=''>    */
+</span>399 <span style=''>  private def addDependencies[F &lt;: Field](field: Field, fieldMap: Map[String, F], dag: Dag): Unit = {
+</span>400 <span style=''>    if (</span><span style='background: #AEF1AE'>!dag.contains(field)</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>401 <span style=''></span><span style='background: #AEF1AE'>      val deps = field.transforms.toSeq.flatMap(_.dependencies(Set(field), fieldMap)).toSet
+</span>402 <span style=''></span><span style='background: #AEF1AE'>      dag.put(field, deps)
+</span>403 <span style=''></span><span style='background: #AEF1AE'>      deps.foreach(addDependencies(_, fieldMap, dag))
+</span>404 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>405 <span style=''>  }
+</span>406 <span style=''>
+</span>407 <span style=''>  /**
+</span>408 <span style=''>    * Returns vertices in topological order.
+</span>409 <span style=''>    *
+</span>410 <span style=''>    * Note: will cause an infinite loop if there are circular dependencies
+</span>411 <span style=''>    *
+</span>412 <span style=''>    * @param dag graph
+</span>413 <span style=''>    * @return ordered vertices
+</span>414 <span style=''>    */
+</span>415 <span style=''>  private def topologicalOrder(dag: Dag): Array[Field] = {
+</span>416 <span style=''>    val res = </span><span style='background: #AEF1AE'>ArrayBuffer.empty[Field]</span><span style=''>
+</span>417 <span style=''>    val remaining = </span><span style='background: #AEF1AE'>new scala.collection.mutable.Queue[Field]() ++ dag.keys</span><span style=''>
+</span>418 <span style=''>    while (</span><span style='background: #AEF1AE'>remaining.nonEmpty</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>419 <span style=''></span><span style='background: #AEF1AE'>      val next = remaining.dequeue()
+</span>420 <span style=''></span><span style='background: #AEF1AE'>      if (dag(next).forall(res.contains)) {
+</span>421 <span style=''></span><span style='background: #AEF1AE'>        res.append(next)
+</span>422 <span style=''></span><span style='background: #AEF1AE'>      } else {
+</span>423 <span style=''></span><span style='background: #AEF1AE'>        remaining.enqueue(next) // put at the back of the queue
+</span>424 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>425 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>426 <span style=''>    </span><span style='background: #AEF1AE'>res.toArray</span><span style=''>
+</span>427 <span style=''>  }
+</span>428 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -430,15 +464,15 @@
         <th>Code</th>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           522
         </td>
         <td>
-          3052
+          3120
           -
-          3063
+          3131
         </td>
         <td>
           Select
@@ -454,15 +488,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           523
         </td>
         <td>
-          3085
+          3153
           -
-          3104
+          3172
         </td>
         <td>
           Select
@@ -478,15 +512,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           524
         </td>
         <td>
-          3067
+          3135
           -
-          3105
+          3173
         </td>
         <td>
           Apply
@@ -502,15 +536,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           525
         </td>
         <td>
-          3042
+          3110
           -
-          3105
+          3173
         </td>
         <td>
           Apply
@@ -526,15 +560,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           526
         </td>
         <td>
-          3023
+          3091
           -
-          3106
+          3174
         </td>
         <td>
           Apply
@@ -550,15 +584,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           529
         </td>
         <td>
-          3019
+          3087
           -
-          3019
+          3087
         </td>
         <td>
           Literal
@@ -574,15 +608,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
           530
         </td>
         <td>
-          3019
+          3087
           -
-          3019
+          3087
         </td>
         <td>
           Block
@@ -598,15 +632,15 @@
         </td>
       </tr><tr>
         <td>
-          62
+          63
         </td>
         <td>
           527
         </td>
         <td>
-          3114
+          3182
           -
-          3244
+          3312
         </td>
         <td>
           Throw
@@ -622,15 +656,15 @@
         </td>
       </tr><tr>
         <td>
-          62
+          63
         </td>
         <td>
           528
         </td>
         <td>
-          3114
+          3182
           -
-          3244
+          3312
         </td>
         <td>
           Block
@@ -646,15 +680,15 @@
         </td>
       </tr><tr>
         <td>
-          67
+          68
         </td>
         <td>
           531
         </td>
         <td>
-          3336
+          3404
           -
-          3342
+          3410
         </td>
         <td>
           Select
@@ -670,15 +704,15 @@
         </td>
       </tr><tr>
         <td>
-          67
+          68
         </td>
         <td>
           532
         </td>
         <td>
-          3346
+          3414
           -
-          3367
+          3435
         </td>
         <td>
           TypeApply
@@ -694,15 +728,15 @@
         </td>
       </tr><tr>
         <td>
-          67
+          68
         </td>
         <td>
           533
         </td>
         <td>
-          3336
+          3404
           -
-          3367
+          3435
         </td>
         <td>
           Apply
@@ -718,15 +752,15 @@
         </td>
       </tr><tr>
         <td>
-          67
+          68
         </td>
         <td>
           534
         </td>
         <td>
-          3330
+          3398
           -
-          3330
+          3398
         </td>
         <td>
           TypeApply
@@ -742,15 +776,15 @@
         </td>
       </tr><tr>
         <td>
-          67
+          68
         </td>
         <td>
           535
         </td>
         <td>
-          3369
+          3437
           -
-          3369
+          3437
         </td>
         <td>
           TypeApply
@@ -766,15 +800,15 @@
         </td>
       </tr><tr>
         <td>
-          67
+          68
         </td>
         <td>
           536
         </td>
         <td>
-          3320
+          3388
           -
-          3374
+          3442
         </td>
         <td>
           ApplyToImplicitArgs
@@ -790,15 +824,15 @@
         </td>
       </tr><tr>
         <td>
-          68
+          69
         </td>
         <td>
           537
         </td>
         <td>
-          3389
+          3457
           -
-          3442
+          3510
         </td>
         <td>
           TypeApply
@@ -814,15 +848,15 @@
         </td>
       </tr><tr>
         <td>
-          71
+          72
         </td>
         <td>
           538
         </td>
         <td>
-          3542
+          3610
           -
-          3569
+          3637
         </td>
         <td>
           Apply
@@ -838,15 +872,15 @@
         </td>
       </tr><tr>
         <td>
-          71
+          72
         </td>
         <td>
           542
         </td>
         <td>
-          3542
+          3610
           -
-          3686
+          3754
         </td>
         <td>
           Apply
@@ -862,15 +896,15 @@
         </td>
       </tr><tr>
         <td>
-          72
+          73
         </td>
         <td>
           539
         </td>
         <td>
-          3617
+          3685
           -
-          3632
+          3700
         </td>
         <td>
           Apply
@@ -886,15 +920,15 @@
         </td>
       </tr><tr>
         <td>
-          72
+          73
         </td>
         <td>
           540
         </td>
         <td>
-          3642
+          3710
           -
-          3679
+          3747
         </td>
         <td>
           Apply
@@ -910,15 +944,15 @@
         </td>
       </tr><tr>
         <td>
-          72
+          73
         </td>
         <td>
           541
         </td>
         <td>
-          3600
+          3668
           -
-          3680
+          3748
         </td>
         <td>
           Apply
@@ -934,15 +968,15 @@
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
           547
         </td>
         <td>
-          3726
+          3794
           -
-          3854
+          3922
         </td>
         <td>
           Apply
@@ -958,15 +992,15 @@
         </td>
       </tr><tr>
         <td>
-          77
+          78
         </td>
         <td>
           543
         </td>
         <td>
-          3798
+          3866
           -
-          3809
+          3877
         </td>
         <td>
           Select
@@ -982,15 +1016,15 @@
         </td>
       </tr><tr>
         <td>
-          77
+          78
         </td>
         <td>
           544
         </td>
         <td>
-          3811
+          3879
           -
-          3827
+          3895
         </td>
         <td>
           Apply
@@ -1006,15 +1040,15 @@
         </td>
       </tr><tr>
         <td>
-          77
+          78
         </td>
         <td>
           545
         </td>
         <td>
-          3787
+          3855
           -
-          3828
+          3896
         </td>
         <td>
           Apply
@@ -1030,15 +1064,15 @@
         </td>
       </tr><tr>
         <td>
-          77
+          78
         </td>
         <td>
           546
         </td>
         <td>
-          3771
+          3839
           -
-          3848
+          3916
         </td>
         <td>
           Apply
@@ -1054,15 +1088,15 @@
         </td>
       </tr><tr>
         <td>
-          79
+          80
         </td>
         <td>
           553
         </td>
         <td>
-          3859
+          3927
           -
-          4014
+          4082
         </td>
         <td>
           Apply
@@ -1080,15 +1114,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          81
         </td>
         <td>
           548
         </td>
         <td>
-          3944
+          4012
           -
-          3969
+          4037
         </td>
         <td>
           Apply
@@ -1104,15 +1138,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          81
         </td>
         <td>
           549
         </td>
         <td>
-          3971
+          4039
           -
-          3987
+          4055
         </td>
         <td>
           Apply
@@ -1128,15 +1162,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          81
         </td>
         <td>
           550
         </td>
         <td>
-          3933
+          4001
           -
-          3988
+          4056
         </td>
         <td>
           Apply
@@ -1152,15 +1186,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          81
         </td>
         <td>
           551
         </td>
         <td>
-          3917
+          3985
           -
-          4008
+          4076
         </td>
         <td>
           Apply
@@ -1176,15 +1210,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          81
         </td>
         <td>
           552
         </td>
         <td>
-          3917
+          3985
           -
-          4008
+          4076
         </td>
         <td>
           Block
@@ -1200,15 +1234,15 @@
         </td>
       </tr><tr>
         <td>
-          84
+          85
         </td>
         <td>
           554
         </td>
         <td>
-          4146
+          4214
           -
-          4167
+          4235
         </td>
         <td>
           Apply
@@ -1224,15 +1258,15 @@
         </td>
       </tr><tr>
         <td>
-          87
+          88
         </td>
         <td>
           555
         </td>
         <td>
-          4242
+          4310
           -
-          4248
+          4316
         </td>
         <td>
           Select
@@ -1248,15 +1282,15 @@
         </td>
       </tr><tr>
         <td>
-          87
+          88
         </td>
         <td>
           556
         </td>
         <td>
-          4241
+          4309
           -
-          4241
+          4309
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1272,15 +1306,15 @@
         </td>
       </tr><tr>
         <td>
-          87
+          88
         </td>
         <td>
           557
         </td>
         <td>
-          4230
+          4298
           -
-          4249
+          4317
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1296,15 +1330,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          89
         </td>
         <td>
           558
         </td>
         <td>
-          4270
+          4338
           -
-          4297
+          4365
         </td>
         <td>
           Apply
@@ -1320,15 +1354,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          89
         </td>
         <td>
           559
         </td>
         <td>
-          4310
+          4378
           -
-          4324
+          4392
         </td>
         <td>
           Apply
@@ -1344,15 +1378,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          89
         </td>
         <td>
           560
         </td>
         <td>
-          4309
+          4377
           -
-          4309
+          4377
         </td>
         <td>
           TypeApply
@@ -1368,15 +1402,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          89
         </td>
         <td>
           561
         </td>
         <td>
-          4331
+          4399
           -
-          4335
+          4403
         </td>
         <td>
           ApplyImplicitView
@@ -1392,15 +1426,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          89
         </td>
         <td>
           562
         </td>
         <td>
-          4270
+          4338
           -
-          4336
+          4404
         </td>
         <td>
           Apply
@@ -1416,15 +1450,15 @@
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           563
         </td>
         <td>
-          4345
+          4413
           -
-          4363
+          4431
         </td>
         <td>
           Select
@@ -1440,15 +1474,15 @@
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           565
         </td>
         <td>
-          4341
+          4409
           -
-          4341
+          4409
         </td>
         <td>
           Literal
@@ -1464,15 +1498,15 @@
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
           566
         </td>
         <td>
-          4341
+          4409
           -
-          4341
+          4409
         </td>
         <td>
           Block
@@ -1488,15 +1522,15 @@
         </td>
       </tr><tr>
         <td>
-          90
+          91
         </td>
         <td>
           564
         </td>
         <td>
-          4373
+          4441
           -
-          4499
+          4567
         </td>
         <td>
           Typed
@@ -1515,15 +1549,15 @@ else
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
           567
         </td>
         <td>
-          4534
+          4602
           -
-          4540
+          4608
         </td>
         <td>
           Select
@@ -1539,15 +1573,15 @@ else
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
           568
         </td>
         <td>
-          4533
+          4601
           -
-          4533
+          4601
         </td>
         <td>
           TypeApply
@@ -1563,15 +1597,15 @@ else
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
           569
         </td>
         <td>
-          4547
+          4615
           -
-          4551
+          4619
         </td>
         <td>
           ApplyImplicitView
@@ -1587,15 +1621,15 @@ else
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
           570
         </td>
         <td>
-          4523
+          4591
           -
-          4552
+          4620
         </td>
         <td>
           Apply
@@ -1611,15 +1645,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
           571
         </td>
         <td>
-          4561
+          4629
           -
-          4576
+          4644
         </td>
         <td>
           Select
@@ -1635,15 +1669,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
           573
         </td>
         <td>
-          4557
+          4625
           -
-          4557
+          4625
         </td>
         <td>
           Literal
@@ -1659,15 +1693,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
           574
         </td>
         <td>
-          4557
+          4625
           -
-          4557
+          4625
         </td>
         <td>
           Block
@@ -1683,15 +1717,15 @@ else
         </td>
       </tr><tr>
         <td>
-          95
+          96
         </td>
         <td>
           572
         </td>
         <td>
-          4586
+          4654
           -
-          4680
+          4748
         </td>
         <td>
           Typed
@@ -1710,15 +1744,15 @@ else
         </td>
       </tr><tr>
         <td>
-          102
+          103
         </td>
         <td>
           575
         </td>
         <td>
-          4777
+          4845
           -
-          4805
+          4873
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1734,15 +1768,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
           576
         </td>
         <td>
-          4827
+          4895
           -
-          4848
+          4916
         </td>
         <td>
           Apply
@@ -1758,15 +1792,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
           577
         </td>
         <td>
-          4810
+          4878
           -
-          4849
+          4917
         </td>
         <td>
           Apply
@@ -1782,15 +1816,15 @@ else
         </td>
       </tr><tr>
         <td>
-          104
+          105
         </td>
         <td>
           578
         </td>
         <td>
-          4862
+          4930
           -
-          4863
+          4931
         </td>
         <td>
           Literal
@@ -1806,15 +1840,15 @@ else
         </td>
       </tr><tr>
         <td>
-          105
+          106
         </td>
         <td>
           579
         </td>
         <td>
-          4879
+          4947
           -
-          4900
+          4968
         </td>
         <td>
           Apply
@@ -1830,15 +1864,15 @@ else
         </td>
       </tr><tr>
         <td>
-          105
+          106
         </td>
         <td>
           580
         </td>
         <td>
-          4875
+          4943
           -
-          4900
+          4968
         </td>
         <td>
           Apply
@@ -1854,15 +1888,15 @@ else
         </td>
       </tr><tr>
         <td>
-          105
+          106
         </td>
         <td>
           593
         </td>
         <td>
-          4902
+          4970
           -
-          4902
+          4970
         </td>
         <td>
           Apply
@@ -1878,15 +1912,15 @@ else
         </td>
       </tr><tr>
         <td>
-          105
+          106
         </td>
         <td>
           594
         </td>
         <td>
-          4902
+          4970
           -
-          5157
+          5225
         </td>
         <td>
           Block
@@ -1913,42 +1947,18 @@ else
         </td>
       </tr><tr>
         <td>
-          105
+          106
         </td>
         <td>
           595
         </td>
         <td>
-          4868
+          4936
           -
-          4868
+          4936
         </td>
         <td>
           Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          105
-        </td>
-        <td>
-          596
-        </td>
-        <td>
-          4868
-          -
-          4868
-        </td>
-        <td>
-          Block
         </td>
         <td>
           &lt;nosymbol&gt;
@@ -1964,12 +1974,36 @@ else
           106
         </td>
         <td>
+          596
+        </td>
+        <td>
+          4936
+          -
+          4936
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
           581
         </td>
         <td>
-          4918
+          4986
           -
-          4938
+          5006
         </td>
         <td>
           Apply
@@ -1985,15 +2019,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           582
         </td>
         <td>
-          5032
+          5100
           -
-          5046
+          5114
         </td>
         <td>
           Select
@@ -2009,15 +2043,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           583
         </td>
         <td>
-          5068
+          5136
           -
-          5082
+          5150
         </td>
         <td>
           Apply
@@ -2033,15 +2067,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           584
         </td>
         <td>
-          5058
+          5126
           -
-          5082
+          5150
         </td>
         <td>
           Apply
@@ -2057,15 +2091,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
           585
         </td>
         <td>
-          5032
+          5100
           -
-          5083
+          5151
         </td>
         <td>
           Apply
@@ -2081,15 +2115,15 @@ else
         </td>
       </tr><tr>
         <td>
-          109
+          110
         </td>
         <td>
           586
         </td>
         <td>
-          5094
+          5162
           -
-          5101
+          5169
         </td>
         <td>
           Apply
@@ -2105,15 +2139,15 @@ else
         </td>
       </tr><tr>
         <td>
-          109
+          110
         </td>
         <td>
           590
         </td>
         <td>
-          5090
+          5158
           -
-          5090
+          5158
         </td>
         <td>
           Literal
@@ -2129,15 +2163,15 @@ else
         </td>
       </tr><tr>
         <td>
-          109
+          110
         </td>
         <td>
           591
         </td>
         <td>
-          5090
+          5158
           -
-          5090
+          5158
         </td>
         <td>
           Block
@@ -2153,15 +2187,15 @@ else
         </td>
       </tr><tr>
         <td>
-          110
+          111
         </td>
         <td>
           587
         </td>
         <td>
-          5124
+          5192
           -
-          5130
+          5198
         </td>
         <td>
           Apply
@@ -2177,15 +2211,15 @@ else
         </td>
       </tr><tr>
         <td>
-          110
+          111
         </td>
         <td>
           588
         </td>
         <td>
-          5113
+          5181
           -
-          5130
+          5198
         </td>
         <td>
           Apply
@@ -2201,15 +2235,15 @@ else
         </td>
       </tr><tr>
         <td>
-          110
+          111
         </td>
         <td>
           589
         </td>
         <td>
-          5113
+          5181
           -
-          5130
+          5198
         </td>
         <td>
           Block
@@ -2225,15 +2259,15 @@ else
         </td>
       </tr><tr>
         <td>
-          112
+          113
         </td>
         <td>
           592
         </td>
         <td>
-          5145
+          5213
           -
-          5151
+          5219
         </td>
         <td>
           Apply
@@ -2249,15 +2283,15 @@ else
         </td>
       </tr><tr>
         <td>
-          114
+          115
         </td>
         <td>
           597
         </td>
         <td>
-          5162
+          5230
           -
-          5178
+          5246
         </td>
         <td>
           Apply
@@ -2273,15 +2307,15 @@ else
         </td>
       </tr><tr>
         <td>
-          118
+          119
         </td>
         <td>
           598
         </td>
         <td>
-          5214
+          5282
           -
-          5228
+          5296
         </td>
         <td>
           Select
@@ -2297,15 +2331,15 @@ else
         </td>
       </tr><tr>
         <td>
-          118
+          119
         </td>
         <td>
           599
         </td>
         <td>
-          5250
+          5318
           -
-          5261
+          5329
         </td>
         <td>
           Select
@@ -2321,15 +2355,15 @@ else
         </td>
       </tr><tr>
         <td>
-          118
+          119
         </td>
         <td>
           600
         </td>
         <td>
-          5240
+          5308
           -
-          5261
+          5329
         </td>
         <td>
           Apply
@@ -2345,15 +2379,15 @@ else
         </td>
       </tr><tr>
         <td>
-          118
+          119
         </td>
         <td>
           601
         </td>
         <td>
-          5214
+          5282
           -
-          5262
+          5330
         </td>
         <td>
           Apply
@@ -2369,15 +2403,15 @@ else
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
           602
         </td>
         <td>
-          5338
+          5406
           -
-          5369
+          5437
         </td>
         <td>
           ApplyToImplicitArgs
@@ -2393,15 +2427,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          123
         </td>
         <td>
           603
         </td>
         <td>
-          5391
+          5459
           -
-          5405
+          5473
         </td>
         <td>
           Select
@@ -2417,15 +2451,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          123
         </td>
         <td>
           604
         </td>
         <td>
-          5430
+          5498
           -
-          5449
+          5517
         </td>
         <td>
           Select
@@ -2441,15 +2475,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          123
         </td>
         <td>
           605
         </td>
         <td>
-          5412
+          5480
           -
-          5450
+          5518
         </td>
         <td>
           Apply
@@ -2465,15 +2499,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          123
         </td>
         <td>
           606
         </td>
         <td>
-          5391
+          5459
           -
-          5451
+          5519
         </td>
         <td>
           Apply
@@ -2489,15 +2523,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          123
         </td>
         <td>
           607
         </td>
         <td>
-          5374
+          5442
           -
-          5452
+          5520
         </td>
         <td>
           Apply
@@ -2513,15 +2547,15 @@ else
         </td>
       </tr><tr>
         <td>
-          123
+          124
         </td>
         <td>
           608
         </td>
         <td>
-          5465
+          5533
           -
-          5466
+          5534
         </td>
         <td>
           Literal
@@ -2537,15 +2571,15 @@ else
         </td>
       </tr><tr>
         <td>
-          124
+          125
         </td>
         <td>
           609
         </td>
         <td>
-          5482
+          5550
           -
-          5503
+          5571
         </td>
         <td>
           Select
@@ -2561,15 +2595,15 @@ else
         </td>
       </tr><tr>
         <td>
-          124
+          125
         </td>
         <td>
           610
         </td>
         <td>
-          5478
+          5546
           -
-          5503
+          5571
         </td>
         <td>
           Apply
@@ -2585,15 +2619,15 @@ else
         </td>
       </tr><tr>
         <td>
-          124
+          125
         </td>
         <td>
           619
         </td>
         <td>
-          5505
+          5573
           -
-          5505
+          5573
         </td>
         <td>
           Apply
@@ -2609,15 +2643,15 @@ else
         </td>
       </tr><tr>
         <td>
-          124
+          125
         </td>
         <td>
           620
         </td>
         <td>
-          5505
+          5573
           -
-          5686
+          5754
         </td>
         <td>
           Block
@@ -2642,15 +2676,15 @@ else
         </td>
       </tr><tr>
         <td>
-          124
+          125
         </td>
         <td>
           621
         </td>
         <td>
-          5471
+          5539
           -
-          5471
+          5539
         </td>
         <td>
           Literal
@@ -2666,15 +2700,15 @@ else
         </td>
       </tr><tr>
         <td>
-          124
+          125
         </td>
         <td>
           622
         </td>
         <td>
-          5471
+          5539
           -
-          5471
+          5539
         </td>
         <td>
           Block
@@ -2690,15 +2724,15 @@ else
         </td>
       </tr><tr>
         <td>
-          125
+          126
         </td>
         <td>
           611
         </td>
         <td>
-          5551
+          5619
           -
-          5570
+          5638
         </td>
         <td>
           Select
@@ -2714,15 +2748,15 @@ else
         </td>
       </tr><tr>
         <td>
-          125
+          126
         </td>
         <td>
           612
         </td>
         <td>
-          5517
+          5585
           -
-          5571
+          5639
         </td>
         <td>
           Apply
@@ -2738,15 +2772,15 @@ else
         </td>
       </tr><tr>
         <td>
-          125
+          126
         </td>
         <td>
           616
         </td>
         <td>
-          5513
+          5581
           -
-          5513
+          5581
         </td>
         <td>
           Literal
@@ -2762,15 +2796,15 @@ else
         </td>
       </tr><tr>
         <td>
-          125
+          126
         </td>
         <td>
           617
         </td>
         <td>
-          5513
+          5581
           -
-          5513
+          5581
         </td>
         <td>
           Block
@@ -2786,15 +2820,15 @@ else
         </td>
       </tr><tr>
         <td>
-          126
+          127
         </td>
         <td>
           613
         </td>
         <td>
-          5594
+          5662
           -
-          5659
+          5727
         </td>
         <td>
           Apply
@@ -2810,15 +2844,15 @@ else
         </td>
       </tr><tr>
         <td>
-          126
+          127
         </td>
         <td>
           614
         </td>
         <td>
-          5583
+          5651
           -
-          5659
+          5727
         </td>
         <td>
           Apply
@@ -2834,15 +2868,15 @@ else
         </td>
       </tr><tr>
         <td>
-          126
+          127
         </td>
         <td>
           615
         </td>
         <td>
-          5583
+          5651
           -
-          5659
+          5727
         </td>
         <td>
           Block
@@ -2858,15 +2892,15 @@ else
         </td>
       </tr><tr>
         <td>
-          128
+          129
         </td>
         <td>
           618
         </td>
         <td>
-          5674
+          5742
           -
-          5680
+          5748
         </td>
         <td>
           Apply
@@ -2882,15 +2916,15 @@ else
         </td>
       </tr><tr>
         <td>
-          130
+          131
         </td>
         <td>
           623
         </td>
         <td>
-          5691
+          5759
           -
-          5705
+          5773
         </td>
         <td>
           Apply
@@ -2906,15 +2940,15 @@ else
         </td>
       </tr><tr>
         <td>
-          134
+          135
         </td>
         <td>
           624
         </td>
         <td>
-          5786
+          5854
           -
-          5789
+          5857
         </td>
         <td>
           Select
@@ -2930,15 +2964,15 @@ else
         </td>
       </tr><tr>
         <td>
-          134
+          135
         </td>
         <td>
           625
         </td>
         <td>
-          5791
+          5859
           -
-          5808
+          5876
         </td>
         <td>
           Select
@@ -2954,15 +2988,15 @@ else
         </td>
       </tr><tr>
         <td>
-          134
+          135
         </td>
         <td>
           626
         </td>
         <td>
-          5769
+          5837
           -
-          5809
+          5877
         </td>
         <td>
           Apply
@@ -2978,15 +3012,15 @@ else
         </td>
       </tr><tr>
         <td>
-          136
+          137
         </td>
         <td>
           627
         </td>
         <td>
-          5832
+          5900
           -
-          5838
+          5906
         </td>
         <td>
           Select
@@ -3002,39 +3036,39 @@ else
         </td>
       </tr><tr>
         <td>
-          137
+          138
         </td>
         <td>
           628
         </td>
         <td>
-          5903
+          5968
           -
-          5906
+          5983
         </td>
         <td>
-          Select
+          Apply
         </td>
         <td>
-          org.locationtech.geomesa.convert2.AbstractConverter.sft
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          AbstractConverter.this.sft
+          AbstractConverter.this.sft.getTypeName()
         </td>
       </tr><tr>
         <td>
-          137
+          138
         </td>
         <td>
           629
         </td>
         <td>
-          5912
+          5989
           -
-          5951
+          6028
         </td>
         <td>
           Apply
@@ -3050,15 +3084,15 @@ else
         </td>
       </tr><tr>
         <td>
-          137
+          138
         </td>
         <td>
           630
         </td>
         <td>
-          5879
+          5947
           -
-          5952
+          6029
         </td>
         <td>
           Apply
@@ -3070,19 +3104,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.metrics.MetricsTags.typeNameTag(AbstractConverter.this.sft).and(org.locationtech.geomesa.convert2.metrics.ConverterMetrics.converterNameTag(name))
+          org.locationtech.geomesa.metrics.micrometer.utils.TagUtils.typeNameTag(AbstractConverter.this.sft.getTypeName()).and(org.locationtech.geomesa.convert2.metrics.ConverterMetrics.converterNameTag(name))
         </td>
       </tr><tr>
         <td>
-          137
+          138
         </td>
         <td>
           631
         </td>
         <td>
-          5879
+          5947
           -
-          5952
+          6029
         </td>
         <td>
           Block
@@ -3094,91 +3128,91 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.metrics.MetricsTags.typeNameTag(AbstractConverter.this.sft).and(org.locationtech.geomesa.convert2.metrics.ConverterMetrics.converterNameTag(name))
+          org.locationtech.geomesa.metrics.micrometer.utils.TagUtils.typeNameTag(AbstractConverter.this.sft.getTypeName()).and(org.locationtech.geomesa.convert2.metrics.ConverterMetrics.converterNameTag(name))
         </td>
       </tr><tr>
         <td>
-          138
+          139
         </td>
         <td>
           632
         </td>
         <td>
-          6009
+          6083
           -
-          6012
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.convert2.AbstractConverter.sft
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          AbstractConverter.this.sft
-        </td>
-      </tr><tr>
-        <td>
-          138
-        </td>
-        <td>
-          633
-        </td>
-        <td>
-          5985
-          -
-          6013
+          6098
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.locationtech.geomesa.utils.metrics.MetricsTags.typeNameTag
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.metrics.MetricsTags.typeNameTag(AbstractConverter.this.sft)
+          AbstractConverter.this.sft.getTypeName()
         </td>
       </tr><tr>
         <td>
-          138
+          139
+        </td>
+        <td>
+          633
+        </td>
+        <td>
+          6062
+          -
+          6099
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.metrics.micrometer.utils.TagUtils.typeNameTag
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.metrics.micrometer.utils.TagUtils.typeNameTag(AbstractConverter.this.sft.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          139
         </td>
         <td>
           634
         </td>
         <td>
-          5985
+          6062
           -
-          6013
+          6099
         </td>
         <td>
           Block
         </td>
         <td>
-          org.locationtech.geomesa.utils.metrics.MetricsTags.typeNameTag
+          org.locationtech.geomesa.metrics.micrometer.utils.TagUtils.typeNameTag
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.metrics.MetricsTags.typeNameTag(AbstractConverter.this.sft)
+          org.locationtech.geomesa.metrics.micrometer.utils.TagUtils.typeNameTag(AbstractConverter.this.sft.getTypeName())
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           635
         </td>
         <td>
-          6073
+          6159
           -
-          6076
+          6162
         </td>
         <td>
           Select
@@ -3194,15 +3228,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           636
         </td>
         <td>
-          6083
+          6169
           -
-          6096
+          6182
         </td>
         <td>
           Apply
@@ -3218,15 +3252,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           637
         </td>
         <td>
-          6104
+          6190
           -
-          6127
+          6213
         </td>
         <td>
           Select
@@ -3242,15 +3276,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           638
         </td>
         <td>
-          6100
+          6186
           -
-          6128
+          6214
         </td>
         <td>
           Apply
@@ -3266,15 +3300,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           639
         </td>
         <td>
-          6100
+          6186
           -
-          6128
+          6214
         </td>
         <td>
           Block
@@ -3290,15 +3324,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           640
         </td>
         <td>
-          6138
+          6224
           -
-          6147
+          6233
         </td>
         <td>
           TypeApply
@@ -3314,15 +3348,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           641
         </td>
         <td>
-          6138
+          6224
           -
-          6147
+          6233
         </td>
         <td>
           Block
@@ -3338,15 +3372,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           642
         </td>
         <td>
-          6154
+          6240
           -
-          6172
+          6258
         </td>
         <td>
           Select
@@ -3362,15 +3396,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           643
         </td>
         <td>
-          6151
+          6237
           -
-          6151
+          6237
         </td>
         <td>
           TypeApply
@@ -3386,15 +3420,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           644
         </td>
         <td>
-          6078
+          6164
           -
-          6172
+          6258
         </td>
         <td>
           ApplyToImplicitArgs
@@ -3413,15 +3447,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           645
         </td>
         <td>
-          6174
+          6260
           -
-          6178
+          6264
         </td>
         <td>
           Select
@@ -3437,15 +3471,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          143
         </td>
         <td>
           646
         </td>
         <td>
-          6050
+          6136
           -
-          6179
+          6265
         </td>
         <td>
           Apply
@@ -3464,15 +3498,15 @@ else
         </td>
       </tr><tr>
         <td>
-          144
+          145
         </td>
         <td>
           647
         </td>
         <td>
-          6243
+          6329
           -
-          6261
+          6347
         </td>
         <td>
           Apply
@@ -3488,15 +3522,15 @@ else
         </td>
       </tr><tr>
         <td>
-          144
+          145
         </td>
         <td>
           648
         </td>
         <td>
-          6239
+          6325
           -
-          6262
+          6348
         </td>
         <td>
           Apply
@@ -3512,15 +3546,15 @@ else
         </td>
       </tr><tr>
         <td>
-          144
+          145
         </td>
         <td>
           649
         </td>
         <td>
-          6239
+          6325
           -
-          6262
+          6348
         </td>
         <td>
           Block
@@ -3536,15 +3570,15 @@ else
         </td>
       </tr><tr>
         <td>
-          144
+          145
         </td>
         <td>
           650
         </td>
         <td>
-          6222
+          6308
           -
-          6222
+          6308
         </td>
         <td>
           TypeApply
@@ -3560,15 +3594,15 @@ else
         </td>
       </tr><tr>
         <td>
-          144
+          145
         </td>
         <td>
           651
         </td>
         <td>
-          6204
+          6290
           -
-          6264
+          6350
         </td>
         <td>
           ApplyToImplicitArgs
@@ -3586,15 +3620,15 @@ else
         </td>
       </tr><tr>
         <td>
-          147
+          148
         </td>
         <td>
           652
         </td>
         <td>
-          6311
+          6397
           -
-          6341
+          6427
         </td>
         <td>
           Apply
@@ -3610,15 +3644,15 @@ else
         </td>
       </tr><tr>
         <td>
-          148
+          149
         </td>
         <td>
           653
         </td>
         <td>
-          6355
+          6441
           -
-          6359
+          6445
         </td>
         <td>
           Select
@@ -3634,15 +3668,15 @@ else
         </td>
       </tr><tr>
         <td>
-          150
+          151
         </td>
         <td>
           654
         </td>
         <td>
-          6425
+          6511
           -
-          6444
+          6530
         </td>
         <td>
           Apply
@@ -3658,15 +3692,15 @@ else
         </td>
       </tr><tr>
         <td>
-          151
+          152
         </td>
         <td>
           655
         </td>
         <td>
-          6474
+          6560
           -
-          6495
+          6581
         </td>
         <td>
           Apply
@@ -3682,15 +3716,15 @@ else
         </td>
       </tr><tr>
         <td>
-          152
+          153
         </td>
         <td>
           656
         </td>
         <td>
-          6513
+          6599
           -
-          6535
+          6621
         </td>
         <td>
           Select
@@ -3706,15 +3740,15 @@ else
         </td>
       </tr><tr>
         <td>
-          152
+          153
         </td>
         <td>
           657
         </td>
         <td>
-          6297
+          6383
           -
-          6536
+          6622
         </td>
         <td>
           Apply
@@ -3730,15 +3764,15 @@ else
         </td>
       </tr><tr>
         <td>
-          155
+          156
         </td>
         <td>
           658
         </td>
         <td>
-          6585
+          6671
           -
-          6617
+          6703
         </td>
         <td>
           Apply
@@ -3754,15 +3788,15 @@ else
         </td>
       </tr><tr>
         <td>
-          156
+          157
         </td>
         <td>
           659
         </td>
         <td>
-          6631
+          6717
           -
-          6635
+          6721
         </td>
         <td>
           Select
@@ -3778,15 +3812,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
           660
         </td>
         <td>
-          6701
+          6787
           -
-          6720
+          6806
         </td>
         <td>
           Apply
@@ -3802,15 +3836,15 @@ else
         </td>
       </tr><tr>
         <td>
-          159
+          160
         </td>
         <td>
           661
         </td>
         <td>
-          6750
+          6836
           -
-          6770
+          6856
         </td>
         <td>
           Apply
@@ -3826,15 +3860,15 @@ else
         </td>
       </tr><tr>
         <td>
-          160
+          161
         </td>
         <td>
           662
         </td>
         <td>
-          6788
+          6874
           -
-          6810
+          6896
         </td>
         <td>
           Select
@@ -3850,15 +3884,15 @@ else
         </td>
       </tr><tr>
         <td>
-          160
+          161
         </td>
         <td>
           663
         </td>
         <td>
-          6571
+          6657
           -
-          6811
+          6897
         </td>
         <td>
           Apply
@@ -3874,15 +3908,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          163
         </td>
         <td>
           664
         </td>
         <td>
-          6837
+          6923
           -
-          6840
+          6926
         </td>
         <td>
           Select
@@ -3898,39 +3932,15 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          163
         </td>
         <td>
           665
         </td>
         <td>
-          6884
+          6970
           -
-          6922
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty.get
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.convert2.metrics.ConverterMetrics.MetricsNamePrefix.get
-        </td>
-      </tr><tr>
-        <td>
-          162
-        </td>
-        <td>
-          666
-        </td>
-        <td>
-          6924
-          -
-          6928
+          6974
         </td>
         <td>
           Select
@@ -3946,39 +3956,39 @@ else
         </td>
       </tr><tr>
         <td>
-          162
+          163
         </td>
         <td>
-          667
+          666
         </td>
         <td>
-          6862
+          6948
           -
-          6929
+          6975
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.locationtech.geomesa.utils.metrics.LatencyMetrics.&lt;init&gt;
+          org.locationtech.geomesa.convert2.AbstractConverter.LatencyMetrics.&lt;init&gt;
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          new org.locationtech.geomesa.utils.metrics.LatencyMetrics(i, org.locationtech.geomesa.convert2.metrics.ConverterMetrics.MetricsNamePrefix.get, AbstractConverter.this.tags, metrics.this.LatencyMetrics.&lt;init&gt;$default$4)
+          new org.locationtech.geomesa.convert2.AbstractConverter.LatencyMetrics(i, AbstractConverter.this.tags)
         </td>
       </tr><tr>
         <td>
-          162
+          163
         </td>
         <td>
-          668
+          667
         </td>
         <td>
-          6837
+          6923
           -
-          6930
+          6976
         </td>
         <td>
           Apply
@@ -3990,19 +4000,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(AbstractConverter.this.sft).getDtgIndex.map[org.locationtech.geomesa.utils.metrics.LatencyMetrics](((i: Int) =&gt; new org.locationtech.geomesa.utils.metrics.LatencyMetrics(i, org.locationtech.geomesa.convert2.metrics.ConverterMetrics.MetricsNamePrefix.get, AbstractConverter.this.tags, metrics.this.LatencyMetrics.&lt;init&gt;$default$4)))
+          org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType(AbstractConverter.this.sft).getDtgIndex.map[org.locationtech.geomesa.convert2.AbstractConverter.LatencyMetrics](((i: Int) =&gt; new org.locationtech.geomesa.convert2.AbstractConverter.LatencyMetrics(i, AbstractConverter.this.tags)))
         </td>
       </tr><tr>
         <td>
-          164
+          165
         </td>
         <td>
-          669
+          668
         </td>
         <td>
-          6978
+          7024
           -
-          6981
+          7027
         </td>
         <td>
           Select
@@ -4018,15 +4028,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          168
         </td>
         <td>
-          670
+          669
         </td>
         <td>
-          7109
+          7155
           -
-          7123
+          7169
         </td>
         <td>
           Select
@@ -4042,15 +4052,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          168
         </td>
         <td>
-          671
+          670
         </td>
         <td>
-          7125
-          -
           7171
+          -
+          7217
         </td>
         <td>
           TypeApply
@@ -4066,15 +4076,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          168
         </td>
         <td>
-          672
+          671
         </td>
         <td>
-          7173
+          7219
           -
-          7179
+          7225
         </td>
         <td>
           Select
@@ -4090,15 +4100,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          168
         </td>
         <td>
-          673
+          672
         </td>
         <td>
-          7181
+          7227
           -
-          7188
+          7234
         </td>
         <td>
           Select
@@ -4114,15 +4124,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          168
         </td>
         <td>
-          674
+          673
         </td>
         <td>
-          7196
+          7242
           -
-          7200
+          7246
         </td>
         <td>
           Select
@@ -4138,15 +4148,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          168
         </td>
         <td>
-          675
+          674
         </td>
         <td>
-          7190
+          7236
           -
-          7201
+          7247
         </td>
         <td>
           Apply
@@ -4162,15 +4172,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          168
         </td>
         <td>
-          676
+          675
         </td>
         <td>
-          7079
+          7125
           -
-          7202
+          7248
         </td>
         <td>
           Apply
@@ -4186,15 +4196,15 @@ else
         </td>
       </tr><tr>
         <td>
-          170
+          171
         </td>
         <td>
-          677
+          676
         </td>
         <td>
-          7379
+          7425
           -
-          7383
+          7429
         </td>
         <td>
           Select
@@ -4210,15 +4220,15 @@ else
         </td>
       </tr><tr>
         <td>
-          170
+          171
         </td>
         <td>
-          678
+          677
         </td>
         <td>
-          7350
+          7396
           -
-          7384
+          7430
         </td>
         <td>
           Apply
@@ -4234,15 +4244,15 @@ else
         </td>
       </tr><tr>
         <td>
-          171
+          172
         </td>
         <td>
-          679
+          678
         </td>
         <td>
-          7419
+          7465
           -
-          7433
+          7479
         </td>
         <td>
           Select
@@ -4258,15 +4268,15 @@ else
         </td>
       </tr><tr>
         <td>
-          171
+          172
         </td>
         <td>
-          680
+          679
         </td>
         <td>
-          7435
-          -
           7481
+          -
+          7527
         </td>
         <td>
           TypeApply
@@ -4282,15 +4292,15 @@ else
         </td>
       </tr><tr>
         <td>
-          171
+          172
         </td>
         <td>
-          681
+          680
         </td>
         <td>
-          7483
+          7529
           -
-          7489
+          7535
         </td>
         <td>
           Select
@@ -4306,15 +4316,15 @@ else
         </td>
       </tr><tr>
         <td>
-          171
+          172
         </td>
         <td>
-          682
+          681
         </td>
         <td>
-          7491
+          7537
           -
-          7498
+          7544
         </td>
         <td>
           Select
@@ -4330,15 +4340,15 @@ else
         </td>
       </tr><tr>
         <td>
-          171
+          172
         </td>
         <td>
-          683
+          682
         </td>
         <td>
-          7389
+          7435
           -
-          7506
+          7552
         </td>
         <td>
           Apply
@@ -4354,15 +4364,15 @@ else
         </td>
       </tr><tr>
         <td>
-          175
+          176
         </td>
         <td>
-          684
+          683
         </td>
         <td>
-          7667
+          7713
           -
-          7680
+          7726
         </td>
         <td>
           Apply
@@ -4378,15 +4388,15 @@ else
         </td>
       </tr><tr>
         <td>
-          175
+          176
         </td>
         <td>
-          685
+          684
         </td>
         <td>
-          7682
+          7728
           -
-          7699
+          7745
         </td>
         <td>
           Select
@@ -4402,15 +4412,15 @@ else
         </td>
       </tr><tr>
         <td>
-          175
+          176
         </td>
         <td>
-          686
+          685
         </td>
         <td>
-          7705
+          7751
           -
-          7715
+          7761
         </td>
         <td>
           Select
@@ -4426,15 +4436,15 @@ else
         </td>
       </tr><tr>
         <td>
-          175
+          176
         </td>
         <td>
-          687
+          686
         </td>
         <td>
-          7641
+          7687
           -
-          7716
+          7762
         </td>
         <td>
           Apply
@@ -4450,15 +4460,15 @@ else
         </td>
       </tr><tr>
         <td>
-          175
+          176
         </td>
         <td>
-          688
+          687
         </td>
         <td>
-          7633
+          7679
           -
-          7721
+          7767
         </td>
         <td>
           Apply
@@ -4474,15 +4484,15 @@ else
         </td>
       </tr><tr>
         <td>
-          176
+          177
         </td>
         <td>
-          689
+          688
         </td>
         <td>
-          7726
+          7772
           -
-          7743
+          7789
         </td>
         <td>
           Select
@@ -4498,15 +4508,15 @@ else
         </td>
       </tr><tr>
         <td>
-          177
+          178
         </td>
         <td>
-          690
+          689
         </td>
         <td>
-          7788
+          7834
           -
-          7797
+          7843
         </td>
         <td>
           Ident
@@ -4522,15 +4532,15 @@ else
         </td>
       </tr><tr>
         <td>
-          178
+          179
         </td>
         <td>
-          691
+          690
         </td>
         <td>
-          7846
+          7892
           -
-          7887
+          7933
         </td>
         <td>
           Select
@@ -4546,15 +4556,15 @@ else
         </td>
       </tr><tr>
         <td>
-          178
+          179
         </td>
         <td>
-          692
+          691
         </td>
         <td>
-          7889
+          7935
           -
-          7906
+          7952
         </td>
         <td>
           Apply
@@ -4570,15 +4580,15 @@ else
         </td>
       </tr><tr>
         <td>
-          178
+          179
         </td>
         <td>
-          693
+          692
         </td>
         <td>
-          7828
+          7874
           -
-          7907
+          7953
         </td>
         <td>
           Apply
@@ -4594,15 +4604,15 @@ else
         </td>
       </tr><tr>
         <td>
-          178
+          179
         </td>
         <td>
-          694
+          693
         </td>
         <td>
-          7828
+          7874
           -
-          7907
+          7953
         </td>
         <td>
           Block
@@ -4618,15 +4628,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          184
         </td>
         <td>
-          703
+          702
         </td>
         <td>
-          8037
+          8083
           -
-          8273
+          8319
         </td>
         <td>
           Apply
@@ -4647,15 +4657,15 @@ else
         </td>
       </tr><tr>
         <td>
-          184
+          185
         </td>
         <td>
-          695
+          694
         </td>
         <td>
-          8096
+          8142
           -
-          8113
+          8159
         </td>
         <td>
           Apply
@@ -4671,15 +4681,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          186
         </td>
         <td>
-          696
+          695
         </td>
         <td>
-          8134
+          8180
           -
-          8165
+          8211
         </td>
         <td>
           TypeApply
@@ -4695,15 +4705,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          186
         </td>
         <td>
-          697
+          696
         </td>
         <td>
-          8126
+          8172
           -
-          8170
+          8216
         </td>
         <td>
           Apply
@@ -4719,15 +4729,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          186
         </td>
         <td>
-          698
+          697
         </td>
         <td>
-          8126
+          8172
           -
-          8170
+          8216
         </td>
         <td>
           Block
@@ -4743,15 +4753,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          187
         </td>
         <td>
-          699
+          698
         </td>
         <td>
-          8211
+          8257
           -
-          8236
+          8282
         </td>
         <td>
           Apply
@@ -4767,15 +4777,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          187
         </td>
         <td>
-          700
+          699
         </td>
         <td>
-          8238
+          8284
           -
-          8258
+          8304
         </td>
         <td>
           Literal
@@ -4791,15 +4801,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          187
         </td>
         <td>
-          701
+          700
         </td>
         <td>
-          8191
+          8237
           -
-          8259
+          8305
         </td>
         <td>
           Apply
@@ -4815,15 +4825,15 @@ else
         </td>
       </tr><tr>
         <td>
-          186
+          187
         </td>
         <td>
-          702
+          701
         </td>
         <td>
-          8191
+          8237
           -
-          8259
+          8305
         </td>
         <td>
           Block
@@ -4839,15 +4849,15 @@ else
         </td>
       </tr><tr>
         <td>
-          225
+          226
         </td>
         <td>
-          742
+          741
         </td>
         <td>
-          9742
+          9788
           -
-          10725
+          10771
         </td>
         <td>
           Apply
@@ -4890,15 +4900,15 @@ else
         </td>
       </tr><tr>
         <td>
-          226
+          227
         </td>
         <td>
-          704
+          703
         </td>
         <td>
-          9829
+          9875
           -
-          9832
+          9878
         </td>
         <td>
           Select
@@ -4914,15 +4924,15 @@ else
         </td>
       </tr><tr>
         <td>
-          226
+          227
         </td>
         <td>
-          705
+          704
         </td>
         <td>
-          9834
+          9880
           -
-          9836
+          9882
         </td>
         <td>
           Literal
@@ -4938,15 +4948,15 @@ else
         </td>
       </tr><tr>
         <td>
-          226
+          227
         </td>
         <td>
-          706
+          705
         </td>
         <td>
-          9806
+          9852
           -
-          9837
+          9883
         </td>
         <td>
           Apply
@@ -4962,15 +4972,15 @@ else
         </td>
       </tr><tr>
         <td>
-          228
+          229
         </td>
         <td>
-          707
+          706
         </td>
         <td>
-          9845
+          9891
           -
-          9861
+          9907
         </td>
         <td>
           Select
@@ -4986,15 +4996,15 @@ else
         </td>
       </tr><tr>
         <td>
-          228
+          229
         </td>
         <td>
-          711
+          710
         </td>
         <td>
-          9845
+          9891
           -
-          9941
+          9987
         </td>
         <td>
           Apply
@@ -5012,15 +5022,15 @@ else
         </td>
       </tr><tr>
         <td>
-          229
+          230
         </td>
         <td>
-          708
+          707
         </td>
         <td>
-          9923
+          9969
           -
-          9932
+          9978
         </td>
         <td>
           Apply
@@ -5036,15 +5046,15 @@ else
         </td>
       </tr><tr>
         <td>
-          229
+          230
         </td>
         <td>
-          709
+          708
         </td>
         <td>
-          9895
+          9941
           -
-          9933
+          9979
         </td>
         <td>
           Apply
@@ -5060,15 +5070,15 @@ else
         </td>
       </tr><tr>
         <td>
-          229
+          230
         </td>
         <td>
-          710
+          709
         </td>
         <td>
-          9895
+          9941
           -
-          9933
+          9979
         </td>
         <td>
           Block
@@ -5084,15 +5094,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          233
         </td>
         <td>
-          712
+          711
         </td>
         <td>
-          10034
+          10080
           -
-          10047
+          10093
         </td>
         <td>
           Apply
@@ -5108,15 +5118,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          233
         </td>
         <td>
-          724
+          723
         </td>
         <td>
-          10030
+          10076
           -
-          10030
+          10076
         </td>
         <td>
           Literal
@@ -5132,15 +5142,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          233
         </td>
         <td>
-          725
+          724
         </td>
         <td>
-          10030
+          10076
           -
-          10030
+          10076
         </td>
         <td>
           Block
@@ -5156,15 +5166,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          234
         </td>
         <td>
-          713
+          712
         </td>
         <td>
-          10066
+          10112
           -
-          10073
+          10119
         </td>
         <td>
           Select
@@ -5180,15 +5190,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          234
         </td>
         <td>
-          714
+          713
         </td>
         <td>
-          10059
+          10105
           -
-          10074
+          10120
         </td>
         <td>
           Apply
@@ -5204,15 +5214,15 @@ else
         </td>
       </tr><tr>
         <td>
-          233
+          234
         </td>
         <td>
-          723
+          722
         </td>
         <td>
-          10059
+          10105
           -
-          10414
+          10460
         </td>
         <td>
           Match
@@ -5238,15 +5248,15 @@ else
         </td>
       </tr><tr>
         <td>
-          234
+          235
         </td>
         <td>
-          719
+          718
         </td>
         <td>
-          10109
+          10155
           -
-          10215
+          10261
         </td>
         <td>
           Block
@@ -5265,15 +5275,15 @@ else
         </td>
       </tr><tr>
         <td>
-          235
+          236
         </td>
         <td>
-          715
+          714
         </td>
         <td>
-          10124
+          10170
           -
-          10136
+          10182
         </td>
         <td>
           Apply
@@ -5289,63 +5299,63 @@ else
         </td>
       </tr><tr>
         <td>
-          236
+          237
+        </td>
+        <td>
+          715
+        </td>
+        <td>
+          10214
+          -
+          10236
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+        </td>
+      </tr><tr>
+        <td>
+          237
         </td>
         <td>
           716
         </td>
         <td>
-          10168
+          10238
           -
-          10190
+          10260
         </td>
         <td>
           Select
         </td>
         <td>
-          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+          java.lang.Boolean.TRUE
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          org.geotools.util.factory.Hints.USE_PROVIDED_FID
+          java.lang.Boolean.TRUE
         </td>
       </tr><tr>
         <td>
-          236
+          237
         </td>
         <td>
           717
         </td>
         <td>
-          10192
+          10195
           -
-          10214
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          java.lang.Boolean.TRUE
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          java.lang.Boolean.TRUE
-        </td>
-      </tr><tr>
-        <td>
-          236
-        </td>
-        <td>
-          718
-        </td>
-        <td>
-          10149
-          -
-          10215
+          10261
         </td>
         <td>
           Apply
@@ -5361,15 +5371,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
-          720
+          719
         </td>
         <td>
-          10237
+          10283
           -
-          10239
+          10285
         </td>
         <td>
           Literal
@@ -5385,15 +5395,15 @@ else
         </td>
       </tr><tr>
         <td>
-          238
+          239
         </td>
         <td>
-          721
+          720
         </td>
         <td>
-          10237
+          10283
           -
-          10239
+          10285
         </td>
         <td>
           Block
@@ -5409,15 +5419,15 @@ else
         </td>
       </tr><tr>
         <td>
-          242
+          243
         </td>
         <td>
-          722
+          721
         </td>
         <td>
-          10353
+          10399
           -
-          10404
+          10450
         </td>
         <td>
           Typed
@@ -5436,15 +5446,15 @@ else
         </td>
       </tr><tr>
         <td>
-          245
+          246
         </td>
         <td>
-          726
+          725
         </td>
         <td>
-          10429
+          10475
           -
-          10444
+          10490
         </td>
         <td>
           Select
@@ -5460,15 +5470,15 @@ else
         </td>
       </tr><tr>
         <td>
-          245
+          246
         </td>
         <td>
-          730
+          729
         </td>
         <td>
-          10429
+          10475
           -
-          10518
+          10564
         </td>
         <td>
           Apply
@@ -5486,15 +5496,15 @@ else
         </td>
       </tr><tr>
         <td>
-          246
+          247
         </td>
         <td>
-          727
+          726
         </td>
         <td>
-          10500
+          10546
           -
-          10509
+          10555
         </td>
         <td>
           Apply
@@ -5510,15 +5520,15 @@ else
         </td>
       </tr><tr>
         <td>
-          246
+          247
         </td>
         <td>
-          728
+          727
         </td>
         <td>
-          10478
+          10524
           -
-          10510
+          10556
         </td>
         <td>
           Apply
@@ -5534,15 +5544,15 @@ else
         </td>
       </tr><tr>
         <td>
-          246
+          247
         </td>
         <td>
-          729
+          728
         </td>
         <td>
-          10478
+          10524
           -
-          10510
+          10556
         </td>
         <td>
           Block
@@ -5558,15 +5568,15 @@ else
         </td>
       </tr><tr>
         <td>
-          248
+          249
         </td>
         <td>
-          731
+          730
         </td>
         <td>
-          10537
+          10583
           -
-          10560
+          10606
         </td>
         <td>
           Apply
@@ -5582,15 +5592,15 @@ else
         </td>
       </tr><tr>
         <td>
-          249
+          250
         </td>
         <td>
-          732
+          731
         </td>
         <td>
-          10571
+          10617
           -
-          10584
+          10630
         </td>
         <td>
           Apply
@@ -5606,15 +5616,15 @@ else
         </td>
       </tr><tr>
         <td>
-          250
+          251
         </td>
         <td>
-          733
+          732
         </td>
         <td>
-          10596
+          10642
           -
-          10605
+          10651
         </td>
         <td>
           Apply
@@ -5630,15 +5640,15 @@ else
         </td>
       </tr><tr>
         <td>
-          250
+          251
         </td>
         <td>
-          734
+          733
         </td>
         <td>
-          10596
+          10642
           -
-          10605
+          10651
         </td>
         <td>
           Block
@@ -5654,15 +5664,15 @@ else
         </td>
       </tr><tr>
         <td>
-          252
+          253
         </td>
         <td>
-          735
+          734
         </td>
         <td>
-          10650
+          10696
           -
-          10654
+          10700
         </td>
         <td>
           Literal
@@ -5678,15 +5688,15 @@ else
         </td>
       </tr><tr>
         <td>
-          252
+          253
         </td>
         <td>
-          736
+          735
         </td>
         <td>
-          10656
+          10702
           -
-          10663
+          10709
         </td>
         <td>
           Select
@@ -5702,15 +5712,15 @@ else
         </td>
       </tr><tr>
         <td>
-          252
+          253
         </td>
         <td>
-          737
+          736
         </td>
         <td>
-          10681
+          10727
           -
-          10708
+          10754
         </td>
         <td>
           Apply
@@ -5726,15 +5736,15 @@ else
         </td>
       </tr><tr>
         <td>
-          252
+          253
         </td>
         <td>
-          738
+          737
         </td>
         <td>
-          10665
+          10711
           -
-          10709
+          10755
         </td>
         <td>
           Apply
@@ -5750,15 +5760,15 @@ else
         </td>
       </tr><tr>
         <td>
-          252
+          253
         </td>
         <td>
-          739
+          738
         </td>
         <td>
-          10634
+          10680
           -
-          10710
+          10756
         </td>
         <td>
           Apply
@@ -5774,15 +5784,15 @@ else
         </td>
       </tr><tr>
         <td>
-          252
+          253
         </td>
         <td>
-          740
+          739
         </td>
         <td>
-          10629
+          10675
           -
-          10711
+          10757
         </td>
         <td>
           Apply
@@ -5798,15 +5808,15 @@ else
         </td>
       </tr><tr>
         <td>
-          252
+          253
         </td>
         <td>
-          741
+          740
         </td>
         <td>
-          10629
+          10675
           -
-          10711
+          10757
         </td>
         <td>
           Block
@@ -5822,15 +5832,15 @@ else
         </td>
       </tr><tr>
         <td>
-          257
+          258
         </td>
         <td>
-          749
+          748
         </td>
         <td>
-          10772
+          10818
           -
-          10885
+          10931
         </td>
         <td>
           Block
@@ -5848,21 +5858,21 @@ else
     &lt;artifact&gt; val x$1: Int = qual$1.success$default$1;
     qual$1.success(x$1)
   };
-  AbstractConverter.this.latency.foreach[Unit](((x$8: org.locationtech.geomesa.utils.metrics.LatencyMetrics) =&gt; x$8.apply(feature)));
+  AbstractConverter.this.latency.foreach[Unit](((x$8: org.locationtech.geomesa.convert2.AbstractConverter.LatencyMetrics) =&gt; x$8.apply(feature)));
   org.locationtech.geomesa.utils.collection.CloseableIterator.single[org.locationtech.geomesa.features.ScalaSimpleFeature](feature, org.locationtech.geomesa.utils.collection.CloseableIterator.single$default$2[Nothing])
 }
         </td>
       </tr><tr>
         <td>
-          258
+          259
         </td>
         <td>
-          743
+          742
         </td>
         <td>
-          10783
+          10829
           -
-          10791
+          10837
         </td>
         <td>
           Select
@@ -5878,15 +5888,15 @@ else
         </td>
       </tr><tr>
         <td>
-          258
+          259
         </td>
         <td>
-          744
+          743
         </td>
         <td>
-          10783
+          10829
           -
-          10801
+          10847
         </td>
         <td>
           Apply
@@ -5902,21 +5912,21 @@ else
         </td>
       </tr><tr>
         <td>
-          259
+          260
         </td>
         <td>
-          745
+          744
         </td>
         <td>
-          10826
+          10872
           -
-          10842
+          10888
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.locationtech.geomesa.utils.metrics.LatencyMetrics.apply
+          org.locationtech.geomesa.convert2.AbstractConverter.LatencyMetrics.apply
         </td>
         <td>
           
@@ -5926,15 +5936,15 @@ else
         </td>
       </tr><tr>
         <td>
-          259
+          260
         </td>
         <td>
-          746
+          745
         </td>
         <td>
-          10810
+          10856
           -
-          10843
+          10889
         </td>
         <td>
           Apply
@@ -5946,19 +5956,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          AbstractConverter.this.latency.foreach[Unit](((x$8: org.locationtech.geomesa.utils.metrics.LatencyMetrics) =&gt; x$8.apply(feature)))
+          AbstractConverter.this.latency.foreach[Unit](((x$8: org.locationtech.geomesa.convert2.AbstractConverter.LatencyMetrics) =&gt; x$8.apply(feature)))
         </td>
       </tr><tr>
         <td>
-          260
+          261
         </td>
         <td>
-          747
+          746
         </td>
         <td>
-          10870
+          10916
           -
-          10870
+          10916
         </td>
         <td>
           TypeApply
@@ -5974,15 +5984,15 @@ else
         </td>
       </tr><tr>
         <td>
-          260
+          261
         </td>
         <td>
-          748
+          747
         </td>
         <td>
-          10852
+          10898
           -
-          10885
+          10931
         </td>
         <td>
           Apply
@@ -5998,15 +6008,15 @@ else
         </td>
       </tr><tr>
         <td>
-          262
+          263
         </td>
         <td>
-          769
+          768
         </td>
         <td>
-          10910
+          10956
           -
-          11562
+          11608
         </td>
         <td>
           Block
@@ -6048,15 +6058,15 @@ else
         </td>
       </tr><tr>
         <td>
-          263
+          264
         </td>
         <td>
-          750
+          749
         </td>
         <td>
-          10921
+          10967
           -
-          10929
+          10975
         </td>
         <td>
           Select
@@ -6072,15 +6082,15 @@ else
         </td>
       </tr><tr>
         <td>
-          263
+          264
         </td>
         <td>
-          751
+          750
         </td>
         <td>
-          10921
+          10967
           -
-          10939
+          10985
         </td>
         <td>
           Apply
@@ -6096,15 +6106,15 @@ else
         </td>
       </tr><tr>
         <td>
-          264
+          265
         </td>
         <td>
-          752
+          751
         </td>
         <td>
-          10984
+          11030
           -
-          11023
+          11069
         </td>
         <td>
           Apply
@@ -6120,15 +6130,15 @@ else
         </td>
       </tr><tr>
         <td>
-          265
+          266
         </td>
         <td>
-          753
+          752
         </td>
         <td>
-          11032
+          11078
           -
-          11049
+          11095
         </td>
         <td>
           Select
@@ -6144,15 +6154,15 @@ else
         </td>
       </tr><tr>
         <td>
-          266
+          267
         </td>
         <td>
-          754
+          753
         </td>
         <td>
-          11096
+          11142
           -
-          11128
+          11174
         </td>
         <td>
           Apply
@@ -6168,15 +6178,15 @@ else
         </td>
       </tr><tr>
         <td>
-          266
+          267
         </td>
         <td>
-          755
+          754
         </td>
         <td>
-          11132
+          11178
           -
-          11174
+          11220
         </td>
         <td>
           Typed
@@ -6195,15 +6205,15 @@ else
         </td>
       </tr><tr>
         <td>
-          267
+          268
         </td>
         <td>
-          756
+          755
         </td>
         <td>
-          11213
+          11259
           -
-          11244
+          11290
         </td>
         <td>
           Apply
@@ -6219,15 +6229,15 @@ else
         </td>
       </tr><tr>
         <td>
-          267
+          268
         </td>
         <td>
-          757
+          756
         </td>
         <td>
-          11248
+          11294
           -
-          11281
+          11327
         </td>
         <td>
           Typed
@@ -6246,15 +6256,15 @@ else
         </td>
       </tr><tr>
         <td>
-          268
+          269
         </td>
         <td>
-          758
+          757
         </td>
         <td>
-          11368
+          11414
           -
-          11387
+          11433
         </td>
         <td>
           Apply
@@ -6270,15 +6280,15 @@ else
         </td>
       </tr><tr>
         <td>
-          268
+          269
         </td>
         <td>
-          759
+          758
         </td>
         <td>
-          11389
+          11435
           -
-          11396
+          11442
         </td>
         <td>
           Select
@@ -6294,15 +6304,15 @@ else
         </td>
       </tr><tr>
         <td>
-          268
+          269
         </td>
         <td>
-          760
+          759
         </td>
         <td>
-          11352
+          11398
           -
-          11397
+          11443
         </td>
         <td>
           Apply
@@ -6318,15 +6328,15 @@ else
         </td>
       </tr><tr>
         <td>
-          268
+          269
         </td>
         <td>
-          761
+          760
         </td>
         <td>
-          11337
+          11383
           -
-          11398
+          11444
         </td>
         <td>
           Apply
@@ -6342,15 +6352,15 @@ else
         </td>
       </tr><tr>
         <td>
-          268
+          269
         </td>
         <td>
-          762
+          761
         </td>
         <td>
-          11323
+          11369
           -
-          11399
+          11445
         </td>
         <td>
           Apply
@@ -6371,15 +6381,15 @@ else
         </td>
       </tr><tr>
         <td>
-          268
+          269
         </td>
         <td>
-          763
+          762
         </td>
         <td>
-          11323
+          11369
           -
-          11399
+          11445
         </td>
         <td>
           Block
@@ -6400,15 +6410,15 @@ else
         </td>
       </tr><tr>
         <td>
-          269
+          270
         </td>
         <td>
-          764
+          763
         </td>
         <td>
-          11440
+          11486
           -
-          11491
+          11537
         </td>
         <td>
           Throw
@@ -6424,15 +6434,15 @@ else
         </td>
       </tr><tr>
         <td>
-          269
+          270
         </td>
         <td>
-          765
+          764
         </td>
         <td>
-          11440
+          11486
           -
-          11491
+          11537
         </td>
         <td>
           Block
@@ -6448,15 +6458,15 @@ else
         </td>
       </tr><tr>
         <td>
-          270
+          271
         </td>
         <td>
-          766
+          765
         </td>
         <td>
-          11509
+          11555
           -
-          11511
+          11557
         </td>
         <td>
           Literal
@@ -6472,15 +6482,15 @@ else
         </td>
       </tr><tr>
         <td>
-          270
+          271
         </td>
         <td>
-          767
+          766
         </td>
         <td>
-          11509
+          11555
           -
-          11511
+          11557
         </td>
         <td>
           Block
@@ -6496,15 +6506,15 @@ else
         </td>
       </tr><tr>
         <td>
-          272
+          273
         </td>
         <td>
-          768
+          767
         </td>
         <td>
-          11539
+          11585
           -
-          11562
+          11608
         </td>
         <td>
           TypeApply
@@ -6520,15 +6530,15 @@ else
         </td>
       </tr><tr>
         <td>
-          277
+          278
         </td>
         <td>
-          770
+          769
         </td>
         <td>
-          11693
+          11739
           -
-          11708
+          11754
         </td>
         <td>
           Apply
@@ -6544,15 +6554,15 @@ else
         </td>
       </tr><tr>
         <td>
-          277
+          278
         </td>
         <td>
-          771
+          770
         </td>
         <td>
-          11712
+          11758
           -
-          11727
+          11773
         </td>
         <td>
           Literal
@@ -6568,15 +6578,15 @@ else
         </td>
       </tr><tr>
         <td>
-          277
+          278
         </td>
         <td>
-          772
+          771
         </td>
         <td>
-          11712
+          11758
           -
-          11727
+          11773
         </td>
         <td>
           Block
@@ -6592,15 +6602,15 @@ else
         </td>
       </tr><tr>
         <td>
-          277
+          278
         </td>
         <td>
-          773
+          772
         </td>
         <td>
-          11739
+          11785
           -
-          11747
+          11793
         </td>
         <td>
           Literal
@@ -6616,15 +6626,15 @@ else
         </td>
       </tr><tr>
         <td>
-          277
+          278
         </td>
         <td>
-          774
+          773
         </td>
         <td>
-          11756
+          11802
           -
-          11758
+          11804
         </td>
         <td>
           Literal
@@ -6640,15 +6650,15 @@ else
         </td>
       </tr><tr>
         <td>
-          277
+          278
         </td>
         <td>
-          775
+          774
         </td>
         <td>
-          11748
+          11794
           -
-          11755
+          11801
         </td>
         <td>
           Select
@@ -6664,15 +6674,15 @@ else
         </td>
       </tr><tr>
         <td>
-          277
+          278
         </td>
         <td>
-          776
+          775
         </td>
         <td>
-          11737
+          11783
           -
-          11758
+          11804
         </td>
         <td>
           Apply
@@ -6688,15 +6698,15 @@ else
         </td>
       </tr><tr>
         <td>
-          277
+          278
         </td>
         <td>
-          777
+          776
         </td>
         <td>
-          11737
+          11783
           -
-          11758
+          11804
         </td>
         <td>
           Block
@@ -6712,15 +6722,15 @@ else
         </td>
       </tr><tr>
         <td>
-          278
+          279
         </td>
         <td>
-          778
+          777
         </td>
         <td>
-          11779
+          11825
           -
-          11799
+          11845
         </td>
         <td>
           Literal
@@ -6736,15 +6746,15 @@ else
         </td>
       </tr><tr>
         <td>
-          278
+          279
         </td>
         <td>
-          779
+          778
         </td>
         <td>
-          11804
+          11850
           -
-          11814
+          11860
         </td>
         <td>
           Literal
@@ -6760,15 +6770,15 @@ else
         </td>
       </tr><tr>
         <td>
-          278
+          279
         </td>
         <td>
-          780
+          779
         </td>
         <td>
-          11822
+          11868
           -
-          11823
+          11869
         </td>
         <td>
           Literal
@@ -6784,15 +6794,15 @@ else
         </td>
       </tr><tr>
         <td>
-          278
+          279
         </td>
         <td>
-          781
+          780
         </td>
         <td>
-          11815
+          11861
           -
-          11821
+          11867
         </td>
         <td>
           Select
@@ -6808,15 +6818,15 @@ else
         </td>
       </tr><tr>
         <td>
-          278
+          279
         </td>
         <td>
-          782
+          781
         </td>
         <td>
-          11777
-          -
           11823
+          -
+          11869
         </td>
         <td>
           Apply
@@ -6832,15 +6842,15 @@ else
         </td>
       </tr><tr>
         <td>
-          279
+          280
         </td>
         <td>
-          783
+          782
         </td>
         <td>
-          11832
+          11878
           -
-          11840
+          11886
         </td>
         <td>
           Select
@@ -6856,15 +6866,15 @@ else
         </td>
       </tr><tr>
         <td>
-          279
+          280
         </td>
         <td>
-          784
+          783
         </td>
         <td>
-          11844
+          11890
           -
-          11849
+          11895
         </td>
         <td>
           Ident
@@ -6880,15 +6890,15 @@ else
         </td>
       </tr><tr>
         <td>
-          281
+          282
         </td>
         <td>
-          785
+          784
         </td>
         <td>
-          11901
+          11947
           -
-          11902
+          11948
         </td>
         <td>
           Literal
@@ -6904,15 +6914,15 @@ else
         </td>
       </tr><tr>
         <td>
-          281
+          282
         </td>
         <td>
-          786
+          785
         </td>
         <td>
-          11907
+          11953
           -
-          11924
+          11970
         </td>
         <td>
           Literal
@@ -6928,15 +6938,15 @@ else
         </td>
       </tr><tr>
         <td>
-          281
+          282
         </td>
         <td>
-          787
+          786
         </td>
         <td>
-          11949
+          11995
           -
-          11953
+          11999
         </td>
         <td>
           Literal
@@ -6952,15 +6962,15 @@ else
         </td>
       </tr><tr>
         <td>
-          281
+          282
         </td>
         <td>
-          788
+          787
         </td>
         <td>
-          11983
+          12029
           -
-          11985
+          12031
         </td>
         <td>
           Literal
@@ -6976,15 +6986,15 @@ else
         </td>
       </tr><tr>
         <td>
-          281
+          282
         </td>
         <td>
-          789
+          788
         </td>
         <td>
-          11942
+          11988
           -
-          11942
+          11988
         </td>
         <td>
           TypeApply
@@ -7000,15 +7010,15 @@ else
         </td>
       </tr><tr>
         <td>
-          281
+          282
         </td>
         <td>
-          790
+          789
         </td>
         <td>
-          11925
+          11971
           -
-          11948
+          11994
         </td>
         <td>
           ApplyToImplicitArgs
@@ -7024,15 +7034,15 @@ else
         </td>
       </tr><tr>
         <td>
-          281
+          282
         </td>
         <td>
-          791
+          790
         </td>
         <td>
-          11954
+          12000
           -
-          11982
+          12028
         </td>
         <td>
           Apply
@@ -7048,15 +7058,15 @@ else
         </td>
       </tr><tr>
         <td>
-          281
+          282
         </td>
         <td>
-          792
+          791
         </td>
         <td>
-          11899
+          11945
           -
-          11985
+          12031
         </td>
         <td>
           Apply
@@ -7072,15 +7082,15 @@ else
         </td>
       </tr><tr>
         <td>
-          281
+          282
         </td>
         <td>
-          793
+          792
         </td>
         <td>
-          11899
+          11945
           -
-          11985
+          12031
         </td>
         <td>
           Block
@@ -7096,15 +7106,15 @@ else
         </td>
       </tr><tr>
         <td>
-          286
+          287
         </td>
         <td>
-          794
+          793
         </td>
         <td>
-          12051
+          12097
           -
-          12064
+          12110
         </td>
         <td>
           Select
@@ -7120,15 +7130,15 @@ else
         </td>
       </tr><tr>
         <td>
-          286
+          287
         </td>
         <td>
-          795
+          794
         </td>
         <td>
-          12050
+          12096
           -
-          12050
+          12096
         </td>
         <td>
           Select
@@ -7144,15 +7154,15 @@ else
         </td>
       </tr><tr>
         <td>
-          286
+          287
         </td>
         <td>
-          796
+          795
         </td>
         <td>
-          12034
+          12080
           -
-          12065
+          12111
         </td>
         <td>
           ApplyToImplicitArgs
@@ -7168,15 +7178,15 @@ else
         </td>
       </tr><tr>
         <td>
-          287
+          288
         </td>
         <td>
-          797
+          796
         </td>
         <td>
-          12087
+          12133
           -
-          12094
+          12140
         </td>
         <td>
           Select
@@ -7192,15 +7202,15 @@ else
         </td>
       </tr><tr>
         <td>
-          287
+          288
         </td>
         <td>
-          798
+          797
         </td>
         <td>
-          12086
+          12132
           -
-          12086
+          12132
         </td>
         <td>
           Select
@@ -7216,15 +7226,15 @@ else
         </td>
       </tr><tr>
         <td>
-          287
+          288
         </td>
         <td>
-          799
+          798
         </td>
         <td>
-          12070
+          12116
           -
-          12095
+          12141
         </td>
         <td>
           ApplyToImplicitArgs
@@ -7240,15 +7250,15 @@ else
         </td>
       </tr><tr>
         <td>
-          288
+          289
         </td>
         <td>
-          800
+          799
         </td>
         <td>
-          12117
+          12163
           -
-          12127
+          12173
         </td>
         <td>
           Select
@@ -7264,15 +7274,15 @@ else
         </td>
       </tr><tr>
         <td>
-          288
+          289
         </td>
         <td>
-          801
+          800
         </td>
         <td>
-          12116
+          12162
           -
-          12116
+          12162
         </td>
         <td>
           Select
@@ -7288,15 +7298,15 @@ else
         </td>
       </tr><tr>
         <td>
-          288
+          289
         </td>
         <td>
-          802
+          801
         </td>
         <td>
-          12100
+          12146
           -
-          12128
+          12174
         </td>
         <td>
           ApplyToImplicitArgs
@@ -7312,15 +7322,15 @@ else
         </td>
       </tr><tr>
         <td>
-          288
+          289
         </td>
         <td>
-          803
+          802
         </td>
         <td>
-          12116
+          12162
           -
-          12116
+          12162
         </td>
         <td>
           Literal
@@ -7336,15 +7346,15 @@ else
         </td>
       </tr><tr>
         <td>
-          296
+          297
         </td>
         <td>
-          804
+          803
         </td>
         <td>
-          12262
+          12308
           -
-          12292
+          12338
         </td>
         <td>
           Literal
@@ -7360,15 +7370,15 @@ else
         </td>
       </tr><tr>
         <td>
-          297
+          298
         </td>
         <td>
-          805
+          804
         </td>
         <td>
-          12329
+          12375
           -
-          12361
+          12407
         </td>
         <td>
           Literal
@@ -7384,15 +7394,15 @@ else
         </td>
       </tr><tr>
         <td>
-          306
+          307
         </td>
         <td>
-          806
+          805
         </td>
         <td>
-          12676
+          12722
           -
-          12680
+          12726
         </td>
         <td>
           Select
@@ -7408,15 +7418,15 @@ else
         </td>
       </tr><tr>
         <td>
-          330
+          331
         </td>
         <td>
-          807
+          806
         </td>
         <td>
-          13524
+          13570
           -
-          13528
+          13574
         </td>
         <td>
           Select
@@ -7432,15 +7442,15 @@ else
         </td>
       </tr><tr>
         <td>
-          330
+          331
         </td>
         <td>
-          808
+          807
         </td>
         <td>
-          13504
+          13550
           -
-          13556
+          13602
         </td>
         <td>
           Apply
@@ -7456,15 +7466,15 @@ else
         </td>
       </tr><tr>
         <td>
-          353
+          354
         </td>
         <td>
-          809
+          808
         </td>
         <td>
-          14208
+          14254
           -
-          14238
+          14284
         </td>
         <td>
           Select
@@ -7480,15 +7490,15 @@ else
         </td>
       </tr><tr>
         <td>
-          354
+          355
         </td>
         <td>
-          810
+          809
         </td>
         <td>
-          14270
+          14316
           -
-          14279
+          14325
         </td>
         <td>
           TypeApply
@@ -7504,15 +7514,15 @@ else
         </td>
       </tr><tr>
         <td>
-          354
+          355
         </td>
         <td>
-          811
+          810
         </td>
         <td>
-          14281
+          14327
           -
-          14298
+          14344
         </td>
         <td>
           Select
@@ -7528,15 +7538,15 @@ else
         </td>
       </tr><tr>
         <td>
-          354
+          355
         </td>
         <td>
-          812
+          811
         </td>
         <td>
-          14300
+          14346
           -
-          14311
+          14357
         </td>
         <td>
           Apply
@@ -7552,15 +7562,15 @@ else
         </td>
       </tr><tr>
         <td>
-          354
+          355
         </td>
         <td>
-          813
+          812
         </td>
         <td>
-          14313
+          14359
           -
-          14335
+          14381
         </td>
         <td>
           Select
@@ -7576,15 +7586,15 @@ else
         </td>
       </tr><tr>
         <td>
-          354
+          355
         </td>
         <td>
-          814
+          813
         </td>
         <td>
-          14245
+          14291
           -
-          14336
+          14382
         </td>
         <td>
           Apply
@@ -7600,15 +7610,570 @@ else
         </td>
       </tr><tr>
         <td>
-          366
+          367
+        </td>
+        <td>
+          814
+        </td>
+        <td>
+          14672
+          -
+          14707
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.convert2.metrics.ConverterMetrics.name
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.convert2.metrics.ConverterMetrics.name(&quot;dtg.latest&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          367
         </td>
         <td>
           815
         </td>
         <td>
-          14620
+          14709
           -
-          14640
+          14713
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.convert2.AbstractConverter.LatencyMetrics.tags
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LatencyMetrics.this.tags
+        </td>
+      </tr><tr>
+        <td>
+          367
+        </td>
+        <td>
+          816
+        </td>
+        <td>
+          14651
+          -
+          14714
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.metrics.micrometer.utils.GaugeUtils.timeGauge
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.metrics.micrometer.utils.GaugeUtils.timeGauge(org.locationtech.geomesa.convert2.metrics.ConverterMetrics.name(&quot;dtg.latest&quot;), LatencyMetrics.this.tags, org.locationtech.geomesa.metrics.micrometer.utils.GaugeUtils.timeGauge$default$3)
+        </td>
+      </tr><tr>
+        <td>
+          370
+        </td>
+        <td>
+          817
+        </td>
+        <td>
+          14776
+          -
+          14812
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.convert2.metrics.ConverterMetrics.name
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.convert2.metrics.ConverterMetrics.name(&quot;dtg.latency&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          371
+        </td>
+        <td>
+          818
+        </td>
+        <td>
+          14828
+          -
+          14832
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.convert2.AbstractConverter.LatencyMetrics.tags
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LatencyMetrics.this.tags
+        </td>
+      </tr><tr>
+        <td>
+          373
+        </td>
+        <td>
+          819
+        </td>
+        <td>
+          14890
+          -
+          14904
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;milliseconds&quot;
+        </td>
+      </tr><tr>
+        <td>
+          374
+        </td>
+        <td>
+          820
+        </td>
+        <td>
+          14936
+          -
+          14938
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Predef.double2Double
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.double2Double(1.0)
+        </td>
+      </tr><tr>
+        <td>
+          375
+        </td>
+        <td>
+          821
+        </td>
+        <td>
+          14986
+          -
+          14987
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1L
+        </td>
+      </tr><tr>
+        <td>
+          375
+        </td>
+        <td>
+          822
+        </td>
+        <td>
+          14970
+          -
+          15006
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Long.toDouble
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.time.Duration.ofDays(1L).toMillis().toDouble
+        </td>
+      </tr><tr>
+        <td>
+          375
+        </td>
+        <td>
+          823
+        </td>
+        <td>
+          14970
+          -
+          15006
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Predef.double2Double
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.double2Double(java.time.Duration.ofDays(1L).toMillis().toDouble)
+        </td>
+      </tr><tr>
+        <td>
+          376
+        </td>
+        <td>
+          824
+        </td>
+        <td>
+          15026
+          -
+          15048
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          io.micrometer.core.instrument.Metrics.globalRegistry
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.micrometer.core.instrument.Metrics.globalRegistry
+        </td>
+      </tr><tr>
+        <td>
+          376
+        </td>
+        <td>
+          825
+        </td>
+        <td>
+          14748
+          -
+          15049
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.DistributionSummary.Builder.register
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.micrometer.core.instrument.DistributionSummary.builder(org.locationtech.geomesa.convert2.metrics.ConverterMetrics.name(&quot;dtg.latency&quot;)).tags(LatencyMetrics.this.tags).publishPercentileHistogram().baseUnit(&quot;milliseconds&quot;).minimumExpectedValue(scala.Predef.double2Double(1.0)).maximumExpectedValue(scala.Predef.double2Double(java.time.Duration.ofDays(1L).toMillis().toDouble)).register(io.micrometer.core.instrument.Metrics.globalRegistry)
+        </td>
+      </tr><tr>
+        <td>
+          384
+        </td>
+        <td>
+          826
+        </td>
+        <td>
+          15225
+          -
+          15233
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.convert2.AbstractConverter.LatencyMetrics.dtgIndex
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LatencyMetrics.this.dtgIndex
+        </td>
+      </tr><tr>
+        <td>
+          384
+        </td>
+        <td>
+          827
+        </td>
+        <td>
+          15204
+          -
+          15253
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Any.asInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getAttribute(LatencyMetrics.this.dtgIndex).asInstanceOf[java.util.Date]
+        </td>
+      </tr><tr>
+        <td>
+          385
+        </td>
+        <td>
+          828
+        </td>
+        <td>
+          15264
+          -
+          15275
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dtg.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          385
+        </td>
+        <td>
+          834
+        </td>
+        <td>
+          15277
+          -
+          15381
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  LatencyMetrics.this.date.set(dtg.getTime());
+  LatencyMetrics.this.latency.record(java.lang.System.currentTimeMillis().-(dtg.getTime()).toDouble)
+}
+        </td>
+      </tr><tr>
+        <td>
+          385
+        </td>
+        <td>
+          835
+        </td>
+        <td>
+          15260
+          -
+          15260
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          385
+        </td>
+        <td>
+          836
+        </td>
+        <td>
+          15260
+          -
+          15260
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          386
+        </td>
+        <td>
+          829
+        </td>
+        <td>
+          15296
+          -
+          15307
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Date.getTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dtg.getTime()
+        </td>
+      </tr><tr>
+        <td>
+          386
+        </td>
+        <td>
+          830
+        </td>
+        <td>
+          15287
+          -
+          15308
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.atomic.AtomicLong.set
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LatencyMetrics.this.date.set(dtg.getTime())
+        </td>
+      </tr><tr>
+        <td>
+          387
+        </td>
+        <td>
+          831
+        </td>
+        <td>
+          15361
+          -
+          15372
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Date.getTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          dtg.getTime()
+        </td>
+      </tr><tr>
+        <td>
+          387
+        </td>
+        <td>
+          832
+        </td>
+        <td>
+          15332
+          -
+          15372
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Long.toDouble
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.currentTimeMillis().-(dtg.getTime()).toDouble
+        </td>
+      </tr><tr>
+        <td>
+          387
+        </td>
+        <td>
+          833
+        </td>
+        <td>
+          15317
+          -
+          15373
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          io.micrometer.core.instrument.DistributionSummary.record
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          LatencyMetrics.this.latency.record(java.lang.System.currentTimeMillis().-(dtg.getTime()).toDouble)
+        </td>
+      </tr><tr>
+        <td>
+          400
+        </td>
+        <td>
+          837
+        </td>
+        <td>
+          15665
+          -
+          15685
         </td>
         <td>
           Select
@@ -7624,15 +8189,15 @@ else
         </td>
       </tr><tr>
         <td>
-          366
+          400
         </td>
         <td>
-          824
+          846
         </td>
         <td>
-          14642
+          15687
           -
-          14822
+          15867
         </td>
         <td>
           Block
@@ -7652,15 +8217,15 @@ else
         </td>
       </tr><tr>
         <td>
-          366
+          400
         </td>
         <td>
-          825
+          847
         </td>
         <td>
-          14616
+          15661
           -
-          14616
+          15661
         </td>
         <td>
           Literal
@@ -7676,15 +8241,15 @@ else
         </td>
       </tr><tr>
         <td>
-          366
+          400
         </td>
         <td>
-          826
+          848
         </td>
         <td>
-          14616
+          15661
           -
-          14616
+          15661
         </td>
         <td>
           Block
@@ -7700,15 +8265,15 @@ else
         </td>
       </tr><tr>
         <td>
-          367
+          401
         </td>
         <td>
-          816
+          838
         </td>
         <td>
-          14661
+          15706
           -
-          14677
+          15722
         </td>
         <td>
           Select
@@ -7724,15 +8289,15 @@ else
         </td>
       </tr><tr>
         <td>
-          367
+          401
         </td>
         <td>
-          817
+          839
         </td>
         <td>
-          14707
+          15752
           -
-          14717
+          15762
         </td>
         <td>
           Apply
@@ -7748,15 +8313,15 @@ else
         </td>
       </tr><tr>
         <td>
-          367
+          401
         </td>
         <td>
-          818
+          840
         </td>
         <td>
-          14692
+          15737
           -
-          14728
+          15773
         </td>
         <td>
           Apply
@@ -7772,15 +8337,15 @@ else
         </td>
       </tr><tr>
         <td>
-          367
+          401
         </td>
         <td>
-          819
+          841
         </td>
         <td>
-          14691
+          15736
           -
-          14691
+          15736
         </td>
         <td>
           TypeApply
@@ -7796,15 +8361,15 @@ else
         </td>
       </tr><tr>
         <td>
-          367
+          401
         </td>
         <td>
-          820
+          842
         </td>
         <td>
-          14661
+          15706
           -
-          14735
+          15780
         </td>
         <td>
           TypeApply
@@ -7820,15 +8385,15 @@ else
         </td>
       </tr><tr>
         <td>
-          368
+          402
         </td>
         <td>
-          821
+          843
         </td>
         <td>
-          14742
+          15787
           -
-          14762
+          15807
         </td>
         <td>
           Apply
@@ -7844,15 +8409,15 @@ else
         </td>
       </tr><tr>
         <td>
-          369
+          403
         </td>
         <td>
-          822
+          844
         </td>
         <td>
-          14782
+          15827
           -
-          14815
+          15860
         </td>
         <td>
           Apply
@@ -7868,15 +8433,15 @@ else
         </td>
       </tr><tr>
         <td>
-          369
+          403
         </td>
         <td>
-          823
+          845
         </td>
         <td>
-          14769
+          15814
           -
-          14816
+          15861
         </td>
         <td>
           Apply
@@ -7892,15 +8457,15 @@ else
         </td>
       </tr><tr>
         <td>
-          382
+          416
         </td>
         <td>
-          827
+          849
         </td>
         <td>
-          15100
+          16145
           -
-          15124
+          16169
         </td>
         <td>
           TypeApply
@@ -7916,15 +8481,15 @@ else
         </td>
       </tr><tr>
         <td>
-          383
+          417
         </td>
         <td>
-          828
+          850
         </td>
         <td>
-          15192
+          16237
           -
-          15200
+          16245
         </td>
         <td>
           Select
@@ -7940,15 +8505,15 @@ else
         </td>
       </tr><tr>
         <td>
-          383
+          417
         </td>
         <td>
-          829
+          851
         </td>
         <td>
-          15189
+          16234
           -
-          15189
+          16234
         </td>
         <td>
           TypeApply
@@ -7964,15 +8529,15 @@ else
         </td>
       </tr><tr>
         <td>
-          383
+          417
         </td>
         <td>
-          830
+          852
         </td>
         <td>
-          15145
+          16190
           -
-          15200
+          16245
         </td>
         <td>
           ApplyToImplicitArgs
@@ -7988,15 +8553,15 @@ else
         </td>
       </tr><tr>
         <td>
-          384
+          418
         </td>
         <td>
-          831
+          853
         </td>
         <td>
-          15212
+          16257
           -
-          15230
+          16275
         </td>
         <td>
           Select
@@ -8012,15 +8577,15 @@ else
         </td>
       </tr><tr>
         <td>
-          384
+          418
         </td>
         <td>
-          839
+          861
         </td>
         <td>
-          15232
+          16277
           -
-          15232
+          16277
         </td>
         <td>
           Apply
@@ -8036,15 +8601,15 @@ else
         </td>
       </tr><tr>
         <td>
-          384
+          418
         </td>
         <td>
-          840
+          862
         </td>
         <td>
-          15232
+          16277
           -
-          15432
+          16477
         </td>
         <td>
           Block
@@ -8071,15 +8636,15 @@ else
         </td>
       </tr><tr>
         <td>
-          384
+          418
         </td>
         <td>
-          841
+          863
         </td>
         <td>
-          15205
+          16250
           -
-          15205
+          16250
         </td>
         <td>
           Literal
@@ -8095,15 +8660,15 @@ else
         </td>
       </tr><tr>
         <td>
-          384
+          418
         </td>
         <td>
-          842
+          864
         </td>
         <td>
-          15205
+          16250
           -
-          15205
+          16250
         </td>
         <td>
           Block
@@ -8119,15 +8684,15 @@ else
         </td>
       </tr><tr>
         <td>
-          385
+          419
         </td>
         <td>
-          832
+          854
         </td>
         <td>
-          15251
+          16296
           -
-          15270
+          16315
         </td>
         <td>
           Apply
@@ -8143,15 +8708,15 @@ else
         </td>
       </tr><tr>
         <td>
-          386
+          420
         </td>
         <td>
-          833
+          855
         </td>
         <td>
-          15298
+          16343
           -
-          15310
+          16355
         </td>
         <td>
           Apply
@@ -8167,15 +8732,15 @@ else
         </td>
       </tr><tr>
         <td>
-          386
+          420
         </td>
         <td>
-          834
+          856
         </td>
         <td>
-          15281
+          16326
           -
-          15311
+          16356
         </td>
         <td>
           Apply
@@ -8193,15 +8758,15 @@ else
         </td>
       </tr><tr>
         <td>
-          387
+          421
         </td>
         <td>
-          835
+          857
         </td>
         <td>
-          15323
+          16368
           -
-          15339
+          16384
         </td>
         <td>
           Apply
@@ -8217,15 +8782,15 @@ else
         </td>
       </tr><tr>
         <td>
-          387
+          421
         </td>
         <td>
-          836
+          858
         </td>
         <td>
-          15323
+          16368
           -
-          15339
+          16384
         </td>
         <td>
           Block
@@ -8241,15 +8806,15 @@ else
         </td>
       </tr><tr>
         <td>
-          389
+          423
         </td>
         <td>
-          837
+          859
         </td>
         <td>
-          15363
+          16408
           -
-          15386
+          16431
         </td>
         <td>
           Apply
@@ -8265,15 +8830,15 @@ else
         </td>
       </tr><tr>
         <td>
-          389
+          423
         </td>
         <td>
-          838
+          860
         </td>
         <td>
-          15363
+          16408
           -
-          15386
+          16431
         </td>
         <td>
           Block
@@ -8289,15 +8854,15 @@ else
         </td>
       </tr><tr>
         <td>
-          392
+          426
         </td>
         <td>
-          843
+          865
         </td>
         <td>
-          15437
+          16482
           -
-          15448
+          16493
         </td>
         <td>
           ApplyToImplicitArgs
