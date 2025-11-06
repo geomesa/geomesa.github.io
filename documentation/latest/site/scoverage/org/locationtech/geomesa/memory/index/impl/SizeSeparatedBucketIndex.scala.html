@@ -1,0 +1,4588 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/memory/index/impl/SizeSeparatedBucketIndex.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.memory.index.impl
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.StrictLogging
+</span>12 <span style=''>import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+</span>13 <span style=''>import org.locationtech.geomesa.memory.index.{SimpleFeatureSpatialIndex, SpatialIndex}
+</span>14 <span style=''>import org.locationtech.geomesa.utils.geotools.GridSnap
+</span>15 <span style=''>import org.locationtech.jts.geom.{Envelope, Geometry}
+</span>16 <span style=''>
+</span>17 <span style=''>import java.util.concurrent.ConcurrentHashMap
+</span>18 <span style=''>import scala.annotation.tailrec
+</span>19 <span style=''>
+</span>20 <span style=''>/**
+</span>21 <span style=''>  * Creates an index suitable for geometries with extents. The index is broken up into tiers, where each
+</span>22 <span style=''>  * geometry is assigned a tier based on its envelope size. When querying, each tier must be evaluated, so
+</span>23 <span style=''>  * if possible tiers should be matched closely to the envelopes of the entries.
+</span>24 <span style=''>  *
+</span>25 <span style=''>  * Values are indexed by the centroid of their envelope. When querying, the bounding box is expanded based
+</span>26 <span style=''>  * on the max envelope size of the tier, to ensure that all potential results are found. Thus, the false
+</span>27 <span style=''>  * positive rate tends to go up with larger tiers, and post-filtering is recommended.
+</span>28 <span style=''>  *
+</span>29 <span style=''>  * @param sizes (x, y) max envelope size for each tier
+</span>30 <span style=''>  * @param xBucketMultiplier multiplier for number of x buckets to create per tier
+</span>31 <span style=''>  * @param yBucketMultiplier multiplier for number of y buckets to create per tier
+</span>32 <span style=''>  * @param extents total area being indexed
+</span>33 <span style=''>  * @tparam T item type
+</span>34 <span style=''>  */
+</span>35 <span style=''>class SizeSeparatedBucketIndex[T](sizes: Seq[(Double, Double)] = SizeSeparatedBucketIndex.DefaultTiers,
+</span>36 <span style=''>                                  xBucketMultiplier: Double = 1,
+</span>37 <span style=''>                                  yBucketMultiplier: Double = 1,
+</span>38 <span style=''>                                  extents: Envelope = new Envelope(-180.0, 180.0, -90.0, 90.0))
+</span>39 <span style=''>    extends SpatialIndex[T] with StrictLogging {
+</span>40 <span style=''>
+</span>41 <span style=''>  // TODO https://geomesa.atlassian.net/browse/GEOMESA-2323 better anti-meridian handling
+</span>42 <span style=''>
+</span>43 <span style=''>  </span><span style='background: #AEF1AE'>require(sizes.nonEmpty, </span><span style='background: #F0ADAD'>&quot;No valid tier sizes specified&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>44 <span style=''>  </span><span style='background: #AEF1AE'>require(sizes.lengthCompare(1) == 0 ||
+</span>45 <span style=''></span><span style='background: #AEF1AE'>      sizes.sliding(2).forall { case Seq((x1, y1), (x2, y2)) =&gt; x1 &lt;= x2 &amp;&amp; y1 &lt;= y2 },
+</span>46 <span style=''></span><span style='background: #AEF1AE'>    </span><span style='background: #F0ADAD'>&quot;Tiers must be ordered by increasing size&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>47 <span style=''>
+</span>48 <span style=''>  // note: for point ops, we always use the first (smallest) tier
+</span>49 <span style=''>
+</span>50 <span style=''>  private val tiers = </span><span style='background: #AEF1AE'>sizes.map { case (width, height) =&gt;
+</span>51 <span style=''></span><span style='background: #AEF1AE'>    val xSize = math.ceil(extents.getWidth * xBucketMultiplier / width).toInt
+</span>52 <span style=''></span><span style='background: #AEF1AE'>    val ySize = math.ceil(extents.getHeight * yBucketMultiplier / height).toInt
+</span>53 <span style=''></span><span style='background: #AEF1AE'>    // create the buckets up front to avoid having to synchronize the whole array
+</span>54 <span style=''></span><span style='background: #AEF1AE'>    // we use a ConcurrentHashMap, which gives us iterators that aren't affected by modifications to the backing map
+</span>55 <span style=''></span><span style='background: #AEF1AE'>    val buckets = Array.fill(xSize, ySize)(new ConcurrentHashMap[String, T]())
+</span>56 <span style=''></span><span style='background: #AEF1AE'>    logger.debug(s&quot;Creating tier for size ($width $height) with buckets [${xSize}x$ySize]&quot;)
+</span>57 <span style=''></span><span style='background: #AEF1AE'>    new Tier(width, height, buckets, new GridSnap(extents, xSize, ySize))
+</span>58 <span style=''></span><span style='background: #AEF1AE'>  }</span><span style=''>
+</span>59 <span style=''>
+</span>60 <span style=''>
+</span>61 <span style=''>  override def insert(geom: Geometry, key: String, value: T): Unit = {
+</span>62 <span style=''>    val envelope = </span><span style='background: #AEF1AE'>geom.getEnvelopeInternal</span><span style=''>
+</span>63 <span style=''>    val tier = </span><span style='background: #AEF1AE'>selectTier(envelope)</span><span style=''>
+</span>64 <span style=''>    // volatile reads should be cheaper than writes, so only update the variable if necessary
+</span>65 <span style=''>    if (</span><span style='background: #AEF1AE'>tier.empty</span><span style=''>) {
+</span>66 <span style=''>      </span><span style='background: #AEF1AE'>tier.empty = false</span><span style=''>
+</span>67 <span style=''>    }
+</span>68 <span style=''>    </span><span style='background: #AEF1AE'>tier.bucket(envelope).put(key, value)</span><span style=''>
+</span>69 <span style=''>  }
+</span>70 <span style=''>
+</span>71 <span style=''>  override def remove(geom: Geometry, key: String): T = {
+</span>72 <span style=''>    val envelope = </span><span style='background: #AEF1AE'>geom.getEnvelopeInternal</span><span style=''>
+</span>73 <span style=''>    </span><span style='background: #AEF1AE'>selectTier(envelope).bucket(envelope).remove(key)</span><span style=''>
+</span>74 <span style=''>  }
+</span>75 <span style=''>
+</span>76 <span style=''>  override def get(geom: Geometry, key: String): T = {
+</span>77 <span style=''>    val envelope = </span><span style='background: #F0ADAD'>geom.getEnvelopeInternal</span><span style=''>
+</span>78 <span style=''>    </span><span style='background: #F0ADAD'>selectTier(envelope).bucket(envelope).get(key)</span><span style=''>
+</span>79 <span style=''>  }
+</span>80 <span style=''>
+</span>81 <span style=''>  override def query(xmin: Double, ymin: Double, xmax: Double, ymax: Double): Iterator[T] =
+</span>82 <span style=''>    </span><span style='background: #AEF1AE'>tiers.iterator.flatMap(_.iterator(xmin, ymin, xmax, ymax))</span><span style=''>
+</span>83 <span style=''>
+</span>84 <span style=''>  override def query(): Iterator[T] = </span><span style='background: #AEF1AE'>query(extents.getMinX, extents.getMinY, extents.getMaxX, extents.getMaxY)</span><span style=''>
+</span>85 <span style=''>
+</span>86 <span style=''>  override def size(): Int = {
+</span>87 <span style=''>    var size = </span><span style='background: #F0ADAD'>0</span><span style=''>
+</span>88 <span style=''>    </span><span style='background: #F0ADAD'>tiers.foreach(tier =&gt; size += tier.size())</span><span style=''>
+</span>89 <span style=''>    size
+</span>90 <span style=''>  }
+</span>91 <span style=''>
+</span>92 <span style=''>  override def clear(): Unit = </span><span style='background: #AEF1AE'>tiers.foreach(_.clear())</span><span style=''>
+</span>93 <span style=''>
+</span>94 <span style=''>  private def selectTier(envelope: Envelope): Tier = {
+</span>95 <span style=''>    val width = </span><span style='background: #AEF1AE'>envelope.getWidth</span><span style=''>
+</span>96 <span style=''>    val height = </span><span style='background: #AEF1AE'>envelope.getHeight</span><span style=''>
+</span>97 <span style=''>    </span><span style='background: #AEF1AE'>tiers.find(t =&gt; t.maxSizeX &gt;= width &amp;&amp; t.maxSizeY &gt;= height).getOrElse {
+</span>98 <span style=''></span><span style='background: #AEF1AE'>      </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Envelope $envelope exceeds the max tier size ${sizes.last}&quot;)</span><span style='background: #AEF1AE'>
+</span>99 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>100 <span style=''>  }
+</span>101 <span style=''>
+</span>102 <span style=''>  private class Tier(val maxSizeX: Double,
+</span>103 <span style=''>                     val maxSizeY: Double,
+</span>104 <span style=''>                     buckets: Array[Array[ConcurrentHashMap[String, T]]],
+</span>105 <span style=''>                     gridSnap: GridSnap) {
+</span>106 <span style=''>
+</span>107 <span style=''>    // we can safely use volatile instead of synchronized here, as this is a primitive boolean whose
+</span>108 <span style=''>    // state doesn't depend on its own value
+</span>109 <span style=''>    @volatile
+</span>110 <span style=''>    var empty: Boolean = </span><span style='background: #AEF1AE'>true</span><span style=''>
+</span>111 <span style=''>
+</span>112 <span style=''>    private val maxX = </span><span style='background: #AEF1AE'>buckets.length - 1</span><span style=''>
+</span>113 <span style=''>    private val maxY = </span><span style='background: #AEF1AE'>buckets(0).length - 1</span><span style=''>
+</span>114 <span style=''>
+</span>115 <span style=''>    def bucket(x: Double, y: Double): ConcurrentHashMap[String, T] = </span><span style='background: #F0ADAD'>buckets(snapX(x))(snapY(y))</span><span style=''>
+</span>116 <span style=''>
+</span>117 <span style=''>    // the bucket is selected based on the envelope centroid
+</span>118 <span style=''>    def bucket(envelope: Envelope): ConcurrentHashMap[String, T] =
+</span>119 <span style=''>      </span><span style='background: #AEF1AE'>buckets(snapX((envelope.getMinX + envelope.getMaxX) / 2.0))(snapY((envelope.getMinY + envelope.getMaxY) / 2.0))</span><span style=''>
+</span>120 <span style=''>
+</span>121 <span style=''>    def iterator(xmin: Double, ymin: Double, xmax: Double, ymax: Double): Iterator[T] =
+</span>122 <span style=''>      if (</span><span style='background: #AEF1AE'>empty</span><span style=''>) { </span><span style='background: #AEF1AE'>Iterator.empty</span><span style=''> } else { </span><span style='background: #AEF1AE'>new TierIterator(xmin, ymin, xmax, ymax)</span><span style=''> }
+</span>123 <span style=''>
+</span>124 <span style=''>    def size(): Int = {
+</span>125 <span style=''>      if (</span><span style='background: #F0ADAD'>empty</span><span style=''>) { </span><span style='background: #F0ADAD'>0</span><span style=''> } else </span><span style='background: #F0ADAD'>{
+</span>126 <span style=''></span><span style='background: #F0ADAD'>        var size = 0
+</span>127 <span style=''></span><span style='background: #F0ADAD'>        var i = 0
+</span>128 <span style=''></span><span style='background: #F0ADAD'>        while (i &lt;= maxX) {
+</span>129 <span style=''></span><span style='background: #F0ADAD'>          var j = 0
+</span>130 <span style=''></span><span style='background: #F0ADAD'>          while (j &lt;= maxY) {
+</span>131 <span style=''></span><span style='background: #F0ADAD'>            size += buckets(i)(j).size()
+</span>132 <span style=''></span><span style='background: #F0ADAD'>            j += 1
+</span>133 <span style=''></span><span style='background: #F0ADAD'>          }
+</span>134 <span style=''></span><span style='background: #F0ADAD'>          i += 1
+</span>135 <span style=''></span><span style='background: #F0ADAD'>        }
+</span>136 <span style=''></span><span style='background: #F0ADAD'>        size
+</span>137 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''>
+</span>138 <span style=''>    }
+</span>139 <span style=''>
+</span>140 <span style=''>    def clear(): Unit = {
+</span>141 <span style=''>      var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
+</span>142 <span style=''>      while (</span><span style='background: #AEF1AE'>i &lt;= maxX</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>143 <span style=''></span><span style='background: #AEF1AE'>        var j = 0
+</span>144 <span style=''></span><span style='background: #AEF1AE'>        while (j &lt;= maxY) {
+</span>145 <span style=''></span><span style='background: #AEF1AE'>          buckets(i)(j).clear()
+</span>146 <span style=''></span><span style='background: #AEF1AE'>          j += 1
+</span>147 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>148 <span style=''></span><span style='background: #AEF1AE'>        i += 1
+</span>149 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>150 <span style=''>    }
+</span>151 <span style=''>
+</span>152 <span style=''>    private def snapX(x: Double): Int = {
+</span>153 <span style=''>      val i = </span><span style='background: #AEF1AE'>gridSnap.i(x)</span><span style=''>
+</span>154 <span style=''>      if (</span><span style='background: #AEF1AE'>i != -1</span><span style=''>) { </span><span style='background: #AEF1AE'>i</span><span style=''> } else </span><span style='background: #AEF1AE'>if (x &lt; extents.getMinX) { 0 } else { maxX }</span><span style=''>
+</span>155 <span style=''>    }
+</span>156 <span style=''>
+</span>157 <span style=''>    private def snapY(y: Double): Int = {
+</span>158 <span style=''>      val j = </span><span style='background: #AEF1AE'>gridSnap.j(y)</span><span style=''>
+</span>159 <span style=''>      if (</span><span style='background: #AEF1AE'>j != -1</span><span style=''>) { </span><span style='background: #AEF1AE'>j</span><span style=''> } else </span><span style='background: #AEF1AE'>if (y &lt; extents.getMinY) { 0 } else { maxY }</span><span style=''>
+</span>160 <span style=''>    }
+</span>161 <span style=''>
+</span>162 <span style=''>    /**
+</span>163 <span style=''>      * Iterator over a range of buckets
+</span>164 <span style=''>      */
+</span>165 <span style=''>    class TierIterator (xmin: Double, ymin: Double, xmax: Double, ymax: Double) extends Iterator[T] {
+</span>166 <span style=''>
+</span>167 <span style=''>      private val maxi = </span><span style='background: #AEF1AE'>snapX(xmax + maxSizeX)</span><span style=''>
+</span>168 <span style=''>      private val minj = </span><span style='background: #AEF1AE'>snapY(ymin - maxSizeY)</span><span style=''>
+</span>169 <span style=''>      private val maxj = </span><span style='background: #AEF1AE'>snapY(ymax + maxSizeY)</span><span style=''>
+</span>170 <span style=''>
+</span>171 <span style=''>      private var i = </span><span style='background: #AEF1AE'>snapX(xmin - maxSizeX)</span><span style=''>
+</span>172 <span style=''>      private var j = </span><span style='background: #AEF1AE'>minj</span><span style=''>
+</span>173 <span style=''>      private var iter = </span><span style='background: #AEF1AE'>buckets(i)(j).values.iterator()</span><span style=''> // note: `.values` is a cached view
+</span>174 <span style=''>
+</span>175 <span style=''>      @tailrec
+</span>176 <span style=''>      override final def hasNext: Boolean = </span><span style='background: #AEF1AE'>iter.hasNext || {
+</span>177 <span style=''></span><span style='background: #AEF1AE'>        if (i == maxi &amp;&amp; j == maxj) { false } else {
+</span>178 <span style=''></span><span style='background: #AEF1AE'>          if (j &lt; maxj) {
+</span>179 <span style=''></span><span style='background: #AEF1AE'>            j += 1
+</span>180 <span style=''></span><span style='background: #AEF1AE'>          } else {
+</span>181 <span style=''></span><span style='background: #AEF1AE'>            j = minj
+</span>182 <span style=''></span><span style='background: #AEF1AE'>            i += 1
+</span>183 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>184 <span style=''></span><span style='background: #AEF1AE'>          iter = buckets(i)(j).values.iterator() // note: `.values` is a cached view
+</span>185 <span style=''></span><span style='background: #AEF1AE'>          hasNext
+</span>186 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>187 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>188 <span style=''>
+</span>189 <span style=''>      override def next(): T = </span><span style='background: #AEF1AE'>iter.next()</span><span style=''>
+</span>190 <span style=''>    }
+</span>191 <span style=''>  }
+</span>192 <span style=''>}
+</span>193 <span style=''>
+</span>194 <span style=''>object SizeSeparatedBucketIndex {
+</span>195 <span style=''>
+</span>196 <span style=''>  // TODO https://geomesa.atlassian.net/browse/GEOMESA-2322 these are somewhat arbitrary
+</span>197 <span style=''>  val DefaultTiers: Seq[(Double, Double)] = </span><span style='background: #AEF1AE'>Seq((1, 1), (4, 4), (32, 32), (360, 180))</span><span style=''>
+</span>198 <span style=''>
+</span>199 <span style=''>  def apply(
+</span>200 <span style=''>      sft: SimpleFeatureType,
+</span>201 <span style=''>      tiers: Seq[(Double, Double)],
+</span>202 <span style=''>      xBucketMultiplier: Double,
+</span>203 <span style=''>      yBucketMultiplier: Double): SimpleFeatureSpatialIndex =
+</span>204 <span style=''>    </span><span style='background: #AEF1AE'>new SimpleFeatureSizeSeparatedBucketIndex(sft, tiers, xBucketMultiplier, yBucketMultiplier)</span><span style=''>
+</span>205 <span style=''>
+</span>206 <span style=''>  private class SimpleFeatureSizeSeparatedBucketIndex(
+</span>207 <span style=''>      val sft: SimpleFeatureType,
+</span>208 <span style=''>      tiers: Seq[(Double, Double)],
+</span>209 <span style=''>      xBucketMultiplier: Double,
+</span>210 <span style=''>      yBucketMultiplier: Double
+</span>211 <span style=''>    ) extends SizeSeparatedBucketIndex[SimpleFeature](tiers, xBucketMultiplier, yBucketMultiplier) with SimpleFeatureSpatialIndex
+</span>212 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          66413
+        </td>
+        <td>
+          2316
+          -
+          2347
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;No valid tier sizes specified&quot;
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          66412
+        </td>
+        <td>
+          2300
+          -
+          2314
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.nonEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.sizes.nonEmpty
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          66414
+        </td>
+        <td>
+          2292
+          -
+          2348
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(SizeSeparatedBucketIndex.this.sizes.nonEmpty, &quot;No valid tier sizes specified&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          66415
+        </td>
+        <td>
+          2379
+          -
+          2380
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          66416
+        </td>
+        <td>
+          2385
+          -
+          2386
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          66422
+        </td>
+        <td>
+          2359
+          -
+          2476
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.sizes.lengthCompare(1).==(0).||(SizeSeparatedBucketIndex.this.sizes.sliding(2).forall(((x0$1: Seq[(Double, Double)]) =&gt; x0$1 match {
+  case scala.collection.Seq.unapplySeq[(Double, Double)](&lt;unapply-selector&gt;) &lt;unapply&gt; ((_1: Double, _2: Double)(Double, Double)((x1 @ _), (y1 @ _)), (_1: Double, _2: Double)(Double, Double)((x2 @ _), (y2 @ _))) =&gt; x1.&lt;=(x2).&amp;&amp;(y1.&lt;=(y2))
+})))
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          66424
+        </td>
+        <td>
+          2351
+          -
+          2525
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(SizeSeparatedBucketIndex.this.sizes.lengthCompare(1).==(0).||(SizeSeparatedBucketIndex.this.sizes.sliding(2).forall(((x0$1: Seq[(Double, Double)]) =&gt; x0$1 match {
+  case scala.collection.Seq.unapplySeq[(Double, Double)](&lt;unapply-selector&gt;) &lt;unapply&gt; ((_1: Double, _2: Double)(Double, Double)((x1 @ _), (y1 @ _)), (_1: Double, _2: Double)(Double, Double)((x2 @ _), (y2 @ _))) =&gt; x1.&lt;=(x2).&amp;&amp;(y1.&lt;=(y2))
+}))), &quot;Tiers must be ordered by increasing size&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          66417
+        </td>
+        <td>
+          2410
+          -
+          2411
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          2
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          66419
+        </td>
+        <td>
+          2454
+          -
+          2474
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x1.&lt;=(x2).&amp;&amp;(y1.&lt;=(y2))
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          66418
+        </td>
+        <td>
+          2466
+          -
+          2474
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          y1.&lt;=(y2)
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          66421
+        </td>
+        <td>
+          2396
+          -
+          2476
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.forall
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.sizes.sliding(2).forall(((x0$1: Seq[(Double, Double)]) =&gt; x0$1 match {
+  case scala.collection.Seq.unapplySeq[(Double, Double)](&lt;unapply-selector&gt;) &lt;unapply&gt; ((_1: Double, _2: Double)(Double, Double)((x1 @ _), (y1 @ _)), (_1: Double, _2: Double)(Double, Double)((x2 @ _), (y2 @ _))) =&gt; x1.&lt;=(x2).&amp;&amp;(y1.&lt;=(y2))
+}))
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          66420
+        </td>
+        <td>
+          2454
+          -
+          2474
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x1.&lt;=(x2).&amp;&amp;(y1.&lt;=(y2))
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          66423
+        </td>
+        <td>
+          2482
+          -
+          2524
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;Tiers must be ordered by increasing size&quot;
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          66435
+        </td>
+        <td>
+          2626
+          -
+          2626
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[SizeSeparatedBucketIndex.this.Tier]
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          66434
+        </td>
+        <td>
+          2649
+          -
+          3253
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val xSize: Int = scala.math.`package`.ceil(SizeSeparatedBucketIndex.this.extents.getWidth().*(SizeSeparatedBucketIndex.this.xBucketMultiplier)./(width)).toInt;
+  val ySize: Int = scala.math.`package`.ceil(SizeSeparatedBucketIndex.this.extents.getHeight().*(SizeSeparatedBucketIndex.this.yBucketMultiplier)./(height)).toInt;
+  val buckets: Array[Array[java.util.concurrent.ConcurrentHashMap[String,T]]] = scala.Array.fill[java.util.concurrent.ConcurrentHashMap[String,T]](xSize, ySize)(new java.util.concurrent.ConcurrentHashMap[String,T]())((ClassTag.apply[java.util.concurrent.ConcurrentHashMap[String,T]](classOf[java.util.concurrent.ConcurrentHashMap]): scala.reflect.ClassTag[java.util.concurrent.ConcurrentHashMap[String,T]]));
+  (if (SizeSeparatedBucketIndex.this.logger.underlying.isDebugEnabled())
+    SizeSeparatedBucketIndex.this.logger.underlying.debug(&quot;Creating tier for size ({} {}) with buckets [{}x{}]&quot;, width.asInstanceOf[AnyRef], height.asInstanceOf[AnyRef], xSize.asInstanceOf[AnyRef], ySize.asInstanceOf[AnyRef])
+  else
+    (): Unit);
+  new SizeSeparatedBucketIndex.this.Tier(width, height, buckets, new org.locationtech.geomesa.utils.geotools.GridSnap(SizeSeparatedBucketIndex.this.extents, xSize, ySize))
+}
+        </td>
+      </tr><tr>
+        <td>
+          50
+        </td>
+        <td>
+          66436
+        </td>
+        <td>
+          2616
+          -
+          3257
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.sizes.map[SizeSeparatedBucketIndex.this.Tier, Seq[SizeSeparatedBucketIndex.this.Tier]](((x0$2: (Double, Double)) =&gt; x0$2 match {
+  case (_1: Double, _2: Double)(Double, Double)((width @ _), (height @ _)) =&gt; {
+    val xSize: Int = scala.math.`package`.ceil(SizeSeparatedBucketIndex.this.extents.getWidth().*(SizeSeparatedBucketIndex.this.xBucketMultiplier)./(width)).toInt;
+    val ySize: Int = scala.math.`package`.ceil(SizeSeparatedBucketIndex.this.extents.getHeight().*(SizeSeparatedBucketIndex.this.yBucketMultiplier)./(height)).toInt;
+    val buckets: Array[Array[java.util.concurrent.ConcurrentHashMap[String,T]]] = scala.Array.fill[java.util.concurrent.ConcurrentHashMap[String,T]](xSize, ySize)(new java.util.concurrent.ConcurrentHashMap[String,T]())((ClassTag.apply[java.util.concurrent.ConcurrentHashMap[String,T]](classOf[java.util.concurrent.ConcurrentHashMap]): scala.reflect.ClassTag[java.util.concurrent.ConcurrentHashMap[String,T]]));
+    (if (SizeSeparatedBucketIndex.this.logger.underlying.isDebugEnabled())
+      SizeSeparatedBucketIndex.this.logger.underlying.debug(&quot;Creating tier for size ({} {}) with buckets [{}x{}]&quot;, width.asInstanceOf[AnyRef], height.asInstanceOf[AnyRef], xSize.asInstanceOf[AnyRef], ySize.asInstanceOf[AnyRef])
+    else
+      (): Unit);
+    new SizeSeparatedBucketIndex.this.Tier(width, height, buckets, new org.locationtech.geomesa.utils.geotools.GridSnap(SizeSeparatedBucketIndex.this.extents, xSize, ySize))
+  }
+}))(collection.this.Seq.canBuildFrom[SizeSeparatedBucketIndex.this.Tier])
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          66425
+        </td>
+        <td>
+          2678
+          -
+          2722
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double./
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.extents.getWidth().*(SizeSeparatedBucketIndex.this.xBucketMultiplier)./(width)
+        </td>
+      </tr><tr>
+        <td>
+          51
+        </td>
+        <td>
+          66426
+        </td>
+        <td>
+          2668
+          -
+          2729
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Double.toInt
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.math.`package`.ceil(SizeSeparatedBucketIndex.this.extents.getWidth().*(SizeSeparatedBucketIndex.this.xBucketMultiplier)./(width)).toInt
+        </td>
+      </tr><tr>
+        <td>
+          52
+        </td>
+        <td>
+          66427
+        </td>
+        <td>
+          2756
+          -
+          2802
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double./
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.extents.getHeight().*(SizeSeparatedBucketIndex.this.yBucketMultiplier)./(height)
+        </td>
+      </tr><tr>
+        <td>
+          52
+        </td>
+        <td>
+          66428
+        </td>
+        <td>
+          2746
+          -
+          2809
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Double.toInt
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.math.`package`.ceil(SizeSeparatedBucketIndex.this.extents.getHeight().*(SizeSeparatedBucketIndex.this.yBucketMultiplier)./(height)).toInt
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          66429
+        </td>
+        <td>
+          3052
+          -
+          3086
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.util.concurrent.ConcurrentHashMap[String,T]()
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          66430
+        </td>
+        <td>
+          3027
+          -
+          3087
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Array.fill
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Array.fill[java.util.concurrent.ConcurrentHashMap[String,T]](xSize, ySize)(new java.util.concurrent.ConcurrentHashMap[String,T]())((ClassTag.apply[java.util.concurrent.ConcurrentHashMap[String,T]](classOf[java.util.concurrent.ConcurrentHashMap]): scala.reflect.ClassTag[java.util.concurrent.ConcurrentHashMap[String,T]]))
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          66431
+        </td>
+        <td>
+          3230
+          -
+          3237
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.extents
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.extents
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          66433
+        </td>
+        <td>
+          3184
+          -
+          3253
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new SizeSeparatedBucketIndex.this.Tier(width, height, buckets, new org.locationtech.geomesa.utils.geotools.GridSnap(SizeSeparatedBucketIndex.this.extents, xSize, ySize))
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          66432
+        </td>
+        <td>
+          3217
+          -
+          3252
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.GridSnap.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.utils.geotools.GridSnap(SizeSeparatedBucketIndex.this.extents, xSize, ySize)
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          66437
+        </td>
+        <td>
+          3350
+          -
+          3374
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Geometry.getEnvelopeInternal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          geom.getEnvelopeInternal()
+        </td>
+      </tr><tr>
+        <td>
+          63
+        </td>
+        <td>
+          66438
+        </td>
+        <td>
+          3390
+          -
+          3410
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.selectTier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.selectTier(envelope)
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          66439
+        </td>
+        <td>
+          3513
+          -
+          3523
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tier.empty
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          66443
+        </td>
+        <td>
+          3509
+          -
+          3509
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          66442
+        </td>
+        <td>
+          3509
+          -
+          3509
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          66441
+        </td>
+        <td>
+          3533
+          -
+          3551
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.empty_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tier.empty_=(false)
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          66440
+        </td>
+        <td>
+          3533
+          -
+          3551
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.empty_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tier.empty_=(false)
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          66445
+        </td>
+        <td>
+          3587
+          -
+          3587
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          66444
+        </td>
+        <td>
+          3562
+          -
+          3599
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          tier.bucket(envelope).put(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          72
+        </td>
+        <td>
+          66446
+        </td>
+        <td>
+          3682
+          -
+          3706
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Geometry.getEnvelopeInternal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          geom.getEnvelopeInternal()
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          66447
+        </td>
+        <td>
+          3711
+          -
+          3760
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.selectTier(envelope).bucket(envelope).remove(key)
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          66448
+        </td>
+        <td>
+          3840
+          -
+          3864
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Geometry.getEnvelopeInternal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          geom.getEnvelopeInternal()
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          66449
+        </td>
+        <td>
+          3869
+          -
+          3915
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SizeSeparatedBucketIndex.this.selectTier(envelope).bucket(envelope).get(key)
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          66451
+        </td>
+        <td>
+          4017
+          -
+          4075
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.Iterator.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.tiers.iterator.flatMap[T](((x$1: SizeSeparatedBucketIndex.this.Tier) =&gt; x$1.iterator(xmin, ymin, xmax, ymax)))
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          66450
+        </td>
+        <td>
+          4040
+          -
+          4074
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.iterator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1.iterator(xmin, ymin, xmax, ymax)
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          66453
+        </td>
+        <td>
+          4138
+          -
+          4153
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Envelope.getMinY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.extents.getMinY()
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          66452
+        </td>
+        <td>
+          4121
+          -
+          4136
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Envelope.getMinX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.extents.getMinX()
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          66455
+        </td>
+        <td>
+          4172
+          -
+          4187
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Envelope.getMaxY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.extents.getMaxY()
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          66454
+        </td>
+        <td>
+          4155
+          -
+          4170
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Envelope.getMaxX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.extents.getMaxX()
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          66456
+        </td>
+        <td>
+          4115
+          -
+          4188
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.query
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.query(SizeSeparatedBucketIndex.this.extents.getMinX(), SizeSeparatedBucketIndex.this.extents.getMinY(), SizeSeparatedBucketIndex.this.extents.getMaxX(), SizeSeparatedBucketIndex.this.extents.getMaxY())
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          66457
+        </td>
+        <td>
+          4236
+          -
+          4237
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          66459
+        </td>
+        <td>
+          4264
+          -
+          4283
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          size.+(tier.size())
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          66458
+        </td>
+        <td>
+          4272
+          -
+          4283
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          tier.size()
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          66460
+        </td>
+        <td>
+          4242
+          -
+          4284
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SizeSeparatedBucketIndex.this.tiers.foreach[Unit](((tier: SizeSeparatedBucketIndex.this.Tier) =&gt; size = size.+(tier.size())))
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          66461
+        </td>
+        <td>
+          4344
+          -
+          4353
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$2.clear()
+        </td>
+      </tr><tr>
+        <td>
+          92
+        </td>
+        <td>
+          66462
+        </td>
+        <td>
+          4330
+          -
+          4354
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.tiers.foreach[Unit](((x$2: SizeSeparatedBucketIndex.this.Tier) =&gt; x$2.clear()))
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          66463
+        </td>
+        <td>
+          4427
+          -
+          4444
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Envelope.getWidth
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          envelope.getWidth()
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          66464
+        </td>
+        <td>
+          4462
+          -
+          4480
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Envelope.getHeight
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          envelope.getHeight()
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          66465
+        </td>
+        <td>
+          4524
+          -
+          4544
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double.&gt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          t.maxSizeY.&gt;=(height)
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          66466
+        </td>
+        <td>
+          4501
+          -
+          4544
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          t.maxSizeX.&gt;=(width).&amp;&amp;(t.maxSizeY.&gt;=(height))
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          66468
+        </td>
+        <td>
+          4485
+          -
+          4667
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.tiers.find(((t: SizeSeparatedBucketIndex.this.Tier) =&gt; t.maxSizeX.&gt;=(width).&amp;&amp;(t.maxSizeY.&gt;=(height)))).getOrElse[SizeSeparatedBucketIndex.this.Tier](throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Envelope &quot;, &quot; exceeds the max tier size &quot;, &quot;&quot;).s(envelope, SizeSeparatedBucketIndex.this.sizes.last)))
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          66467
+        </td>
+        <td>
+          4564
+          -
+          4661
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Envelope &quot;, &quot; exceeds the max tier size &quot;, &quot;&quot;).s(envelope, SizeSeparatedBucketIndex.this.sizes.last))
+        </td>
+      </tr><tr>
+        <td>
+          110
+        </td>
+        <td>
+          66469
+        </td>
+        <td>
+          5062
+          -
+          5066
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          66470
+        </td>
+        <td>
+          5091
+          -
+          5109
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.buckets.length.-(1)
+        </td>
+      </tr><tr>
+        <td>
+          113
+        </td>
+        <td>
+          66471
+        </td>
+        <td>
+          5133
+          -
+          5154
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.buckets.apply(0).length.-(1)
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          66473
+        </td>
+        <td>
+          5243
+          -
+          5251
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.snapY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Tier.this.snapY(y)
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          66472
+        </td>
+        <td>
+          5233
+          -
+          5241
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.snapX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Tier.this.snapX(x)
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          66474
+        </td>
+        <td>
+          5225
+          -
+          5252
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Array.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Tier.this.buckets.apply(Tier.this.snapX(x)).apply(Tier.this.snapY(y))
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          66475
+        </td>
+        <td>
+          5402
+          -
+          5445
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double./
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          envelope.getMinX().+(envelope.getMaxX())./(2.0)
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          66477
+        </td>
+        <td>
+          5454
+          -
+          5497
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double./
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          envelope.getMinY().+(envelope.getMaxY())./(2.0)
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          66476
+        </td>
+        <td>
+          5396
+          -
+          5446
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.snapX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.snapX(envelope.getMinX().+(envelope.getMaxX())./(2.0))
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          66479
+        </td>
+        <td>
+          5388
+          -
+          5499
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Array.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.buckets.apply(Tier.this.snapX(envelope.getMinX().+(envelope.getMaxX())./(2.0))).apply(Tier.this.snapY(envelope.getMinY().+(envelope.getMaxY())./(2.0)))
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          66478
+        </td>
+        <td>
+          5448
+          -
+          5498
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.snapY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.snapY(envelope.getMinY().+(envelope.getMaxY())./(2.0))
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          66481
+        </td>
+        <td>
+          5608
+          -
+          5622
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.Iterator.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.`package`.Iterator.empty
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          66480
+        </td>
+        <td>
+          5599
+          -
+          5604
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.empty
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          66483
+        </td>
+        <td>
+          5632
+          -
+          5672
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new Tier.this.TierIterator(xmin, ymin, xmax, ymax)
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          66482
+        </td>
+        <td>
+          5608
+          -
+          5622
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.Iterator.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.`package`.Iterator.empty
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          66484
+        </td>
+        <td>
+          5632
+          -
+          5672
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new Tier.this.TierIterator(xmin, ymin, xmax, ymax)
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          66485
+        </td>
+        <td>
+          5710
+          -
+          5715
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Tier.this.empty
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          66487
+        </td>
+        <td>
+          5719
+          -
+          5720
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          66486
+        </td>
+        <td>
+          5719
+          -
+          5720
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          66507
+        </td>
+        <td>
+          5728
+          -
+          5966
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  var size: Int = 0;
+  var i: Int = 0;
+  while$2(){
+    if (i.&lt;=(Tier.this.maxX))
+      {
+        {
+          var j: Int = 0;
+          while$1(){
+            if (j.&lt;=(Tier.this.maxY))
+              {
+                {
+                  size = size.+(Tier.this.buckets.apply(i).apply(j).size());
+                  j = j.+(1)
+                };
+                while$1()
+              }
+            else
+              ()
+          };
+          i = i.+(1)
+        };
+        while$2()
+      }
+    else
+      ()
+  };
+  size
+}
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          66488
+        </td>
+        <td>
+          5749
+          -
+          5750
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          66489
+        </td>
+        <td>
+          5767
+          -
+          5768
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          66491
+        </td>
+        <td>
+          5784
+          -
+          5793
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          i.&lt;=(Tier.this.maxX)
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          66490
+        </td>
+        <td>
+          5789
+          -
+          5793
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Tier.this.maxX
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          66503
+        </td>
+        <td>
+          5795
+          -
+          5795
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.while$2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          while$2()
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          66505
+        </td>
+        <td>
+          5777
+          -
+          5777
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          66504
+        </td>
+        <td>
+          5795
+          -
+          5945
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  {
+    var j: Int = 0;
+    while$1(){
+      if (j.&lt;=(Tier.this.maxY))
+        {
+          {
+            size = size.+(Tier.this.buckets.apply(i).apply(j).size());
+            j = j.+(1)
+          };
+          while$1()
+        }
+      else
+        ()
+    };
+    i = i.+(1)
+  };
+  while$2()
+}
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          66506
+        </td>
+        <td>
+          5777
+          -
+          5777
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          66492
+        </td>
+        <td>
+          5815
+          -
+          5816
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          66493
+        </td>
+        <td>
+          5839
+          -
+          5843
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Tier.this.maxY
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          66494
+        </td>
+        <td>
+          5834
+          -
+          5843
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          j.&lt;=(Tier.this.maxY)
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          66499
+        </td>
+        <td>
+          5845
+          -
+          5918
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  {
+    size = size.+(Tier.this.buckets.apply(i).apply(j).size());
+    j = j.+(1)
+  };
+  while$1()
+}
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          66498
+        </td>
+        <td>
+          5845
+          -
+          5845
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.while$1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          while$1()
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          66501
+        </td>
+        <td>
+          5827
+          -
+          5827
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          66500
+        </td>
+        <td>
+          5827
+          -
+          5827
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          66495
+        </td>
+        <td>
+          5867
+          -
+          5887
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          Tier.this.buckets.apply(i).apply(j).size()
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          66496
+        </td>
+        <td>
+          5859
+          -
+          5887
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          size.+(Tier.this.buckets.apply(i).apply(j).size())
+        </td>
+      </tr><tr>
+        <td>
+          132
+        </td>
+        <td>
+          66497
+        </td>
+        <td>
+          5900
+          -
+          5906
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          j.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          66502
+        </td>
+        <td>
+          5929
+          -
+          5935
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          i.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          66508
+        </td>
+        <td>
+          6014
+          -
+          6015
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          66509
+        </td>
+        <td>
+          6034
+          -
+          6038
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.maxX
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          66510
+        </td>
+        <td>
+          6029
+          -
+          6038
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.&lt;=(Tier.this.maxX)
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          66521
+        </td>
+        <td>
+          6040
+          -
+          6040
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.while$4
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$4()
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          66523
+        </td>
+        <td>
+          6022
+          -
+          6022
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          66522
+        </td>
+        <td>
+          6040
+          -
+          6169
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    var j: Int = 0;
+    while$3(){
+      if (j.&lt;=(Tier.this.maxY))
+        {
+          {
+            Tier.this.buckets.apply(i).apply(j).clear();
+            j = j.+(1)
+          };
+          while$3()
+        }
+      else
+        ()
+    };
+    i = i.+(1)
+  };
+  while$4()
+}
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          66524
+        </td>
+        <td>
+          6022
+          -
+          6022
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          143
+        </td>
+        <td>
+          66511
+        </td>
+        <td>
+          6058
+          -
+          6059
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          66513
+        </td>
+        <td>
+          6075
+          -
+          6084
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          j.&lt;=(Tier.this.maxY)
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          66512
+        </td>
+        <td>
+          6080
+          -
+          6084
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.maxY
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          66517
+        </td>
+        <td>
+          6086
+          -
+          6146
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  {
+    Tier.this.buckets.apply(i).apply(j).clear();
+    j = j.+(1)
+  };
+  while$3()
+}
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          66516
+        </td>
+        <td>
+          6086
+          -
+          6086
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.while$3
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          while$3()
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          66519
+        </td>
+        <td>
+          6068
+          -
+          6068
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          66518
+        </td>
+        <td>
+          6068
+          -
+          6068
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          145
+        </td>
+        <td>
+          66514
+        </td>
+        <td>
+          6098
+          -
+          6119
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.buckets.apply(i).apply(j).clear()
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          66515
+        </td>
+        <td>
+          6130
+          -
+          6136
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          j.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          148
+        </td>
+        <td>
+          66520
+        </td>
+        <td>
+          6155
+          -
+          6161
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          153
+        </td>
+        <td>
+          66525
+        </td>
+        <td>
+          6233
+          -
+          6246
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.GridSnap.i
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.gridSnap.i(x)
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          66527
+        </td>
+        <td>
+          6268
+          -
+          6269
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.i
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          66526
+        </td>
+        <td>
+          6257
+          -
+          6264
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          i.!=(-1)
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          66529
+        </td>
+        <td>
+          6281
+          -
+          6300
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x.&lt;(SizeSeparatedBucketIndex.this.extents.getMinX())
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          66528
+        </td>
+        <td>
+          6285
+          -
+          6300
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Envelope.getMinX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.extents.getMinX()
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          66531
+        </td>
+        <td>
+          6304
+          -
+          6305
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          66530
+        </td>
+        <td>
+          6304
+          -
+          6305
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          66533
+        </td>
+        <td>
+          6315
+          -
+          6319
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.maxX
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          66532
+        </td>
+        <td>
+          6315
+          -
+          6319
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.maxX
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          66534
+        </td>
+        <td>
+          6277
+          -
+          6321
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (x.&lt;(SizeSeparatedBucketIndex.this.extents.getMinX()))
+  0
+else
+  Tier.this.maxX
+        </td>
+      </tr><tr>
+        <td>
+          158
+        </td>
+        <td>
+          66535
+        </td>
+        <td>
+          6385
+          -
+          6398
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.geotools.GridSnap.j
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.gridSnap.j(y)
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          66537
+        </td>
+        <td>
+          6420
+          -
+          6421
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.j
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          j
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          66536
+        </td>
+        <td>
+          6409
+          -
+          6416
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          j.!=(-1)
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          66539
+        </td>
+        <td>
+          6433
+          -
+          6452
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          y.&lt;(SizeSeparatedBucketIndex.this.extents.getMinY())
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          66538
+        </td>
+        <td>
+          6437
+          -
+          6452
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.jts.geom.Envelope.getMinY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SizeSeparatedBucketIndex.this.extents.getMinY()
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          66541
+        </td>
+        <td>
+          6456
+          -
+          6457
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          66540
+        </td>
+        <td>
+          6456
+          -
+          6457
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          66543
+        </td>
+        <td>
+          6467
+          -
+          6471
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.maxY
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          66542
+        </td>
+        <td>
+          6467
+          -
+          6471
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.maxY
+        </td>
+      </tr><tr>
+        <td>
+          159
+        </td>
+        <td>
+          66544
+        </td>
+        <td>
+          6429
+          -
+          6473
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (y.&lt;(SizeSeparatedBucketIndex.this.extents.getMinY()))
+  0
+else
+  Tier.this.maxY
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          66545
+        </td>
+        <td>
+          6680
+          -
+          6688
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxSizeX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.maxSizeX
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          66547
+        </td>
+        <td>
+          6667
+          -
+          6689
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.snapX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.snapX(TierIterator.this.xmax.+(Tier.this.maxSizeX))
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          66546
+        </td>
+        <td>
+          6673
+          -
+          6688
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.xmax.+(Tier.this.maxSizeX)
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          66549
+        </td>
+        <td>
+          6721
+          -
+          6736
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.ymin.-(Tier.this.maxSizeY)
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          66548
+        </td>
+        <td>
+          6728
+          -
+          6736
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxSizeY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.maxSizeY
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          66550
+        </td>
+        <td>
+          6715
+          -
+          6737
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.snapY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.snapY(TierIterator.this.ymin.-(Tier.this.maxSizeY))
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          66551
+        </td>
+        <td>
+          6776
+          -
+          6784
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxSizeY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.maxSizeY
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          66553
+        </td>
+        <td>
+          6763
+          -
+          6785
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.snapY
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.snapY(TierIterator.this.ymax.+(Tier.this.maxSizeY))
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          66552
+        </td>
+        <td>
+          6769
+          -
+          6784
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.ymax.+(Tier.this.maxSizeY)
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          66555
+        </td>
+        <td>
+          6815
+          -
+          6830
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Double.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.xmin.-(Tier.this.maxSizeX)
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          66554
+        </td>
+        <td>
+          6822
+          -
+          6830
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.maxSizeX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.maxSizeX
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          66556
+        </td>
+        <td>
+          6809
+          -
+          6831
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.snapX
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.snapX(TierIterator.this.xmin.-(Tier.this.maxSizeX))
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          66557
+        </td>
+        <td>
+          6854
+          -
+          6858
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.minj
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.minj
+        </td>
+      </tr><tr>
+        <td>
+          173
+        </td>
+        <td>
+          66558
+        </td>
+        <td>
+          6884
+          -
+          6915
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collection.iterator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.buckets.apply(TierIterator.this.i).apply(TierIterator.this.j).values().iterator()
+        </td>
+      </tr><tr>
+        <td>
+          176
+        </td>
+        <td>
+          66579
+        </td>
+        <td>
+          7012
+          -
+          7319
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.iter.hasNext().||(if (TierIterator.this.i.==(TierIterator.this.maxi).&amp;&amp;(TierIterator.this.j.==(TierIterator.this.maxj)))
+  false
+else
+  {
+    if (TierIterator.this.j.&lt;(TierIterator.this.maxj))
+      TierIterator.this.j_=(TierIterator.this.j.+(1))
+    else
+      {
+        TierIterator.this.j_=(TierIterator.this.minj);
+        TierIterator.this.i_=(TierIterator.this.i.+(1))
+      };
+    TierIterator.this.iter_=(Tier.this.buckets.apply(TierIterator.this.i).apply(TierIterator.this.j).values().iterator());
+    TierIterator.this.hasNext
+  })
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          66559
+        </td>
+        <td>
+          7047
+          -
+          7051
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.maxi
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.maxi
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          66561
+        </td>
+        <td>
+          7055
+          -
+          7064
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.j.==(TierIterator.this.maxj)
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          66560
+        </td>
+        <td>
+          7060
+          -
+          7064
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.maxj
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.maxj
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          66563
+        </td>
+        <td>
+          7068
+          -
+          7073
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          66562
+        </td>
+        <td>
+          7042
+          -
+          7064
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.i.==(TierIterator.this.maxi).&amp;&amp;(TierIterator.this.j.==(TierIterator.this.maxj))
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          66564
+        </td>
+        <td>
+          7068
+          -
+          7073
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          false
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          66578
+        </td>
+        <td>
+          7081
+          -
+          7311
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  if (TierIterator.this.j.&lt;(TierIterator.this.maxj))
+    TierIterator.this.j_=(TierIterator.this.j.+(1))
+  else
+    {
+      TierIterator.this.j_=(TierIterator.this.minj);
+      TierIterator.this.i_=(TierIterator.this.i.+(1))
+    };
+  TierIterator.this.iter_=(Tier.this.buckets.apply(TierIterator.this.i).apply(TierIterator.this.j).values().iterator());
+  TierIterator.this.hasNext
+}
+        </td>
+      </tr><tr>
+        <td>
+          178
+        </td>
+        <td>
+          66565
+        </td>
+        <td>
+          7101
+          -
+          7105
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.maxj
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.maxj
+        </td>
+      </tr><tr>
+        <td>
+          178
+        </td>
+        <td>
+          66566
+        </td>
+        <td>
+          7097
+          -
+          7105
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.j.&lt;(TierIterator.this.maxj)
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          66567
+        </td>
+        <td>
+          7121
+          -
+          7127
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.j.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          66569
+        </td>
+        <td>
+          7121
+          -
+          7127
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.j_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.j_=(TierIterator.this.j.+(1))
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          66568
+        </td>
+        <td>
+          7121
+          -
+          7127
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.j_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.j_=(TierIterator.this.j.+(1))
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          66574
+        </td>
+        <td>
+          7145
+          -
+          7198
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  TierIterator.this.j_=(TierIterator.this.minj);
+  TierIterator.this.i_=(TierIterator.this.i.+(1))
+}
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          66571
+        </td>
+        <td>
+          7159
+          -
+          7167
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.j_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.j_=(TierIterator.this.minj)
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          66570
+        </td>
+        <td>
+          7163
+          -
+          7167
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.minj
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.minj
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          66573
+        </td>
+        <td>
+          7180
+          -
+          7186
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.i_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.i_=(TierIterator.this.i.+(1))
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          66572
+        </td>
+        <td>
+          7180
+          -
+          7186
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.i.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          184
+        </td>
+        <td>
+          66575
+        </td>
+        <td>
+          7216
+          -
+          7247
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Collection.iterator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          Tier.this.buckets.apply(TierIterator.this.i).apply(TierIterator.this.j).values().iterator()
+        </td>
+      </tr><tr>
+        <td>
+          184
+        </td>
+        <td>
+          66576
+        </td>
+        <td>
+          7209
+          -
+          7247
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.iter_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.iter_=(Tier.this.buckets.apply(TierIterator.this.i).apply(TierIterator.this.j).values().iterator())
+        </td>
+      </tr><tr>
+        <td>
+          185
+        </td>
+        <td>
+          66577
+        </td>
+        <td>
+          7294
+          -
+          7301
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.Tier.TierIterator.hasNext
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.hasNext
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          66580
+        </td>
+        <td>
+          7352
+          -
+          7363
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Iterator.next
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          TierIterator.this.iter.next()
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          66581
+        </td>
+        <td>
+          7549
+          -
+          7555
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Tuple2.apply[Double, Double](1.0, 1.0)
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          66583
+        </td>
+        <td>
+          7565
+          -
+          7573
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Tuple2.apply[Double, Double](32.0, 32.0)
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          66582
+        </td>
+        <td>
+          7557
+          -
+          7563
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Tuple2.apply[Double, Double](4.0, 4.0)
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          66585
+        </td>
+        <td>
+          7545
+          -
+          7586
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[(Double, Double)](scala.Tuple2.apply[Double, Double](1.0, 1.0), scala.Tuple2.apply[Double, Double](4.0, 4.0), scala.Tuple2.apply[Double, Double](32.0, 32.0), scala.Tuple2.apply[Double, Double](360.0, 180.0))
+        </td>
+      </tr><tr>
+        <td>
+          197
+        </td>
+        <td>
+          66584
+        </td>
+        <td>
+          7575
+          -
+          7585
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Tuple2.apply[Double, Double](360.0, 180.0)
+        </td>
+      </tr><tr>
+        <td>
+          204
+        </td>
+        <td>
+          66586
+        </td>
+        <td>
+          7766
+          -
+          7857
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.memory.index.impl.SizeSeparatedBucketIndex.SimpleFeatureSizeSeparatedBucketIndex.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new SizeSeparatedBucketIndex.this.SimpleFeatureSizeSeparatedBucketIndex(sft, tiers, xBucketMultiplier, yBucketMultiplier)
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>
