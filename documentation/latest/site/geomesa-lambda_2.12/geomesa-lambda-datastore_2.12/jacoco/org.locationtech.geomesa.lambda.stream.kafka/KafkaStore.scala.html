@@ -1,0 +1,300 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaStore.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Lambda DataStore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.lambda.stream.kafka</a> &gt; <span class="el_source">KafkaStore.scala</span></div><h1>KafkaStore.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.lambda.stream.kafka
+
+import com.typesafe.scalalogging.LazyLogging
+import io.micrometer.core.instrument.Tags
+import org.apache.kafka.clients.admin.{AdminClient, NewTopic}
+import org.apache.kafka.clients.consumer.{Consumer, ConsumerRebalanceListener, KafkaConsumer}
+import org.apache.kafka.clients.producer._
+import org.apache.kafka.common.serialization._
+import org.apache.kafka.common.{Cluster, TopicPartition}
+import org.geotools.api.data.{DataStore, Query}
+import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+import org.geotools.api.filter.Filter
+import org.geotools.util.factory.Hints
+import org.locationtech.geomesa.features.SerializationOption
+import org.locationtech.geomesa.features.kryo.{KryoBufferSimpleFeature, KryoFeatureSerializer}
+import org.locationtech.geomesa.index.geotools.{GeoMesaDataStore, GeoMesaFeatureWriter}
+import org.locationtech.geomesa.index.planning.QueryInterceptor.QueryInterceptorFactory
+import org.locationtech.geomesa.index.planning.QueryRunner.QueryResult
+import org.locationtech.geomesa.index.utils.{ExplainLogging, Explainer}
+import org.locationtech.geomesa.kafka.versions.KafkaConsumerVersions
+import org.locationtech.geomesa.lambda.data.LambdaDataStore
+import org.locationtech.geomesa.lambda.data.LambdaDataStore.LambdaConfig
+import org.locationtech.geomesa.lambda.stream.kafka.KafkaStore.MessageTypes
+import org.locationtech.geomesa.lambda.stream.{OffsetManager, TransientStore}
+import org.locationtech.geomesa.security.AuthorizationsProvider
+import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes
+import org.locationtech.geomesa.utils.index.ByteArrays
+import org.locationtech.geomesa.utils.io.{CloseWithLogging, WithClose}
+
+import java.io.Flushable
+import java.time.Clock
+import java.util.{Collections, Properties, UUID}
+import scala.util.control.NonFatal
+import scala.util.hashing.MurmurHash3
+
+<span class="nc bnc" id="L45" title="All 4 branches missed.">class KafkaStore(</span>
+    ds: DataStore,
+<span class="nc" id="L47">    val sft: SimpleFeatureType,</span>
+    authProvider: Option[AuthorizationsProvider],
+<span class="nc" id="L49">    offsetManager: OffsetManager,</span>
+<span class="nc" id="L50">    config: LambdaConfig)</span>
+<span class="nc" id="L51">   (implicit clock: Clock = Clock.systemUTC()</span>
+<span class="nc" id="L52">   ) extends TransientStore with Flushable with LazyLogging {</span>
+
+<span class="nc" id="L54">  private val topic = LambdaDataStore.topic(sft, config.zkNamespace)</span>
+
+<span class="nc" id="L56">  private val producer = KafkaStore.producer(sft, config.producerConfig)</span>
+
+<span class="nc" id="L58">  private val cache = new KafkaFeatureCache(ds, sft, offsetManager, topic, config.persistence)</span>
+
+<span class="nc" id="L60">  private val serializer = {</span>
+    // use immutable so we can return query results without copying or worrying about user modification
+    // use lazy so that we don't create lots of objects that get replaced/updated before actually being read
+<span class="nc" id="L63">    val options = SerializationOption.builder.withUserData.withoutFidHints.immutable.`lazy`.build()</span>
+<span class="nc" id="L64">    KryoFeatureSerializer(sft, options)</span>
+  }
+
+<span class="nc" id="L67">  private val interceptors = QueryInterceptorFactory(ds)</span>
+
+<span class="nc" id="L69">  private val queryRunner = {</span>
+<span class="nc" id="L70">    val catalogTag = ds match {</span>
+<span class="nc bnc" id="L71" title="All 2 branches missed.">      case gm: GeoMesaDataStore[_] =&gt; Tags.of(&quot;catalog&quot;, gm.config.catalog)</span>
+<span class="nc" id="L72">      case _ =&gt; Tags.of(&quot;catalog&quot;, ds.getClass.getSimpleName)</span>
+    }
+<span class="nc" id="L74">    new KafkaQueryRunner(cache, authProvider, interceptors, catalogTag.and(&quot;store&quot;, &quot;lambda&quot;))</span>
+  }
+
+<span class="nc" id="L77">  private val loader = {</span>
+<span class="nc" id="L78">    val consumers = KafkaStore.consumers(config.consumerConfig, topic, offsetManager, config.consumers, cache.partitionAssigned)</span>
+<span class="nc" id="L79">    val frequency = KafkaStore.LoadIntervalProperty.toDuration.get.toMillis</span>
+<span class="nc" id="L80">    new KafkaCacheLoader(consumers, topic, frequency, config.offsetCommitInterval, serializer, cache)</span>
+  }
+
+  override def createSchema(): Unit = {
+<span class="nc" id="L84">    val props = new Properties()</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">    config.producerConfig.foreach { case (k, v) =&gt; props.put(k, v) }</span>
+
+<span class="nc" id="L87">    WithClose(AdminClient.create(props)) { admin =&gt;</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">      if (admin.listTopics().names().get.contains(topic)) {</span>
+<span class="nc bnc" id="L89" title="All 2 branches missed.">        logger.warn(s&quot;Topic [$topic] already exists - it may contain stale data&quot;)</span>
+      } else {
+<span class="nc" id="L91">        val replication = SystemProperty(&quot;geomesa.kafka.replication&quot;).option.map(_.toInt).getOrElse(1)</span>
+<span class="nc" id="L92">        val newTopic = new NewTopic(topic, config.partitions, replication.toShort)</span>
+<span class="nc" id="L93">        admin.createTopics(Collections.singletonList(newTopic)).all().get</span>
+      }
+    }
+  }
+
+  override def removeSchema(): Unit = {
+<span class="nc" id="L99">    offsetManager.deleteOffsets(topic)</span>
+<span class="nc" id="L100">    val props = new Properties()</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">    config.producerConfig.foreach { case (k, v) =&gt; props.put(k, v) }</span>
+
+<span class="nc" id="L103">    WithClose(AdminClient.create(props)) { admin =&gt;</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">      if (admin.listTopics().names().get.contains(topic)) {</span>
+<span class="nc" id="L105">        admin.deleteTopics(Collections.singletonList(topic)).all().get</span>
+      } else {
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        logger.warn(s&quot;Topic [$topic] does not exist, can't delete it&quot;)</span>
+      }
+    }
+  }
+
+  override def read(
+<span class="nc" id="L113">      filter: Option[Filter] = None,</span>
+<span class="nc" id="L114">      transforms: Option[Array[String]] = None,</span>
+<span class="nc" id="L115">      hints: Option[Hints] = None,</span>
+<span class="nc" id="L116">      explain: Explainer = new ExplainLogging): QueryResult = {</span>
+<span class="nc" id="L117">    val query = new Query(sft.getTypeName)</span>
+<span class="nc" id="L118">    filter.foreach(query.setFilter)</span>
+<span class="nc" id="L119">    transforms.foreach(query.setPropertyNames(_: _*))</span>
+<span class="nc" id="L120">    hints.foreach(query.setHints)</span>
+<span class="nc" id="L121">    queryRunner.query(sft, query, explain)</span>
+  }
+
+  override def write(original: SimpleFeature): Unit = {
+<span class="nc" id="L125">    val feature = GeoMesaFeatureWriter.featureWithFid(original)</span>
+<span class="nc" id="L126">    val key = KafkaStore.serializeKey(clock.millis(), MessageTypes.Write)</span>
+<span class="nc" id="L127">    producer.send(new ProducerRecord(topic, key, serializer.serialize(feature)))</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">    logger.trace(s&quot;Wrote feature to [$topic]: $feature&quot;)</span>
+  }
+
+  override def delete(original: SimpleFeature): Unit = {
+    // send a message to delete from all transient stores
+<span class="nc" id="L133">    val feature = GeoMesaFeatureWriter.featureWithFid(original)</span>
+<span class="nc" id="L134">    val key = KafkaStore.serializeKey(clock.millis(), MessageTypes.Delete)</span>
+<span class="nc" id="L135">    producer.send(new ProducerRecord(topic, key, serializer.serialize(feature)))</span>
+  }
+
+<span class="nc" id="L138">  override def persist(): Unit = cache.persist()</span>
+
+<span class="nc" id="L140">  override def flush(): Unit = producer.flush()</span>
+
+  override def close(): Unit = {
+<span class="nc" id="L143">    CloseWithLogging(loader)</span>
+<span class="nc" id="L144">    CloseWithLogging(interceptors)</span>
+<span class="nc" id="L145">    CloseWithLogging(cache)</span>
+  }
+}
+
+<span class="nc" id="L149">object KafkaStore {</span>
+
+<span class="nc" id="L151">  val SimpleFeatureSpecConfig = &quot;geomesa.sft.spec&quot;</span>
+
+<span class="nc" id="L153">  val LoadIntervalProperty: SystemProperty = SystemProperty(&quot;geomesa.lambda.load.interval&quot;, &quot;100ms&quot;)</span>
+
+<span class="nc" id="L155">  object MessageTypes {</span>
+<span class="nc" id="L156">    val Write:  Byte = 0</span>
+<span class="nc" id="L157">    val Delete: Byte = 1</span>
+  }
+
+<span class="nc" id="L160">  def producer(sft: SimpleFeatureType, connect: Map[String, String]): Producer[Array[Byte], Array[Byte]] = {</span>
+    import org.apache.kafka.clients.producer.ProducerConfig._
+<span class="nc" id="L162">    val props = new Properties()</span>
+    // set some defaults but allow them to be overridden
+<span class="nc" id="L164">    props.put(ACKS_CONFIG, &quot;1&quot;) // mix of reliability and performance</span>
+<span class="nc" id="L165">    props.put(RETRIES_CONFIG, Int.box(3))</span>
+<span class="nc" id="L166">    props.put(LINGER_MS_CONFIG, Int.box(3)) // helps improve batching at the expense of slight delays in write</span>
+<span class="nc" id="L167">    props.put(PARTITIONER_CLASS_CONFIG, classOf[FeatureIdPartitioner].getName)</span>
+<span class="nc" id="L168">    props.put(SimpleFeatureSpecConfig, SimpleFeatureTypes.encodeType(sft, includeUserData = false))</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">    connect.foreach { case (k, v) =&gt; props.put(k, v) }</span>
+<span class="nc" id="L170">    props.put(KEY_SERIALIZER_CLASS_CONFIG, classOf[ByteArraySerializer].getName)</span>
+<span class="nc" id="L171">    props.put(VALUE_SERIALIZER_CLASS_CONFIG, classOf[ByteArraySerializer].getName)</span>
+<span class="nc" id="L172">    new KafkaProducer[Array[Byte], Array[Byte]](props)</span>
+  }
+
+  def consumer(connect: Map[String, String], group: String): Consumer[Array[Byte], Array[Byte]] = {
+    import org.apache.kafka.clients.consumer.ConsumerConfig._
+<span class="nc" id="L177">    val props = new Properties()</span>
+<span class="nc" id="L178">    props.put(GROUP_ID_CONFIG, group)</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">    connect.foreach { case (k, v) =&gt; props.put(k, v) }</span>
+<span class="nc" id="L180">    props.put(ENABLE_AUTO_COMMIT_CONFIG, &quot;false&quot;)</span>
+<span class="nc" id="L181">    props.put(AUTO_OFFSET_RESET_CONFIG, &quot;earliest&quot;)</span>
+<span class="nc" id="L182">    props.put(KEY_DESERIALIZER_CLASS_CONFIG, classOf[ByteArrayDeserializer].getName)</span>
+<span class="nc" id="L183">    props.put(VALUE_DESERIALIZER_CLASS_CONFIG, classOf[ByteArrayDeserializer].getName)</span>
+<span class="nc" id="L184">    new KafkaConsumer[Array[Byte], Array[Byte]](props)</span>
+  }
+
+  // creates a consumer and sets to the latest offsets
+  private [kafka] def consumers(connect: Map[String, String],
+                                topic: String,
+                                manager: OffsetManager,
+                                parallelism: Int,
+                                callback: (Int, Long) =&gt; Unit): Seq[Consumer[Array[Byte], Array[Byte]]] = {
+<span class="nc bnc" id="L193" title="All 2 branches missed.">    require(parallelism &gt; 0, &quot;Parallelism must be greater than 0&quot;)</span>
+
+<span class="nc" id="L195">    val group = UUID.randomUUID().toString</span>
+
+<span class="nc" id="L197">    Seq.fill(parallelism) {</span>
+<span class="nc" id="L198">      val consumer = KafkaStore.consumer(connect, group)</span>
+<span class="nc" id="L199">      val listener = new OffsetRebalanceListener(consumer, manager, callback)</span>
+<span class="nc" id="L200">      KafkaConsumerVersions.subscribe(consumer, topic, listener)</span>
+<span class="nc" id="L201">      consumer</span>
+    }
+  }
+
+  private [kafka] def serializeKey(time: Long, action: Byte): Array[Byte] = {
+<span class="nc" id="L206">    val result = Array.ofDim[Byte](9)</span>
+
+<span class="nc" id="L208">    result(0) = ((time &gt;&gt; 56) &amp; 0xff).asInstanceOf[Byte]</span>
+<span class="nc" id="L209">    result(1) = ((time &gt;&gt; 48) &amp; 0xff).asInstanceOf[Byte]</span>
+<span class="nc" id="L210">    result(2) = ((time &gt;&gt; 40) &amp; 0xff).asInstanceOf[Byte]</span>
+<span class="nc" id="L211">    result(3) = ((time &gt;&gt; 32) &amp; 0xff).asInstanceOf[Byte]</span>
+<span class="nc" id="L212">    result(4) = ((time &gt;&gt; 24) &amp; 0xff).asInstanceOf[Byte]</span>
+<span class="nc" id="L213">    result(5) = ((time &gt;&gt; 16) &amp; 0xff).asInstanceOf[Byte]</span>
+<span class="nc" id="L214">    result(6) = ((time &gt;&gt; 8)  &amp; 0xff).asInstanceOf[Byte]</span>
+<span class="nc" id="L215">    result(7) = (time &amp; 0xff        ).asInstanceOf[Byte]</span>
+<span class="nc" id="L216">    result(8) = action</span>
+
+<span class="nc" id="L218">    result</span>
+  }
+
+<span class="nc" id="L221">  private [kafka] def deserializeKey(key: Array[Byte]): (Long, Byte) = (ByteArrays.readLong(key), key(8))</span>
+
+<span class="nc bnc" id="L223" title="All 4 branches missed.">  private [kafka] class OffsetRebalanceListener(consumer: Consumer[Array[Byte], Array[Byte]],</span>
+<span class="nc" id="L224">                                                manager: OffsetManager,</span>
+<span class="nc" id="L225">                                                callback: (Int, Long) =&gt; Unit)</span>
+<span class="nc" id="L226">      extends ConsumerRebalanceListener with LazyLogging {</span>
+
+<span class="nc" id="L228">    override def onPartitionsRevoked(topicPartitions: java.util.Collection[TopicPartition]): Unit = {}</span>
+
+    override def onPartitionsAssigned(topicPartitions: java.util.Collection[TopicPartition]): Unit = {
+      import scala.collection.JavaConverters._
+
+      // ensure we have queues for each partition
+      // read our last committed offsets and seek to them
+<span class="nc" id="L235">      topicPartitions.asScala.foreach { tp =&gt;</span>
+
+        // seek to earliest existing offset and return the offset
+        def seekToBeginning(): Long = {
+<span class="nc" id="L239">          KafkaConsumerVersions.seekToBeginning(consumer, tp)</span>
+<span class="nc" id="L240">          consumer.position(tp) - 1</span>
+        }
+
+<span class="nc" id="L243">        val lastRead = manager.getOffset(tp.topic(), tp.partition())</span>
+
+<span class="nc" id="L245">        KafkaConsumerVersions.pause(consumer, tp)</span>
+
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        val offset = if (lastRead &lt; 0) { seekToBeginning() } else {</span>
+<span class="nc" id="L248">          try { consumer.seek(tp, lastRead + 1); lastRead } catch {</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">            case NonFatal(e) =&gt;</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">              logger.warn(s&quot;Error seeking to initial offset: [${tp.topic}:${tp.partition}:$lastRead]&quot; +</span>
+<span class="nc" id="L251">                  s&quot;, seeking to beginning: $e&quot;)</span>
+<span class="nc" id="L252">              seekToBeginning()</span>
+          }
+        }
+<span class="nc" id="L255">        callback.apply(tp.partition, offset)</span>
+
+<span class="nc" id="L257">        KafkaConsumerVersions.resume(consumer, tp)</span>
+      }
+    }
+  }
+
+  /**
+    * Ensures that updates to a given feature go to the same partition, so that they maintain order
+    */
+<span class="nc" id="L265">  class FeatureIdPartitioner extends Partitioner {</span>
+
+<span class="nc" id="L267">    private var serializer: KryoFeatureSerializer = _</span>
+
+<span class="nc bnc" id="L269" title="All 2 branches missed.">    private val features = new ThreadLocal[KryoBufferSimpleFeature]() {</span>
+<span class="nc" id="L270">      override def initialValue(): KryoBufferSimpleFeature = serializer.getReusableFeature</span>
+    }
+
+    override def partition(
+        topic: String,
+        key: scala.Any,
+        keyBytes: Array[Byte],
+        value: scala.Any,
+        valueBytes: Array[Byte],
+        cluster: Cluster): Int = {
+<span class="nc" id="L280">      val numPartitions = cluster.partitionsForTopic(topic).size</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">      if (numPartitions &lt; 2) { 0 } else {</span>
+<span class="nc" id="L282">        val feature = features.get</span>
+<span class="nc" id="L283">        feature.setBuffer(valueBytes)</span>
+<span class="nc" id="L284">        Math.abs(MurmurHash3.stringHash(feature.getID)) % numPartitions</span>
+      }
+    }
+
+    override def configure(configs: java.util.Map[String, _]): Unit = {
+<span class="nc" id="L289">      val spec = configs.get(SimpleFeatureSpecConfig) match {</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        case s: String =&gt; s</span>
+<span class="nc" id="L291">        case s =&gt; throw new IllegalStateException(s&quot;Invalid spec config for $SimpleFeatureSpecConfig: $s&quot;)</span>
+      }
+<span class="nc" id="L293">      val options = SerializationOption.builder.immutable.`lazy`.build()</span>
+<span class="nc" id="L294">      serializer = KryoFeatureSerializer(SimpleFeatureTypes.createType(&quot;&quot;, spec), options)</span>
+    }
+
+<span class="nc" id="L297">    override def close(): Unit = {}</span>
+  }
+<span class="nc" id="L299">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

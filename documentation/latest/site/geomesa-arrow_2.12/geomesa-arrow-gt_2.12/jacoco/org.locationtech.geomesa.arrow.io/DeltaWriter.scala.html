@@ -1,0 +1,1254 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DeltaWriter.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Arrow GeoTools Abstractions</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.arrow.io</a> &gt; <span class="el_source">DeltaWriter.scala</span></div><h1>DeltaWriter.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.arrow.io
+
+import com.typesafe.scalalogging.StrictLogging
+import org.apache.arrow.memory.BufferAllocator
+import org.apache.arrow.vector.complex.{ListVector, StructVector}
+import org.apache.arrow.vector.dictionary.DictionaryProvider.MapDictionaryProvider
+import org.apache.arrow.vector.ipc.ArrowStreamWriter
+import org.apache.arrow.vector.ipc.message.IpcOption
+import org.apache.arrow.vector.types.pojo.{ArrowType, DictionaryEncoding}
+import org.apache.arrow.vector.util.TransferPair
+import org.apache.arrow.vector.{FieldVector, IntVector}
+import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+import org.locationtech.geomesa.arrow.ArrowAllocator
+import org.locationtech.geomesa.arrow.io.records.{RecordBatchLoader, RecordBatchUnloader}
+import org.locationtech.geomesa.arrow.jts.{GeometryFields, GeometryVector}
+import org.locationtech.geomesa.arrow.vector.ArrowAttributeReader.{ArrowDateReader, ArrowDictionaryReader, ArrowListDictionaryReader}
+import org.locationtech.geomesa.arrow.vector.ArrowDictionary.ArrowDictionaryArray
+import org.locationtech.geomesa.arrow.vector.SimpleFeatureVector.SimpleFeatureEncoding
+import org.locationtech.geomesa.arrow.vector._
+import org.locationtech.geomesa.utils.collection.CloseableIterator
+import org.locationtech.geomesa.utils.geotools.{AttributeOrdering, ObjectType, SimpleFeatureOrdering, SimpleFeatureTypes}
+import org.locationtech.geomesa.utils.index.ByteArrays
+import org.locationtech.geomesa.utils.io.{CloseWithLogging, WithClose}
+import org.locationtech.jts.geom.Geometry
+
+import java.io.{ByteArrayOutputStream, Closeable, OutputStream}
+import java.nio.channels.Channels
+import java.util.concurrent.ThreadLocalRandom
+import java.util.{Collections, PriorityQueue}
+import scala.annotation.tailrec
+import scala.collection.mutable.ArrayBuffer
+import scala.util.control.NonFatal
+
+/**
+  * Builds up dictionaries and write record batches. Dictionaries are encoded as deltas
+  * to minimize redundant messages.
+  *
+  * @param sft simple feature type
+  * @param dictionaryFields dictionary fields
+  * @param encoding simple feature encoding
+  * @param sort sort
+  * @param initialCapacity initial allocation size, will expand if needed
+  */
+<span class="nc" id="L52">class DeltaWriter(</span>
+<span class="nc" id="L53">    val sft: SimpleFeatureType,</span>
+<span class="nc" id="L54">    dictionaryFields: Seq[String],</span>
+<span class="nc" id="L55">    encoding: SimpleFeatureEncoding,</span>
+<span class="nc" id="L56">    ipcOpts: IpcOption,</span>
+    sort: Option[(String, Boolean)],
+<span class="nc" id="L58">    initialCapacity: Int</span>
+<span class="nc" id="L59">  ) extends Closeable with StrictLogging {</span>
+
+  import DeltaWriter._
+  import org.locationtech.geomesa.utils.geotools.RichAttributeDescriptors.RichAttributeDescriptor
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L66">  private val allocator = ArrowAllocator(s&quot;delta-writer:${sft.getTypeName}&quot;)</span>
+
+  // threading key that we use to group results in the reduce phase
+<span class="nc" id="L69">  private var threadingKey: Long = math.abs(ThreadLocalRandom.current().nextLong)</span>
+<span class="nc bnc" id="L70" title="All 2 branches missed.">  logger.trace(s&quot;$threadingKey created&quot;)</span>
+
+<span class="nc" id="L72">  private val result = new ByteArrayOutputStream</span>
+
+<span class="nc" id="L74">  private val vector = StructVector.empty(sft.getTypeName, allocator)</span>
+
+<span class="nc bnc" id="L76" title="All 2 branches missed.">  private val ordering = sort.map { case (field, reverse) =&gt; SimpleFeatureOrdering(sft, field, reverse) }</span>
+
+<span class="nc" id="L78">  private val idWriter = ArrowAttributeWriter.id(sft, encoding, vector)</span>
+
+<span class="nc" id="L80">  private val writers = sft.getAttributeDescriptors.asScala.map { descriptor =&gt;</span>
+<span class="nc" id="L81">    val name = descriptor.getLocalName</span>
+<span class="nc" id="L82">    val isList = descriptor.isList</span>
+<span class="nc" id="L83">    val bindings = ObjectType.selectType(descriptor)</span>
+<span class="nc" id="L84">    val metadata = Map(SimpleFeatureVector.DescriptorKey -&gt; SimpleFeatureTypes.encodeDescriptor(sft, descriptor))</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">    if (dictionaryFields.contains(name)) {</span>
+      // for list types, we encode the list items, not the whole list
+      val attribute = {
+<span class="nc bnc" id="L88" title="All 2 branches missed.">        val desc = if (isList) { s&quot;$name:List[Integer]&quot; } else { s&quot;$name:Integer&quot; }</span>
+<span class="nc" id="L89">        val encodedMetadata = Map(SimpleFeatureVector.DescriptorKey -&gt; desc)</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        val encodedBindings = if (isList) { Seq(ObjectType.LIST, ObjectType.INT) } else { Seq(ObjectType.INT) }</span>
+<span class="nc" id="L91">        ArrowAttributeWriter(name, encodedBindings, None, encodedMetadata, encoding, VectorFactory(vector))</span>
+      }
+      // for list types, get the list item binding (which is the tail of the bindings)
+<span class="nc bnc" id="L94" title="All 2 branches missed.">      val dictBindings = if (isList) { bindings.tail } else { bindings }</span>
+<span class="nc" id="L95">      val ordering = AttributeOrdering(dictBindings)</span>
+<span class="nc" id="L96">      val dict = ArrowAttributeWriter(name, dictBindings, None, metadata, encoding, VectorFactory(allocator))</span>
+<span class="nc" id="L97">      dict.vector.setInitialCapacity(initialCapacity)</span>
+<span class="nc" id="L98">      dict.vector.allocateNew()</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">      if (isList) {</span>
+<span class="nc" id="L100">        new DictionaryListFieldWriter(sft.indexOf(name), attribute, dict, ordering, ipcOpts)</span>
+      } else {
+<span class="nc" id="L102">        new DictionaryFieldWriter(sft.indexOf(name), attribute, dict, ordering, ipcOpts)</span>
+      }
+    } else {
+<span class="nc" id="L105">      val attribute = ArrowAttributeWriter(name, bindings, None, metadata, encoding, VectorFactory(vector))</span>
+<span class="nc" id="L106">      new AttributeFieldWriter(sft.indexOf(name), attribute)</span>
+    }
+  }
+
+  // writer per-dictionary - keep in dictionary field order
+<span class="nc" id="L111">  private val dictionaryWriters = dictionaryFields.flatMap { field =&gt;</span>
+<span class="nc bnc" id="L112" title="All 16 branches missed.">    writers.collectFirst { case d: DictionaryFieldWriter if d.attribute.name == field =&gt; d }</span>
+  }
+
+  // single writer to write out all vectors at once (not including dictionaries)
+<span class="nc" id="L116">  private val writer = new BatchWriter(vector, ipcOpts)</span>
+
+  // set capacity after all child vectors have been created by the writers, then allocate
+<span class="nc" id="L119">  vector.setInitialCapacity(initialCapacity)</span>
+<span class="nc" id="L120">  vector.allocateNew()</span>
+
+  /**
+    * Clear any existing dictionary values
+    */
+  def reset(): Unit = {
+<span class="nc" id="L126">    val last = threadingKey</span>
+<span class="nc" id="L127">    threadingKey = math.abs(ThreadLocalRandom.current().nextLong)</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">    logger.trace(s&quot;$last resetting to $threadingKey&quot;)</span>
+<span class="nc" id="L129">    dictionaryWriters.foreach(_.resetDictionary())</span>
+  }
+
+  /**
+    * Writes out a record batch. Format is:
+    *
+    * 8 bytes long - threading key
+    * (foreach dictionaryField) -&gt; {
+    *   4 byte int - length of dictionary batch
+    *   anyref vector batch with dictionary delta values
+    * }
+    * 4 byte int - length of record batch
+    * record batch (may be dictionary encodings)
+    *
+    * Note: will sort the feature array in place if sorting is defined
+    *
+    * @param features features to write
+    * @param count number of features to write, starting from array index 0
+    * @return serialized record batch
+    */
+  def encode(features: Array[SimpleFeature], count: Int): Array[Byte] = {
+
+<span class="nc" id="L151">    result.reset()</span>
+<span class="nc" id="L152">    result.write(ByteArrays.toBytes(threadingKey))</span>
+
+<span class="nc" id="L154">    ordering.foreach(java.util.Arrays.sort(features, 0, count, _))</span>
+
+    // write out the dictionaries
+
+<span class="nc" id="L158">    dictionaryWriters.foreach { dictionary =&gt;</span>
+<span class="nc" id="L159">      var i = 0</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">      while (i &lt; count) {</span>
+<span class="nc" id="L161">        dictionary.addDictionaryValue(features(i))</span>
+<span class="nc" id="L162">        i += 1</span>
+      }
+<span class="nc" id="L164">      val delta = dictionary.writeDictionaryDelta(result)</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">      logger.trace(s&quot;$threadingKey writing dictionary delta with $delta values&quot;)</span>
+    }
+
+    // set feature ids in the vector
+<span class="nc bnc" id="L169" title="All 2 branches missed.">    if (encoding.fids.isDefined) {</span>
+<span class="nc" id="L170">      var i = 0</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">      while (i &lt; count) {</span>
+<span class="nc" id="L172">        idWriter.apply(i, features(i))</span>
+<span class="nc" id="L173">        i += 1</span>
+      }
+<span class="nc" id="L175">      idWriter.setValueCount(count)</span>
+    }
+
+    // set attributes in the vector
+<span class="nc" id="L179">    writers.foreach { writer =&gt;</span>
+<span class="nc" id="L180">      var i = 0</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">      while (i &lt; count) {</span>
+<span class="nc" id="L182">        writer.write(i, features(i))</span>
+<span class="nc" id="L183">        i += 1</span>
+      }
+<span class="nc" id="L185">      writer.setValueCount(count)</span>
+    }
+
+<span class="nc bnc" id="L188" title="All 2 branches missed.">    logger.trace(s&quot;$threadingKey writing batch with $count values&quot;)</span>
+
+    // write out the vector batch
+<span class="nc" id="L191">    writer.writeBatch(count, result)</span>
+
+<span class="nc" id="L193">    result.toByteArray</span>
+  }
+
+  /**
+    * Close the writer
+    */
+  override def close(): Unit = {
+<span class="nc" id="L200">    CloseWithLogging(writer) // also closes `vector`</span>
+<span class="nc" id="L201">    CloseWithLogging(dictionaryWriters) // also closes dictionary vectors</span>
+<span class="nc" id="L202">    CloseWithLogging(allocator)</span>
+  }
+}
+
+<span class="nc" id="L206">object DeltaWriter extends StrictLogging {</span>
+
+  import org.locationtech.geomesa.utils.geotools.RichAttributeDescriptors.RichAttributeDescriptor
+
+  import scala.collection.JavaConverters._
+
+  // empty provider
+<span class="nc" id="L213">  private val Provider = new MapDictionaryProvider()</span>
+
+  /**
+   * Reduce function for delta records created by DeltaWriter
+   *
+   * @param sft simple feature type
+   * @param dictionaryFields dictionary fields
+   * @param encoding simple feature encoding
+   * @param sort sort metadata, if defined each delta is assumed to be sorted
+   * @param sorted whether features are already globally sorted or not
+   * @param batchSize batch size
+   * @param deltas output from `DeltaWriter.encode`
+   * @return single arrow streaming file, with potentially multiple record batches
+   */
+  def reduce(
+      sft: SimpleFeatureType,
+      dictionaryFields: Seq[String],
+      encoding: SimpleFeatureEncoding,
+      ipcOpts: IpcOption,
+      sort: Option[(String, Boolean)],
+      sorted: Boolean,
+      batchSize: Int,
+      deltas: CloseableIterator[Array[Byte]]): CloseableIterator[Array[Byte]] = {
+<span class="nc" id="L236">    reduce(sft, dictionaryFields, encoding, ipcOpts, sort, sorted, batchSize, process = true, deltas)</span>
+  }
+
+  /**
+   * Reduce function for delta records created by DeltaWriter
+   *
+   * @param sft simple feature type
+   * @param dictionaryFields dictionary fields
+   * @param encoding simple feature encoding
+   * @param sort sort metadata, if defined each delta is assumed to be sorted
+   * @param sorted whether features are already globally sorted or not
+   * @param batchSize batch size
+   * @param deltas output from `DeltaWriter.encode`
+   * @param process process the output into a valid arrow file (which usually requires reading the entire input stream)
+   * @return single arrow streaming file, with potentially multiple record batches, or raw delta batches
+   */
+  def reduce(
+      sft: SimpleFeatureType,
+      dictionaryFields: Seq[String],
+      encoding: SimpleFeatureEncoding,
+      ipcOpts: IpcOption,
+      sort: Option[(String, Boolean)],
+      sorted: Boolean,
+      batchSize: Int,
+      process: Boolean,
+      deltas: CloseableIterator[Array[Byte]]): CloseableIterator[Array[Byte]] = {
+<span class="nc bnc" id="L262" title="All 2 branches missed.">    if (process) {</span>
+<span class="nc" id="L263">      new ReducingIterator(sft, dictionaryFields, encoding, ipcOpts, sort, sorted, batchSize, deltas)</span>
+    } else {
+<span class="nc" id="L265">      new RawIterator(sft, dictionaryFields, encoding, ipcOpts, sort, deltas)</span>
+    }
+  }
+
+  /**
+   * Merge without sorting
+   *
+   * @param sft simple feature type
+   * @param dictionaryFields dictionary fields
+   * @param encoding simple feature encoding
+   * @param mergedDictionaries merged dictionaries and batch mappings
+   * @param sort sort metadata for file headers
+   * @param batchSize record batch size
+   * @param threadedBatches record batches, grouped by threading key
+   * @return
+   */
+  private def reduceNoSort(
+<span class="nc" id="L282">      sft: SimpleFeatureType,</span>
+<span class="nc" id="L283">      dictionaryFields: Seq[String],</span>
+      encoding: SimpleFeatureEncoding,
+<span class="nc" id="L285">      ipcOpts: IpcOption,</span>
+<span class="nc" id="L286">      mergedDictionaries: MergedDictionaries,</span>
+<span class="nc" id="L287">      sort: Option[(String, Boolean)],</span>
+<span class="nc" id="L288">      batchSize: Int,</span>
+      threadedBatches: Array[Array[Array[Byte]]]): CloseableIterator[Array[Byte]] = {
+
+<span class="nc" id="L291">    val iter: CloseableIterator[Array[Byte]] = new CloseableIterator[Array[Byte]] {</span>
+<span class="nc" id="L292">      private var writeHeader = true</span>
+<span class="nc" id="L293">      private val toLoad = SimpleFeatureVector.create(sft, mergedDictionaries.dictionaries, encoding, batchSize)</span>
+<span class="nc" id="L294">      private val result = SimpleFeatureVector.create(sft, mergedDictionaries.dictionaries, encoding, batchSize)</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">      logger.trace(s&quot;merge unsorted deltas - read schema ${result.underlying.getField}&quot;)</span>
+<span class="nc" id="L296">      private val loader = new RecordBatchLoader(toLoad.underlying)</span>
+<span class="nc" id="L297">      private val unloader = new RecordBatchUnloader(result, ipcOpts)</span>
+
+<span class="nc" id="L299">      private val transfers: Seq[(String, (Int, Int, java.util.Map[Integer, Integer]) =&gt; Unit)] = {</span>
+<span class="nc" id="L300">        toLoad.underlying.getChildrenFromFields.asScala.map { fromVector =&gt;</span>
+<span class="nc" id="L301">          val name = fromVector.getField.getName</span>
+<span class="nc" id="L302">          val toVector = result.underlying.getChild(name)</span>
+          val transfer: (Int, Int, java.util.Map[Integer, Integer]) =&gt; Unit =
+<span class="nc bnc" id="L304" title="All 2 branches missed.">            if (mergedDictionaries.dictionaries.contains(name)) {</span>
+<span class="nc bnc" id="L305" title="All 4 branches missed.">              (fromVector, toVector) match {</span>
+<span class="nc bnc" id="L306" title="All 4 branches missed.">                case (from: IntVector, to: IntVector) =&gt;</span>
+<span class="nc" id="L307">                  (fromIndex: Int, toIndex: Int, mapping: java.util.Map[Integer, Integer]) =&gt; {</span>
+<span class="nc" id="L308">                    val n = from.getObject(fromIndex)</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">                    if (n == null) {</span>
+<span class="nc" id="L310">                      to.setNull(toIndex)</span>
+                    } else {
+<span class="nc" id="L312">                      to.setSafe(toIndex, mapping.get(n))</span>
+                    }
+                  }
+
+<span class="nc bnc" id="L316" title="All 4 branches missed.">                case (from: ListVector, to: ListVector) =&gt;</span>
+<span class="nc" id="L317">                  val innerTo = to.getDataVector.asInstanceOf[IntVector]</span>
+<span class="nc" id="L318">                  (fromIndex: Int, toIndex: Int, mapping: java.util.Map[Integer, Integer]) =&gt; {</span>
+                    // note: should not be nulls as they are converted to empty list
+<span class="nc" id="L320">                    val list = from.getObject(fromIndex).asInstanceOf[java.util.List[Integer]]</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">                    if (to.getLastSet &gt;= toIndex) {</span>
+<span class="nc" id="L322">                      to.setLastSet(toIndex - 1)</span>
+                    }
+<span class="nc" id="L324">                    val start = to.startNewValue(toIndex)</span>
+<span class="nc" id="L325">                    var offset = 0</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                    while (offset &lt; list.size()) {</span>
+                      // note: nulls get encoded in the dictionary
+<span class="nc" id="L328">                      innerTo.setSafe(start + offset, mapping.get(list.get(offset)))</span>
+<span class="nc" id="L329">                      offset += 1</span>
+                    }
+<span class="nc" id="L331">                    to.endValue(toIndex, offset)</span>
+                  }
+
+                case _ =&gt;
+<span class="nc" id="L335">                  throw new IllegalStateException(s&quot;Encountered unexpected dictionary vector: $fromVector&quot;)</span>
+              }
+<span class="nc bnc" id="L337" title="All 2 branches missed.">            } else if (sft.indexOf(name) != -1 &amp;&amp;</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">                classOf[Geometry].isAssignableFrom(sft.getDescriptor(name).getType.getBinding)) {</span>
+              // geometry vectors use FixedSizeList vectors, for which transfer pairs aren't implemented
+<span class="nc" id="L340">              val binding = sft.getDescriptor(name).getType.getBinding</span>
+<span class="nc" id="L341">              val from = GeometryFields.wrap(fromVector, binding).asInstanceOf[GeometryVector[Geometry, FieldVector]]</span>
+<span class="nc" id="L342">              val to = GeometryFields.wrap(toVector, binding).asInstanceOf[GeometryVector[Geometry, FieldVector]]</span>
+<span class="nc" id="L343">              (fromIndex: Int, toIndex: Int, _: java.util.Map[Integer, Integer]) =&gt; {</span>
+<span class="nc" id="L344">                from.transfer(fromIndex, toIndex, to)</span>
+              }
+            } else {
+<span class="nc" id="L347">              val pair = fromVector.makeTransferPair(toVector)</span>
+<span class="nc" id="L348">              (fromIndex: Int, toIndex: Int, _: java.util.Map[Integer, Integer]) =&gt; {</span>
+<span class="nc" id="L349">                pair.copyValueSafe(fromIndex, toIndex)</span>
+              }
+            }
+<span class="nc" id="L352">          (name, transfer)</span>
+        }.toSeq
+      }
+
+<span class="nc" id="L356">      private val threadIterator = threadedBatches.iterator</span>
+<span class="nc" id="L357">      private var threadIndex = -1</span>
+<span class="nc" id="L358">      private var batches: Iterator[Array[Byte]] = Iterator.empty</span>
+<span class="nc" id="L359">      private var mappings: Map[String, java.util.Map[Integer, Integer]] = _</span>
+<span class="nc" id="L360">      private var count = 0 // records read in current batch</span>
+
+<span class="nc bnc" id="L362" title="All 4 branches missed.">      override def hasNext: Boolean = count &lt; toLoad.reader.getValueCount || loadNextBatch()</span>
+
+      override def next(): Array[Byte] = {
+<span class="nc" id="L365">        var total = 0</span>
+<span class="nc bnc" id="L366" title="All 4 branches missed.">        while (total &lt; batchSize &amp;&amp; hasNext) {</span>
+          // read the rest of the current vector, up to the batch size
+<span class="nc" id="L368">          val toRead = math.min(batchSize - total, toLoad.reader.getValueCount - count)</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">          transfers.foreach { case (name, transfer) =&gt;</span>
+<span class="nc" id="L370">            val mapping = mappings.get(name).orNull</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            logger.trace(s&quot;dictionary mappings for $name: $mapping&quot;)</span>
+<span class="nc" id="L372">            var i = 0</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">            while (i &lt; toRead) {</span>
+<span class="nc" id="L374">              transfer(i + count, i + total, mapping)</span>
+<span class="nc" id="L375">              i += 1</span>
+            }
+          }
+<span class="nc" id="L378">          count += toRead</span>
+<span class="nc" id="L379">          total += toRead</span>
+        }
+<span class="nc" id="L381">        var i = 0</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        while (i &lt; count) {</span>
+<span class="nc" id="L383">          result.underlying.setIndexDefined(i)</span>
+<span class="nc" id="L384">          i += 1</span>
+        }
+
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        if (writeHeader) {</span>
+          // write the header in the first result, which includes the metadata and dictionaries
+<span class="nc" id="L389">          writeHeader = false</span>
+<span class="nc" id="L390">          writeHeaderAndFirstBatch(result, mergedDictionaries.dictionaries, ipcOpts, sort, total)</span>
+        } else {
+<span class="nc" id="L392">          unloader.unload(total)</span>
+        }
+      }
+
+<span class="nc" id="L396">      override def close(): Unit = CloseWithLogging.raise(Seq(toLoad, result, mergedDictionaries))</span>
+
+      /**
+        * Read the next batch
+        *
+        * @return true if there was a batch to load, false if we've read all batches
+        */
+      @tailrec
+      private def loadNextBatch(): Boolean = {
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        if (batches.hasNext) {</span>
+<span class="nc" id="L406">          val batch = batches.next</span>
+          // skip the dictionary batches
+<span class="nc" id="L408">          var offset = 8 // initial threading key offset</span>
+<span class="nc" id="L409">          dictionaryFields.foreach { _ =&gt;</span>
+<span class="nc" id="L410">            offset += ByteArrays.readInt(batch, offset) + 4</span>
+          }
+<span class="nc" id="L412">          val messageLength = ByteArrays.readInt(batch, offset)</span>
+<span class="nc" id="L413">          offset += 4 // skip over message length bytes</span>
+          // load the record batch
+<span class="nc" id="L415">          loader.load(batch, offset, messageLength)</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">          if (toLoad.reader.getValueCount &gt; 0) {</span>
+<span class="nc" id="L417">            count = 0 // reset count for this batch</span>
+<span class="nc" id="L418">            true</span>
+          } else {
+<span class="nc" id="L420">            loadNextBatch()</span>
+          }
+<span class="nc bnc" id="L422" title="All 2 branches missed.">        } else if (threadIterator.hasNext) {</span>
+<span class="nc" id="L423">          threadIndex += 1</span>
+          // set the mappings for this thread
+<span class="nc bnc" id="L425" title="All 2 branches missed.">          mappings = mergedDictionaries.mappings.map { case (f, m) =&gt; (f, m(threadIndex)) }</span>
+<span class="nc" id="L426">          batches = threadIterator.next.iterator</span>
+<span class="nc" id="L427">          loadNextBatch()</span>
+        } else {
+<span class="nc" id="L429">          false</span>
+        }
+      }
+    }
+
+<span class="nc" id="L434">    createFileFromBatches(sft, mergedDictionaries.dictionaries, encoding, ipcOpts, None, iter, firstBatchHasHeader = true)</span>
+  }
+
+  /**
+    * Merge with sorting. Each batch is assumed to be already sorted
+    *
+    * @param sft simple feature type
+    * @param dictionaryFields dictionary fields
+    * @param encoding simple feature encoding
+    * @param mergedDictionaries merged dictionaries and batch mappings
+    * @param sortBy sort field
+    * @param reverse reverse sort or not
+    * @param batchSize record batch size
+    * @param threadedBatches record batches, grouped by threading key, internally sorted
+    * @return
+    */
+  private def reduceWithSort(
+      sft: SimpleFeatureType,
+      dictionaryFields: Seq[String],
+      encoding: SimpleFeatureEncoding,
+<span class="nc" id="L454">      ipcOpts: IpcOption,</span>
+<span class="nc" id="L455">      mergedDictionaries: MergedDictionaries,</span>
+<span class="nc" id="L456">      sortBy: String,</span>
+<span class="nc" id="L457">      reverse: Boolean,</span>
+<span class="nc" id="L458">      batchSize: Int,</span>
+      threadedBatches: Array[Array[Array[Byte]]]): CloseableIterator[Array[Byte]] = {
+
+<span class="nc" id="L461">    val dictionaries = mergedDictionaries.dictionaries</span>
+
+<span class="nc" id="L463">    val result = SimpleFeatureVector.create(sft, dictionaries, encoding)</span>
+<span class="nc" id="L464">    val unloader = new RecordBatchUnloader(result, ipcOpts)</span>
+
+<span class="nc bnc" id="L466" title="All 2 branches missed.">    logger.trace(s&quot;merging sorted deltas - read schema: ${result.underlying.getField}&quot;)</span>
+
+    // we do a merge sort of each batch
+    // queue sorted by current value in each batch
+<span class="nc" id="L470">    val queue = {</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">      val ordering = if (reverse) { BatchMergerOrdering.reverse } else { BatchMergerOrdering }</span>
+<span class="nc" id="L472">      new PriorityQueue[BatchMerger[Any]](ordering)</span>
+    }
+
+    // track our open vectors to close later
+<span class="nc" id="L476">    val cleanup = ArrayBuffer.empty[SimpleFeatureVector]</span>
+<span class="nc" id="L477">    cleanup.sizeHint(threadedBatches.foldLeft(0)((sum, a) =&gt; sum + a.length))</span>
+
+<span class="nc bnc" id="L479" title="All 2 branches missed.">    foreachIndex(threadedBatches) { case (batches, batchIndex) =&gt;</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">      val mappings = mergedDictionaries.mappings.map { case (f, m) =&gt; (f, m(batchIndex)) }</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">      logger.trace(s&quot;loading ${batches.length} batch(es) from a single thread&quot;)</span>
+
+<span class="nc" id="L483">      batches.foreach { batch =&gt;</span>
+<span class="nc" id="L484">        val toLoad = SimpleFeatureVector.create(sft, dictionaries, encoding)</span>
+<span class="nc" id="L485">        val loader = new RecordBatchLoader(toLoad.underlying)</span>
+<span class="nc" id="L486">        cleanup += toLoad</span>
+
+        // skip the dictionary batches
+<span class="nc" id="L489">        var offset = 8</span>
+<span class="nc" id="L490">        dictionaryFields.foreach { _ =&gt;</span>
+<span class="nc" id="L491">          offset += ByteArrays.readInt(batch, offset) + 4</span>
+        }
+<span class="nc" id="L493">        val messageLength = ByteArrays.readInt(batch, offset)</span>
+<span class="nc" id="L494">        offset += 4 // skip the length bytes</span>
+        // load the record batch
+<span class="nc" id="L496">        loader.load(batch, offset, messageLength)</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">        if (toLoad.reader.getValueCount &gt; 0) {</span>
+<span class="nc" id="L498">          val transfers: Seq[(Int, Int) =&gt; Unit] = toLoad.underlying.getChildrenFromFields.asScala.map { fromVector =&gt;</span>
+<span class="nc" id="L499">            val name = fromVector.getField.getName</span>
+<span class="nc" id="L500">            val toVector = result.underlying.getChild(name)</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">            if (dictionaries.contains(name)) {</span>
+<span class="nc" id="L502">              val mapping = mappings(name)</span>
+<span class="nc bnc" id="L503" title="All 4 branches missed.">              (fromVector, toVector) match {</span>
+<span class="nc bnc" id="L504" title="All 4 branches missed.">                case (from: IntVector, to: IntVector) =&gt;</span>
+<span class="nc" id="L505">                  (fromIndex: Int, toIndex: Int) =&gt; {</span>
+<span class="nc" id="L506">                    val n = from.getObject(fromIndex)</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">                    if (n == null) {</span>
+<span class="nc" id="L508">                      to.setNull(toIndex)</span>
+                    } else {
+<span class="nc" id="L510">                      to.setSafe(toIndex, mapping.get(n))</span>
+                    }
+                  }
+
+<span class="nc bnc" id="L514" title="All 4 branches missed.">                case (from: ListVector, to: ListVector) =&gt;</span>
+<span class="nc" id="L515">                  val innerTo = to.getDataVector.asInstanceOf[IntVector]</span>
+<span class="nc" id="L516">                  (fromIndex: Int, toIndex: Int) =&gt; {</span>
+                    // note: should not be nulls as they are converted to empty list
+<span class="nc" id="L518">                    val list = from.getObject(fromIndex).asInstanceOf[java.util.List[Integer]]</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">                    if (to.getLastSet &gt;= toIndex) {</span>
+<span class="nc" id="L520">                      to.setLastSet(toIndex - 1)</span>
+                    }
+<span class="nc" id="L522">                    val start = to.startNewValue(toIndex)</span>
+<span class="nc" id="L523">                    var offset = 0</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">                    while (offset &lt; list.size()) {</span>
+                      // note: nulls get encoded in the dictionary
+<span class="nc" id="L526">                      innerTo.setSafe(start + offset, mapping.get(list.get(offset)))</span>
+<span class="nc" id="L527">                      offset += 1</span>
+                    }
+<span class="nc" id="L529">                    to.endValue(toIndex, offset)</span>
+                  }
+
+                case _ =&gt;
+<span class="nc" id="L533">                  throw new IllegalStateException(s&quot;Encountered unexpected dictionary vector: $fromVector&quot;)</span>
+              }
+<span class="nc bnc" id="L535" title="All 2 branches missed.">            } else if (sft.indexOf(name) != -1 &amp;&amp;</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">                classOf[Geometry].isAssignableFrom(sft.getDescriptor(name).getType.getBinding)) {</span>
+              // geometry vectors use FixedSizeList vectors, for which transfer pairs aren't implemented
+<span class="nc" id="L538">              val binding = sft.getDescriptor(name).getType.getBinding</span>
+<span class="nc" id="L539">              val from = GeometryFields.wrap(fromVector, binding).asInstanceOf[GeometryVector[Geometry, FieldVector]]</span>
+<span class="nc" id="L540">              val to = GeometryFields.wrap(toVector, binding).asInstanceOf[GeometryVector[Geometry, FieldVector]]</span>
+<span class="nc" id="L541">              (fromIndex: Int, toIndex: Int) =&gt; from.transfer(fromIndex, toIndex, to)</span>
+            } else {
+<span class="nc" id="L543">              val transfer = fromVector.makeTransferPair(toVector)</span>
+<span class="nc" id="L544">              (fromIndex: Int, toIndex: Int) =&gt; transfer.copyValueSafe(fromIndex, toIndex)</span>
+            }
+          }.toSeq
+<span class="nc" id="L547">          val mapVector = toLoad.underlying</span>
+<span class="nc" id="L548">          val dict = dictionaries.get(sortBy)</span>
+<span class="nc" id="L549">          val descriptor = sft.getDescriptor(sortBy)</span>
+<span class="nc" id="L550">          val merger = ArrowAttributeReader(descriptor, mapVector.getChild(sortBy), dict, encoding) match {</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">            case r: ArrowDictionaryReader =&gt; new DictionaryBatchMerger(toLoad, transfers, r, mappings.get(sortBy).orNull)</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">            case r: ArrowListDictionaryReader =&gt; new DictionaryListBatchMerger(toLoad, transfers, r, mappings.get(sortBy).orNull)</span>
+<span class="nc bnc" id="L553" title="All 2 branches missed.">            case r: ArrowDateReader =&gt; new DateBatchMerger(toLoad, transfers, r)</span>
+<span class="nc" id="L554">            case r =&gt; new AttributeBatchMerger(toLoad, transfers, r, AttributeOrdering(descriptor))</span>
+          }
+<span class="nc" id="L556">          queue.add(merger.asInstanceOf[BatchMerger[Any]])</span>
+        }
+      }
+    }
+
+<span class="nc" id="L561">    var writtenHeader = false</span>
+
+    // gets the next record batch to write - returns null if no further records
+    def nextBatch(): Array[Byte] = {
+<span class="nc bnc" id="L565" title="All 2 branches missed.">      if (queue.isEmpty) { null } else {</span>
+<span class="nc" id="L566">        result.clear()</span>
+<span class="nc" id="L567">        var resultIndex = 0</span>
+        // copy the next sorted value and then queue and sort the next element out of the batch we copied from
+        while ({
+          {
+<span class="nc" id="L571">            val next = queue.remove()</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">            if (next.transfer(resultIndex)) {</span>
+<span class="nc" id="L573">              queue.add(next)</span>
+            }
+<span class="nc" id="L575">            result.underlying.setIndexDefined(resultIndex)</span>
+<span class="nc" id="L576">            resultIndex += 1</span>
+<span class="nc bnc" id="L577" title="All 4 branches missed.">          }; !queue.isEmpty &amp;&amp; resultIndex &lt; batchSize</span>
+<span class="nc" id="L578">        })()</span>
+
+<span class="nc bnc" id="L580" title="All 2 branches missed.">        if (writtenHeader) {</span>
+<span class="nc" id="L581">          unloader.unload(resultIndex)</span>
+        } else {
+          // write the header in the first result, which includes the metadata and dictionaries
+<span class="nc" id="L584">          writtenHeader = true</span>
+<span class="nc" id="L585">          writeHeaderAndFirstBatch(result, dictionaries, ipcOpts, Some(sortBy -&gt; reverse), resultIndex)</span>
+        }
+      }
+    }
+
+<span class="nc" id="L590">    val merged: CloseableIterator[Array[Byte]] = new CloseableIterator[Array[Byte]] {</span>
+
+<span class="nc" id="L592">      private var batch: Array[Byte] = _</span>
+
+      override def hasNext: Boolean = {
+<span class="nc bnc" id="L595" title="All 2 branches missed.">        if (batch == null) {</span>
+<span class="nc" id="L596">          batch = nextBatch()</span>
+        }
+<span class="nc bnc" id="L598" title="All 2 branches missed.">        batch != null</span>
+      }
+
+      override def next(): Array[Byte] = {
+<span class="nc" id="L602">        val res = batch</span>
+<span class="nc" id="L603">        batch = null</span>
+<span class="nc" id="L604">        res</span>
+      }
+
+      override def close(): Unit = {
+<span class="nc" id="L608">        CloseWithLogging(result)</span>
+<span class="nc" id="L609">        CloseWithLogging(cleanup)</span>
+<span class="nc" id="L610">        CloseWithLogging(mergedDictionaries)</span>
+      }
+    }
+
+<span class="nc" id="L614">    createFileFromBatches(sft, dictionaries, encoding, ipcOpts, Some(sortBy -&gt; reverse), merged, firstBatchHasHeader = true)</span>
+  }
+
+  /**
+    * Merge delta dictionary batches
+    *
+    * @param sft simple feature type
+    * @param dictionaryFields dictionary fields
+    * @param deltas Seq of threaded dictionary deltas
+    * @return
+    */
+  private def mergeDictionaries(
+      sft: SimpleFeatureType,
+      dictionaryFields: Seq[String],
+      deltas: Array[Array[Array[Byte]]],
+      encoding: SimpleFeatureEncoding): MergedDictionaries = {
+
+<span class="nc" id="L631">    val allocator = ArrowAllocator(s&quot;merge-dictionaries:${sft.getTypeName}&quot;)</span>
+
+<span class="nc bnc" id="L633" title="All 2 branches missed.">    if (dictionaryFields.isEmpty) {</span>
+<span class="nc" id="L634">      return MergedDictionaries(Map.empty, Map.empty, allocator)</span>
+    }
+
+    // calculate our vector bindings/metadata once up front
+<span class="nc" id="L638">    val vectorMetadata = dictionaryFields.toArray.map { name =&gt;</span>
+<span class="nc" id="L639">      val descriptor = sft.getDescriptor(name)</span>
+      val bindings = {
+<span class="nc" id="L641">        val base = ObjectType.selectType(descriptor)</span>
+        // for list types, get the list item binding (which is the tail of the bindings)
+<span class="nc bnc" id="L643" title="All 2 branches missed.">        if (descriptor.isList) { base.tail } else { base }</span>
+      }
+<span class="nc" id="L645">      val ordering = AttributeOrdering(bindings)</span>
+<span class="nc bnc" id="L646" title="All 2 branches missed.">      val desc = if (descriptor.isList) { s&quot;$name:${descriptor.getListType().getSimpleName}&quot; } else {</span>
+<span class="nc" id="L647">        SimpleFeatureTypes.encodeDescriptor(sft, descriptor)</span>
+      }
+<span class="nc" id="L649">      val metadata = Map(SimpleFeatureVector.DescriptorKey -&gt; desc)</span>
+<span class="nc" id="L650">      val factory = VectorFactory(allocator)</span>
+<span class="nc" id="L651">      (name, bindings, ordering, metadata, factory)</span>
+    }
+
+    // create a vector for each dictionary field
+    def createNewVectors: Array[ArrowAttributeReader] = {
+<span class="nc bnc" id="L656" title="All 2 branches missed.">      vectorMetadata.map { case (name, bindings, _, metadata, factory) =&gt;</span>
+        // use the writer to create the appropriate child vector
+<span class="nc" id="L658">        val vector = ArrowAttributeWriter(name, bindings, None, metadata, encoding, factory).vector</span>
+<span class="nc" id="L659">        ArrowAttributeReader(bindings, vector, None, encoding)</span>
+      }
+    }
+
+<span class="nc" id="L663">    val orderings = vectorMetadata.map(_._3)</span>
+
+    // final results
+<span class="nc" id="L666">    val results = createNewVectors</span>
+
+    // re-used queue, gets emptied after each dictionary field
+    // batch state is tracked in the DictionaryMerger instances
+<span class="nc" id="L670">    val queue = new PriorityQueue[DictionaryMerger](Ordering.ordered[DictionaryMerger])</span>
+
+    // merge each threaded delta vector into a single dictionary for that thread
+<span class="nc" id="L673">    var batch = -1</span>
+<span class="nc" id="L674">    val allMerges: Array[DictionaryMerger] = deltas.map { deltas =&gt;</span>
+      // deltas are threaded batches containing partial dictionary vectors
+<span class="nc" id="L676">      batch += 1</span>
+
+      // per-dictionary vectors for our final merged results for this threaded batch
+<span class="nc" id="L679">      val dictionaries = createNewVectors</span>
+
+      // tracks the offset for each dictionary, based on the deltas that came before it
+<span class="nc" id="L682">      val offsets = Array.fill(dictionaries.length)(0)</span>
+
+      // the delta vectors, each sorted internally
+<span class="nc" id="L685">      val toMerge: Array[DictionaryMerger] = deltas.map { bytes =&gt;</span>
+<span class="nc" id="L686">        val vectors = createNewVectors // per-dictionary vectors from this batch</span>
+
+<span class="nc" id="L688">        var i = 0</span>
+<span class="nc" id="L689">        var offset = 8 // start after threading key</span>
+<span class="nc bnc" id="L690" title="All 2 branches missed.">        while (i &lt; dictionaries.length) {</span>
+<span class="nc" id="L691">          val length = ByteArrays.readInt(bytes, offset)</span>
+<span class="nc" id="L692">          offset += 4 // increment past length</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">          if (length &gt; 0) {</span>
+<span class="nc" id="L694">            new RecordBatchLoader(vectors(i).vector).load(bytes, offset, length)</span>
+<span class="nc" id="L695">            offset += length</span>
+          }
+<span class="nc" id="L697">          i += 1</span>
+        }
+<span class="nc bnc" id="L699" title="All 2 branches missed.">        logger.trace(s&quot;dictionary deltas: ${vectors.map(v =&gt; Seq.tabulate(v.getValueCount)(v.apply).mkString(&quot;,&quot;)).mkString(&quot;;&quot;)}&quot;)</span>
+
+        // copy the current dictionary offsets to account for previous batches
+<span class="nc" id="L702">        val off = Array.ofDim[Int](offsets.length)</span>
+<span class="nc" id="L703">        System.arraycopy(offsets, 0, off, 0, offsets.length)</span>
+
+<span class="nc" id="L705">        var j = -1</span>
+<span class="nc" id="L706">        val transfers = vectors.map { v =&gt;</span>
+<span class="nc" id="L707">          j += 1</span>
+<span class="nc" id="L708">          offsets(j) += v.getValueCount // note: side-effect in map - update our offsets for the next batch</span>
+<span class="nc" id="L709">          v.vector.makeTransferPair(dictionaries(j).vector)</span>
+        }
+
+<span class="nc" id="L712">        new DictionaryMerger(vectors, transfers, off, orderings, null, -1) // we don't care about the batch number here</span>
+      }
+
+<span class="nc" id="L715">      val transfers = Array.ofDim[TransferPair](dictionaries.length)</span>
+<span class="nc" id="L716">      val mappings = Array.fill(dictionaries.length)(new java.util.HashMap[Integer, Integer]())</span>
+
+<span class="nc" id="L718">      var i = 0 // dictionary field index</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">      while (i &lt; dictionaries.length) {</span>
+        // set initial values in the sorting queue
+<span class="nc" id="L721">        toMerge.foreach { merger =&gt;</span>
+<span class="nc bnc" id="L722" title="All 2 branches missed.">          if (merger.setCurrent(i)) {</span>
+<span class="nc" id="L723">            queue.add(merger)</span>
+          }
+        }
+
+<span class="nc" id="L727">        var count = 0</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">        while (!queue.isEmpty) {</span>
+<span class="nc" id="L729">          val merger = queue.remove()</span>
+<span class="nc" id="L730">          merger.transfer(count)</span>
+<span class="nc" id="L731">          mappings(i).put(count, merger.offset)</span>
+<span class="nc bnc" id="L732" title="All 2 branches missed.">          if (merger.advance()) {</span>
+<span class="nc" id="L733">            queue.add(merger)</span>
+          }
+<span class="nc" id="L735">          count += 1</span>
+        }
+<span class="nc" id="L737">        dictionaries(i).vector.setValueCount(count)</span>
+<span class="nc" id="L738">        transfers(i) = dictionaries(i).vector.makeTransferPair(results(i).vector)</span>
+<span class="nc" id="L739">        i += 1</span>
+      }
+
+<span class="nc" id="L742">      new DictionaryMerger(dictionaries, transfers, Array.empty, orderings, mappings, batch)</span>
+    }
+
+    // now merge the separate threads together
+
+    // final mappings - we build up a new map as otherwise we'd get key/value overlaps
+    // dictionary(batch(mapping))
+<span class="nc" id="L749">    val mappings = Array.fill(results.length)(Array.fill(allMerges.length)(new java.util.HashMap[Integer, Integer]()))</span>
+
+<span class="nc bnc" id="L751" title="All 2 branches missed.">    foreachIndex(results) { case (result, i) =&gt;</span>
+<span class="nc" id="L752">      allMerges.foreach { merger =&gt;</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">        if (merger.setCurrent(i)) {</span>
+<span class="nc" id="L754">          queue.add(merger)</span>
+        }
+      }
+
+<span class="nc" id="L758">      var count = 0</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">      while (!queue.isEmpty) {</span>
+<span class="nc" id="L760">        val merger = queue.remove()</span>
+        // check for duplicates
+<span class="nc bnc" id="L762" title="All 4 branches missed.">        if (count == 0 || result.apply(count - 1) != merger.value) {</span>
+<span class="nc" id="L763">          merger.transfer(count)</span>
+<span class="nc" id="L764">          count += 1</span>
+        }
+        // update the dictionary mapping from the per-thread to the global dictionary
+<span class="nc bnc" id="L767" title="All 2 branches missed.">        logger.trace(s&quot;remap ${merger.value} ${merger.batch} ${merger.mappings(i)} ${merger.index} -&gt; ${count - 1}&quot;)</span>
+<span class="nc" id="L768">        val remap = merger.remap</span>
+<span class="nc bnc" id="L769" title="All 2 branches missed.">        if (remap != null) {</span>
+<span class="nc" id="L770">          mappings(i)(merger.batch).put(remap, count - 1)</span>
+        }
+<span class="nc bnc" id="L772" title="All 2 branches missed.">        if (merger.advance()) {</span>
+<span class="nc" id="L773">          queue.add(merger)</span>
+        }
+      }
+<span class="nc" id="L776">      result.vector.setValueCount(count)</span>
+    }
+
+    // convert from indexed arrays to dictionary-field-keyed maps
+<span class="nc" id="L780">    val dictionaryBuilder = Map.newBuilder[String, ArrowDictionary]</span>
+<span class="nc" id="L781">    dictionaryBuilder.sizeHint(dictionaryFields.length)</span>
+<span class="nc" id="L782">    val mappingsBuilder = Map.newBuilder[String, Array[java.util.Map[Integer, Integer]]]</span>
+<span class="nc" id="L783">    mappingsBuilder.sizeHint(dictionaryFields.length)</span>
+
+<span class="nc bnc" id="L785" title="All 4 branches missed.">    foreachIndex(vectorMetadata) { case ((name, bindings, _, _, _), i) =&gt;</span>
+<span class="nc bnc" id="L786" title="All 2 branches missed.">      logger.trace(&quot;merged dictionary: &quot; + Seq.tabulate(results(i).getValueCount)(results(i).apply).mkString(&quot;,&quot;))</span>
+<span class="nc" id="L787">      val enc = new DictionaryEncoding(i, true, new ArrowType.Int(32, true))</span>
+<span class="nc" id="L788">      dictionaryBuilder += name -&gt; ArrowDictionary.create(enc, results(i).vector, bindings, encoding)</span>
+<span class="nc" id="L789">      mappingsBuilder += name -&gt; mappings(i).asInstanceOf[Array[java.util.Map[Integer, Integer]]]</span>
+    }
+
+<span class="nc" id="L792">    val dictionaryMap = dictionaryBuilder.result()</span>
+<span class="nc" id="L793">    val mappingsMap = mappingsBuilder.result()</span>
+
+<span class="nc bnc" id="L795" title="All 2 branches missed.">    logger.trace(s&quot;batch dictionary mappings: ${mappingsMap.mapValues(_.mkString(&quot;,&quot;)).mkString(&quot;;&quot;)}&quot;)</span>
+<span class="nc" id="L796">    MergedDictionaries(dictionaryMap, mappingsMap, allocator)</span>
+  }
+
+  private def foreachIndex[T](array: Array[T])(fn: (T, Int) =&gt; Unit): Unit = {
+<span class="nc" id="L800">    var i = 0</span>
+<span class="nc" id="L801">    array.foreach { item =&gt;</span>
+<span class="nc" id="L802">      fn(item, i)</span>
+<span class="nc" id="L803">      i += 1</span>
+    }
+  }
+
+  // holder for merged dictionaries and mappings from written values to merged values
+<span class="nc bnc" id="L808" title="All 32 branches missed.">  private case class MergedDictionaries(</span>
+<span class="nc" id="L809">      dictionaries: Map[String, ArrowDictionary],</span>
+<span class="nc" id="L810">      mappings: Map[String, Array[java.util.Map[Integer, Integer]]],</span>
+<span class="nc" id="L811">      allocator: BufferAllocator</span>
+<span class="nc" id="L812">    ) extends Closeable {</span>
+    override def close(): Unit = {
+<span class="nc bnc" id="L814" title="All 2 branches missed.">      dictionaries.foreach { case (_, d) =&gt; CloseWithLogging(d) }</span>
+<span class="nc" id="L815">      CloseWithLogging(allocator)</span>
+    }
+  }
+
+<span class="nc" id="L819">  private sealed abstract class FieldWriter(val attribute: ArrowAttributeWriter) {</span>
+    def write(i: Int, f: SimpleFeature): Unit
+<span class="nc" id="L821">    def setValueCount(i: Int): Unit = attribute.setValueCount(i)</span>
+  }
+
+<span class="nc" id="L824">  private class AttributeFieldWriter(index: Int, attribute: ArrowAttributeWriter) extends FieldWriter(attribute) {</span>
+<span class="nc" id="L825">    override def write(i: Int, f: SimpleFeature): Unit = attribute.apply(i, f.getAttribute(index))</span>
+  }
+
+<span class="nc" id="L828">  private class DictionaryFieldWriter(</span>
+<span class="nc" id="L829">      index: Int,</span>
+      attribute: ArrowAttributeWriter,
+<span class="nc" id="L831">      dict: ArrowAttributeWriter,</span>
+      ordering: Ordering[AnyRef],
+      ipcOpts: IpcOption
+<span class="nc" id="L834">    ) extends FieldWriter(attribute) with Closeable {</span>
+
+<span class="nc" id="L836">    protected val values = scala.collection.mutable.Map.empty[AnyRef, Integer]</span>
+<span class="nc" id="L837">    protected val delta  = new java.util.TreeSet[AnyRef](ordering)</span>
+<span class="nc" id="L838">    protected val writer = new BatchWriter(dict.vector, ipcOpts)</span>
+
+<span class="nc" id="L840">    override def write(i: Int, f: SimpleFeature): Unit = attribute.apply(i, values(f.getAttribute(index)))</span>
+
+    def addDictionaryValue(f: SimpleFeature): Unit = {
+<span class="nc" id="L843">      val value = f.getAttribute(index)</span>
+<span class="nc bnc" id="L844" title="All 2 branches missed.">      if (!values.contains(value)) {</span>
+<span class="nc" id="L845">        delta.add(value)</span>
+      }
+    }
+
+    def writeDictionaryDelta(out: ByteArrayOutputStream): Int = {
+<span class="nc" id="L850">      val size = values.size</span>
+<span class="nc" id="L851">      var i = 0</span>
+      // update the dictionary mappings, and write the new values to the vector
+<span class="nc" id="L853">      delta.asScala.foreach { n =&gt;</span>
+<span class="nc" id="L854">        values.put(n, i + size)</span>
+<span class="nc" id="L855">        dict.apply(i, n)</span>
+<span class="nc" id="L856">        i += 1</span>
+      }
+      // write out the dictionary batch
+<span class="nc" id="L859">      dict.setValueCount(i)</span>
+<span class="nc" id="L860">      writer.writeBatch(i, out)</span>
+<span class="nc" id="L861">      delta.clear()</span>
+<span class="nc" id="L862">      i</span>
+    }
+
+<span class="nc" id="L865">    def resetDictionary(): Unit = values.clear()</span>
+
+<span class="nc" id="L867">    override def close(): Unit = writer.close()</span>
+  }
+
+<span class="nc" id="L870">  private class DictionaryListFieldWriter(</span>
+<span class="nc" id="L871">      index: Int,</span>
+      attribute: ArrowAttributeWriter,
+      dict: ArrowAttributeWriter,
+      ordering: Ordering[AnyRef],
+      ipcOpts: IpcOption
+<span class="nc" id="L876">    ) extends DictionaryFieldWriter(index, attribute, dict, ordering, ipcOpts) {</span>
+
+    override def write(i: Int, f: SimpleFeature): Unit = {
+<span class="nc" id="L879">      val list = f.getAttribute(index).asInstanceOf[java.util.List[AnyRef]]</span>
+<span class="nc bnc" id="L880" title="All 2 branches missed.">      val encoded = if (list == null) { Collections.emptyList() } else {</span>
+<span class="nc" id="L881">        val e = new java.util.ArrayList[Integer](list.size)</span>
+<span class="nc" id="L882">        list.asScala.foreach(v =&gt; e.add(values(v)))</span>
+<span class="nc" id="L883">        e</span>
+      }
+<span class="nc" id="L885">      attribute.apply(i, encoded)</span>
+    }
+
+    override def addDictionaryValue(f: SimpleFeature): Unit = {
+<span class="nc" id="L889">      val value = f.getAttribute(index).asInstanceOf[java.util.List[AnyRef]]</span>
+<span class="nc bnc" id="L890" title="All 2 branches missed.">      if (value != null) {</span>
+<span class="nc" id="L891">        value.asScala.foreach { v =&gt;</span>
+<span class="nc bnc" id="L892" title="All 2 branches missed.">          if (!values.contains(v)) {</span>
+<span class="nc" id="L893">            delta.add(v)</span>
+          }
+        }
+      }
+    }
+  }
+
+<span class="nc" id="L900">  private object BatchMergerOrdering extends Ordering[BatchMerger[Any]] {</span>
+<span class="nc" id="L901">    override def compare(x: BatchMerger[Any], y: BatchMerger[Any]): Int = x.compare(y)</span>
+  }
+
+  /**
+   * Tracks sorted merging of delta record batches
+   *
+   * @param vector vector for this batch
+   * @param transfers transfer functions to the result batch
+   * @tparam T type param
+   */
+<span class="nc" id="L911">  private abstract class BatchMerger[T](</span>
+<span class="nc" id="L912">      vector: SimpleFeatureVector,</span>
+<span class="nc" id="L913">      transfers: Seq[(Int, Int) =&gt; Unit]</span>
+<span class="nc" id="L914">    ) extends Ordered[T] {</span>
+
+<span class="nc" id="L916">    protected var index: Int = 0</span>
+
+    def transfer(to: Int): Boolean = {
+<span class="nc" id="L919">      transfers.foreach(_.apply(index, to))</span>
+<span class="nc" id="L920">      index += 1</span>
+<span class="nc bnc" id="L921" title="All 2 branches missed.">      if (vector.reader.getValueCount &gt; index) {</span>
+<span class="nc" id="L922">        load()</span>
+<span class="nc" id="L923">        true</span>
+      } else {
+<span class="nc" id="L925">        false</span>
+      }
+    }
+
+    protected def load(): Unit
+  }
+
+  /**
+   * Batch merger for dictionary-encoded values
+   *
+   * @param vector vector for this batch
+   * @param transfers transfer functions to the result batch
+   * @param sort vector holding the values being sorted on
+   * @param dictionaryMappings mappings from the batch to the global dictionary
+   */
+<span class="nc" id="L940">  private class DictionaryBatchMerger(</span>
+      vector: SimpleFeatureVector,
+      transfers: Seq[(Int, Int) =&gt; Unit],
+<span class="nc" id="L943">      sort: ArrowDictionaryReader,</span>
+<span class="nc" id="L944">      dictionaryMappings: java.util.Map[Integer, Integer]</span>
+<span class="nc" id="L945">    ) extends BatchMerger[DictionaryBatchMerger](vector, transfers) {</span>
+
+<span class="nc" id="L947">    private var value: Int = dictionaryMappings.get(sort.getEncoded(0))</span>
+
+    override protected def load(): Unit = {
+      // since we've sorted the dictionaries, we can just compare the encoded index values
+<span class="nc" id="L951">      value = dictionaryMappings.get(sort.getEncoded(index))</span>
+    }
+
+<span class="nc" id="L954">    override def compare(that: DictionaryBatchMerger): Int = java.lang.Integer.compare(value, that.value)</span>
+  }
+
+  /**
+   * Batch merger for dictionary-encoded values
+   *
+   * @param vector vector for this batch
+   * @param transfers transfer functions to the result batch
+   * @param sort vector holding the values being sorted on
+   * @param dictionaryMappings mappings from the batch to the global dictionary
+   */
+<span class="nc" id="L965">  private class DictionaryListBatchMerger(</span>
+      vector: SimpleFeatureVector,
+      transfers: Seq[(Int, Int) =&gt; Unit],
+<span class="nc" id="L968">      sort: ArrowListDictionaryReader,</span>
+<span class="nc" id="L969">      dictionaryMappings: java.util.Map[Integer, Integer]</span>
+<span class="nc" id="L970">    ) extends BatchMerger[DictionaryListBatchMerger](vector, transfers) {</span>
+
+<span class="nc" id="L972">    private var value: java.util.List[Integer] = {</span>
+<span class="nc" id="L973">      val list = sort.getEncoded(0)</span>
+<span class="nc" id="L974">      var i = 0</span>
+<span class="nc bnc" id="L975" title="All 2 branches missed.">      while (i &lt; list.size) {</span>
+<span class="nc" id="L976">        list.set(i, dictionaryMappings.get(list.get(i)))</span>
+<span class="nc" id="L977">        i += 1</span>
+      }
+<span class="nc" id="L979">      list</span>
+    }
+
+    override protected def load(): Unit = {
+      // since we've sorted the dictionaries, we can just compare the encoded index values
+<span class="nc" id="L984">      value = sort.getEncoded(index)</span>
+<span class="nc" id="L985">      var i = 0</span>
+<span class="nc bnc" id="L986" title="All 2 branches missed.">      while (i &lt; value.size) {</span>
+<span class="nc" id="L987">        value.set(i, dictionaryMappings.get(value.get(i)))</span>
+<span class="nc" id="L988">        i += 1</span>
+      }
+    }
+
+    override def compare(that: DictionaryListBatchMerger): Int =
+<span class="nc" id="L993">      AttributeOrdering.IntListOrdering.compare(value, that.value)</span>
+  }
+
+  /**
+   * Merger for date values. We can avoid allocating a Date object and just compare the millisecond timestamp
+   *
+   * @param vector vector for this batch
+   * @param transfers transfer functions to the result batch
+   * @param sort vector holding the values being sorted on
+   */
+<span class="nc" id="L1003">  private class DateBatchMerger(</span>
+      vector: SimpleFeatureVector,
+      transfers: Seq[(Int, Int) =&gt; Unit],
+<span class="nc" id="L1006">      sort: ArrowDateReader</span>
+<span class="nc" id="L1007">    ) extends BatchMerger[DateBatchMerger](vector, transfers) {</span>
+
+<span class="nc" id="L1009">    private var value: Long = sort.getTime(0)</span>
+
+<span class="nc" id="L1011">    override protected def load(): Unit = value = sort.getTime(index)</span>
+
+<span class="nc" id="L1013">    override def compare(that: DateBatchMerger): Int = java.lang.Long.compare(value, that.value)</span>
+  }
+
+  /**
+   * Generic batch merger for non-specialized attribute types
+   *
+   * @param vector vector for this batch
+   * @param transfers transfer functions to the result batch
+   * @param sort vector holding the values being sorted on
+   */
+<span class="nc" id="L1023">  private class AttributeBatchMerger(</span>
+      vector: SimpleFeatureVector,
+      transfers: Seq[(Int, Int) =&gt; Unit],
+<span class="nc" id="L1026">      sort: ArrowAttributeReader,</span>
+<span class="nc" id="L1027">      ordering: Ordering[AnyRef]</span>
+<span class="nc" id="L1028">    ) extends BatchMerger[AttributeBatchMerger](vector, transfers) {</span>
+
+<span class="nc" id="L1030">    private var value: AnyRef = sort.apply(0)</span>
+
+<span class="nc" id="L1032">    override protected def load(): Unit = value = sort.apply(index)</span>
+
+<span class="nc" id="L1034">    override def compare(that: AttributeBatchMerger): Int = ordering.compare(value, that.value)</span>
+  }
+
+  /**
+   * Dictionary merger for tracking threaded delta batches. Each member variable is an array, with
+   * one entry per dictionary field
+   *
+   * @param readers attribute readers for the dictionary values
+   * @param transfers transfers for the dictionary vectors
+   * @param offsets dictionary offsets based on the number of threaded delta batches
+   * @param orderings orderings for sorting the dictionary values
+   * @param mappings mappings from the local threaded batch dictionary to the global dictionary
+   * @param batch the batch number
+   */
+<span class="nc" id="L1048">  private class DictionaryMerger(</span>
+<span class="nc" id="L1049">      readers: Array[ArrowAttributeReader],</span>
+<span class="nc" id="L1050">      transfers: Array[TransferPair],</span>
+<span class="nc" id="L1051">      offsets: Array[Int],</span>
+<span class="nc" id="L1052">      orderings: Array[Ordering[AnyRef]],</span>
+<span class="nc" id="L1053">      val mappings: Array[java.util.HashMap[Integer, Integer]],</span>
+<span class="nc" id="L1054">      val batch: Int</span>
+<span class="nc" id="L1055">    ) extends Ordered[DictionaryMerger] {</span>
+
+<span class="nc" id="L1057">    private var current: Int = 0</span>
+<span class="nc" id="L1058">    private var _index: Int = 0</span>
+<span class="nc" id="L1059">    private var _value: AnyRef = _</span>
+
+    /**
+     * The read position of the current dictionary
+     *
+     * @return
+     */
+<span class="nc" id="L1066">    def index: Int = _index</span>
+
+    /**
+     * The current dictionary value
+     *
+     * @return
+     */
+<span class="nc" id="L1073">    def value: AnyRef = _value</span>
+
+    /**
+     * The global offset of the current dictionary, based on the batch threading and the current read position
+     *
+     * @return
+     */
+<span class="nc" id="L1080">    def offset: Int = offsets(current) + _index</span>
+
+    /**
+     * Set the current dictionary to operate on, and reads the first value
+     *
+     * @param i dictionary index
+     * @return true if the dictionary has any values to read
+     */
+    def setCurrent(i: Int): Boolean = {
+<span class="nc" id="L1089">      current = i</span>
+<span class="nc" id="L1090">      _index = -1</span>
+<span class="nc" id="L1091">      advance()</span>
+    }
+
+    /**
+     * Transfer the current dictionary/value to a new vector
+     *
+     * @param to destination index to transfer to
+     */
+<span class="nc" id="L1099">    def transfer(to: Int): Unit = transfers(current).copyValueSafe(_index, to)</span>
+
+    /**
+     * Get the reverse global mapping for the current dictionary and value
+     *
+     * @return
+     */
+<span class="nc" id="L1106">    def remap: Integer = mappings(current).get(_index)</span>
+
+    /**
+     * Read the next value from the current dictionary. Closes the current dictionary if there are no more values.
+     *
+     * @return true if there are more values
+     */
+    def advance(): Boolean = {
+<span class="nc" id="L1114">      _index += 1</span>
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">      if (readers(current).getValueCount &gt; _index) {</span>
+<span class="nc" id="L1116">        _value = readers(current).apply(_index)</span>
+<span class="nc" id="L1117">        true</span>
+      } else {
+<span class="nc" id="L1119">        _value = null</span>
+<span class="nc" id="L1120">        CloseWithLogging(readers(current).vector)</span>
+<span class="nc" id="L1121">        false</span>
+      }
+    }
+
+<span class="nc" id="L1125">    override def compare(that: DictionaryMerger): Int = orderings(current).compare(_value, that._value)</span>
+  }
+
+  /**
+    * Writes out a 4-byte int with the batch length, then a single batch
+    *
+    * @param vector vector
+    */
+<span class="nc" id="L1133">  private class BatchWriter(vector: FieldVector, ipcOpts: IpcOption) extends Closeable {</span>
+
+<span class="nc" id="L1135">    private val root = createRoot(vector)</span>
+<span class="nc" id="L1136">    private val os = new ByteArrayOutputStream()</span>
+<span class="nc" id="L1137">    private val writer = new ArrowStreamWriter(root, Provider, Channels.newChannel(os), ipcOpts)</span>
+<span class="nc" id="L1138">    writer.start() // start the writer - we'll discard the metadata later, as we only care about the record batches</span>
+
+<span class="nc bnc" id="L1140" title="All 2 branches missed.">    logger.trace(s&quot;write schema: ${vector.getField}&quot;)</span>
+
+    def writeBatch(count: Int, to: OutputStream): Unit = {
+<span class="nc" id="L1143">      os.reset()</span>
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">      if (count &lt; 1) {</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">        logger.trace(&quot;writing 0 bytes&quot;)</span>
+<span class="nc" id="L1146">        to.write(ByteArrays.toBytes(0))</span>
+      } else {
+<span class="nc" id="L1148">        vector.setValueCount(count)</span>
+<span class="nc" id="L1149">        root.setRowCount(count)</span>
+<span class="nc" id="L1150">        writer.writeBatch()</span>
+<span class="nc bnc" id="L1151" title="All 2 branches missed.">        logger.trace(s&quot;writing ${os.size} bytes&quot;)</span>
+<span class="nc" id="L1152">        to.write(ByteArrays.toBytes(os.size()))</span>
+<span class="nc" id="L1153">        os.writeTo(to)</span>
+      }
+    }
+
+    override def close(): Unit = {
+<span class="nc" id="L1158">      CloseWithLogging(writer)</span>
+<span class="nc" id="L1159">      CloseWithLogging(root) // also closes the vector</span>
+    }
+  }
+
+<span class="nc" id="L1163">  private class ReducingIterator(</span>
+<span class="nc" id="L1164">      sft: SimpleFeatureType,</span>
+<span class="nc" id="L1165">      dictionaryFields: Seq[String],</span>
+<span class="nc" id="L1166">      encoding: SimpleFeatureEncoding,</span>
+<span class="nc" id="L1167">      ipcOpts: IpcOption,</span>
+<span class="nc" id="L1168">      sort: Option[(String, Boolean)],</span>
+<span class="nc" id="L1169">      sorted: Boolean,</span>
+<span class="nc" id="L1170">      batchSize: Int,</span>
+<span class="nc" id="L1171">      deltas: CloseableIterator[Array[Byte]]</span>
+<span class="nc" id="L1172">    ) extends CloseableIterator[Array[Byte]] {</span>
+
+<span class="nc bnc" id="L1174" title="All 4 branches missed.">    private lazy val reduced = {</span>
+<span class="nc" id="L1175">      try {</span>
+        val grouped = scala.collection.mutable.Map.empty[Long, scala.collection.mutable.ArrayBuilder[Array[Byte]]]
+        while (deltas.hasNext) {
+          val delta = deltas.next
+<span class="nc" id="L1179">          grouped.getOrElseUpdate(ByteArrays.readLong(delta), Array.newBuilder) += delta</span>
+        }
+        val threaded = Array.ofDim[Array[Array[Byte]]](grouped.size)
+        var i = 0
+<span class="nc bnc" id="L1183" title="All 2 branches missed.">        grouped.foreach { case (_, builder) =&gt; threaded(i) = builder.result; i += 1 }</span>
+        logger.trace(s&quot;merging delta batches from ${threaded.length} thread(s)&quot;)
+        val dictionaries = mergeDictionaries(sft, dictionaryFields, threaded, encoding)
+        if (sorted || sort.isEmpty) {
+          reduceNoSort(sft, dictionaryFields, encoding, ipcOpts, dictionaries, sort, batchSize, threaded)
+        } else {
+          val Some((s, r)) = sort
+          reduceWithSort(sft, dictionaryFields, encoding, ipcOpts, dictionaries, s, r, batchSize, threaded)
+        }
+      } catch {
+<span class="nc" id="L1193">        case NonFatal(e) =&gt;</span>
+          // if we get an error, re-throw it on next()
+<span class="nc" id="L1195">          new CloseableIterator[Array[Byte]] {</span>
+<span class="nc" id="L1196">            override def hasNext: Boolean = true</span>
+<span class="nc" id="L1197">            override def next(): Array[Byte] = throw e</span>
+<span class="nc" id="L1198">            override def close(): Unit = {}</span>
+          }
+      }
+    }
+
+<span class="nc" id="L1203">    override def hasNext: Boolean = reduced.hasNext</span>
+
+<span class="nc" id="L1205">    override def next(): Array[Byte] = reduced.next()</span>
+
+<span class="nc" id="L1207">    override def close(): Unit = CloseWithLogging(deltas, reduced)</span>
+  }
+
+<span class="nc" id="L1210">  private class RawIterator(</span>
+<span class="nc" id="L1211">      sft: SimpleFeatureType,</span>
+<span class="nc" id="L1212">      dictionaryFields: Seq[String],</span>
+<span class="nc" id="L1213">      encoding: SimpleFeatureEncoding,</span>
+<span class="nc" id="L1214">      ipcOpts: IpcOption,</span>
+<span class="nc" id="L1215">      sort: Option[(String, Boolean)],</span>
+<span class="nc" id="L1216">      deltas: CloseableIterator[Array[Byte]]</span>
+<span class="nc" id="L1217">    ) extends CloseableIterator[Array[Byte]] {</span>
+
+<span class="nc bnc" id="L1219" title="All 4 branches missed.">    private lazy val reduced = {</span>
+<span class="nc" id="L1220">      try {</span>
+        // write out an empty batch so that we get the header and dictionaries
+        var i = -1L
+        val dictionaries = dictionaryFields.map { name =&gt;
+<span class="nc" id="L1224">          val descriptor = sft.getDescriptor(name)</span>
+<span class="nc bnc" id="L1225" title="All 2 branches missed.">          val binding = if (descriptor.isList) { descriptor.getListType() } else { descriptor.getType.getBinding }</span>
+          // delta dicts are encoded as int32s since we don't know the size up front
+<span class="nc" id="L1227">          val enc = new DictionaryEncoding({i += 1; i}, true, new ArrowType.Int(32, true))</span>
+<span class="nc" id="L1228">          name -&gt; new ArrowDictionaryArray(sft.getTypeName, enc, Array.empty, 0, binding.asInstanceOf[Class[AnyRef]])</span>
+        }.toMap
+        val header = WithClose(SimpleFeatureVector.create(sft, dictionaries, encoding, 0)) { vector =&gt;
+<span class="nc" id="L1231">          writeHeaderAndFirstBatch(vector, dictionaries, ipcOpts, sort, 0)</span>
+        }
+        CloseWithLogging(dictionaries.values)
+        val length = Array.ofDim[Byte](4)
+        ByteArrays.writeInt(header.length, length)
+<span class="nc" id="L1236">        Iterator(length, header) ++ deltas</span>
+      } catch {
+<span class="nc" id="L1238">        case NonFatal(e) =&gt;</span>
+          // if we get an error, re-throw it on next()
+<span class="nc" id="L1240">          new Iterator[Array[Byte]] {</span>
+<span class="nc" id="L1241">            override def hasNext: Boolean = true</span>
+<span class="nc" id="L1242">            override def next(): Array[Byte] = throw e</span>
+          }
+      }
+    }
+
+<span class="nc" id="L1247">    override def hasNext: Boolean = reduced.hasNext</span>
+
+<span class="nc" id="L1249">    override def next(): Array[Byte] = reduced.next()</span>
+
+<span class="nc" id="L1251">    override def close(): Unit = CloseWithLogging(deltas)</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

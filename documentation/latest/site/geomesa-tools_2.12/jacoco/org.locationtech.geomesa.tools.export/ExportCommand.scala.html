@@ -1,0 +1,688 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ExportCommand.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Tools</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.tools.export</a> &gt; <span class="el_source">ExportCommand.scala</span></div><h1>ExportCommand.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.tools.`export`
+
+import com.beust.jcommander.{Parameter, ParameterException}
+import com.typesafe.scalalogging.LazyLogging
+import org.apache.commons.io.FilenameUtils
+import org.apache.commons.io.output.CountingOutputStream
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileContext, Path}
+import org.apache.hadoop.mapreduce.Job
+import org.geotools.api.data.{DataStore, FileDataStore, Query}
+import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+import org.geotools.api.filter.Filter
+import org.geotools.api.filter.sort.SortOrder
+import org.geotools.filter.text.ecql.ECQL
+import org.geotools.util.factory.Hints
+import org.locationtech.geomesa.features.SerializationOption
+import org.locationtech.geomesa.features.exporters.FileSystemExporter.{OrcFileSystemExporter, ParquetFileSystemExporter}
+import org.locationtech.geomesa.features.exporters._
+import org.locationtech.geomesa.index.conf.QueryHints
+import org.locationtech.geomesa.index.geoserver.ViewParams
+import org.locationtech.geomesa.index.iterators.BinAggregatingScan
+import org.locationtech.geomesa.index.planning.QueryRunner
+import org.locationtech.geomesa.jobs.JobResult.{JobFailure, JobSuccess}
+import org.locationtech.geomesa.jobs.{GeoMesaConfigurator, JobResult}
+import org.locationtech.geomesa.tools.Command.CommandException
+import org.locationtech.geomesa.tools.DistributedRunParam.RunModes
+import org.locationtech.geomesa.tools._
+import org.locationtech.geomesa.tools.export.ExportCommand.{ChunkedExporter, ExportOptions, ExportParams, Exporter}
+import org.locationtech.geomesa.tools.utils.ParameterConverters.{BytesConverter, ExportFormatConverter}
+import org.locationtech.geomesa.tools.utils.{JobRunner, NoopParameterSplitter, Prompt, TerminalCallback}
+import org.locationtech.geomesa.utils.collection.CloseableIterator
+import org.locationtech.geomesa.utils.io.fs.FileSystemDelegate.{CreateMode, FileHandle}
+import org.locationtech.geomesa.utils.io.fs.LocalDelegate.StdInHandle
+import org.locationtech.geomesa.utils.io.{FileSizeEstimator, PathUtils, WithClose}
+
+import java.io._
+import java.util.Collections
+import java.util.zip.GZIPOutputStream
+import scala.annotation.tailrec
+import scala.util.control.NonFatal
+
+<span class="nc" id="L50">trait ExportCommand[DS &lt;: DataStore] extends DataStoreCommand[DS]</span>
+    with DistributedCommand with InteractiveCommand /*with MethodProfiling*/ {
+
+  import ExportCommand.CountKey
+
+<span class="nc" id="L55">  override val name = &quot;export&quot;</span>
+  override def params: ExportParams
+
+<span class="nc" id="L58">  override def libjarsFiles: Seq[String] = Seq(&quot;org/locationtech/geomesa/tools/export-libjars.list&quot;)</span>
+
+  override def execute(): Unit = {
+<span class="nc" id="L61">    val start = System.currentTimeMillis()</span>
+<span class="nc" id="L62">    withDataStore(export) match {</span>
+<span class="nc bnc" id="L63" title="All 2 branches missed.">      case JobSuccess(message, counts) =&gt;</span>
+<span class="nc" id="L64">        val count = counts.get(CountKey).map(c =&gt; s&quot; for $c features&quot;).getOrElse(&quot;&quot;)</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">        Command.user.info(s&quot;$message$count in ${System.currentTimeMillis() - start}ms&quot;)</span>
+
+<span class="nc bnc" id="L67" title="All 2 branches missed.">      case JobFailure(message) =&gt;</span>
+<span class="nc bnc" id="L68" title="All 2 branches missed.">        Command.user.info(s&quot;Feature export failed in ${System.currentTimeMillis() - start}ms: $message&quot;)</span>
+<span class="nc" id="L69">        throw new CommandException(message) // propagate out and return an exit code error</span>
+    }
+  }
+
+  private def export(ds: DS): JobResult = {
+    // for file data stores, handle setting the default type name so the user doesn't have to
+    for {
+<span class="nc bnc" id="L76" title="All 4 branches missed.">      p &lt;- Option(params).collect { case p: ProvidedTypeNameParam =&gt; p }</span>
+<span class="nc bnc" id="L77" title="All 4 branches missed.">      f &lt;- Option(ds).collect { case f: FileDataStore =&gt; f }</span>
+<span class="nc" id="L78">    } { p.featureName = f.getSchema.getTypeName }</span>
+
+<span class="nc" id="L80">    val options = ExportOptions(params)</span>
+<span class="nc" id="L81">    val remote = options.file.exists(PathUtils.isRemote)</span>
+<span class="nc" id="L82">    val reducers = Option(params.reducers).map(_.intValue()).getOrElse(-1)</span>
+<span class="nc bnc" id="L83" title="All 2 branches missed.">    val mode = params.mode.getOrElse(if (reducers == -1) { RunModes.Local } else { RunModes.Distributed })</span>
+<span class="nc" id="L84">    val chunks = Option(params.chunkSize).map(_.longValue())</span>
+
+    // do some validation up front
+<span class="nc bnc" id="L87" title="All 4 branches missed.">    if (options.file.isEmpty &amp;&amp; !options.format.streaming) {</span>
+<span class="nc" id="L88">      throw new ParameterException(s&quot;Format '${options.format}' requires file-based output, please use --output&quot;)</span>
+<span class="nc bnc" id="L89" title="All 8 branches missed.">    } else if (remote &amp;&amp; options.format == ExportFormat.Shp) {</span>
+<span class="nc" id="L90">      throw new ParameterException(&quot;Shape file export is not supported for distributed file systems&quot;)</span>
+<span class="nc bnc" id="L91" title="All 8 branches missed.">    } else if (!remote &amp;&amp; mode == RunModes.Distributed) {</span>
+<span class="nc" id="L92">      throw new ParameterException(&quot;Distributed export requires an output file in a distributed file system&quot;)</span>
+<span class="nc bnc" id="L93" title="All 8 branches missed.">    } else if (mode == RunModes.Distributed &amp;&amp; params.maxFeatures != null) {</span>
+<span class="nc" id="L94">      throw new ParameterException(&quot;Distributed export does not support --max-features&quot;)</span>
+    }
+
+<span class="nc" id="L97">    val sft = ds.getSchema(params.featureName)</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">    if (sft == null) {</span>
+<span class="nc" id="L99">      throw new ParameterException(s&quot;Schema '${params.featureName}' does not exist in the store&quot;)</span>
+    }
+
+<span class="nc" id="L102">    val query = ExportCommand.createQuery(sft, params)</span>
+
+<span class="nc" id="L104">    mode match {</span>
+<span class="nc bnc" id="L105" title="All 6 branches missed.">      case RunModes.Local =&gt;</span>
+<span class="nc" id="L106">        options.file.map(PathUtils.getHandle).foreach { file =&gt;</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">          if (file.exists) {</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">            if (params.force) {</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">              Command.user.warn(s&quot;Output file '${file.path}' exists - deleting it&quot;)</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">            } else if (!Prompt.confirm(s&quot;WARNING Output file '${file.path}' exists, delete it and continue (y/n)? &quot;)) {</span>
+<span class="nc" id="L111">              throw new ParameterException(s&quot;Output file '${file.path}' exists&quot;)</span>
+            }
+<span class="nc" id="L113">            file.delete()</span>
+          }
+        }
+<span class="nc" id="L116">        val exporter = chunks match {</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">          case None    =&gt; new Exporter(options, query.getHints)</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">          case Some(c) =&gt; new ChunkedExporter(options, query.getHints, c)</span>
+        }
+<span class="nc bnc" id="L120" title="All 2 branches missed.">        val count = try { export(ds, query, exporter, !params.suppressEmpty) } finally { exporter.close() }</span>
+<span class="nc" id="L121">        val outFile = options.file match {</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">          case None =&gt; &quot;standard out&quot;</span>
+<span class="nc bnc" id="L123" title="All 4 branches missed.">          case Some(f) if chunks.isDefined =&gt; PathUtils.getBaseNameAndExtension(f).productIterator.mkString(&quot;_*&quot;)</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">          case Some(f) =&gt; f</span>
+        }
+
+<span class="nc" id="L127">        JobSuccess(s&quot;Feature export complete to $outFile&quot;, count.map(CountKey -&gt; _).toMap)</span>
+
+<span class="nc bnc" id="L129" title="All 6 branches missed.">      case RunModes.Distributed =&gt;</span>
+<span class="nc" id="L130">        val job = Job.getInstance(new Configuration, &quot;GeoMesa Tools Export&quot;)</span>
+
+        // for remote jobs, don't push down format transforms, to enable counting and global sorting
+<span class="nc" id="L133">        val hints = new Hints(query.getHints)</span>
+<span class="nc" id="L134">        ExportCommand.disableAggregation(sft, query.getHints)</span>
+
+<span class="nc" id="L136">        configure(job, ds, query) // note: do this first so that input format is set for the TotalOrderPartitioner</span>
+
+        // note: these confs should be set by the input format
+<span class="nc" id="L139">        val reduce = Seq(GeoMesaConfigurator.Keys.FeatureReducer, GeoMesaConfigurator.Keys.Sorting).filter { key =&gt;</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">          job.getConfiguration.get(key) != null</span>
+        }
+
+<span class="nc bnc" id="L143" title="All 4 branches missed.">        if (reducers &lt; 1 &amp;&amp; reduce.nonEmpty) {</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">          if (reduce.contains(GeoMesaConfigurator.Keys.Sorting)) {</span>
+<span class="nc" id="L145">            throw new ParameterException(&quot;Distributed export sorting requires --num-reducers&quot;)</span>
+          } else {
+<span class="nc" id="L147">            throw new ParameterException(s&quot;Distributed export format '${options.format}' requires --num-reducers&quot;)</span>
+          }
+        }
+
+        // must be some due to our remote check
+<span class="nc" id="L152">        val file = options.file.getOrElse(throw new IllegalStateException(&quot;file should be Some&quot;))</span>
+<span class="nc" id="L153">        val output = new Path(PathUtils.getUrl(file).toURI).getParent</span>
+
+        // file output format doesn't generally let you write to an existing directory
+<span class="nc" id="L156">        val context = FileContext.getFileContext(output.toUri, job.getConfiguration)</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        if (context.util.exists(output)) {</span>
+<span class="nc" id="L158">          val warning = s&quot;Output directory '$output' exists - files may be overwritten&quot;</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">          if (params.force) {</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            Command.user.warn(warning)</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">          } else if (!Prompt.confirm(s&quot;WARNING $warning. Continue anyway (y/n)? &quot;)) {</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (Prompt.confirm(&quot;WARNING DATA MAY BE LOST - delete directory and proceed with export (y/n)? &quot;)) {</span>
+<span class="nc" id="L163">              context.delete(output, true)</span>
+            } else {
+<span class="nc" id="L165">              throw new ParameterException(s&quot;Output directory '$output' exists&quot;)</span>
+            }
+          }
+        }
+
+<span class="nc" id="L170">        val filename = FilenameUtils.getName(file)</span>
+
+        // note: use our original hints, which have the aggregating keys
+<span class="nc" id="L173">        ExportJob.configure(job, connection, sft, hints, filename, output, options.format, options.headers,</span>
+<span class="nc" id="L174">          chunks, options.gzip, reducers, libjars(options.format), libjarsPaths)</span>
+
+<span class="nc" id="L176">        val reporter = TerminalCallback()</span>
+<span class="nc" id="L177">        JobRunner.run(job, reporter, ExportJob.Counters.mapping(job), ExportJob.Counters.reducing(job)).merge {</span>
+<span class="nc" id="L178">          Some(JobSuccess(s&quot;Feature export complete to $output&quot;, Map(CountKey -&gt; ExportJob.Counters.count(job))))</span>
+        }
+
+<span class="nc" id="L181">      case _ =&gt; throw new UnsupportedOperationException() // someone added a run mode and didn't implement it here...</span>
+    }
+  }
+
+  /**
+   * Hook for overriding export
+   *
+   * @param ds data store
+   * @param query query
+   * @param exporter exporter
+   * @param writeEmptyFiles export empty files or no
+   * @return
+   */
+  protected def export(ds: DS, query: Query, exporter: FeatureExporter, writeEmptyFiles: Boolean): Option[Long] = {
+<span class="nc" id="L195">    try {</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">      Command.user.info(&quot;Running export - please wait...&quot;)</span>
+<span class="nc" id="L197">      val features = ds.getFeatureSource(query.getTypeName).getFeatures(query)</span>
+<span class="nc" id="L198">      WithClose(CloseableIterator(features.features())) { iter =&gt;</span>
+<span class="nc bnc" id="L199" title="All 4 branches missed.">        if (writeEmptyFiles || iter.hasNext) {</span>
+<span class="nc" id="L200">          exporter.start(features.getSchema)</span>
+<span class="nc" id="L201">          exporter.export(iter)</span>
+        } else {
+<span class="nc" id="L203">          Some(0L)</span>
+        }
+      }
+    } catch {
+<span class="nc bnc" id="L207" title="All 2 branches missed.">      case NonFatal(e) =&gt;</span>
+<span class="nc" id="L208">        throw new RuntimeException(&quot;Could not execute export query. Please ensure &quot; +</span>
+<span class="nc" id="L209">            &quot;that all arguments are correct&quot;, e)</span>
+    }
+  }
+
+  /**
+    * Configure an export job, with the appropriate input format for this particular data store. Must be
+    * overridden to provide distributed export support
+    *
+    * @return
+    */
+  protected def configure(job: Job, ds: DS, query: Query): Unit =
+<span class="nc" id="L220">    throw new ParameterException(&quot;Distributed export is not supported by this store, please use --run-mode local&quot;)</span>
+
+  /**
+    * Get the list of libjars files for a given format
+    *
+    * @param format export format
+    * @return
+    */
+  private def libjars(format: ExportFormat): Seq[String] = {
+<span class="nc" id="L229">    val path = s&quot;org/locationtech/geomesa/tools/export-libjars-$format.list&quot;</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">    Seq(path).filter(getClass.getClassLoader.getResource(_) != null) ++ libjarsFiles</span>
+  }
+}
+
+<span class="nc bnc" id="L234" title="All 4 branches missed.">object ExportCommand extends LazyLogging {</span>
+
+  import org.locationtech.geomesa.index.conf.QueryHints.RichHints
+  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L241">  private val CountKey = &quot;count&quot;</span>
+
+  /**
+    * Create the query to execute
+    *
+    * @param sft simple feature type
+    * @param params parameters
+    * @return
+    */
+  def createQuery(sft: SimpleFeatureType, params: ExportParams): Query = {
+<span class="nc bnc" id="L251" title="All 4 branches missed.">    val typeName = Option(params).collect { case p: TypeNameParam =&gt; p.featureName }.orNull</span>
+<span class="nc" id="L252">    val filter = Option(params.cqlFilter).getOrElse(Filter.INCLUDE)</span>
+
+<span class="nc" id="L254">    val query = new Query(typeName, filter)</span>
+<span class="nc" id="L255">    val hints = query.getHints</span>
+<span class="nc" id="L256">    Option(params.maxFeatures).map(Int.unbox).foreach(query.setMaxFeatures)</span>
+<span class="nc bnc" id="L257" title="All 4 branches missed.">    Option(params).collect { case p: OptionalIndexParam =&gt; p }.foreach { p =&gt;</span>
+<span class="nc" id="L258">      Option(p.index).foreach { index =&gt;</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        logger.debug(s&quot;Using index $index&quot;)</span>
+<span class="nc" id="L260">        hints.put(QueryHints.QUERY_INDEX, index)</span>
+      }
+    }
+
+<span class="nc" id="L264">    Option(params.hints).foreach { hintStrings =&gt;</span>
+<span class="nc" id="L265">      hints.put(Hints.VIRTUAL_TABLE_PARAMETERS, hintStrings)</span>
+<span class="nc" id="L266">      ViewParams.setHints(query)</span>
+    }
+
+<span class="nc bnc" id="L269" title="All 6 branches missed.">    if (params.outputFormat == ExportFormat.Arrow) {</span>
+<span class="nc" id="L270">      hints.put(QueryHints.ARROW_ENCODE, java.lang.Boolean.TRUE)</span>
+<span class="nc bnc" id="L271" title="All 6 branches missed.">    } else if (params.outputFormat == ExportFormat.Bin) {</span>
+      // if not specified in hints, set it here to trigger the bin query
+<span class="nc bnc" id="L273" title="All 2 branches missed.">      if (!hints.containsKey(QueryHints.BIN_TRACK)) {</span>
+<span class="nc" id="L274">        hints.put(QueryHints.BIN_TRACK, &quot;id&quot;)</span>
+      }
+<span class="nc bnc" id="L276" title="All 2 branches missed.">      if (!hints.containsKey(QueryHints.BIN_DTG)) {</span>
+<span class="nc" id="L277">        sft.getDtgField.foreach(hints.put(QueryHints.BIN_DTG, _))</span>
+      }
+<span class="nc bnc" id="L279" title="All 6 branches missed.">    } else if (params.outputFormat == ExportFormat.Leaflet) {</span>
+<span class="nc" id="L280">      configureLeafletExport(params)</span>
+    }
+
+    val attributes: Array[String] = {
+<span class="nc" id="L284">      val combined = params.attributes.asScala ++ params.transforms.asScala</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">      if (combined.nonEmpty) {</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        val (id, attributes) = combined.partition(_.equalsIgnoreCase(&quot;id&quot;))</span>
+<span class="nc bnc" id="L287" title="All 4 branches missed.">        if (id.isEmpty &amp;&amp; !hints.containsKey(QueryHints.ARROW_INCLUDE_FID)) {</span>
+          // note: we also use this hint for delimited text export
+<span class="nc" id="L289">          hints.put(QueryHints.ARROW_INCLUDE_FID, java.lang.Boolean.FALSE)</span>
+        }
+<span class="nc" id="L291">        attributes.toArray</span>
+<span class="nc bnc" id="L292" title="All 6 branches missed.">      } else if (params.outputFormat == ExportFormat.Bin) {</span>
+<span class="nc" id="L293">        BinAggregatingScan.propertyNames(hints, sft).toArray</span>
+      } else {
+<span class="nc" id="L295">        null // all props</span>
+      }
+    }
+<span class="nc" id="L298">    query.setPropertyNames(attributes: _*)</span>
+
+<span class="nc bnc" id="L300" title="All 2 branches missed.">    if (!params.sortFields.isEmpty) {</span>
+<span class="nc" id="L301">      val fields = params.sortFields.asScala.toSeq</span>
+<span class="nc bnc" id="L302" title="All 4 branches missed.">      if (fields.exists(a =&gt; sft.indexOf(a) == -1)) {</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        val errors = fields.filter(a =&gt; sft.indexOf(a) == -1)</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        throw new ParameterException(s&quot;Invalid sort attribute${if (errors.lengthCompare(1) == 0) &quot;&quot; else &quot;s&quot;}: &quot; +</span>
+<span class="nc" id="L305">            errors.mkString(&quot;, &quot;))</span>
+      }
+<span class="nc bnc" id="L307" title="All 2 branches missed.">      val order = if (params.sortDescending) { SortOrder.DESCENDING } else { SortOrder.ASCENDING }</span>
+<span class="nc" id="L308">      query.setSortBy(fields.map(f =&gt; org.locationtech.geomesa.filter.ff.sort(f, order)): _*)</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">    } else if (hints.isArrowQuery) {</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">      hints.getArrowSort.foreach { case (f, r) =&gt;</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        val order = if (r) { SortOrder.DESCENDING } else { SortOrder.ASCENDING }</span>
+<span class="nc" id="L312">        query.setSortBy(org.locationtech.geomesa.filter.ff.sort(f, order))</span>
+      }
+    }
+
+<span class="nc bnc" id="L316" title="All 2 branches missed.">    logger.debug(s&quot;Applying CQL filter ${ECQL.toCQL(filter)}&quot;)</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">    logger.debug(s&quot;Applying transform ${Option(attributes).map(_.mkString(&quot;,&quot;)).orNull}&quot;)</span>
+
+<span class="nc" id="L319">    QueryRunner.configureQuery(sft, query)</span>
+  }
+
+  /**
+   * Configure parameters for a leaflet export
+   *
+   * @param params params
+   * @throws ParameterException if params are not valid for a leaflet export
+   */
+  @throws(classOf[ParameterException])
+  private def configureLeafletExport(params: ExportParams): Unit = {
+<span class="nc" id="L330">    val large = &quot;The Leaflet map may exhibit performance issues when displaying large numbers of features. For a &quot; +</span>
+        &quot;more robust solution, consider using GeoServer.&quot;
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    if (params.maxFeatures == null) {</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">      Command.user.warn(large)</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">      Command.user.warn(s&quot;Limiting max features to ${LeafletMapExporter.MaxFeatures}. To override, &quot; +</span>
+<span class="nc" id="L335">          &quot;please use --max-features&quot;)</span>
+<span class="nc" id="L336">      params.maxFeatures = LeafletMapExporter.MaxFeatures</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">    } else if (params.maxFeatures &gt; LeafletMapExporter.MaxFeatures) {</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">      if (params.force) {</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        Command.user.warn(large)</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">      } else if (!Prompt.confirm(s&quot;$large Would you like to continue anyway (y/n)? &quot;)) {</span>
+<span class="nc" id="L341">        throw new ParameterException(&quot;Terminating execution&quot;)</span>
+      }
+    }
+
+<span class="nc bnc" id="L345" title="All 2 branches missed.">    if (params.gzip != null) {</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">      Command.user.warn(&quot;Ignoring gzip parameter for Leaflet export&quot;)</span>
+<span class="nc" id="L347">      params.gzip = null</span>
+    }
+
+<span class="nc bnc" id="L350" title="All 2 branches missed.">    if (params.file == null) {</span>
+<span class="nc" id="L351">      params.file = sys.props(&quot;user.dir&quot;)</span>
+    }
+<span class="nc bnc" id="L353" title="All 2 branches missed.">    if (PathUtils.isRemote(params.file)) {</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">      if (params.file.endsWith(&quot;/&quot;)) {</span>
+<span class="nc" id="L355">        params.file = s&quot;${params.file}index.html&quot;</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">      } else if (FilenameUtils.indexOfExtension(params.file) == -1) {</span>
+<span class="nc" id="L357">        params.file = s&quot;${params.file}/index.html&quot;</span>
+      }
+    } else {
+<span class="nc" id="L360">      val file = new File(params.file)</span>
+<span class="nc bnc" id="L361" title="All 6 branches missed.">      val destination = if (file.isDirectory || (!file.exists &amp;&amp; file.getName.indexOf(&quot;.&quot;) == -1)) {</span>
+<span class="nc" id="L362">        new File(file, &quot;index.html&quot;)</span>
+      } else {
+<span class="nc" id="L364">        file</span>
+      }
+<span class="nc" id="L366">      params.file = destination.getAbsolutePath</span>
+    }
+  }
+  /**
+    * Disable hints for aggregating scans by removing them, and moving any aggregating sort hints to
+    * regular sort hints
+    *
+    * @param sft simple feature type
+    * @param hints hints
+    * @return
+    */
+  private def disableAggregation(sft: SimpleFeatureType, hints: Hints): Unit = {
+<span class="nc bnc" id="L378" title="All 2 branches missed.">    if (hints.isArrowQuery) {</span>
+<span class="nc" id="L379">      hints.remove(QueryHints.ARROW_ENCODE)</span>
+<span class="nc" id="L380">      val sort = hints.remove(QueryHints.ARROW_SORT_FIELD).asInstanceOf[String]</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">      if (sort != null) {</span>
+<span class="nc" id="L382">        val reverse = Option(hints.remove(QueryHints.ARROW_SORT_REVERSE).asInstanceOf[java.lang.Boolean])</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        val order = if (reverse.exists(_.booleanValue)) { SortOrder.DESCENDING } else { SortOrder.ASCENDING }</span>
+<span class="nc" id="L384">        val hint = org.locationtech.geomesa.filter.ff.sort(sort, order)</span>
+<span class="nc" id="L385">        hints.put(QueryHints.Internal.SORT_FIELDS, QueryHints.Internal.toSortHint(Array(hint)))</span>
+      }
+<span class="nc bnc" id="L387" title="All 2 branches missed.">    } else if (hints.isBinQuery) {</span>
+<span class="nc" id="L388">      hints.remove(QueryHints.BIN_TRACK)</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">      if (hints.isBinSorting) {</span>
+<span class="nc" id="L390">        hints.getBinDtgField.orElse(sft.getDtgField).foreach { dtg =&gt;</span>
+<span class="nc" id="L391">          val hint = org.locationtech.geomesa.filter.ff.sort(dtg, SortOrder.ASCENDING)</span>
+<span class="nc" id="L392">          hints.put(QueryHints.Internal.SORT_FIELDS, QueryHints.Internal.toSortHint(Array(hint)))</span>
+        }
+      }
+    }
+  }
+
+  /**
+   * Options from the input params, in a more convenient format
+   *
+   * @param format output format
+   * @param file file path (or stdout)
+   * @param gzip compression
+   * @param headers headers (for delimited text only)
+   * @param writeEmptyFiles write empty files (i.e. headers, etc), or suppress all output
+   */
+<span class="nc bnc" id="L407" title="All 42 branches missed.">  case class ExportOptions(</span>
+<span class="nc" id="L408">    format: ExportFormat,</span>
+<span class="nc" id="L409">    file: Option[String],</span>
+<span class="nc" id="L410">    gzip: Option[Int],</span>
+<span class="nc" id="L411">    headers: Boolean,</span>
+<span class="nc" id="L412">    writeEmptyFiles: Boolean</span>
+  )
+
+<span class="nc" id="L415">  object ExportOptions {</span>
+    def apply(params: ExportParams): ExportOptions =
+<span class="nc bnc" id="L417" title="All 4 branches missed.">      ExportOptions(params.outputFormat, Option(params.file), Option(params.gzip).map(_.intValue), !params.noHeader, !params.suppressEmpty)</span>
+  }
+
+  /**
+    * Single exporter that handles the command options and delegates to the correct implementation
+    *
+    * @param options options
+    * @param hints query hints
+    */
+<span class="nc" id="L426">  class Exporter(options: ExportOptions, hints: Hints) extends FeatureExporter {</span>
+
+    // used only for streaming export formats
+<span class="nc bnc" id="L429" title="All 4 branches missed.">    private lazy val stream: ByteCounterStream = {</span>
+      // avro compression is handled differently, see AvroExporter below
+<span class="nc bnc" id="L431" title="All 12 branches missed.">      val gzip = options.gzip.filter(_ =&gt; options.format != ExportFormat.Avro &amp;&amp; options.format != ExportFormat.AvroNative)</span>
+<span class="nc" id="L432">      val handle = options.file match {</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        case None =&gt; StdInHandle.get() // writes to std out</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        case Some(f) =&gt; PathUtils.getHandle(f)</span>
+      }
+<span class="nc bnc" id="L436" title="All 2 branches missed.">      if (options.writeEmptyFiles) {</span>
+<span class="nc" id="L437">        new ExportStream(handle, gzip)</span>
+      } else {
+<span class="nc" id="L439">        new LazyExportStream(handle, gzip)</span>
+      }
+    }
+
+    // used only for file-based export formats
+<span class="nc bnc" id="L444" title="All 4 branches missed.">    private lazy val name = options.file.getOrElse {</span>
+      // should have been validated already...
+<span class="nc" id="L446">      throw new IllegalStateException(&quot;Export format requires a file but none was specified&quot;)</span>
+    }
+
+    // noinspection ComparingUnrelatedTypes
+<span class="nc bnc" id="L450" title="All 6 branches missed.">    private lazy val fids = !Option(hints.get(QueryHints.ARROW_INCLUDE_FID)).contains(java.lang.Boolean.FALSE)</span>
+
+<span class="nc" id="L452">    private val exporter = options.format match {</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">      case ExportFormat.Arrow      =&gt; new ArrowExporter(stream, hints)</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">      case ExportFormat.Avro       =&gt; new AvroExporter(stream, options.gzip)</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">      case ExportFormat.AvroNative =&gt; new AvroExporter(stream, options.gzip, Set(SerializationOption.NativeCollections))</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">      case ExportFormat.Bin        =&gt; new BinExporter(stream, hints)</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">      case ExportFormat.Csv        =&gt; DelimitedExporter.csv(stream, options.headers, fids)</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">      case ExportFormat.Gml2       =&gt; GmlExporter.gml2(stream)</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">      case ExportFormat.Gml3       =&gt; GmlExporter(stream)</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">      case ExportFormat.Json       =&gt; new GeoJsonExporter(stream)</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">      case ExportFormat.Leaflet    =&gt; new LeafletMapExporter(stream)</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">      case ExportFormat.Null       =&gt; NullExporter</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">      case ExportFormat.Orc        =&gt; new OrcFileSystemExporter(name)</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">      case ExportFormat.Parquet    =&gt; new ParquetFileSystemExporter(name)</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">      case ExportFormat.Shp        =&gt; new ShapefileExporter(new File(name))</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">      case ExportFormat.Tsv        =&gt; DelimitedExporter.tsv(stream, options.headers, fids)</span>
+      // shouldn't happen unless someone adds a new format and doesn't implement it here
+<span class="nc" id="L468">      case _ =&gt; throw new UnsupportedOperationException(s&quot;Export for '${options.format}' is not implemented&quot;)</span>
+    }
+
+<span class="nc" id="L471">    override def start(sft: SimpleFeatureType): Unit = exporter.start(sft)</span>
+
+<span class="nc" id="L473">    override def export(features: Iterator[SimpleFeature]): Option[Long] = exporter.export(features)</span>
+
+    def bytes: Long = {
+<span class="nc bnc" id="L476" title="All 2 branches missed.">      if (options.format.streaming) {</span>
+<span class="nc" id="L477">        stream.bytes</span>
+      } else {
+<span class="nc" id="L479">        exporter match {</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">          case e: ShapefileExporter =&gt; e.bytes</span>
+<span class="nc" id="L481">          case _ =&gt; PathUtils.getHandle(name).length</span>
+        }
+      }
+    }
+
+<span class="nc" id="L486">    override def close(): Unit = exporter.close()</span>
+  }
+
+  /**
+    * Feature exporter that handles chunking output into multiple files
+    *
+    * @param options export options
+    * @param hints query hints
+    * @param chunks number of bytes to write per file
+    */
+<span class="nc bnc" id="L496" title="All 4 branches missed.">  class ChunkedExporter(options: ExportOptions, hints: Hints, chunks: Long)</span>
+<span class="nc" id="L497">      extends FeatureExporter with LazyLogging {</span>
+
+<span class="nc" id="L499">    private val names = options.file match {</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">      case None    =&gt; Iterator.continually(None)</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">      case Some(f) =&gt; new IncrementingFileName(f).map(Option.apply)</span>
+    }
+
+<span class="nc" id="L504">    private var sft: SimpleFeatureType = _</span>
+<span class="nc" id="L505">    private var exporter: Exporter = _</span>
+<span class="nc" id="L506">    private var estimator: FileSizeEstimator = _</span>
+<span class="nc" id="L507">    private var count = 0L // number of features written</span>
+<span class="nc" id="L508">    private var total = 0L // sum size of all finished chunks</span>
+
+    override def start(sft: SimpleFeatureType): Unit = {
+<span class="nc" id="L511">      this.sft = sft</span>
+<span class="nc" id="L512">      estimator = new FileSizeEstimator(chunks, 0.05f, options.format.bytesPerFeature(sft)) // 5% error threshold</span>
+<span class="nc" id="L513">      nextChunk()</span>
+    }
+
+<span class="nc" id="L516">    override def export(features: Iterator[SimpleFeature]): Option[Long] = export(features, None)</span>
+
+<span class="nc bnc" id="L518" title="All 2 branches missed.">    override def close(): Unit = if (exporter != null) { exporter.close() }</span>
+
+    private def nextChunk(): Unit = {
+<span class="nc bnc" id="L521" title="All 2 branches missed.">      if (exporter != null) {</span>
+<span class="nc" id="L522">        exporter.close()</span>
+        // adjust our estimate to account for the actual bytes written
+        // do this after closing the exporter to account for footers, batching, etc
+<span class="nc" id="L525">        val written = exporter.bytes</span>
+<span class="nc" id="L526">        estimator.update(written, count)</span>
+<span class="nc" id="L527">        total += written</span>
+      }
+<span class="nc" id="L529">      exporter = new Exporter(options.copy(file = names.next), hints)</span>
+<span class="nc" id="L530">      exporter.start(sft)</span>
+<span class="nc" id="L531">      count = 0L</span>
+    }
+
+    @tailrec
+    private def export(features: Iterator[SimpleFeature], result: Option[Long]): Option[Long] = {
+<span class="nc" id="L536">      var estimate = estimator.estimate(exporter.bytes)</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">      val counter = features.takeWhile { _ =&gt; count += 1; estimate -= 1; estimate &gt;= 0 }</span>
+<span class="nc" id="L538">      val exported = exporter.export(counter) match {</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        case None    =&gt; result</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">        case Some(c) =&gt; result.map(_ + c).orElse(Some(c))</span>
+      }
+<span class="nc bnc" id="L542" title="All 2 branches missed.">      if (features.isEmpty) {</span>
+<span class="nc" id="L543">        exported</span>
+      } else {
+        // if it's a countable format, the bytes should be available now and we can compare to our chunk size
+        // otherwise, the bytes aren't generally available until after closing the writer,
+        // so we have to go with our initial estimate and adjust after the first chunk
+<span class="nc bnc" id="L548" title="All 2 branches missed.">        if (options.format.countable) {</span>
+<span class="nc" id="L549">          val bytes = exporter.bytes</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">          if (estimator.done(bytes)) {</span>
+<span class="nc" id="L551">            nextChunk()</span>
+          } else {
+<span class="nc" id="L553">            estimator.update(bytes, count)</span>
+          }
+        } else {
+<span class="nc" id="L556">          nextChunk()</span>
+        }
+<span class="nc" id="L558">        export(features, exported)</span>
+      }
+    }
+  }
+
+  /**
+   * Export output stream, lazily instantiated
+   *
+   * @param out file handle
+   * @param gzip gzip
+   */
+<span class="nc" id="L569">  class LazyExportStream(out: FileHandle, gzip: Option[Int] = None) extends ByteCounterStream {</span>
+
+<span class="nc" id="L571">    private var stream: ExportStream = _</span>
+
+    private def ensureStream(): OutputStream = {
+<span class="nc bnc" id="L574" title="All 2 branches missed.">      if (stream == null) {</span>
+<span class="nc" id="L575">        stream = new ExportStream(out, gzip)</span>
+      }
+<span class="nc" id="L577">      stream</span>
+    }
+
+<span class="nc bnc" id="L580" title="All 2 branches missed.">    def bytes: Long = if (stream == null) { 0L } else { stream.bytes }</span>
+
+<span class="nc" id="L582">    override def write(b: Array[Byte]): Unit = ensureStream().write(b)</span>
+<span class="nc" id="L583">    override def write(b: Array[Byte], off: Int, len: Int): Unit = ensureStream().write(b, off, len)</span>
+<span class="nc" id="L584">    override def write(b: Int): Unit = ensureStream().write(b)</span>
+
+<span class="nc bnc" id="L586" title="All 2 branches missed.">    override def flush(): Unit = if (stream != null) { stream.flush() }</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">    override def close(): Unit = if (stream != null) { stream.close() }</span>
+  }
+
+  /**
+   * Export output stream
+   *
+   * @param out file handle
+   * @param gzip gzip
+   */
+<span class="nc" id="L596">  class ExportStream(out: FileHandle, gzip: Option[Int] = None) extends ByteCounterStream {</span>
+
+    // lowest level - keep track of the bytes we write
+    // do this before any compression, buffering, etc so we get an accurate count
+<span class="nc" id="L600">    private val counter = new CountingOutputStream(out.write(CreateMode.Create))</span>
+<span class="nc" id="L601">    private val stream = {</span>
+<span class="nc" id="L602">      val compressed = gzip match {</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">        case None =&gt; counter</span>
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        case Some(c) =&gt; new GZIPOutputStream(counter) { `def`.setLevel(c) } // hack to access the protected deflate level</span>
+      }
+<span class="nc" id="L606">      new BufferedOutputStream(compressed)</span>
+    }
+
+<span class="nc" id="L609">    override def bytes: Long = counter.getByteCount</span>
+
+<span class="nc" id="L611">    override def write(b: Array[Byte]): Unit = stream.write(b)</span>
+<span class="nc" id="L612">    override def write(b: Array[Byte], off: Int, len: Int): Unit = stream.write(b, off, len)</span>
+<span class="nc" id="L613">    override def write(b: Int): Unit = stream.write(b)</span>
+
+<span class="nc" id="L615">    override def flush(): Unit = stream.flush()</span>
+<span class="nc" id="L616">    override def close(): Unit = stream.close()</span>
+  }
+
+  trait ByteCounterStream extends OutputStream {
+    def bytes: Long
+  }
+
+  /**
+    * Export parameters
+    */
+<span class="nc" id="L626">  trait ExportParams extends OptionalCqlFilterParam with QueryHintsParams</span>
+      with DistributedRunParam with TypeNameParam with NumReducersParam with OptionalForceParam {
+    @Parameter(names = Array(&quot;-o&quot;, &quot;--output&quot;), description = &quot;Output to a file instead of std out&quot;)
+    var file: String = _
+
+    @Parameter(names = Array(&quot;--gzip&quot;), description = &quot;Level of gzip compression to apply to output, from 1-9&quot;)
+    var gzip: Integer = _
+
+    @Parameter(
+      names = Array(&quot;--no-header&quot;),
+      description = &quot;Export as a delimited text format (csv|tsv) without a type header&quot;)
+<span class="nc" id="L637">    var noHeader: Boolean = false</span>
+
+    @Parameter(
+      names = Array(&quot;--suppress-empty&quot;),
+      description = &quot;Suppress all output (headers, etc) if there are no features exported&quot;)
+<span class="nc" id="L642">    var suppressEmpty: Boolean = false</span>
+
+    @Parameter(
+      names = Array(&quot;-m&quot;, &quot;--max-features&quot;),
+      description = &quot;Restrict the maximum number of features returned&quot;)
+    var maxFeatures: java.lang.Integer = _
+
+    @Parameter(
+      names = Array(&quot;--attribute&quot;),
+      description = &quot;Attributes or derived expressions to export, or 'id' to include the feature ID&quot;,
+      splitter = classOf[NoopParameterSplitter])
+<span class="nc" id="L653">    var transforms: java.util.List[String] = Collections.emptyList()</span>
+
+    @Parameter(
+      names = Array(&quot;-a&quot;, &quot;--attributes&quot;),
+      description = &quot;Comma-separated attributes to export, or 'id' to include the feature ID&quot;)
+<span class="nc" id="L658">    var attributes: java.util.List[String] = Collections.emptyList()</span>
+
+    @Parameter(names = Array(&quot;--sort-by&quot;), description = &quot;Sort by the specified attributes (comma-delimited)&quot;)
+<span class="nc" id="L661">    var sortFields: java.util.List[String] = Collections.emptyList()</span>
+
+    @Parameter(
+      names = Array(&quot;--sort-descending&quot;),
+      description = &quot;Sort in descending order, instead of ascending&quot;,
+      arity = 0)
+<span class="nc" id="L667">    var sortDescending: Boolean = false</span>
+
+    @Parameter(
+      names = Array(&quot;--chunk-size&quot;),
+      description = &quot;Split the output into multiple files, by specifying the rough number of bytes to store per file&quot;,
+      converter = classOf[BytesConverter])
+    var chunkSize: java.lang.Long = _
+
+    @Parameter(
+      names = Array(&quot;-F&quot;, &quot;--output-format&quot;),
+      description = &quot;File format of output files (csv|tsv|gml|json|shp|avro|avro-native|leaflet|orc|parquet|arrow)&quot;,
+      converter = classOf[ExportFormatConverter])
+    var explicitOutputFormat: ExportFormat = _
+
+    lazy val outputFormat: ExportFormat = {
+<span class="nc bnc" id="L682" title="All 2 branches missed.">      if (explicitOutputFormat != null) { explicitOutputFormat } else {</span>
+<span class="nc" id="L683">        Option(file).flatMap(f =&gt; ExportFormat(PathUtils.getUncompressedExtension(f))).getOrElse(ExportFormat.Csv)</span>
+      }
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

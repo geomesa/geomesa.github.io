@@ -1,0 +1,369 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AccumuloIndexAdapter.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Accumulo DataStore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.accumulo.data</a> &gt; <span class="el_source">AccumuloIndexAdapter.scala</span></div><h1>AccumuloIndexAdapter.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.accumulo.data
+
+import com.github.benmanes.caffeine.cache.{CacheLoader, Caffeine}
+import com.typesafe.scalalogging.LazyLogging
+import org.apache.accumulo.core.client.IteratorSetting
+import org.apache.accumulo.core.data.{Key, Range, Value}
+import org.apache.accumulo.core.file.keyfunctor.RowFunctor
+import org.apache.hadoop.io.Text
+import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+import org.locationtech.geomesa.accumulo.AccumuloProperties.TableProperties.TableCacheExpiry
+import org.locationtech.geomesa.accumulo.data.AccumuloIndexAdapter._
+import org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.{BatchScanLocalProcessorPlan, BatchScanPlan, EmptyPlan}
+import org.locationtech.geomesa.accumulo.data.writer.tx.AccumuloAtomicIndexWriter
+import org.locationtech.geomesa.accumulo.data.writer.{AccumuloIndexWriter, ColumnFamilyMapper}
+import org.locationtech.geomesa.accumulo.index.AttributeJoinIndex
+import org.locationtech.geomesa.accumulo.iterators.ArrowIterator.AccumuloArrowResultsToFeatures
+import org.locationtech.geomesa.accumulo.iterators.BinAggregatingIterator.AccumuloBinResultsToFeatures
+import org.locationtech.geomesa.accumulo.iterators.DensityIterator.AccumuloDensityResultsToFeatures
+import org.locationtech.geomesa.accumulo.iterators.StatsIterator.AccumuloStatsResultsToFeatures
+import org.locationtech.geomesa.accumulo.iterators._
+import org.locationtech.geomesa.accumulo.util.TableManager
+import org.locationtech.geomesa.index.api.IndexAdapter.{IndexWriter, RequiredVisibilityWriter}
+import org.locationtech.geomesa.index.api.QueryPlan.{FeatureReducer, IndexResultsToFeatures, ResultsToFeatures}
+import org.locationtech.geomesa.index.api._
+import org.locationtech.geomesa.index.conf.QueryHints
+import org.locationtech.geomesa.index.index.id.IdIndex
+import org.locationtech.geomesa.index.iterators.StatsScan
+import org.locationtech.geomesa.index.planning.LocalQueryRunner.LocalProcessor
+import org.locationtech.geomesa.index.utils.Explainer
+import org.locationtech.geomesa.security.SecurityUtils
+import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.{Configs, InternalConfigs}
+import org.locationtech.geomesa.utils.index.VisibilityLevel
+import org.locationtech.geomesa.utils.io.WithClose
+
+import java.util.Collections
+import java.util.Map.Entry
+
+/**
+  * Index adapter for accumulo back-end
+  *
+  * @param ds data store
+  */
+<span class="nc bnc" id="L52" title="All 4 branches missed.">class AccumuloIndexAdapter(ds: AccumuloDataStore)</span>
+<span class="nc" id="L53">    extends TableManager(ds.client) with IndexAdapter[AccumuloDataStore] with LazyLogging {</span>
+
+  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L59">  private val tableOps = ds.client.tableOperations()</span>
+
+<span class="nc" id="L61">  private val tableSizeCache =</span>
+<span class="nc" id="L62">    Caffeine.newBuilder().expireAfterWrite(TableCacheExpiry.toJavaDuration.get).build[String, Integer](</span>
+<span class="nc bnc" id="L63" title="All 2 branches missed.">      new CacheLoader[String, Integer]() {</span>
+<span class="nc" id="L64">        override def load(table: String): Integer = tableOps.listSplits(table).size() + 1</span>
+      }
+    )
+
+  // noinspection ScalaDeprecation
+  override def createTable(
+      index: GeoMesaFeatureIndex[_, _],
+      partition: Option[String],
+      splits: =&gt; Seq[Array[Byte]]): Unit = {
+<span class="nc" id="L73">    val table = index.configureTableName(partition) // writes table name to metadata</span>
+    // create table if it doesn't exist
+<span class="nc" id="L75">    val created = ensureTableExists(table, index.sft.isLogicalTime)</span>
+
+    def addSplitsAndGroups(): Unit = {
+      // create splits
+<span class="nc" id="L79">      val splitsToAdd = splits.map(new Text(_)).toSet -- tableOps.listSplits(table).asScala.toSet</span>
+<span class="nc bnc" id="L80" title="All 2 branches missed.">      if (splitsToAdd.nonEmpty) {</span>
+<span class="nc" id="L81">        tableOps.addSplits(table, new java.util.TreeSet(splitsToAdd.asJava))</span>
+      }
+
+      // create locality groups
+<span class="nc" id="L85">      val existingGroups = tableOps.getLocalityGroups(table)</span>
+<span class="nc" id="L86">      val localityGroups = new java.util.HashMap[String, java.util.Set[Text]](existingGroups)</span>
+
+      def addGroup(cf: Text): Unit = {
+<span class="nc" id="L89">        val key = cf.toString</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        if (localityGroups.containsKey(key)) {</span>
+<span class="nc" id="L91">          val update = new java.util.HashSet[Text](localityGroups.get(key))</span>
+<span class="nc" id="L92">          update.add(cf)</span>
+<span class="nc" id="L93">          localityGroups.put(key, update)</span>
+        } else {
+<span class="nc" id="L95">          localityGroups.put(key, Collections.singleton(cf))</span>
+        }
+      }
+
+<span class="nc bnc" id="L99" title="All 2 branches missed.">      groups.apply(index.sft).foreach { case (k, _) =&gt; addGroup(new Text(k)) }</span>
+
+<span class="nc bnc" id="L101" title="All 6 branches missed.">      if (localityGroups != existingGroups) {</span>
+<span class="nc" id="L102">        tableOps.setLocalityGroups(table, localityGroups)</span>
+      }
+    }
+
+<span class="nc bnc" id="L106" title="All 2 branches missed.">    if (created) {</span>
+      import org.apache.accumulo.core.conf.Property.{TABLE_BLOCKCACHE_ENABLED, TABLE_BLOOM_ENABLED, TABLE_BLOOM_KEY_FUNCTOR}
+
+<span class="nc" id="L109">      addSplitsAndGroups()</span>
+
+      // block cache config
+      val enableBlockCache = {
+<span class="nc bnc" id="L113" title="All 2 branches missed.">        val key = if (index.sft.isPartitioned) { InternalConfigs.PartitionTableCache } else { Configs.TableCacheEnabled }</span>
+<span class="nc" id="L114">        val config = index.sft.getUserData.get(key).asInstanceOf[String]</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        if (config == null) { true } else {</span>
+<span class="nc" id="L116">          val enabled = config.split(',').exists { hint =&gt;</span>
+<span class="nc bnc" id="L117" title="All 4 branches missed.">            hint.equalsIgnoreCase(index.name) || hint.equalsIgnoreCase((Seq(index.name) ++ index.attributes).mkString(&quot;:&quot;)) ||</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">              hint.equalsIgnoreCase(index.identifier)</span>
+          }
+<span class="nc bnc" id="L120" title="All 2 branches missed.">          logger.debug(s&quot;Setting ${TABLE_BLOCKCACHE_ENABLED.getKey}=$enabled for index ${index.identifier} based on user config: $config&quot;)</span>
+<span class="nc" id="L121">          enabled</span>
+        }
+      }
+<span class="nc bnc" id="L124" title="All 2 branches missed.">      if (enableBlockCache) {</span>
+<span class="nc" id="L125">        tableOps.setProperty(table, TABLE_BLOCKCACHE_ENABLED.getKey, &quot;true&quot;)</span>
+      }
+
+<span class="nc bnc" id="L128" title="All 6 branches missed.">      if (index.name == IdIndex.name) {</span>
+        // enable the row functor as the feature ID is stored in the Row ID
+<span class="nc" id="L130">        tableOps.setProperty(table, TABLE_BLOOM_KEY_FUNCTOR.getKey, classOf[RowFunctor].getCanonicalName)</span>
+<span class="nc" id="L131">        tableOps.setProperty(table, TABLE_BLOOM_ENABLED.getKey, &quot;true&quot;)</span>
+      }
+
+<span class="nc bnc" id="L134" title="All 2 branches missed.">      index.sft.getTableProps.foreach { case (k, v) =&gt; tableOps.setProperty(table, k, v) }</span>
+
+<span class="nc bnc" id="L136" title="All 2 branches missed.">      if (index.sft.isVisibilityRequired) {</span>
+<span class="nc" id="L137">        VisibilityIterator.set(tableOps, table)</span>
+      }
+<span class="nc bnc" id="L139" title="All 2 branches missed.">    } else if (index.keySpace.sharing.nonEmpty) {</span>
+      // even if the table existed, we still need to check the splits and locality groups if it's shared
+<span class="nc" id="L141">      addSplitsAndGroups()</span>
+    }
+  }
+
+  override def deleteTables(tables: Seq[String]): Unit =
+<span class="nc" id="L146">    tables.toList.map(table =&gt; CachedThreadPool.submit(() =&gt; deleteTable(table))).foreach(_.get)</span>
+
+  override def clearTables(tables: Seq[String], prefix: Option[Array[Byte]]): Unit = {
+<span class="nc" id="L149">    val auths = ds.auths // get the auths once up front</span>
+    def clearOne(table: String): Unit = {
+<span class="nc bnc" id="L151" title="All 2 branches missed.">      if (tableOps.exists(table)) {</span>
+<span class="nc" id="L152">        WithClose(ds.client.createBatchDeleter(table, auths, ds.config.queries.threads)) { deleter =&gt;</span>
+<span class="nc" id="L153">          val range = prefix.map(p =&gt; Range.prefix(new Text(p))).getOrElse(new Range())</span>
+<span class="nc" id="L154">          deleter.setRanges(Collections.singletonList(range))</span>
+<span class="nc" id="L155">          deleter.delete()</span>
+        }
+      }
+    }
+<span class="nc" id="L159">    tables.toList.map(table =&gt; CachedThreadPool.submit(() =&gt; clearOne(table))).foreach(_.get)</span>
+  }
+
+  override def createQueryPlan(strategy: QueryStrategy): AccumuloQueryPlan = {
+    import org.locationtech.geomesa.index.conf.QueryHints.RichHints
+
+<span class="nc" id="L165">    val index = strategy.index</span>
+<span class="nc" id="L166">    val ecql = strategy.ecql</span>
+<span class="nc" id="L167">    val hints = strategy.hints</span>
+<span class="nc" id="L168">    val ranges = strategy.ranges.map(toAccumuloRange)</span>
+<span class="nc bnc" id="L169" title="All 6 branches missed.">    val numThreads = if (index.name == IdIndex.name) { ds.config.queries.recordThreads } else { ds.config.queries.threads }</span>
+<span class="nc" id="L170">    val tables = index.getTablesForQuery(strategy.filter.filter)</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">    val (colFamily, schema) = {</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">      val (cf, s) = groups.group(index.sft, hints.getTransformDefinition, ecql)</span>
+<span class="nc" id="L173">      (Some(new Text(ColumnFamilyMapper(index)(cf))), s)</span>
+    }
+<span class="nc bnc" id="L175" title="All 2 branches missed.">    lazy val returnSchema = hints.getTransformSchema.getOrElse(schema)</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">    lazy val fti = FilterTransformIterator.configure(schema, index, ecql, hints)</span>
+
+<span class="nc" id="L178">    index match {</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">      case i: AttributeJoinIndex =&gt;</span>
+<span class="nc" id="L180">        AccumuloJoinIndexAdapter.createQueryPlan(ds, i, strategy, tables, ranges, colFamily, schema, ecql, hints, numThreads)</span>
+
+      case _ =&gt;
+        val baselineIters = {
+          // configure additional iterators based on the index
+<span class="nc" id="L185">          val indexIter = strategy.values.flatMap(IndexIterators.configure(index, _, ZIterPriority, hints.getFilterCompatibility))</span>
+          // add the attribute-level vis iterator if necessary
+<span class="nc" id="L187">          val visIter = index.sft.getVisibilityLevel match {</span>
+<span class="nc bnc" id="L188" title="All 6 branches missed.">            case VisibilityLevel.Attribute =&gt; Seq(KryoVisibilityRowEncoder.configure(schema))</span>
+<span class="nc" id="L189">            case _ =&gt; Seq.empty</span>
+          }
+<span class="nc" id="L191">          indexIter.toSeq ++ visIter</span>
+        }
+
+        def scanPlan(iter: Option[IteratorSetting], toFeatures: ResultsToFeatures[Entry[Key, Value]], reduce: Option[FeatureReducer]): BatchScanPlan = {
+<span class="nc" id="L195">          val iters = iter.toSeq ++ baselineIters</span>
+<span class="nc" id="L196">          val sort = hints.getSortFields</span>
+<span class="nc" id="L197">          val max = hints.getMaxFeatures</span>
+<span class="nc" id="L198">          val projection = hints.getProjection</span>
+<span class="nc" id="L199">          BatchScanPlan(ds, strategy, tables, ranges, iters, colFamily, toFeatures, reduce, sort, max, projection, numThreads)</span>
+        }
+
+        def semiLocalPlan(): BatchScanLocalProcessorPlan = {
+<span class="nc" id="L203">          val iters = fti.toSeq ++ baselineIters</span>
+          // transforms are handled in the filterTransformIter
+<span class="nc" id="L205">          val processor = LocalProcessor(returnSchema, QueryHints.Internal.clearTransforms(hints), None)</span>
+<span class="nc" id="L206">          val projection = hints.getProjection</span>
+<span class="nc" id="L207">          BatchScanLocalProcessorPlan(ds, strategy, tables, ranges, iters, colFamily, processor, projection, numThreads)</span>
+        }
+
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        val plan = if (hints.isBinQuery) {</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">          if (ds.config.remote.bin) {</span>
+<span class="nc" id="L212">            val iter = BinAggregatingIterator.configure(schema, index, ecql, hints)</span>
+<span class="nc" id="L213">            scanPlan(Some(iter), new AccumuloBinResultsToFeatures(), None)</span>
+          } else {
+<span class="nc" id="L215">            semiLocalPlan()</span>
+          }
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        } else if (hints.isArrowQuery) {</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">          if (ds.config.remote.arrow) {</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            val (iter, reduce) = ArrowIterator.configure(schema, index, ds.stats, strategy.filter.filter, ecql, hints)</span>
+<span class="nc" id="L220">            scanPlan(Some(iter), new AccumuloArrowResultsToFeatures(), Some(reduce))</span>
+          } else {
+<span class="nc" id="L222">            semiLocalPlan()</span>
+          }
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        } else if (hints.isDensityQuery) {</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">          if (ds.config.remote.density) {</span>
+<span class="nc" id="L226">            val iter = DensityIterator.configure(schema, index, ecql, hints)</span>
+<span class="nc" id="L227">            scanPlan(Some(iter), new AccumuloDensityResultsToFeatures(), None)</span>
+          } else {
+<span class="nc" id="L229">            semiLocalPlan()</span>
+          }
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        } else if (hints.isStatsQuery) {</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">          if (ds.config.remote.stats) {</span>
+<span class="nc" id="L233">            val iter = StatsIterator.configure(schema, index, ecql, hints)</span>
+<span class="nc" id="L234">            val reduce = Some(StatsScan.StatsReducer(schema, hints))</span>
+<span class="nc" id="L235">            scanPlan(Some(iter), new AccumuloStatsResultsToFeatures(), reduce)</span>
+          } else {
+<span class="nc" id="L237">            semiLocalPlan()</span>
+          }
+        } else {
+<span class="nc" id="L240">          scanPlan(fti, AccumuloResultsToFeatures(index, returnSchema), None)</span>
+        }
+
+<span class="nc bnc" id="L243" title="All 4 branches missed.">        if (tables.isEmpty || ranges.isEmpty) { EmptyPlan(strategy, plan.reducer) } else { plan }</span>
+    }
+  }
+
+  override def createWriter(
+      sft: SimpleFeatureType,
+      indices: Seq[GeoMesaFeatureIndex[_, _]],
+      partition: Option[String],
+      atomic: Boolean): IndexWriter = {
+<span class="nc" id="L252">    val wrapper = WritableFeature.wrapper(sft, groups)</span>
+<span class="nc bnc" id="L253" title="All 8 branches missed.">    (atomic, sft.isVisibilityRequired) match {</span>
+<span class="nc bnc" id="L254" title="All 4 branches missed.">      case (false, false) =&gt; new AccumuloIndexWriter(ds, indices, wrapper, partition)</span>
+<span class="nc bnc" id="L255" title="All 4 branches missed.">      case (false, true)  =&gt; new AccumuloIndexWriter(ds, indices, wrapper, partition)  with RequiredVisibilityWriter</span>
+<span class="nc bnc" id="L256" title="All 4 branches missed.">      case (true, false)  =&gt; new AccumuloAtomicIndexWriter(ds, sft, indices, wrapper, partition)</span>
+<span class="nc bnc" id="L257" title="All 4 branches missed.">      case (true, true)   =&gt; new AccumuloAtomicIndexWriter(ds, sft, indices, wrapper, partition)  with RequiredVisibilityWriter</span>
+    }
+  }
+
+  override def getStrategyCost(strategy: FilterStrategy, explain: Explainer): Option[Long] = {
+<span class="nc" id="L262">    explain.pushLevel(s&quot;Calculating cost for ${strategy.index.identifier}&quot;)</span>
+<span class="nc" id="L263">    val start = System.currentTimeMillis()</span>
+    try {
+<span class="nc" id="L265">      val tables = strategy.index.getTablesForQuery(strategy.filter)</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">      if (tables.isEmpty) {</span>
+<span class="nc" id="L267">        return Some(0L)</span>
+      }
+<span class="nc" id="L269">      val ranges = strategy.getQueryStrategy(explain).ranges.map(toAccumuloRange).asJava</span>
+      val cost =
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        tables.foldLeft(0d) { case (sum, table) =&gt;</span>
+<span class="nc" id="L272">          val numTablets = tableSizeCache.get(table)</span>
+<span class="nc" id="L273">          val tabletsScanned = tableOps.locate(table, ranges).groupByTablet().size()</span>
+<span class="nc" id="L274">          explain(s&quot;Strategy hits $tabletsScanned/$numTablets tablets for table $table&quot;)</span>
+<span class="nc" id="L275">          val cost = 100 * (tabletsScanned.toDouble / numTablets)</span>
+<span class="nc" id="L276">          sum + cost</span>
+        }
+<span class="nc" id="L278">      Some(cost.toLong)</span>
+    } finally {
+<span class="nc" id="L280">      explain(s&quot;Cost calculations took ${System.currentTimeMillis() - start}ms&quot;).popLevel()</span>
+    }
+  }
+}
+
+<span class="nc" id="L285">object AccumuloIndexAdapter {</span>
+
+<span class="nc" id="L287">  val ZIterPriority = 23</span>
+
+  /**
+   * Converts a generic index-api range into an Accumulo range
+   *
+   * @param range range
+   * @return
+   */
+<span class="nc" id="L295">  private def toAccumuloRange(range: ByteRange): Range = range match {</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">    case BoundedByteRange(lower, upper) =&gt;</span>
+      // index api defines empty start/end for open-ended range - in accumulo, it's indicated with null
+<span class="nc bnc" id="L298" title="All 2 branches missed.">      val start = if (lower.length == 0) { null } else { new Key(new Text(lower)) }</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">      val end = if (upper.length == 0) { null } else { new Key(new Text(upper)) }</span>
+      // index api defines start row inclusive, end row exclusive
+<span class="nc" id="L301">      new Range(start, true, end, false)</span>
+
+<span class="nc bnc" id="L303" title="All 2 branches missed.">    case SingleRowByteRange(row) =&gt;</span>
+<span class="nc" id="L304">      new Range(new Text(row))</span>
+
+    case _ =&gt;
+<span class="nc" id="L307">      throw new IllegalArgumentException(s&quot;Unexpected range type $range&quot;)</span>
+  }
+
+  /**
+    * Accumulo entries to features
+    *
+    * @param _index index
+    * @param _sft simple feature type
+    */
+<span class="nc" id="L316">  abstract class AccumuloResultsToFeatures(_index: GeoMesaFeatureIndex[_, _], _sft: SimpleFeatureType)</span>
+<span class="nc" id="L317">      extends IndexResultsToFeatures[Entry[Key, Value]](_index, _sft)</span>
+
+<span class="nc" id="L319">  object AccumuloResultsToFeatures {</span>
+
+    def apply(index: GeoMesaFeatureIndex[_, _], sft: SimpleFeatureType): AccumuloResultsToFeatures = {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">      if (index.serializedWithId) {</span>
+<span class="nc" id="L323">        new AccumuloIndexWithIdResultsToFeatures(index, sft)</span>
+      } else {
+<span class="nc" id="L325">        new AccumuloIndexResultsToFeatures(index, sft)</span>
+      }
+    }
+
+    /**
+     * Set visibility in a feature based on the row key visibility
+     *
+     * @param sf feature
+     * @param key row key
+     */
+    private def applyVisibility(sf: SimpleFeature, key: Key): Unit = {
+<span class="nc" id="L336">      val visibility = key.getColumnVisibility</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">      if (visibility.getLength &gt; 0) {</span>
+<span class="nc" id="L338">        SecurityUtils.setFeatureVisibility(sf, visibility.toString)</span>
+      }
+    }
+
+<span class="nc" id="L342">    class AccumuloIndexResultsToFeatures(_index: GeoMesaFeatureIndex[_, _], _sft: SimpleFeatureType)</span>
+<span class="nc" id="L343">        extends AccumuloResultsToFeatures(_index, _sft) {</span>
+
+<span class="nc" id="L345">      def this() = this(null, null) // no-arg constructor required for serialization</span>
+
+      override def apply(result: Entry[Key, Value]): SimpleFeature = {
+<span class="nc" id="L348">        val row = result.getKey.getRow</span>
+<span class="nc" id="L349">        val id = index.getIdFromRow(row.getBytes, 0, row.getLength, null)</span>
+<span class="nc" id="L350">        val sf = serializer.deserialize(id, result.getValue.get)</span>
+<span class="nc" id="L351">        applyVisibility(sf, result.getKey)</span>
+<span class="nc" id="L352">        sf</span>
+      }
+    }
+
+<span class="nc" id="L356">    class AccumuloIndexWithIdResultsToFeatures(_index: GeoMesaFeatureIndex[_, _], _sft: SimpleFeatureType)</span>
+<span class="nc" id="L357">        extends AccumuloResultsToFeatures(_index, _sft) {</span>
+
+<span class="nc" id="L359">      def this() = this(null, null) // no-arg constructor required for serialization</span>
+
+      override def apply(result: Entry[Key, Value]): SimpleFeature = {
+<span class="nc" id="L362">        val sf = serializer.deserialize(result.getValue.get)</span>
+<span class="nc" id="L363">        applyVisibility(sf, result.getKey)</span>
+<span class="nc" id="L364">        sf</span>
+      }
+    }
+  }
+<span class="nc" id="L368">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,367 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RedisAgeOff.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Redis Datastore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.redis.data.index</a> &gt; <span class="el_source">RedisAgeOff.scala</span></div><h1>RedisAgeOff.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.redis.data.index
+
+import com.typesafe.scalalogging.StrictLogging
+import org.geotools.api.data.Transaction
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.geotools.api.filter.identity.Identifier
+import org.locationtech.geomesa.filter.FilterHelper
+import org.locationtech.geomesa.redis.data.index.RedisAgeOff.{AgeOffExecutor, AgeOffWriter}
+import org.locationtech.geomesa.redis.data.util.RedisLocking
+import org.locationtech.geomesa.redis.data.{CloseableJedisCommands, RedisDataStore, RedisSystemProperties}
+import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
+import org.locationtech.geomesa.utils.io.WithClose
+import redis.clients.jedis.{Jedis, UnifiedJedis}
+import redis.clients.jedis.params.ZAddParams
+import redis.clients.jedis.util.Pool
+
+import java.io.{Closeable, Flushable}
+import java.nio.charset.StandardCharsets
+import java.util.Collections
+import java.util.concurrent.{Executors, ScheduledFuture, TimeUnit}
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+import scala.concurrent.duration.Duration
+import scala.util.control.NonFatal
+
+/**
+  * Tracks and deletes features based on a time-to-live.
+  *
+  * TTLs are stored in a separate sorted set for each feature type, with the score of the set being the
+  * system time in millis when the feature should be expired. We do a two-step process to expire features:
+  *
+  * 1. Scan and remove the TTL set by score range, which will return all the feature IDs for expired features
+  * 2. Remove the features from the index tables based on the feature ID
+  *
+  * @param ds data store
+  */
+<span class="nc" id="L44">class RedisAgeOff(ds: RedisDataStore) extends Closeable {</span>
+
+  import RedisAgeOff.key
+  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+<span class="nc bnc" id="L49" title="All 2 branches missed.">  private val executor = RedisSystemProperties.AgeOffInterval.toDuration.collect {</span>
+<span class="nc bnc" id="L50" title="All 4 branches missed.">    case i if i.isFinite =&gt; new AgeOffExecutor(ds, i)</span>
+  }
+
+  /**
+    * Start the age-off for a feature type
+    *
+    * @param sft simple feature type
+    */
+  def add(sft: SimpleFeatureType): Unit = {
+<span class="nc bnc" id="L59" title="All 2 branches missed.">    if (sft.isFeatureExpirationEnabled) {</span>
+<span class="nc" id="L60">      executor.foreach(_.schedule(sft.getTypeName))</span>
+    }
+  }
+
+  /**
+    * Update the age-off for a modified feature type
+    *
+    * @param sft modified simple feature type
+    * @param previous previous simple feature type
+    */
+  def update(sft: SimpleFeatureType, previous: SimpleFeatureType): Unit = {
+<span class="nc bnc" id="L71" title="All 2 branches missed.">    if (previous.isFeatureExpirationEnabled) {</span>
+<span class="nc bnc" id="L72" title="All 2 branches missed.">      if (!sft.isFeatureExpirationEnabled) {</span>
+<span class="nc" id="L73">        remove(previous)</span>
+<span class="nc bnc" id="L74" title="All 6 branches missed.">      } else if (sft.getTypeName != previous.getTypeName) {</span>
+<span class="nc" id="L75">        executor.foreach(_.cancel(previous.getTypeName))</span>
+        // rename the ttl table to match the new type name
+<span class="nc" id="L77">        WithClose(ds.connection.getResource)(_.renamenx(key(ds, previous.getTypeName), key(ds, sft.getTypeName)))</span>
+<span class="nc" id="L78">        executor.foreach(_.schedule(sft.getTypeName))</span>
+      }
+<span class="nc bnc" id="L80" title="All 2 branches missed.">    } else if (sft.isFeatureExpirationEnabled) {</span>
+<span class="nc" id="L81">      executor.foreach(_.schedule(sft.getTypeName))</span>
+    }
+  }
+
+  /**
+    * Remove the age-off for a feature type
+    *
+    * @param sft simple feature type
+    */
+  def remove(sft: SimpleFeatureType): Unit = {
+<span class="nc bnc" id="L91" title="All 2 branches missed.">    if (sft.isFeatureExpirationEnabled) {</span>
+<span class="nc" id="L92">      executor.foreach(_.cancel(sft.getTypeName))</span>
+<span class="nc" id="L93">      WithClose(ds.connection.getResource)(_.del(key(ds, sft.getTypeName)))</span>
+    }
+  }
+
+  /**
+    * Gets a writer to track ttl for features
+    *
+    * @param sft simple feature type
+    * @return
+    */
+  def writer(sft: SimpleFeatureType): Option[AgeOffWriter] = {
+<span class="nc bnc" id="L104" title="All 2 branches missed.">    if (sft.isFeatureExpirationEnabled) {</span>
+<span class="nc" id="L105">      Some(new AgeOffWriter(ds.connection, key(ds, sft.getTypeName)))</span>
+    } else {
+<span class="nc" id="L107">      None</span>
+    }
+  }
+
+<span class="nc" id="L111">  override def close(): Unit = executor.foreach(_.close())</span>
+}
+
+<span class="nc" id="L114">object RedisAgeOff extends StrictLogging {</span>
+
+  import redis.clients.jedis.resps.{Tuple =&gt; JedisTuple}
+
+<span class="nc" id="L118">  val TtlUserDataKey = &quot;t&quot; // the user data is cleared, so no chance of key collision - save space with a short key</span>
+
+<span class="nc" id="L120">  val AgeOffLockTimeout: SystemProperty = SystemProperty(&quot;geomesa.redis.age.off.lock.timeout&quot;, &quot;1 second&quot;)</span>
+
+  /**
+    * Initialize the age-off for the data store
+    *
+    * @param ds data store
+    */
+<span class="nc" id="L127">  def init(ds: RedisDataStore): Unit = ds.getTypeNames.foreach(n =&gt; ds.aging.add(ds.getSchema(n)))</span>
+
+  /**
+    * Key of the Redis SortedSet containing the ttl for the given feature type
+    *
+    * @param ds data store
+    * @param typeName simple feature type name
+    * @return
+    */
+  private def key(ds: RedisDataStore, typeName: String): Array[Byte] =
+<span class="nc" id="L137">    s&quot;${ds.config.catalog}_${typeName}_ttl&quot;.getBytes(StandardCharsets.UTF_8)</span>
+
+  /**
+    * Writes time-to-lives for new features
+    *
+    * @param connection jedis connection
+    * @param table ttl table for the feature type
+    */
+<span class="nc" id="L145">  class AgeOffWriter(connection: Pool[_ &lt;: CloseableJedisCommands], table: Array[Byte]) extends Closeable with Flushable {</span>
+
+<span class="nc" id="L147">    private val writes = new java.util.HashMap[Array[Byte], java.lang.Double]</span>
+<span class="nc" id="L148">    private val deletes = ArrayBuffer.empty[Array[Byte]]</span>
+
+    // note: the regular feature ids have the length pre-pended as a 2-byte short, so use the raw id instead
+<span class="nc" id="L151">    def write(feature: RedisWritableFeature): Unit = writes.put(feature.rawId, feature.ttl)</span>
+<span class="nc" id="L152">    def delete(feature: RedisWritableFeature): Unit = deletes += feature.rawId</span>
+
+    override def flush(): Unit = {
+<span class="nc bnc" id="L155" title="All 4 branches missed.">      if (!writes.isEmpty || deletes.nonEmpty) {</span>
+        try {
+<span class="nc" id="L157">          WithClose(connection.getResource) { jedis =&gt;</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">            if (deletes.nonEmpty) {</span>
+<span class="nc" id="L159">              jedis.zrem(table, deletes.toSeq: _*)</span>
+            }
+<span class="nc bnc" id="L161" title="All 2 branches missed.">            if (!writes.isEmpty) {</span>
+<span class="nc" id="L162">              jedis.zadd(table, writes)</span>
+            }
+          }
+        } finally {
+<span class="nc" id="L166">          writes.clear()</span>
+<span class="nc" id="L167">          deletes.clear()</span>
+        }
+      }
+    }
+
+<span class="nc" id="L172">    override def close(): Unit = flush()</span>
+  }
+
+  /**
+    * Class for tracking scheduled expiration tasks
+    *
+    * @param ds data store
+    * @param frequency run frequency
+    */
+<span class="nc" id="L181">  private class AgeOffExecutor(ds: RedisDataStore, frequency: Duration) extends Closeable {</span>
+
+    // expiration tasks, keyed by feature type name
+    // note: synchronize access to ensure thread safety
+<span class="nc" id="L185">    private val tasks = scala.collection.mutable.Map.empty[String, ScheduledFuture[_]]</span>
+<span class="nc" id="L186">    private val rate = frequency.toMillis</span>
+<span class="nc" id="L187">    private val es = Executors.newScheduledThreadPool(3)</span>
+
+    /**
+      * Schedule the removal of features for the feature type
+      *
+      * @param typeName simple feature type name
+      */
+    def schedule(typeName: String): Unit = {
+      // schedule with a short initial delay to quickly remove any features that may
+      // have expired since the last time there was an active datastore running
+<span class="nc" id="L197">      val future = es.scheduleAtFixedRate(new AgeOffRunner(ds, typeName), 5000L, rate, TimeUnit.MILLISECONDS)</span>
+<span class="nc" id="L198">      synchronized {</span>
+<span class="nc" id="L199">        tasks.put(typeName, future).foreach(_.cancel(false))</span>
+      }
+    }
+
+    /**
+      * Cancel any scheduled tasks for the feature type
+      *
+      * @param typeName simple feature type name
+      */
+    def cancel(typeName: String): Unit = {
+      synchronized {
+<span class="nc" id="L210">        tasks.remove(typeName).foreach(_.cancel(false))</span>
+      }
+    }
+
+<span class="nc" id="L214">    override def close(): Unit = es.shutdown()</span>
+  }
+
+  /**
+    * Runnable class to check and remove expired features
+    *
+    * @param ds data store
+    * @param typeName simple feature type name to check
+    */
+<span class="nc" id="L223">  private class AgeOffRunner(ds: RedisDataStore, typeName: String) extends Runnable with RedisLocking {</span>
+
+    import scala.collection.JavaConverters._
+
+<span class="nc" id="L227">    private val table = key(ds, typeName)</span>
+<span class="nc" id="L228">    private val lockPath = s&quot;/org.locationtech.geomesa.redis.${ds.config.catalog}.ttl.$typeName&quot;</span>
+
+<span class="nc" id="L230">    private val timeout = AgeOffLockTimeout.toDuration.map(_.toMillis).getOrElse {</span>
+      // note: should always be valid due to the default
+<span class="nc" id="L232">      throw new IllegalStateException(&quot;Invalid age-off lock timeout&quot;)</span>
+    }
+
+<span class="nc" id="L235">    override def connection: Pool[_ &lt;: CloseableJedisCommands] = ds.connection</span>
+
+    override def run(): Unit = {
+<span class="nc" id="L238">      val timestamp = System.currentTimeMillis()</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">      logger.debug(s&quot;Age-off for schema '$typeName' starting with timestamp $timestamp&quot;)</span>
+
+<span class="nc" id="L241">      val ids = removeExpiredIds(timestamp)</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">      if (!ids.isEmpty) {</span>
+<span class="nc" id="L243">        removeExpiredFeatures(ids, timestamp)</span>
+      }
+    }
+
+    /**
+      * Queries and removes expired ids and ttls
+      *
+      * @param timestamp expiration time
+      * @return
+      */
+    private def removeExpiredIds(timestamp: Long): java.util.List[JedisTuple] = {
+      def exec: java.util.List[JedisTuple] = {
+<span class="nc" id="L255">        WithClose(ds.connection.getResource) { jedis =&gt;</span>
+          // Use Lua script to atomically get and remove expired entries
+<span class="nc" id="L257">          val script = &quot;&quot;&quot;</span>
+            local scores = redis.call('zrangebyscore', KEYS[1], 0, ARGV[1], 'WITHSCORES')
+            if #scores &gt; 0 then
+              redis.call('zremrangebyscore', KEYS[1], 0, ARGV[1])
+            end
+            return scores
+          &quot;&quot;&quot;
+<span class="nc" id="L264">          val result = jedis.eval(script.getBytes(StandardCharsets.UTF_8), 1, table, timestamp.toString.getBytes(StandardCharsets.UTF_8))</span>
+          // Convert the result to a List[JedisTuple]
+<span class="nc" id="L266">          result match {</span>
+<span class="nc bnc" id="L267" title="All 4 branches missed.">            case list: java.util.List[_] if list.size() &gt; 0 =&gt;</span>
+<span class="nc" id="L268">              val tuples = new java.util.ArrayList[JedisTuple](list.size() / 2)</span>
+<span class="nc" id="L269">              var i = 0</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">              while (i &lt; list.size()) {</span>
+<span class="nc" id="L271">                val member = list.get(i).asInstanceOf[Array[Byte]]</span>
+<span class="nc" id="L272">                val score = list.get(i + 1) match {</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">                  case s: String =&gt; s.toDouble</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">                  case b: Array[Byte] =&gt; new String(b, StandardCharsets.UTF_8).toDouble</span>
+<span class="nc" id="L275">                  case _ =&gt; throw new IllegalStateException(s&quot;Unexpected score type: ${list.get(i + 1).getClass}&quot;)</span>
+                }
+<span class="nc" id="L277">                tuples.add(new JedisTuple(member, score))</span>
+<span class="nc" id="L278">                i += 2</span>
+              }
+<span class="nc" id="L280">              tuples</span>
+<span class="nc" id="L281">            case _ =&gt; Collections.emptyList[JedisTuple]()</span>
+          }
+        }
+      }
+
+      def noLock: java.util.List[JedisTuple] = {
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        logger.debug(s&quot;Could not acquire distributed lock for schema '$typeName' after ${timeout}ms&quot;)</span>
+<span class="nc" id="L288">        Collections.emptyList[JedisTuple]()</span>
+      }
+
+      // acquire a lock so that we're not repeating work in multiple data store instances
+<span class="nc" id="L292">      val ids = try { withLock(lockPath, timeout, exec, noLock) } catch {</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        case NonFatal(e) =&gt;</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">          logger.error(&quot;Error executing ttl script:&quot;, e)</span>
+<span class="nc" id="L295">          Collections.emptyList[JedisTuple]()</span>
+      }
+
+<span class="nc bnc" id="L298" title="All 2 branches missed.">      logger.debug(s&quot;Age-off for schema '$typeName' found ${ids.size} features for expiration&quot;)</span>
+
+<span class="nc" id="L300">      ids</span>
+    }
+
+    /**
+      * Removes expired features from the data store
+      *
+      * @param ids expired ids and ttls
+      * @param timestamp expiration time
+      */
+    private def removeExpiredFeatures(ids: java.util.List[JedisTuple], timestamp: Long): Unit = {
+<span class="nc" id="L310">      try {</span>
+<span class="nc" id="L311">        val fids = new java.util.HashSet[Identifier](ids.size)</span>
+<span class="nc" id="L312">        ids.asScala.foreach(id =&gt; fids.add(FilterHelper.ff.featureId(id.getElement)))</span>
+
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        logger.trace(s&quot;Age-off for schema '$typeName' found the following features: $fids&quot;)</span>
+<span class="nc" id="L315">        val trace = logger.underlying.isTraceEnabled</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        lazy val results = ListBuffer.empty[String]</span>
+
+<span class="nc" id="L318">        var i = 0</span>
+<span class="nc" id="L319">        WithClose(ds.getFeatureWriter(typeName, FilterHelper.ff.id(fids), Transaction.AUTO_COMMIT)) { writer =&gt;</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">          while (writer.hasNext) {</span>
+<span class="nc" id="L321">            val sf = writer.next()</span>
+            // verify that the feature hasn't been updated since we fetched the expired ids
+            // note: if the feature is updated between our call to `next` and `remove`, the
+            // member keys won't match and our deletion will not affect anything, as desired
+<span class="nc" id="L325">            val ttl = sf.getUserData.get(TtlUserDataKey)</span>
+<span class="nc bnc" id="L326" title="All 4 branches missed.">            if (ttl != null &amp;&amp; ttl.asInstanceOf[Long] &lt;= timestamp) {</span>
+<span class="nc" id="L327">              writer.remove()</span>
+<span class="nc" id="L328">              i += 1</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">              if (trace) {</span>
+<span class="nc" id="L330">                results += sf.getID</span>
+              }
+            } else {
+<span class="nc bnc" id="L333" title="All 2 branches missed.">              logger.debug(s&quot;Age-off for schema '$typeName' ignoring updated feature: ${sf.getID}&quot;)</span>
+            }
+          }
+        }
+<span class="nc bnc" id="L337" title="All 2 branches missed.">        logger.debug(s&quot;Age-off for schema '$typeName' removed $i features&quot;)</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        logger.trace(s&quot;Age-off for schema '$typeName' removed the following features: [${results.mkString(&quot;, &quot;)}]&quot;)</span>
+      } catch {
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        case NonFatal(e) =&gt;</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">          logger.error(s&quot;Error executing age-off for schema '$typeName':&quot;, e)</span>
+          // try to re-insert the keys, otherwise they might never expire
+<span class="nc" id="L343">          reinsertFailedIds(ids)</span>
+      }
+    }
+
+    /**
+      * Reinserts ids for features that were not deleted from the data store
+      *
+      * @param ids expired ids and ttls
+      */
+    private def reinsertFailedIds(ids: java.util.List[JedisTuple]): Unit = {
+<span class="nc" id="L353">      try {</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        logger.debug(s&quot;Age-off for schema '$typeName' re-inserting ttls&quot;)</span>
+<span class="nc" id="L355">        val reinserts = new java.util.HashMap[Array[Byte], java.lang.Double](ids.size)</span>
+<span class="nc" id="L356">        ids.asScala.foreach(id =&gt; reinserts.put(id.getBinaryElement, id.getScore))</span>
+        // use nx so that if a feature update has come through we don't overwrite the new ttl
+<span class="nc" id="L358">        WithClose(ds.connection.getResource)(_.zadd(table, reinserts, new ZAddParams().nx()))</span>
+      } catch {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        case NonFatal(e) =&gt;</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">          logger.error(s&quot;Error re-inserting ttls for schema '$typeName'. The following features &quot; +</span>
+<span class="nc" id="L362">              s&quot;may never expire: [${ids.asScala.map(_.getElement).mkString(&quot;, &quot;)}]&quot;, e)</span>
+      }
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompactPartitions.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa GeoTools Postgis Partitioning</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.gt.partition.postgis.dialect.procedures</a> &gt; <span class="el_source">CompactPartitions.scala</span></div><h1>CompactPartitions.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.gt.partition.postgis.dialect
+package procedures
+
+import org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData
+import org.locationtech.geomesa.gt.partition.postgis.dialect.tables.UserDataTable
+
+/**
+ * Re-sorts a partition table. Can be used for maintenance if time-latent data comes in and degrades performance
+ * of the BRIN index
+ */
+<span class="nc" id="L19">object CompactPartitions extends SqlProcedure {</span>
+
+<span class="nc" id="L21">  override def name(info: TypeInfo): FunctionName = FunctionName(s&quot;${info.typeName}_compact_partitions&quot;)</span>
+
+<span class="nc" id="L23">  override protected def createStatements(info: TypeInfo): Seq[String] = Seq(proc(info))</span>
+
+  private def proc(info: TypeInfo): String = {
+<span class="nc" id="L26">    s&quot;&quot;&quot;CREATE OR REPLACE PROCEDURE ${info.schema.quoted}.${name(info).quoted}(for_date timestamp without time zone) LANGUAGE plpgsql AS</span>
+       |  $$BODY$$
+       |    DECLARE
+       |      partition_name text;
+       |      spill_partition text;
+       |      min_dtg timestamp without time zone;         -- min date in our partitioned tables
+       |      partition_start timestamp without time zone; -- start bounds for the partition we're writing
+       |      partition_end timestamp without time zone;   -- end bounds for the partition we're writing
+       |      partition_size int;                          -- size of the partition, in hours
+       |      partition_tablespace text;
+       |      index_tablespace text;                       -- index tablespace
+       |      table_wa_logging text;                       -- wa log options
+       |      unsorted_count bigint;
+       |      pexists boolean;                             -- table exists check
+       |    BEGIN
+       |      IF for_date IS NULL THEN
+       |        RAISE EXCEPTION 'date is null' USING HINT = 'Please use a valid date';
+       |      END IF;
+       |
+       |      SELECT COALESCE(
+<span class="nc" id="L46">       |        (SELECT value::int FROM ${info.schema.quoted}.${UserDataTable.Name.quoted}</span>
+<span class="nc" id="L47">       |          WHERE type_name = ${literal(info.typeName)} AND key = ${literal(SftUserData.IntervalHours.key)}),</span>
+<span class="nc" id="L48">       |          ${SftUserData.IntervalHours.default})</span>
+       |        INTO partition_size;
+<span class="nc" id="L50">       |      partition_name := ${info.tables.mainPartitions.name.asLiteral} || '_' ||</span>
+<span class="nc" id="L51">       |        to_char(${info.schema.quoted}.truncate_to_partition(for_date, partition_size), 'YYYY_MM_DD_HH24');</span>
+       |
+<span class="nc" id="L53">       |      SELECT value FROM ${info.schema.quoted}.${UserDataTable.Name.quoted}</span>
+<span class="nc" id="L54">       |        WHERE type_name = ${literal(info.typeName)} AND key = ${literal(SftUserData.MainTableSpace.key)}</span>
+       |        INTO partition_tablespace;
+       |      IF partition_tablespace IS NULL THEN
+       |        index_tablespace := '';
+       |        partition_tablespace := '';
+       |      ELSE
+       |        index_tablespace := ' USING INDEX TABLESPACE '|| quote_ident(partition_tablespace);
+       |        partition_tablespace := ' TABLESPACE ' || quote_ident(partition_tablespace);
+       |      END IF;
+       |
+       |      SELECT COALESCE(
+<span class="nc" id="L65">       |        (SELECT value FROM ${info.schema.quoted}.${UserDataTable.Name.quoted}</span>
+<span class="nc" id="L66">       |          WHERE type_name = ${literal(info.typeName)} AND key = ${literal(SftUserData.WalLogEnabled.key)}),</span>
+<span class="nc" id="L67">       |          '${SftUserData.WalLogEnabled.default}'</span>
+       |        ) INTO table_wa_logging;
+       |      IF table_wa_logging IS NULL OR NOT table_wa_logging::boolean THEN
+       |        table_wa_logging := '';
+       |      ELSE
+       |        table_wa_logging := 'UNLOGGED ';
+       |      END IF;
+       |
+       |      RAISE INFO '% Compacting partition table %', timeofday()::timestamp, partition_name;
+<span class="nc" id="L76">       |      LOCK TABLE ONLY ${info.tables.mainPartitions.name.qualified} IN SHARE UPDATE EXCLUSIVE MODE;</span>
+       |      -- lock the child table to prevent any inserts that would be lost
+<span class="nc" id="L78">       |      EXECUTE 'LOCK TABLE ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |        ' IN SHARE ROW EXCLUSIVE MODE';
+<span class="nc" id="L80">       |      EXECUTE 'SELECT ${info.cols.dtg.quoted} FROM ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |        ' LIMIT 1' INTO min_dtg;
+<span class="nc" id="L82">       |      partition_start := ${info.schema.quoted}.truncate_to_partition(min_dtg, partition_size);</span>
+       |      partition_end := partition_start + make_interval(hours =&gt; partition_size);
+<span class="nc" id="L84">       |      spill_partition := ${info.tables.spillPartitions.name.asLiteral} || '_' || to_char(partition_start, 'YYYY_MM_DD_HH24');</span>
+       |
+<span class="nc" id="L86">       |      SELECT EXISTS(SELECT FROM pg_tables WHERE schemaname = ${info.schema.asLiteral} AND tablename = spill_partition)</span>
+       |        INTO pexists;
+       |
+       |      -- use &quot;create table as&quot; (vs create then insert) for performance benefits related to WAL skipping
+       |      IF pexists THEN
+       |        -- lock the child table to prevent any inserts that would be lost
+<span class="nc" id="L92">       |        EXECUTE 'LOCK TABLE ${info.schema.quoted}.' || quote_ident(spill_partition) ||</span>
+       |          ' IN SHARE ROW EXCLUSIVE MODE';
+<span class="nc" id="L94">       |        EXECUTE 'CREATE ' || table_wa_logging || 'TABLE ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||</span>
+       |          partition_tablespace || ' AS SELECT * FROM' ||
+<span class="nc" id="L96">       |          ' (SELECT * FROM ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+<span class="nc" id="L97">       |          ' UNION ALL SELECT * FROM ${info.schema.quoted}.' || quote_ident(spill_partition) ||</span>
+       |          ') results' ||
+<span class="nc" id="L99">       |          ' ORDER BY _st_sortablehash(${info.cols.geom.quoted})';</span>
+       |        GET DIAGNOSTICS unsorted_count := ROW_COUNT;
+       |      ELSE
+<span class="nc" id="L102">       |        EXECUTE 'CREATE ' || table_wa_logging || 'TABLE ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||</span>
+       |          partition_tablespace || ' AS SELECT * FROM ' || quote_ident(partition_name) ||
+<span class="nc" id="L104">       |          ' ORDER BY _st_sortablehash(${info.cols.geom.quoted})';</span>
+       |        GET DIAGNOSTICS unsorted_count := ROW_COUNT;
+       |      END IF;
+       |
+<span class="nc" id="L108">       |      EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||</span>
+       |        ' ADD CONSTRAINT ' || quote_ident(partition_name || '_pkey_tmp_sort') ||
+<span class="nc" id="L110">       |        ' PRIMARY KEY (fid, ${info.cols.dtg.quoted})' || index_tablespace;</span>
+       |      -- creating a constraint allows it to be attached to the parent without any additional checks
+<span class="nc" id="L112">       |      EXECUTE 'ALTER TABLE  ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||</span>
+       |        ' ADD CONSTRAINT ' || quote_ident(partition_name || '_constraint_tmp_sort') ||
+<span class="nc" id="L114">       |        ' CHECK ( ${info.cols.dtg.quoted} &gt;= ' || quote_literal(partition_start) ||</span>
+<span class="nc" id="L115">       |        ' AND ${info.cols.dtg.quoted} &lt; ' || quote_literal(partition_end) || ' )';</span>
+       |
+       |      -- create indices before attaching to minimize time to attach, copied from PartitionTables code
+<span class="nc" id="L118">       |      EXECUTE 'CREATE INDEX IF NOT EXISTS ' || quote_ident(partition_name || '_${info.cols.geom.raw}_tmp_sort') ||</span>
+<span class="nc" id="L119">       |        ' ON ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||</span>
+<span class="nc" id="L120">       |        ' USING BRIN(${info.cols.geom.quoted})' || partition_tablespace;</span>
+<span class="nc" id="L121">       |      EXECUTE 'CREATE INDEX IF NOT EXISTS ' || quote_ident(partition_name || '_${info.cols.dtg.raw}_tmp_sort') ||</span>
+<span class="nc" id="L122">       |        ' ON ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||</span>
+<span class="nc" id="L123">       |        ' (${info.cols.dtg.quoted})' || partition_tablespace;</span>
+<span class="nc" id="L124">       |${info.cols.indexed.map { col =&gt;</span>
+<span class="nc" id="L125">    s&quot;&quot;&quot;      EXECUTE 'CREATE INDEX IF NOT EXISTS ' || quote_ident(partition_name || '_${col.raw}_tmp_sort') ||</span>
+<span class="nc" id="L126">       |        ' ON ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||</span>
+<span class="nc" id="L127">       |        ' (${col.quoted})' || partition_tablespace;&quot;&quot;&quot;.stripMargin}.mkString(&quot;\n&quot;)}</span>
+       |
+       |      RAISE INFO '% Dropping old partition table (queries will be blocked) %', timeofday()::timestamp, partition_name;
+<span class="nc" id="L130">       |      EXECUTE 'DROP TABLE IF EXISTS ${info.schema.quoted}.' || quote_ident(partition_name);</span>
+       |      IF pexists THEN
+<span class="nc" id="L132">       |        EXECUTE 'DROP TABLE IF EXISTS ${info.schema.quoted}.' || quote_ident(spill_partition);</span>
+       |      END IF;
+       |
+       |      RAISE INFO '% Renaming newly sorted partition table %', timeofday()::timestamp, partition_name;
+<span class="nc" id="L136">       |      EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_name || '_tmp_sort') ||</span>
+       |        ' RENAME TO ' || quote_ident(partition_name);
+<span class="nc" id="L138">       |      EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |        ' RENAME CONSTRAINT ' || quote_ident(partition_name || '_pkey_tmp_sort') ||
+       |        ' TO ' || quote_ident(partition_name || '_pkey');
+<span class="nc" id="L141">       |      EXECUTE 'ALTER INDEX ' || quote_ident(partition_name || '_${info.cols.geom.raw}_tmp_sort') ||</span>
+<span class="nc" id="L142">       |        ' RENAME TO ' || quote_ident(partition_name || '_${info.cols.geom.raw}');</span>
+<span class="nc" id="L143">       |      EXECUTE 'ALTER INDEX ' || quote_ident(partition_name || '_${info.cols.dtg.raw}_tmp_sort') ||</span>
+<span class="nc" id="L144">       |        ' RENAME TO ' || quote_ident(partition_name || '_${info.cols.dtg.raw}');</span>
+<span class="nc" id="L145">       |${info.cols.indexed.map { col =&gt;</span>
+<span class="nc" id="L146">    s&quot;&quot;&quot;      EXECUTE 'ALTER INDEX ' || quote_ident(partition_name || '_${col.raw}_tmp_sort') ||</span>
+<span class="nc" id="L147">       |        ' RENAME TO ' || quote_ident(partition_name || '_${col.raw}');&quot;&quot;&quot;.stripMargin}.mkString(&quot;\n&quot;)}</span>
+       |
+       |      RAISE INFO '% Attaching newly sorted partition table %', timeofday()::timestamp, partition_name;
+<span class="nc" id="L150">       |      EXECUTE 'ALTER TABLE ${info.tables.mainPartitions.name.qualified}' ||</span>
+<span class="nc" id="L151">       |        ' ATTACH PARTITION ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |        ' FOR VALUES FROM (' || quote_literal(partition_start) || ') TO (' ||
+       |        quote_literal(partition_end) || ' );';
+       |      RAISE INFO '% Done compacting partition table %', timeofday()::timestamp, partition_name;
+       |
+       |      -- now that we've attached the table we can drop the redundant constraint
+       |      RAISE INFO '% Dropping constraint for partition table %', timeofday()::timestamp, partition_name;
+<span class="nc" id="L158">       |      EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |        ' DROP CONSTRAINT ' || quote_ident(partition_name || '_constraint_tmp_sort');
+       |
+       |      -- mark the partition to be analyzed in a separate thread
+<span class="nc" id="L162">       |      INSERT INTO ${info.tables.analyzeQueue.name.qualified}(partition_name, enqueued)</span>
+       |        VALUES (partition_name, now());
+       |
+       |      -- commit to release our locks
+       |      COMMIT;
+       |      RAISE INFO '% Done compacting % rows in partition %', timeofday()::timestamp, unsorted_count, partition_name;
+       |
+       |    END;
+       |  $$BODY$$;
+       |&quot;&quot;&quot;.stripMargin
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

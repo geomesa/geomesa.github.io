@@ -1,0 +1,374 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>GeohashUtils.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Utils</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.utils.geohash</a> &gt; <span class="el_source">GeohashUtils.scala</span></div><h1>GeohashUtils.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.utils.geohash
+
+import com.typesafe.scalalogging.LazyLogging
+import org.locationtech.geomesa.utils.geotools.GeometryUtils
+import org.locationtech.geomesa.utils.text.WKTUtils
+import org.locationtech.jts.geom._
+import org.locationtech.spatial4j.context.jts.JtsSpatialContext
+
+import scala.annotation.tailrec
+import scala.collection.BitSet
+import scala.collection.immutable.Range.Inclusive
+import scala.util.Try
+import scala.util.control.Exception.catching
+
+/**
+ * The following bits of code are related to common operations involving
+ * GeoHashes, such as recommending a GeoHash precision for an enclosing
+ * polygon; decomposing a polygon into a fixed number of subordinate
+ * GeoHashes; enumerating possible sub-strings within subordinate GeoHashes
+ * for a given polygon; etc.
+ */
+<span class="nc bnc" id="L30" title="All 4 branches missed.">object GeohashUtils extends LazyLogging {</span>
+
+  // make sure the implicits related to distance are in-scope
+  import org.locationtech.geomesa.utils.geotools.Conversions.RichGeometry
+
+  /**
+   * Simple place-holder for a pair of resolutions, minimum and maximum, along
+   * with an increment.
+   *
+   * @param minBitsResolution minimum number of bits (GeoHash) resolution to consider; must be ODD
+   * @param maxBitsResolution maximum number of bits (GeoHash) resolution to consider; must be ODD
+   */
+<span class="nc bnc" id="L42" title="All 20 branches missed.">  case class ResolutionRange(minBitsResolution:Int=5,</span>
+<span class="nc" id="L43">                             maxBitsResolution:Int=63,</span>
+<span class="nc" id="L44">                             numBitsIncrement:Int=2) {</span>
+    // validate resolution arguments
+<span class="nc bnc" id="L46" title="All 2 branches missed.">    if (minBitsResolution &gt;= maxBitsResolution)</span>
+<span class="nc" id="L47">      throw new IllegalArgumentException(&quot;Minimum resolution must be strictly greater than maximum resolution.&quot;)</span>
+
+<span class="nc bnc" id="L49" title="All 4 branches missed.">    lazy val range: Range = new Inclusive(minBitsResolution, maxBitsResolution, numBitsIncrement)</span>
+<span class="nc" id="L50">    override def toString: String = &quot;{&quot; + minBitsResolution.toString + &quot;, +&quot; + numBitsIncrement + &quot;..., &quot; + maxBitsResolution.toString + &quot;}&quot;</span>
+
+<span class="nc" id="L52">    private def getNumChildren: Int = 1 &lt;&lt; numBitsIncrement</span>
+
+    def getNextChildren(parent:BitSet, oldPrecision:Int) : List[BitSet] =
+<span class="nc" id="L55">      Range(0, getNumChildren).map { i =&gt;</span>
+        // compute bit-set corresponding to this integer,
+        // and add it to the left-shifted version of the parent
+<span class="nc" id="L58">        val bitString = i.toBinaryString</span>
+
+<span class="nc bnc" id="L60" title="All 2 branches missed.">        Range(0, numBitsIncrement).foldLeft(parent) { case (bs, j) =&gt;</span>
+<span class="nc bnc" id="L61" title="All 2 branches missed.">          val c = if (j &lt; bitString.length) bitString.charAt(j) else '0'</span>
+<span class="nc bnc" id="L62" title="All 2 branches missed.">          if (c == '1') bs + (oldPrecision + bitString.length - 1 - j)</span>
+<span class="nc" id="L63">          else bs</span>
+        }
+      }.toList
+
+  }
+
+  // default precision model
+<span class="nc" id="L70">  private val maxRealisticGeoHashPrecision : Int = 45</span>
+<span class="nc" id="L71">  private val numDistinctGridPoints: Long = 1L &lt;&lt; ((maxRealisticGeoHashPrecision+1)/2).toLong</span>
+<span class="nc" id="L72">  private val defaultPrecisionModel = new PrecisionModel(numDistinctGridPoints.toDouble)</span>
+
+  // default factory for WGS84
+<span class="nc" id="L75">  private val defaultGeometryFactory : GeometryFactory = new GeometryFactory(defaultPrecisionModel, 4326)</span>
+
+  /**
+   * Utility function that computes the minimum-bounding GeoHash that completely
+   * encloses the given (target) geometry.  This can be useful as a starting
+   * point for other calculations on the geometry.
+   *
+   * This is a bit of a short-cut, because what it *really* does is to start
+   * with the centroid of the target geometry, and step down through resolutions
+   * (in bits) for as long as a GeoHash constructed for that centroid continues
+   * to enclose the entire geometry.  This works, because any GeoHash that
+   * encloses the entire geometry must also include the centroid (as well as
+   * any other point).
+   *
+   * @param geom the target geometry that is to be enclosed
+   * @return the smallest GeoHash -- at an odd number of bits resolution -- that
+   *         completely encloses the target geometry
+   */
+  private def getMinimumBoundingGeohash(geom:Geometry, resolutions:ResolutionRange) : GeoHash = {
+    // save yourself some effort by computing the geometry's centroid and envelope up front
+<span class="nc" id="L95">    val centroid = getCentroid(geom)</span>
+<span class="nc" id="L96">    val env = defaultGeometryFactory.toGeometry(geom.getEnvelopeInternal)</span>
+
+    // conduct the search through the various candidate resolutions
+<span class="nc bnc" id="L99" title="All 6 branches missed.">    val (_, ghOpt) = resolutions.range.foldRight((resolutions.minBitsResolution, Option.empty[GeoHash])){</span>
+<span class="nc" id="L100">      case (bits, orig@(res, _)) =&gt;</span>
+<span class="nc" id="L101">        val gh = GeoHash(centroid.getX, centroid.getY, bits)</span>
+<span class="nc bnc" id="L102" title="All 4 branches missed.">        if (gh.contains(env) &amp;&amp; bits &gt;= res) (bits, Some(gh)) else orig</span>
+    }
+
+    // validate that you found a usable result
+<span class="nc" id="L106">    val gh = ghOpt.getOrElse(GeoHash(centroid.getX, centroid.getY, resolutions.minBitsResolution))</span>
+<span class="nc bnc" id="L107" title="All 4 branches missed.">    if (!gh.contains(env) &amp;&amp; !gh.geom.equals(env))</span>
+<span class="nc" id="L108">      throw new Exception(&quot;ERROR:  Could not find a suitable &quot; +</span>
+<span class="nc" id="L109">        resolutions.minBitsResolution + &quot;-bit MBR for the target geometry:  &quot; +</span>
+<span class="nc" id="L110">        geom)</span>
+
+<span class="nc" id="L112">    gh</span>
+  }
+
+  /**
+   * Computes the centroid of the given geometry as a WGS84 point.
+   *
+   * @param geom the target geometry whose centroid is sought
+   * @return the centroid of the given geometry
+   */
+  private def getCentroid(geom:Geometry) : Point = {
+<span class="nc" id="L122">    val pt = geom.safeCentroid()</span>
+<span class="nc" id="L123">    geom.getFactory.createPoint(new Coordinate(pt.getX, pt.getY))</span>
+  }
+
+  // represents a degenerate (empty) geometry
+<span class="nc bnc" id="L127" title="All 4 branches missed.">  private lazy val emptyGeometry: Geometry = WKTUtils.read(&quot;POLYGON((0 0,0 0,0 0,0 0,0 0))&quot;)</span>
+
+  /**
+   * Utility class for the geometry-decomposition routines.  This represents
+   * one GeoHash-cell candidate within a decomposition.
+   *
+   * @param gh the associated GeoHash cell
+   * @param targetGeom the geometry being decomposed
+   */
+<span class="nc" id="L136">  abstract class DecompositionCandidate(val gh:GeoHash, val targetGeom:Geometry) {</span>
+
+<span class="nc bnc" id="L138" title="All 4 branches missed.">    lazy val area: Double = Try(gh.getArea).getOrElse(0.0)</span>
+    val areaOutside: Double
+<span class="nc bnc" id="L140" title="All 4 branches missed.">    lazy val resolution: Int = gh.prec</span>
+<span class="nc bnc" id="L141" title="All 4 branches missed.">    lazy val intersectsTarget: Boolean = Try(gh.intersects(targetGeom)).getOrElse(false)</span>
+<span class="nc bnc" id="L142" title="All 4 branches missed.">    lazy val intersection: Geometry = Try(gh.intersection(targetGeom)).getOrElse(emptyGeometry)</span>
+    def isLT(than:DecompositionCandidate): Boolean = {
+<span class="nc bnc" id="L144" title="All 2 branches missed.">      if (areaOutside &gt; than.areaOutside) true</span>
+      else {
+<span class="nc bnc" id="L146" title="All 4 branches missed.">        if (areaOutside == than.areaOutside) area &lt; than.area</span>
+<span class="nc" id="L147">        else false</span>
+      }
+    }
+  }
+
+<span class="nc" id="L152">  private class PointDecompositionCandidate(gh:GeoHash, targetGeom:Point)</span>
+<span class="nc" id="L153">    extends DecompositionCandidate(gh, targetGeom) {</span>
+
+    /**
+     * If the GeoHash does not contain the point, then the entire cell's area is
+     * outside of the target.  If the GeoHash does contain the point, then be
+     * careful:  Only some fraction of the cell's area should count as overage
+     * (otherwise, we can't favor smaller GeoHash cells in the decomposer).
+     */
+<span class="nc bnc" id="L161" title="All 6 branches missed.">    override lazy val areaOutside: Double = area * (if (intersectsTarget) 0.75 else 1.0)</span>
+  }
+
+<span class="nc" id="L164">  private class LineDecompositionCandidate(gh:GeoHash, targetGeom:MultiLineString, targetArea:Double)</span>
+<span class="nc" id="L165">    extends DecompositionCandidate(gh, targetGeom) {</span>
+
+    /**
+     * If the GeoHash intersects the target lines, then the overlap is the
+     * area of the GeoHash cell less the length of the intersection.  Otherwise,
+     * they are disjoint, and the overlap is the entire area of the GeoHash cell.
+     *
+     * Yes, this mixes units, but it observes two trends:
+     * 1.  the longer a segment intersects, the smaller the area outside will be;
+     * 2.  the smaller a GeoHash cell, the smaller the area outside will be
+     */
+<span class="nc bnc" id="L176" title="All 4 branches missed.">    override lazy val areaOutside : Double =</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">      if (intersectsTarget) area * (1.0 - intersection.getLength / targetArea)</span>
+<span class="nc" id="L178">      else area</span>
+  }
+
+<span class="nc" id="L181">  private class PolygonDecompositionCandidate(gh:GeoHash, targetGeom:MultiPolygon)</span>
+<span class="nc" id="L182">    extends DecompositionCandidate(gh, targetGeom) {</span>
+
+    /**
+     * If the GeoHash intersects the target polygon, then the overlap is the
+     * area of the GeoHash cell less the area of the intersection.  Otherwise,
+     * they are disjoint, and the overlap is the entire area of the GeoHash cell.
+     */
+<span class="nc bnc" id="L189" title="All 4 branches missed.">    override lazy val areaOutside : Double =</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">      if (intersectsTarget) area - intersection.getArea</span>
+<span class="nc" id="L191">      else area</span>
+  }
+
+<span class="nc" id="L194">  private def decompositionCandidateSorter(a:DecompositionCandidate, b:DecompositionCandidate): Boolean = a.isLT(b)</span>
+
+  /**
+   * Decomposes the given polygon into a collection of disjoint GeoHash cells
+   * so that these constraints are satisfied:
+   * 1.  the total number of decomposed GeoHashes does not exceed the maximum
+   *     specified as an argument
+   * 2.  the resolution of the GeoHashes falls within the given range
+   * 3.  when replacing larger boxes with smaller boxes, always decompose first
+   *     the box that contains the most area outside the target polygon
+   *
+   * @param targetGeom the polygon to be decomposed
+   * @param maxSize the maximum number of GeoHash cells into which this polygon
+   *                should be decomposed
+   * @param resolutions the list of acceptable resolutions for the GeoHash cells
+   * @return the list of GeoHash cells into which this polygon was decomposed
+   *         under the given constraints
+   */
+  private def decomposeGeometry_(targetGeom: Geometry, maxSize: Int, resolutions: ResolutionRange): List[GeoHash] = {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">    lazy val geomCatcher = catching(classOf[Exception])</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">    lazy val targetLength : Double = geomCatcher.opt { targetGeom.getLength }.getOrElse(0.0)</span>
+
+    // qua factory
+    def createDecompositionCandidate(gh: GeoHash): DecompositionCandidate = {
+      // simple switch based on the geometry type
+<span class="nc" id="L219">      targetGeom match {</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        case multipoly: MultiPolygon    =&gt;</span>
+<span class="nc" id="L221">          new PolygonDecompositionCandidate(gh, multipoly)</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        case polygon: Polygon           =&gt;</span>
+<span class="nc" id="L223">          new PolygonDecompositionCandidate(</span>
+<span class="nc" id="L224">            gh, new MultiPolygon(Array(polygon), polygon.getFactory))</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        case line: LineString           =&gt;</span>
+<span class="nc" id="L226">          new LineDecompositionCandidate(  // promote to a multi-line string of one element</span>
+<span class="nc" id="L227">            gh, new MultiLineString(Array(line), line.getFactory), targetLength)</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        case multiLine: MultiLineString =&gt;</span>
+<span class="nc" id="L229">          new LineDecompositionCandidate(gh, multiLine, targetLength)</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        case point: Point               =&gt;</span>
+<span class="nc" id="L231">          new PointDecompositionCandidate(gh, point)  // should never be called, but it works</span>
+        case _                          =&gt;
+<span class="nc" id="L233">          throw new Exception(s&quot;Unsupported Geometry type for decomposition:  ${targetGeom.getClass.getName}&quot;)</span>
+      }
+    }
+
+    // recursive routine that will do the actual decomposition
+    @tailrec
+    def decomposeStep(candidates: List[DecompositionCandidate]): List[DecompositionCandidate] = {
+      // complain, if needed
+<span class="nc bnc" id="L241" title="All 2 branches missed.">      if (candidates.size &gt; maxSize) throw new Exception(&quot;Too many candidates upon entry.&quot;)</span>
+      else {
+        // identify the partial to replace...
+        // which of the single candidates contains the least overlap (area outside the target geometry)?
+        // assume that these are always sorted so that they are in descending order of overlap-area
+<span class="nc" id="L246">        val candidate : DecompositionCandidate = candidates.head</span>
+<span class="nc" id="L247">        val childResolution : Int = candidate.gh.prec+resolutions.numBitsIncrement</span>
+
+        // decompose this (worst) candidate into its four children
+<span class="nc" id="L250">        val candidateBitSet : BitSet = candidate.gh.bitset</span>
+<span class="nc" id="L251">        val children:List[DecompositionCandidate] = resolutions.getNextChildren(candidateBitSet, candidate.gh.prec).map(childBitSet =&gt; {</span>
+<span class="nc" id="L252">          createDecompositionCandidate(GeoHash(childBitSet, childResolution))</span>
+<span class="nc" id="L253">        }).filter(child =&gt; child.intersectsTarget)</span>
+
+        // build the next iteration of candidates
+<span class="nc" id="L256">        val newCandidates : List[DecompositionCandidate] = (candidates.tail ++ children).sortWith(decompositionCandidateSorter)</span>
+
+        // recurse, if appropriate
+<span class="nc bnc" id="L259" title="All 4 branches missed.">        if ((newCandidates.size &lt;= maxSize) &amp;&amp; (childResolution &lt;= resolutions.maxBitsResolution)) {</span>
+<span class="nc" id="L260">          decomposeStep(newCandidates)</span>
+<span class="nc" id="L261">        } else candidates</span>
+      }
+    }
+
+    // identify the smallest GeoHash that contains the entire polygon
+<span class="nc" id="L266">    val ghMBR = getMinimumBoundingGeohash(targetGeom, resolutions)</span>
+<span class="nc" id="L267">    val candidateMBR = createDecompositionCandidate(ghMBR)</span>
+
+    // recursively decompose worst choices
+<span class="nc" id="L270">    val (keepers:List[DecompositionCandidate]) = decomposeStep(List(candidateMBR))</span>
+
+    // return only the keepers
+<span class="nc bnc" id="L273" title="All 2 branches missed.">    (for (keeper:DecompositionCandidate &lt;- keepers) yield keeper.gh).toList</span>
+  }
+
+<span class="nc" id="L276">  private def getDecomposableGeometry(targetGeom: Geometry): Geometry = targetGeom match {</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">    case _: Point                                            =&gt; targetGeom</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">    case _: Polygon                                          =&gt; targetGeom</span>
+<span class="nc bnc" id="L279" title="All 4 branches missed.">    case _: LineString      if targetGeom.getNumPoints &lt; 100 =&gt; targetGeom</span>
+<span class="nc bnc" id="L280" title="All 4 branches missed.">    case _: MultiLineString if targetGeom.getNumPoints &lt; 100 =&gt; targetGeom</span>
+<span class="nc" id="L281">    case _                                                   =&gt; targetGeom.convexHull</span>
+  }
+
+  /**
+   * Transforms a geometry with lon in (-inf, inf) and lat in [-90,90] to a geometry in whole earth BBOX
+   * 1) any coords of geometry outside lon [-180,180] are transformed to be within [-180,180]
+   *    (to avoid spatial4j validation errors)
+   * 2) use spatial4j to create a geometry with inferred International Date Line crossings
+   *    (if successive coordinates longitudinal difference is greater than 180)
+   * Parts of geometries with lat outside [-90,90] are ignored.
+   * To represent a geometry with successive coordinates having lon diff &gt; 180 and not wrapping
+   * the IDL, you must insert a waypoint such that the difference is less than 180
+   */
+  def getInternationalDateLineSafeGeometry(targetGeom: Geometry): Try[Geometry] = {
+
+<span class="nc" id="L296">    def degreesLonTranslation(lon: Double): Double = (((lon + 180) / 360.0).floor * -360).toInt</span>
+
+    def translateCoord(coord: Coordinate): Coordinate = {
+<span class="nc" id="L299">      new Coordinate(coord.x + degreesLonTranslation(coord.x), coord.y)</span>
+    }
+
+    def translatePolygon(geometry: Geometry): Geometry =
+<span class="nc" id="L303">      defaultGeometryFactory.createPolygon(geometry.getCoordinates.map(c =&gt; translateCoord(c)))</span>
+
+    def translateLineString(geometry: Geometry): Geometry =
+<span class="nc" id="L306">      defaultGeometryFactory.createLineString(geometry.getCoordinates.map(c =&gt; translateCoord(c)))</span>
+
+    def translateMultiLineString(geometry: Geometry): Geometry = {
+<span class="nc" id="L309">      val coords = Seq.tabulate(geometry.getNumGeometries)(geometry.getGeometryN)</span>
+<span class="nc" id="L310">      val translated = coords.map { c =&gt; translateLineString(c).asInstanceOf[LineString] }</span>
+<span class="nc" id="L311">      defaultGeometryFactory.createMultiLineString(translated.toArray)</span>
+    }
+
+    def translateMultiPolygon(geometry: Geometry): Geometry = {
+<span class="nc" id="L315">      val coords = Seq.tabulate(geometry.getNumGeometries)(geometry.getGeometryN)</span>
+<span class="nc" id="L316">      val translated = coords.map { c =&gt; translatePolygon(c).asInstanceOf[Polygon] }</span>
+<span class="nc" id="L317">      defaultGeometryFactory.createMultiPolygon(translated.toArray)</span>
+    }
+
+    def translateMultiPoint(geometry: Geometry): Geometry =
+<span class="nc" id="L321">      defaultGeometryFactory.createMultiPointFromCoords(geometry.getCoordinates.map(c =&gt; translateCoord(c)))</span>
+
+    def translatePoint(geometry: Geometry): Geometry = {
+<span class="nc" id="L324">      defaultGeometryFactory.createPoint(translateCoord(geometry.getCoordinate))</span>
+    }
+
+    def translateGeometry(geometry: Geometry): Geometry = {
+<span class="nc" id="L328">      geometry match {</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        case _: Polygon =&gt;          translatePolygon(geometry)</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        case _: LineString =&gt;       translateLineString(geometry)</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        case _: MultiLineString =&gt;  translateMultiLineString(geometry)</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        case _: MultiPolygon =&gt;     translateMultiPolygon(geometry)</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        case _: MultiPoint =&gt;       translateMultiPoint(geometry)</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        case _: Point =&gt;            translatePoint(geometry)</span>
+      }
+    }
+
+<span class="nc" id="L338">    Try {</span>
+      // copy the geometry so that we don't modify the input - JTS mutates the geometry
+      // don't use the defaultGeometryFactory as it has limited precision
+<span class="nc" id="L341">      val copy = GeometryUtils.geoFactory.createGeometry(targetGeom)</span>
+      val withinBoundsGeom =
+<span class="nc bnc" id="L343" title="All 4 branches missed.">        if (targetGeom.getEnvelopeInternal.getMinX &lt; -180 || targetGeom.getEnvelopeInternal.getMaxX &gt; 180)</span>
+<span class="nc" id="L344">          translateGeometry(copy)</span>
+        else
+<span class="nc" id="L346">          copy</span>
+
+<span class="nc" id="L348">      JtsSpatialContext.GEO.getShapeFactory.makeShape(withinBoundsGeom, true, true).getGeom</span>
+    }
+  }
+
+  /**
+   * Quick-and-dirty sieve that ensures that we don't waste time decomposing
+   * single points.
+   */
+  def decomposeGeometry(targetGeom: Geometry,
+<span class="nc" id="L357">                        maxSize: Int = 100,</span>
+<span class="nc" id="L358">                        resolutions: ResolutionRange = ResolutionRange(0, 40, 5)): List[(Double, Double, Double, Double)] = {</span>
+  // quick hit to avoid wasting time for single points
+<span class="nc" id="L360">    targetGeom match {</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">      case point: Point =&gt;</span>
+<span class="nc" id="L362">        val gh = GeoHash(point.getX, point.getY, resolutions.maxBitsResolution)</span>
+<span class="nc" id="L363">        List((gh.bbox.ll.getX, gh.bbox.ll.getY, gh.bbox.ur.getX, gh.bbox.ur.getY))</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">      case gc: GeometryCollection =&gt;</span>
+<span class="nc" id="L365">        List.tabulate(gc.getNumGeometries)(gc.getGeometryN).flatMap(decomposeGeometry(_, maxSize, resolutions)).distinct</span>
+      case _ =&gt;
+<span class="nc" id="L367">        val safeGeom = getInternationalDateLineSafeGeometry(targetGeom).getOrElse(targetGeom)</span>
+<span class="nc" id="L368">        val relaxed = getDecomposableGeometry(safeGeom)</span>
+<span class="nc" id="L369">        decomposeGeometry_(relaxed, maxSize, resolutions)</span>
+<span class="nc" id="L370">          .map(gh =&gt; (gh.bbox.ll.getX, gh.bbox.ll.getY, gh.bbox.ur.getX, gh.bbox.ur.getY))</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

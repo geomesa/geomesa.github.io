@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ZookeeperOffsetManager.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Lambda DataStore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.lambda.stream</a> &gt; <span class="el_source">ZookeeperOffsetManager.scala</span></div><h1>ZookeeperOffsetManager.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.lambda.stream
+
+import com.typesafe.scalalogging.LazyLogging
+import org.apache.curator.framework.recipes.cache.{PathChildrenCache, PathChildrenCacheEvent, PathChildrenCacheListener}
+import org.apache.curator.framework.recipes.locks.InterProcessSemaphoreMutex
+import org.apache.curator.framework.{CuratorFramework, CuratorFrameworkFactory}
+import org.apache.curator.retry.ExponentialBackoffRetry
+import org.locationtech.geomesa.lambda.stream.OffsetManager.OffsetListener
+import org.locationtech.geomesa.lambda.stream.ZookeeperOffsetManager.CuratorOffsetListener
+import org.locationtech.geomesa.utils.index.ByteArrays
+import org.locationtech.geomesa.utils.io.CloseWithLogging
+
+import java.io.Closeable
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.{Executors, TimeUnit}
+import scala.util.control.NonFatal
+import scala.util.{Failure, Success, Try}
+
+<span class="nc" id="L27">class ZookeeperOffsetManager(zookeepers: String, namespace: String = &quot;geomesa&quot;) extends OffsetManager {</span>
+
+  import ZookeeperOffsetManager.offsetsPath
+
+<span class="nc" id="L31">  private val client =</span>
+<span class="nc" id="L32">    CuratorFrameworkFactory.builder()</span>
+<span class="nc" id="L33">      .connectString(zookeepers)</span>
+<span class="nc" id="L34">      .retryPolicy(new ExponentialBackoffRetry(1000, 3))</span>
+      .dontUseContainerParents()
+<span class="nc" id="L36">      .namespace(namespace)</span>
+      .build()
+<span class="nc" id="L38">  client.start()</span>
+
+<span class="nc" id="L40">  private val listeners = scala.collection.mutable.Map.empty[String, CuratorOffsetListener]</span>
+
+  override def getOffset(topic: String, partition: Int): Long = {
+<span class="nc" id="L43">    val path = ZookeeperOffsetManager.offsetsPath(topic, partition)</span>
+<span class="nc bnc" id="L44" title="All 2 branches missed.">    if (client.checkExists().forPath(path) == null) { -1L } else {</span>
+<span class="nc" id="L45">      ZookeeperOffsetManager.deserializeOffsets(client.getData.forPath(path))</span>
+    }
+  }
+
+  override def setOffset(topic: String, partition: Int, offset: Long): Unit = {
+<span class="nc" id="L50">    val path = ZookeeperOffsetManager.offsetsPath(topic, partition)</span>
+<span class="nc bnc" id="L51" title="All 2 branches missed.">    if (client.checkExists().forPath(path) == null) {</span>
+<span class="nc" id="L52">      client.create().creatingParentsIfNeeded().forPath(path)</span>
+    }
+<span class="nc" id="L54">    client.setData().forPath(path, ZookeeperOffsetManager.serializeOffset(offset))</span>
+  }
+
+  override def deleteOffsets(topic: String): Unit = {
+<span class="nc" id="L58">    val path = ZookeeperOffsetManager.offsetsPath(topic)</span>
+<span class="nc bnc" id="L59" title="All 2 branches missed.">    if (client.checkExists().forPath(path) != null) {</span>
+<span class="nc" id="L60">      client.delete().deletingChildrenIfNeeded().forPath(path)</span>
+    }
+  }
+
+  override def addOffsetListener(topic: String, listener: OffsetListener): Unit = synchronized {
+<span class="nc" id="L65">    listeners.getOrElseUpdate(topic, new CuratorOffsetListener(client, offsetsPath(topic))).addListener(listener)</span>
+  }
+
+  override def removeOffsetListener(topic: String, listener: OffsetListener): Unit = synchronized {
+<span class="nc" id="L69">    listeners.get(topic).foreach(_.removeListener(listener))</span>
+  }
+
+<span class="nc" id="L72">  override def close(): Unit = synchronized {</span>
+<span class="nc" id="L73">    CloseWithLogging(listeners.values)</span>
+<span class="nc" id="L74">    listeners.clear()</span>
+<span class="nc" id="L75">    CloseWithLogging(client)</span>
+  }
+
+  override protected def acquireDistributedLock(path: String): Closeable =
+<span class="nc" id="L79">    acquireLock(path, lock =&gt; { lock.acquire(); true })</span>
+
+  override protected def acquireDistributedLock(path: String, timeOut: Long): Option[Closeable] =
+<span class="nc" id="L82">    Option(acquireLock(path, lock =&gt; lock.acquire(timeOut, TimeUnit.MILLISECONDS)))</span>
+
+  private def acquireLock(path: String, acquire: InterProcessSemaphoreMutex =&gt; Boolean): Closeable = {
+<span class="nc" id="L85">    val lock = new InterProcessSemaphoreMutex(client, s&quot;/$path/locks&quot;)</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">    if (acquire(lock)) {</span>
+<span class="nc" id="L87">      () =&gt; lock.release()</span>
+    } else {
+<span class="nc" id="L89">      null</span>
+    }
+  }
+}
+
+<span class="nc" id="L94">object ZookeeperOffsetManager {</span>
+
+<span class="nc" id="L96">  def serializeOffset(offset: Long): Array[Byte] = offset.toString.getBytes(StandardCharsets.UTF_8)</span>
+<span class="nc" id="L97">  def deserializeOffsets(bytes: Array[Byte]): Long = new String(bytes, StandardCharsets.UTF_8).toLong</span>
+
+<span class="nc" id="L99">  private def offsetsPath(topic: String): String = s&quot;/$topic/offsets&quot;</span>
+<span class="nc" id="L100">  private def offsetsPath(topic: String, partition: Int): String = s&quot;${offsetsPath(topic)}/$partition&quot;</span>
+<span class="nc" id="L101">  private def partitionFromPath(path: String): Int = path.substring(path.lastIndexOf(&quot;/&quot;) + 1).toInt</span>
+
+<span class="nc bnc" id="L103" title="All 4 branches missed.">  private class CuratorOffsetListener(client: CuratorFramework, path: String)</span>
+<span class="nc" id="L104">      extends PathChildrenCacheListener with Closeable with LazyLogging {</span>
+
+<span class="nc" id="L106">    private val executor = Executors.newCachedThreadPool()</span>
+
+<span class="nc" id="L108">    private val listeners = scala.collection.mutable.Set.empty[OffsetListener]</span>
+
+<span class="nc" id="L110">    private var cache: PathChildrenCache = _</span>
+
+    def addListener(listener: OffsetListener): Unit = {
+<span class="nc" id="L113">      closeCache()</span>
+<span class="nc" id="L114">      listeners += listener</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">      cache = new PathChildrenCache(client, path, true) {</span>
+        // override ensure path to avoid using containers, which aren't supported in zk 3.4
+        override protected def ensurePath(): Unit = {
+<span class="nc bnc" id="L118" title="All 2 branches missed.">          if (client.checkExists().forPath(path) == null) {</span>
+<span class="nc" id="L119">            client.create().creatingParentsIfNeeded().forPath(path)</span>
+          }
+        }
+      }
+<span class="nc" id="L123">      cache.getListenable.addListener(this)</span>
+<span class="nc" id="L124">      cache.start()</span>
+    }
+
+    def removeListener(listener: OffsetListener): Unit = {
+<span class="nc" id="L128">      listeners -= listener</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">      if (listeners.isEmpty) {</span>
+<span class="nc" id="L130">        closeCache()</span>
+      }
+    }
+
+    override def childEvent(client: CuratorFramework, event: PathChildrenCacheEvent): Unit = {
+      import PathChildrenCacheEvent.Type.{CHILD_ADDED, CHILD_UPDATED}
+<span class="nc" id="L136">      try {</span>
+<span class="nc" id="L137">        val eventPath = Option(event.getData).map(_.getPath).getOrElse(&quot;&quot;)</span>
+<span class="nc bnc" id="L138" title="All 14 branches missed.">        if ((event.getType == CHILD_ADDED || event.getType == CHILD_UPDATED) &amp;&amp; eventPath.startsWith(path)) {</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">          logger.trace(s&quot;ZK event triggered for: $eventPath&quot;)</span>
+<span class="nc" id="L140">          val partition = partitionFromPath(eventPath)</span>
+<span class="nc" id="L141">          val data = event.getData.getData</span>
+<span class="nc" id="L142">          Try(ZookeeperOffsetManager.deserializeOffsets(data)) match {</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">            case Success(offset) =&gt;</span>
+<span class="nc" id="L144">              listeners.foreach { listener =&gt;</span>
+<span class="nc" id="L145">                executor.execute(() =&gt; {</span>
+<span class="nc" id="L146">                  try { listener.offsetChanged(partition, offset) } catch {</span>
+<span class="nc bnc" id="L147" title="All 4 branches missed.">                    case NonFatal(e) =&gt; logger.warn(&quot;Error calling offset listener&quot;, e)</span>
+                  }
+                })
+              }
+
+<span class="nc bnc" id="L152" title="All 2 branches missed.">            case Failure(e) =&gt;</span>
+              // for some reason we get IP addresses sometimes... seems to be something curator is doing.
+              // we generally get the correct data immediately afterwards, so it appears to be harmless
+<span class="nc bnc" id="L155" title="All 2 branches missed.">              logger.warn(</span>
+<span class="nc" id="L156">                s&quot;Error deserializing offset data &quot; +</span>
+<span class="nc" id="L157">                  s&quot;'${Try(new String(data, StandardCharsets.UTF_8)).getOrElse(ByteArrays.toHex(data))}': ${e.getClass.getName}&quot;)</span>
+          }
+        }
+      } catch {
+<span class="nc bnc" id="L161" title="All 4 branches missed.">        case NonFatal(e) =&gt; logger.warn(&quot;Error handling ZK event&quot;, e)</span>
+      }
+    }
+
+    override def close(): Unit = {
+<span class="nc" id="L166">      executor.shutdown()</span>
+<span class="nc" id="L167">      closeCache()</span>
+    }
+
+    private def closeCache(): Unit = synchronized {
+<span class="nc bnc" id="L171" title="All 2 branches missed.">      if (cache != null) {</span>
+<span class="nc" id="L172">        cache.getListenable.removeListener(this)</span>
+<span class="nc" id="L173">        CloseWithLogging(cache)</span>
+<span class="nc" id="L174">        cache = null</span>
+      }
+    }
+  }
+<span class="nc" id="L178">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

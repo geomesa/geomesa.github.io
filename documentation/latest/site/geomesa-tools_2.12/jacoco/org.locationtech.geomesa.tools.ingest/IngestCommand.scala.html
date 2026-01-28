@@ -1,0 +1,488 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>IngestCommand.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Tools</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.tools.ingest</a> &gt; <span class="el_source">IngestCommand.scala</span></div><h1>IngestCommand.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.tools.ingest
+
+import com.beust.jcommander.{Parameter, ParameterException}
+import com.typesafe.config.{Config, ConfigFactory, ConfigRenderOptions, ConfigValueFactory}
+import com.typesafe.scalalogging.LazyLogging
+import org.apache.commons.io.{FilenameUtils, IOUtils}
+import org.apache.hadoop.mapreduce.Job
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat
+import org.geotools.api.data.DataStore
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.locationtech.geomesa.convert.all.TypeAwareInference
+import org.locationtech.geomesa.convert.{ConverterConfigLoader, EvaluationContext}
+import org.locationtech.geomesa.convert2.SimpleFeatureConverter
+import org.locationtech.geomesa.jobs.Awaitable
+import org.locationtech.geomesa.jobs.JobResult.{JobFailure, JobSuccess}
+import org.locationtech.geomesa.jobs.mapreduce.ConverterCombineInputFormat
+import org.locationtech.geomesa.tools.Command.CommandException
+import org.locationtech.geomesa.tools.DistributedRunParam.RunModes
+import org.locationtech.geomesa.tools.DistributedRunParam.RunModes.RunMode
+import org.locationtech.geomesa.tools._
+import org.locationtech.geomesa.tools.data.CreateSchemaCommand.SchemaOptionsCommand
+import org.locationtech.geomesa.tools.ingest.IngestCommand.{IngestCounters, IngestParams, Inputs}
+import org.locationtech.geomesa.tools.utils.{CLArgResolver, Prompt, TerminalCallback}
+import org.locationtech.geomesa.utils.collection.CloseableIterator
+import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypeComparator.TypeComparison
+import org.locationtech.geomesa.utils.geotools.{ConfigSftParsing, SimpleFeatureTypeComparator, SimpleFeatureTypes}
+import org.locationtech.geomesa.utils.io.fs.FileSystemDelegate.FileHandle
+import org.locationtech.geomesa.utils.io.fs.LocalDelegate.{CachingStdInHandle, StdInHandle}
+import org.locationtech.geomesa.utils.io.{PathUtils, WithClose}
+import org.locationtech.geomesa.utils.text.TextTools
+
+import java.io.{File, FileWriter, InputStream, PrintWriter}
+import java.nio.charset.StandardCharsets
+import java.util.{Collections, Locale}
+import scala.collection.mutable.ListBuffer
+import scala.util.control.NonFatal
+import scala.util.{Failure, Success, Try}
+
+trait IngestCommand[DS &lt;: DataStore]
+<span class="nc" id="L49">    extends DataStoreCommand[DS] with DistributedCommand with InteractiveCommand with SchemaOptionsCommand {</span>
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L53">  override val name = &quot;ingest&quot;</span>
+  override def params: IngestParams
+
+<span class="nc" id="L56">  override def libjarsFiles: Seq[String] = Seq(&quot;org/locationtech/geomesa/tools/ingest-libjars.list&quot;)</span>
+
+  override def execute(): Unit = {
+    val inputs: Inputs = {
+<span class="nc" id="L60">      val files = Inputs(params.files.asScala.toSeq)</span>
+<span class="nc bnc" id="L61" title="All 4 branches missed.">      if (files.stdin &amp;&amp; !StdInHandle.isAvailable) {</span>
+<span class="nc bnc" id="L62" title="All 2 branches missed.">        if (files.paths.isEmpty) {</span>
+<span class="nc" id="L63">          throw new ParameterException(&quot;Missing option: &lt;files&gt;... is required, or use `-` to ingest from standard in&quot;)</span>
+        } else {
+<span class="nc bnc" id="L65" title="All 2 branches missed.">          Command.user.info(&quot;Waiting for input...&quot;)</span>
+<span class="nc bnc" id="L66" title="All 2 branches missed.">          while (!StdInHandle.isAvailable) {</span>
+<span class="nc" id="L67">            Thread.sleep(10)</span>
+          }
+        }
+      }
+<span class="nc bnc" id="L71" title="All 2 branches missed.">      if (params.srcList) { files.asSourceList } else { files }</span>
+    }
+
+<span class="nc" id="L74">    val format = IngestCommand.getDataFormat(params, inputs.paths)</span>
+<span class="nc" id="L75">    val remote = inputs.paths.exists(PathUtils.isRemote)</span>
+
+<span class="nc bnc" id="L77" title="All 2 branches missed.">    if (remote) {</span>
+      // If we have a remote file, make sure they are all the same FS
+<span class="nc" id="L79">      val prefix = inputs.paths.head.split(&quot;/&quot;)(0).toLowerCase</span>
+<span class="nc bnc" id="L80" title="All 2 branches missed.">      if (!inputs.paths.drop(1).forall(_.toLowerCase.startsWith(prefix))) {</span>
+<span class="nc" id="L81">        throw new ParameterException(s&quot;Files must all be on the same file system: ($prefix) or all be local&quot;)</span>
+      }
+    }
+
+<span class="nc bnc" id="L85" title="All 2 branches missed.">    val mode = if (format.contains(&quot;shp&quot;)) {</span>
+      // shapefiles have to be ingested locally, as we need access to the related files
+<span class="nc bnc" id="L87" title="All 8 branches missed.">      if (params.mode.exists(_ != RunModes.Local)) {</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">        Command.user.warn(&quot;Forcing run mode to local for shapefile ingestion&quot;)</span>
+      }
+<span class="nc" id="L90">      RunModes.Local</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">    } else if (remote) {</span>
+<span class="nc" id="L92">      params.mode.getOrElse(RunModes.Distributed)</span>
+    } else {
+<span class="nc bnc" id="L94" title="All 8 branches missed.">      if (params.mode.exists(_ != RunModes.Local)) {</span>
+<span class="nc" id="L95">        throw new ParameterException(&quot;Input files must be in a distributed file system to run in distributed mode&quot;)</span>
+      }
+<span class="nc" id="L97">      RunModes.Local</span>
+    }
+
+<span class="nc bnc" id="L100" title="All 6 branches missed.">    if (mode == RunModes.Local) {</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">      if (!params.waitForCompletion) {</span>
+<span class="nc" id="L102">        throw new ParameterException(&quot;Tracking must be enabled when running in local mode&quot;)</span>
+      }
+<span class="nc bnc" id="L104" title="All 2 branches missed.">    } else if (params.threads != 1) {</span>
+<span class="nc" id="L105">      throw new ParameterException(&quot;Threads can only be specified in local mode&quot;)</span>
+    }
+<span class="nc bnc" id="L107" title="All 4 branches missed.">    if (params.maxSplitSize != null &amp;&amp; !params.combineInputs) {</span>
+<span class="nc" id="L108">      throw new ParameterException(&quot;--split-max-size can only be used with --combine-inputs&quot;)</span>
+    }
+
+<span class="nc" id="L111">    withDataStore { ds =&gt;</span>
+      // use .get to re-throw the exception if we fail
+<span class="nc bnc" id="L113" title="All 2 branches missed.">      IngestCommand.getSftAndConverter(params, inputs, format, Some(ds)).get.foreach { case (sft, converter) =&gt;</span>
+<span class="nc" id="L114">        val start = System.currentTimeMillis()</span>
+        // create schema for the feature prior to ingest
+<span class="nc" id="L116">        var existing = Try(ds.getSchema(sft.getTypeName)).getOrElse(null)</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">        if (existing == null) {</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">          Command.user.info(s&quot;Creating schema '${sft.getTypeName}'&quot;)</span>
+<span class="nc" id="L119">          setBackendSpecificOptions(sft)</span>
+<span class="nc" id="L120">          ds.createSchema(sft)</span>
+<span class="nc" id="L121">          existing = ds.getSchema(sft.getTypeName)</span>
+        } else {
+          // note: sft will have been loaded from the datastore if it already exists, so will match existing
+<span class="nc bnc" id="L124" title="All 2 branches missed.">          Command.user.info(s&quot;Schema '${sft.getTypeName}' exists&quot;)</span>
+        }
+<span class="nc" id="L126">        val result = startIngest(mode, ds, existing, converter, inputs)</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">        if (params.waitForCompletion) {</span>
+<span class="nc" id="L128">          result.await(TerminalCallback()) match {</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">            case JobSuccess(message, counts) =&gt;</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">              Command.user.info(s&quot;Ingestion complete in ${TextTools.getTime(start)}&quot;)</span>
+<span class="nc" id="L131">              val count = counts.getOrElse(IngestCounters.Persisted, counts.getOrElse(IngestCounters.Ingested, 0L))</span>
+<span class="nc" id="L132">              val failed = counts.getOrElse(IngestCounters.Failed, 0L)</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">              Command.user.info(IngestCommand.getStatInfo(count, failed, input = message))</span>
+
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            case JobFailure(message) =&gt;</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">              Command.user.error(s&quot;Ingestion failed in ${TextTools.getTime(start)}&quot;)</span>
+              // propagate out and return an exit code error
+<span class="nc" id="L138">              throw new CommandException(message)</span>
+          }
+        } else {
+<span class="nc bnc" id="L141" title="All 2 branches missed.">          Command.user.info(&quot;Job submitted, check tracking for progress and result&quot;)</span>
+        }
+      }
+    }
+  }
+
+  /**
+   * Start the ingestion asynchronously, returning an object for reporting status
+   *
+   * @param mode run mode
+   * @param ds data store
+   * @param sft simple feature type
+   * @param converter converter config
+   * @param inputs input files
+   * @return
+   */
+  protected def startIngest(
+      mode: RunMode,
+      ds: DS,
+      sft: SimpleFeatureType,
+      converter: Config,
+      inputs: Inputs): Awaitable = {
+<span class="nc" id="L163">    mode match {</span>
+<span class="nc bnc" id="L164" title="All 6 branches missed.">      case RunModes.Local =&gt;</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        Command.user.info(&quot;Running ingestion in local mode&quot;)</span>
+<span class="nc" id="L166">        new LocalConverterIngest(ds, connection.asJava, sft, converter, inputs, params.threads)</span>
+
+<span class="nc bnc" id="L168" title="All 6 branches missed.">      case RunModes.Distributed =&gt;</span>
+<span class="nc bnc" id="L169" title="All 4 branches missed.">        Command.user.info(s&quot;Running ingestion in distributed ${if (params.combineInputs) &quot;combine &quot; else &quot;&quot; }mode&quot;)</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        new ConverterIngestJob(connection, sft, converter, inputs.paths, libjarsFiles, libjarsPaths) {</span>
+          override def configureJob(job: Job): Unit = {
+<span class="nc" id="L172">            super.configureJob(job)</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">            if (params.combineInputs) {</span>
+<span class="nc" id="L174">              job.setInputFormatClass(classOf[ConverterCombineInputFormat])</span>
+<span class="nc" id="L175">              Option(params.maxSplitSize).foreach(s =&gt; FileInputFormat.setMaxInputSplitSize(job, s.toLong))</span>
+            }
+          }
+        }
+
+      case _ =&gt;
+<span class="nc" id="L181">        throw new UnsupportedOperationException(s&quot;Missing implementation for mode $mode&quot;)</span>
+    }
+  }
+}
+
+<span class="nc bnc" id="L186" title="All 4 branches missed.">object IngestCommand extends LazyLogging {</span>
+
+<span class="nc" id="L188">  val LocalBatchSize: SystemProperty = SystemProperty(&quot;geomesa.ingest.local.batch.size&quot;, &quot;20000&quot;)</span>
+
+  // @Parameters(commandDescription = &quot;Ingest/convert various file formats into GeoMesa&quot;)
+<span class="nc" id="L191">  trait IngestParams extends OptionalTypeNameParam with OptionalFeatureSpecParam with OptionalForceParam</span>
+      with ConverterConfigParam with OptionalInputFormatParam with DistributedRunParam with DistributedCombineParam {
+
+    @Parameter(names = Array(&quot;-t&quot;, &quot;--threads&quot;), description = &quot;Number of threads if using local ingest&quot;)
+<span class="nc" id="L195">    var threads: Integer = 1</span>
+
+    @Parameter(names = Array(&quot;--src-list&quot;), description = &quot;Input files are text files with lists of files, one per line, to ingest.&quot;)
+<span class="nc" id="L198">    var srcList: Boolean = false</span>
+
+    @Parameter(names = Array(&quot;--no-tracking&quot;), description = &quot;Return immediately after submitting ingest job (distributed jobs)&quot;)
+<span class="nc" id="L201">    var noWaitForCompletion: Boolean = false</span>
+
+<span class="nc bnc" id="L203" title="All 2 branches missed.">    def waitForCompletion: Boolean = !noWaitForCompletion</span>
+  }
+
+  /**
+    * Determine the input file data format
+    *
+    * @param params params
+    * @param files input files
+    * @return input format, as a lower-case string
+    */
+  def getDataFormat(params: OptionalInputFormatParam, files: Seq[String]): Option[String] = {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">    val raw = if (params.inputFormat != null) { Some(params.inputFormat) } else {</span>
+<span class="nc" id="L215">      val exts = files.iterator.flatMap(PathUtils.interpretPath).map(_.format).filter(_.nonEmpty)</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">      if (exts.hasNext) { Some(exts.next) } else { None }</span>
+    }
+<span class="nc" id="L218">    raw.map {</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">      case r if r.equalsIgnoreCase(&quot;gml&quot;)     =&gt; &quot;xml&quot;</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">      case r if r.equalsIgnoreCase(&quot;geojson&quot;) =&gt; &quot;json&quot;</span>
+<span class="nc" id="L221">      case r =&gt; r.toLowerCase(Locale.US)</span>
+    }
+  }
+
+  /**
+    * Loads and/or infers a SimpleFeatureType and Converter config based on the inputs. If not possible to load
+    * or infer the values, will return a failure. If `interactive` and the user declines to use an
+    * inferred result, will return a Success(None). Otherwise will return a Success(Some)
+    *
+    * @param params params
+    * @param inputs input files
+    * @param format input format
+    * @param ds data store for loading schemas by name
+    * @return None if user declines inferred result, otherwise the loaded/inferred result
+    */
+<span class="nc" id="L236">  def getSftAndConverter(</span>
+      params: TypeNameParam with FeatureSpecParam with ConverterConfigParam with OptionalForceParam,
+      inputs: Inputs,
+      format: Option[String],
+<span class="nc bnc" id="L240" title="All 2 branches missed.">      ds: Option[_ &lt;: DataStore]): Try[Option[(SimpleFeatureType, Config)]] = Try {</span>
+    // try to load the sft, first check for an existing schema, then load from the params/environment
+<span class="nc" id="L242">    var sft: SimpleFeatureType = loadSft(params, ds).orNull</span>
+
+<span class="nc" id="L244">    var converter: Config = Option(params.config).map(CLArgResolver.getConfig).orNull</span>
+
+    // if there is no converter passed in
+<span class="nc bnc" id="L247" title="All 6 branches missed.">    if (converter == null &amp;&amp; (inputs.stdin || inputs.paths.nonEmpty)) {</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">      val errorMsg = if (inputs.stdin) { &quot;Unable to read data from stdin&quot; } else {</span>
+<span class="nc" id="L249">        &quot;Parameter &lt;files&gt; did not evaluate to something that could be read&quot;</span>
+      }
+      // try to infer the schema from the inputs
+<span class="nc bnc" id="L252" title="All 2 branches missed.">      Command.user.info(</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        s&quot;No converter defined - will attempt to detect schema from ${if (inputs.stdin) &quot;stdin&quot; else &quot;input files&quot;}&quot;)</span>
+<span class="nc" id="L254">      val file = inputs.handles.headOption.getOrElse(throw new ParameterException(errorMsg))</span>
+<span class="nc" id="L255">      val opened = ListBuffer.empty[CloseableIterator[InputStream]]</span>
+      def open(): InputStream = {
+<span class="nc" id="L257">        val is = try {</span>
+<span class="nc" id="L258">          val streams = file.open.map(_._2)</span>
+<span class="nc" id="L259">          opened += streams</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">          if (streams.hasNext) { streams.next } else { null }</span>
+        } catch {
+<span class="nc bnc" id="L262" title="All 2 branches missed.">          case NonFatal(e) =&gt; throw new RuntimeException(errorMsg, e)</span>
+        }
+<span class="nc bnc" id="L264" title="All 2 branches missed.">        if (is == null) {</span>
+<span class="nc" id="L265">          throw new ParameterException(errorMsg)</span>
+        } else {
+<span class="nc" id="L267">          is</span>
+        }
+      }
+
+<span class="nc bnc" id="L271" title="All 2 branches missed.">      val path = if (inputs.stdin) { Map.empty[String, AnyRef] } else { EvaluationContext.inputFileParam(file.path) }</span>
+<span class="nc" id="L272">      val opt = format match {</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        case None =&gt; SimpleFeatureConverter.infer(open _, Option(sft), path)</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        case Some(fmt) =&gt; TypeAwareInference.infer(fmt, open _, Option(sft), path)</span>
+      }
+
+<span class="nc bnc" id="L277" title="All 2 branches missed.">      val (inferredSft, inferredConverter) = opt match {</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">        case Success(o) =&gt; o</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        case Failure(e) =&gt;</span>
+<span class="nc" id="L280">          throw new ParameterException(&quot;Could not determine converter from inputs - please specify a converter&quot;, e)</span>
+      }
+
+<span class="nc" id="L283">      val renderOptions = ConfigRenderOptions.concise().setFormatted(true)</span>
+<span class="nc" id="L284">      var inferredSftString: Option[String] = None</span>
+
+<span class="nc bnc" id="L286" title="All 2 branches missed.">      if (sft == null) {</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        val typeName = if (inputs.stdin) {</span>
+          // Throw an error if the user doesn't specify an SFT name
+<span class="nc" id="L289">          Option(params.featureName).getOrElse {</span>
+<span class="nc" id="L290">            throw new ParameterException(</span>
+<span class="nc" id="L291">              &quot;SimpleFeatureType name not specified. Please ensure the -f or --feature-name flag is set.&quot;)</span>
+          }
+        } else {
+<span class="nc" id="L294">          Option(params.featureName).getOrElse {</span>
+<span class="nc" id="L295">            val existing = ds.toSet[DataStore].flatMap(_.getTypeNames)</span>
+<span class="nc" id="L296">            val fileName = Option(FilenameUtils.getBaseName(file.path))</span>
+<span class="nc" id="L297">            val base = fileName.map(_.trim.replaceAll(&quot;[^A-Za-z0-9]+&quot;, &quot;_&quot;)).filterNot(_.isEmpty).getOrElse {</span>
+<span class="nc" id="L298">              throw new RuntimeException(&quot;Unable to infer SimpleFeatureType name from file name. &quot; +</span>
+                  &quot;Please specify a name manually by setting the -f or --feature-name flag.&quot;)
+            }
+<span class="nc" id="L301">            var name = base</span>
+<span class="nc" id="L302">            var i = 0</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            while (existing.contains(name)) {</span>
+<span class="nc" id="L304">              name = s&quot;${base}_$i&quot;</span>
+<span class="nc" id="L305">              i += 1</span>
+            }
+<span class="nc" id="L307">            name</span>
+          }
+        }
+
+<span class="nc" id="L311">        sft = SimpleFeatureTypes.renameSft(inferredSft, typeName)</span>
+<span class="nc" id="L312">        inferredSftString = Some(SimpleFeatureTypes.toConfig(sft, includePrefix = false).root().render(renderOptions))</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        if (!params.force) {</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">          Command.user.info(s&quot;Inferred schema: $typeName identified ${SimpleFeatureTypes.encodeType(sft)}&quot;)</span>
+        }
+      }
+<span class="nc" id="L317">      converter = inferredConverter</span>
+
+<span class="nc bnc" id="L319" title="All 2 branches missed.">      if (!params.force) {</span>
+<span class="nc" id="L320">        val converterString = inferredConverter.root().render(renderOptions)</span>
+
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        def persist(): Unit = if (Prompt.confirm(&quot;Persist this converter for future use (y/n)? &quot;)) {</span>
+<span class="nc" id="L323">          writeInferredConverter(sft.getTypeName, converterString, inferredSftString)</span>
+        }
+
+<span class="nc bnc" id="L326" title="All 2 branches missed.">        Command.user.info(s&quot;Inferred converter:\n$converterString&quot;)</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">        if (Prompt.confirm(&quot;Use inferred converter (y/n)? &quot;)) {</span>
+<span class="nc" id="L328">          persist()</span>
+        } else {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">          Command.user.info(&quot;Please re-run with a valid converter&quot;)</span>
+<span class="nc" id="L331">          persist()</span>
+<span class="nc" id="L332">          return Success(None)</span>
+        }
+      }
+    }
+
+<span class="nc bnc" id="L337" title="All 2 branches missed.">    if (sft == null) {</span>
+<span class="nc" id="L338">      throw new ParameterException(&quot;SimpleFeatureType name and/or specification argument is required&quot;)</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">    } else if (converter == null) {</span>
+<span class="nc" id="L340">      throw new ParameterException(&quot;Converter config argument is required&quot;)</span>
+    }
+
+<span class="nc bnc" id="L343" title="All 2 branches missed.">    if (params.errorMode != null) {</span>
+<span class="nc" id="L344">      val opts = ConfigValueFactory.fromMap(Collections.singletonMap(&quot;error-mode&quot;, params.errorMode.toString))</span>
+<span class="nc" id="L345">      converter = ConfigFactory.empty().withValue(&quot;options&quot;, opts).withFallback(converter)</span>
+    }
+
+<span class="nc" id="L348">    Some((sft, converter))</span>
+  }
+
+  /**
+    * Gets status as a string
+    */
+<span class="nc" id="L354">  def getStatInfo(successes: Long, failures: Long, action: String = &quot;Ingested&quot;, input: String = &quot;&quot;): String = {</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">    val failureString = if (failures == 0) {</span>
+<span class="nc" id="L356">      &quot;with no failures&quot;</span>
+    } else {
+<span class="nc" id="L358">      s&quot;and failed to ingest ${TextTools.getPlural(failures, &quot;feature&quot;)}&quot;</span>
+    }
+<span class="nc" id="L360">    s&quot;$action ${TextTools.getPlural(successes, &quot;feature&quot;)} $failureString${TextTools.prefixSpace(input)}&quot;</span>
+  }
+
+<span class="nc" id="L363">  object IngestCounters {</span>
+<span class="nc" id="L364">    val Ingested  = &quot;ingested&quot;</span>
+<span class="nc" id="L365">    val Failed    = &quot;failed&quot;</span>
+<span class="nc" id="L366">    val Persisted = &quot;persisted&quot;</span>
+  }
+
+  /**
+   * Command inputs
+   *
+   * @param paths paths to files for ingest
+   */
+<span class="nc bnc" id="L374" title="All 18 branches missed.">  case class Inputs(paths: Seq[String]) {</span>
+
+    import Inputs.StdInInputs
+
+    import scala.collection.JavaConverters.asScalaIteratorConverter
+
+<span class="nc bnc" id="L380" title="All 8 branches missed.">    val stdin: Boolean = paths.isEmpty || paths == StdInInputs</span>
+
+    /**
+     * Interprets the input paths into actual files, handling wildcards, etc
+     */
+<span class="nc bnc" id="L385" title="All 4 branches missed.">    lazy val handles: List[FileHandle] = paths match {</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">      case Nil         =&gt; CachingStdInHandle.available().toList</span>
+<span class="nc bnc" id="L387" title="All 6 branches missed.">      case StdInInputs =&gt; List(CachingStdInHandle.get())</span>
+<span class="nc" id="L388">      case _           =&gt; paths.flatMap(PathUtils.interpretPath).toList</span>
+    }
+
+    /**
+     * Interprets the paths as lists of source file names (instead of the files to ingest)
+     *
+     * @return the actual inputs to ingest
+     */
+    def asSourceList: Inputs = {
+<span class="nc" id="L397">      val paths = handles.flatMap { file =&gt;</span>
+<span class="nc" id="L398">        WithClose(file.open) { iter =&gt;</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">          iter.flatMap { case (_, is) =&gt; IOUtils.lineIterator(is, StandardCharsets.UTF_8).asScala }.toList</span>
+        }
+      }
+<span class="nc" id="L402">      Inputs(paths)</span>
+    }
+  }
+
+<span class="nc" id="L406">  object Inputs {</span>
+<span class="nc" id="L407">    val StdInInputs: Seq[String] = Seq(&quot;-&quot;)</span>
+  }
+
+  /**
+    * Tries to load a feature type, first from the data store then from the params/environment
+    *
+    * @param params params
+    * @param ds data store access
+    * @return
+    */
+<span class="nc" id="L417">  private def loadSft(</span>
+      params: TypeNameParam with FeatureSpecParam,
+      ds: Option[_ &lt;: DataStore]): Option[SimpleFeatureType] = {
+    val fromStore = for {
+<span class="nc" id="L421">      d    &lt;- ds</span>
+<span class="nc" id="L422">      name &lt;- Option(params.featureName)</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">      sft  &lt;- Try(d.getSchema(name)).filter(_ != null).toOption</span>
+    } yield {
+<span class="nc" id="L425">      sft</span>
+    }
+<span class="nc bnc" id="L427" title="All 2 branches missed.">    lazy val fromEnv = Option(params.spec).map(CLArgResolver.getSft(_, params.featureName)).orElse {</span>
+<span class="nc" id="L428">      Option(params.featureName).flatMap(name =&gt; Try(CLArgResolver.getSft(name)).toOption)</span>
+    }
+
+<span class="nc bnc" id="L431" title="All 2 branches missed.">    if (logger.underlying.isWarnEnabled()) {</span>
+<span class="nc" id="L432">      for { fs &lt;- fromStore; fe &lt;- fromEnv } {</span>
+<span class="nc" id="L433">        SimpleFeatureTypeComparator.compare(fs, fe) match {</span>
+<span class="nc bnc" id="L434" title="All 12 branches missed.">          case TypeComparison.Compatible(false, false, _) if fs.getTypeName == fe.getTypeName =&gt; // ok</span>
+          case _ =&gt;
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            logger.warn(</span>
+<span class="nc" id="L437">              &quot;Schema from data store does not match schema from environment.&quot; +</span>
+<span class="nc" id="L438">                s&quot;\n  From data store:  ${fs.getTypeName} identified ${SimpleFeatureTypes.encodeType(fs)}&quot; +</span>
+<span class="nc" id="L439">                s&quot;\n  From environment: ${fe.getTypeName} identified ${SimpleFeatureTypes.encodeType(fe)}&quot;)</span>
+        }
+      }
+    }
+
+<span class="nc" id="L444">    fromStore.orElse(fromEnv)</span>
+  }
+
+  private def writeInferredConverter(typeName: String, converterString: String, schemaString: Option[String]): Unit = {
+    import scala.collection.JavaConverters._
+
+<span class="nc" id="L450">    try {</span>
+<span class="nc" id="L451">      val conf = this.getClass.getClassLoader.getResources(&quot;reference.conf&quot;).asScala.find { u =&gt;</span>
+<span class="nc bnc" id="L452" title="All 4 branches missed.">        &quot;file&quot;.equalsIgnoreCase(u.getProtocol) &amp;&amp; u.getPath.endsWith(&quot;/conf/reference.conf&quot;)</span>
+      }
+<span class="nc" id="L454">      conf match {</span>
+<span class="nc bnc" id="L455" title="All 4 branches missed.">        case None =&gt; Command.user.error(&quot;Could not persist converter: could not find 'conf/reference.conf'&quot;)</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        case Some(r) =&gt;</span>
+<span class="nc" id="L457">          val reference = new File(r.toURI)</span>
+<span class="nc" id="L458">          val folder = reference.getParentFile</span>
+<span class="nc" id="L459">          val baseName = typeName.replaceAll(&quot;[^A-Za-z0-9_]+&quot;, &quot;_&quot;)</span>
+<span class="nc" id="L460">          var convert = new File(folder, s&quot;$baseName.conf&quot;)</span>
+<span class="nc" id="L461">          var i = 1</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">          while (convert.exists()) {</span>
+<span class="nc" id="L463">            convert = new File(folder, s&quot;${baseName}_$i.conf&quot;)</span>
+<span class="nc" id="L464">            i += 1</span>
+          }
+<span class="nc" id="L466">          WithClose(new PrintWriter(new FileWriter(convert))) { writer =&gt;</span>
+<span class="nc" id="L467">            writer.println(s&quot;${ConverterConfigLoader.path}.$baseName : $converterString&quot;)</span>
+<span class="nc" id="L468">            schemaString.foreach(s =&gt; writer.println(s&quot;${ConfigSftParsing.path}.$baseName : $s&quot;))</span>
+          }
+<span class="nc" id="L470">          WithClose(new PrintWriter(new FileWriter(reference, true))) { writer =&gt;</span>
+<span class="nc" id="L471">            writer.println(s&quot;&quot;&quot;include &quot;${convert.getName}&quot;&quot;&quot;&quot;)</span>
+          }
+<span class="nc bnc" id="L473" title="All 4 branches missed.">          val (names, refs) = if (schemaString.isDefined) {</span>
+<span class="nc" id="L474">            (&quot;schema and converter&quot;, s&quot;'--spec $baseName' and '--converter $baseName'&quot;)</span>
+          } else {
+<span class="nc" id="L476">            (&quot;converter&quot;, s&quot;'--converter $baseName'&quot;)</span>
+          }
+<span class="nc bnc" id="L478" title="All 2 branches missed.">          Command.user.info(s&quot;Added import in reference.conf and saved inferred $names to ${convert.getAbsolutePath}&quot;)</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">          Command.user.info(s&quot;In future commands, the $names may be invoked with $refs&quot;)</span>
+      }
+    } catch {
+<span class="nc bnc" id="L482" title="All 2 branches missed.">      case NonFatal(e) =&gt;</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">        logger.error(&quot;Error trying to persist inferred schema&quot;, e)</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">        Command.user.error(s&quot;Error trying to persist inferred schema: $e&quot;)</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,581 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MetadataBackedStats.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Index API</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.index.stats</a> &gt; <span class="el_source">MetadataBackedStats.scala</span></div><h1>MetadataBackedStats.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.index.stats
+
+import com.typesafe.scalalogging.LazyLogging
+import org.geotools.api.data.DataStore
+import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+import org.geotools.api.filter._
+import org.geotools.filter.text.ecql.ECQL
+import org.geotools.util.factory.Hints
+import org.locationtech.geomesa.curve.BinnedTime
+import org.locationtech.geomesa.curve.TimePeriod.TimePeriod
+import org.locationtech.geomesa.filter.visitor.QueryPlanFilterVisitor
+import org.locationtech.geomesa.filter.{Bounds, FilterHelper}
+import org.locationtech.geomesa.index.metadata.{GeoMesaMetadata, HasGeoMesaMetadata, MetadataSerializer, TableBasedMetadata}
+import org.locationtech.geomesa.index.stats.GeoMesaStats.{GeoMesaStatWriter, StatUpdater}
+import org.locationtech.geomesa.index.stats.impl._
+import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+import java.time.{Instant, ZoneOffset, ZonedDateTime}
+import java.util.Date
+import java.util.concurrent.ConcurrentHashMap
+import scala.reflect.ClassTag
+import scala.util.control.NonFatal
+
+/**
+ * Tracks stats via entries stored in metadata
+ */
+<span class="nc" id="L35">abstract class MetadataBackedStats(ds: DataStore, metadata: GeoMesaMetadata[Stat])</span>
+<span class="nc" id="L36">    extends RunnableStats(ds) with StatsBasedEstimator {</span>
+
+  import MetadataBackedStats._
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L42">  override val writer: GeoMesaStatWriter = new MetadataStatWriter()</span>
+
+  override def getCount(sft: SimpleFeatureType, filter: Filter, exact: Boolean, queryHints: Hints): Option[Long] = {
+<span class="nc bnc" id="L45" title="All 2 branches missed.">    if (exact) {</span>
+<span class="nc" id="L46">      query[CountStat](sft, filter, Stat.Count(), queryHints).map(_.count)</span>
+<span class="nc bnc" id="L47" title="All 6 branches missed.">    } else if (filter == Filter.INCLUDE) {</span>
+      // note: compared to the 'read' method, we want to return empty counts (indicating no features)
+<span class="nc bnc" id="L49" title="All 4 branches missed.">      try { metadata.read(sft.getTypeName, countKey()).collect { case s: CountStat =&gt; s.count } } catch {</span>
+<span class="nc bnc" id="L50" title="All 4 branches missed.">        case NonFatal(e) =&gt; logger.error(&quot;Error reading existing stats:&quot;, e); None</span>
+      }
+    } else {
+<span class="nc" id="L53">      estimateCount(sft, QueryPlanFilterVisitor(sft, filter))</span>
+    }
+  }
+
+  override def getMinMax[T](
+      sft: SimpleFeatureType,
+      attribute: String,
+      filter: Filter,
+      exact: Boolean): Option[MinMax[T]] = {
+<span class="nc bnc" id="L62" title="All 2 branches missed.">    if (exact) { super.getMinMax(sft, attribute, filter, exact) } else {</span>
+<span class="nc" id="L63">      read(sft, filter, minMaxKey(attribute))</span>
+    }
+  }
+
+  // note: enumeration stats aren't persisted, so we don't override the super method
+
+  override def getFrequency[T](
+      sft: SimpleFeatureType,
+      attribute: String,
+      precision: Int,
+      filter: Filter,
+      exact: Boolean): Option[Frequency[T]] = {
+<span class="nc bnc" id="L75" title="All 2 branches missed.">    if (exact) { super.getFrequency(sft, attribute, precision, filter, exact) } else {</span>
+<span class="nc" id="L76">      val keys = extractBins(sft, filter) match {</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">        case None =&gt; Seq(frequencyKey(attribute))</span>
+<span class="nc bnc" id="L78" title="All 2 branches missed.">        case Some(bins) =&gt; bins.map(frequencyKey(attribute, _))</span>
+      }
+<span class="nc" id="L80">      read(sft, filter, keys)</span>
+    }
+  }
+
+  override def getTopK[T](
+      sft: SimpleFeatureType,
+      attribute: String,
+      filter: Filter,
+      exact: Boolean): Option[TopK[T]] = {
+<span class="nc bnc" id="L89" title="All 2 branches missed.">    if (exact) { super.getTopK(sft, attribute, filter, exact) } else {</span>
+<span class="nc" id="L90">      read(sft, filter, topKKey(attribute))</span>
+    }
+  }
+
+  override def getHistogram[T](
+      sft: SimpleFeatureType,
+      attribute: String,
+      bins: Int,
+      min: T,
+      max: T,
+      filter: Filter,
+      exact: Boolean): Option[Histogram[T]] = {
+<span class="nc bnc" id="L102" title="All 2 branches missed.">    if (exact) { super.getHistogram(sft, attribute, bins, min, max, filter, exact) } else {</span>
+<span class="nc" id="L103">      read(sft, filter, histogramKey(attribute))</span>
+    }
+  }
+
+  override def getZ3Histogram(
+      sft: SimpleFeatureType,
+      geom: String,
+      dtg: String,
+      period: TimePeriod,
+      bins: Int,
+      filter: Filter,
+      exact: Boolean): Option[Z3Histogram] = {
+<span class="nc bnc" id="L115" title="All 2 branches missed.">    if (exact) { super.getZ3Histogram(sft, geom, dtg, period, bins, filter, exact) } else {</span>
+<span class="nc bnc" id="L116" title="All 8 branches missed.">      val keys = if (sft.getGeomField != geom || !sft.getDtgField.contains(dtg)) { Seq.empty } else {</span>
+        // z3 histograms are stored by time bin - calculate the times to retrieve
+        // either use the filter passed in, or else calculate from the time bounds
+<span class="nc" id="L119">        val timeBins = extractBins(sft, filter).orElse {</span>
+<span class="nc" id="L120">          read[MinMax[Date]](sft, Filter.INCLUDE, minMaxKey(dtg)).map { bounds =&gt;</span>
+<span class="nc" id="L121">            val timeToBin = BinnedTime.timeToBinnedTime(sft.getZ3Interval)</span>
+<span class="nc" id="L122">            val lBin = timeToBin(bounds.min.getTime).bin</span>
+<span class="nc" id="L123">            val uBin = timeToBin(bounds.max.getTime).bin</span>
+<span class="nc" id="L124">            Range.inclusive(lBin, uBin).map(_.toShort)</span>
+          }
+        }
+<span class="nc" id="L127">        timeBins.getOrElse(Seq.empty).map(histogramKey(geom, dtg, _))</span>
+      }
+<span class="nc" id="L129">      read(sft, filter, keys)</span>
+    }
+  }
+
+  override def getStat[T &lt;: Stat](
+      sft: SimpleFeatureType,
+      query: String,
+<span class="nc" id="L136">      filter: Filter = Filter.INCLUDE,</span>
+<span class="nc" id="L137">      exact: Boolean = false): Option[T] = {</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">    if (exact) { super.getStat(sft, query , filter, exact) } else {</span>
+<span class="nc" id="L139">      def getStat(stat: Stat): Option[Stat] = stat match {</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        case _: CountStat          =&gt; read[CountStat](sft, filter, countKey())</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        case s: Histogram[_]       =&gt; getHistogram(sft, s.property, s.length, s.min, s.max, filter, exact)</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        case s: Z3Histogram        =&gt; getZ3Histogram(sft, s.geom, s.dtg, s.period, s.length, filter, exact)</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        case s: TopK[_]            =&gt; getTopK(sft, s.property, filter, exact)</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        case s: Frequency[_]       =&gt; getFrequency(sft, s.property, s.precision, filter, exact)</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        case s: EnumerationStat[_] =&gt; getEnumeration(sft, s.property, filter, exact)</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        case s: MinMax[_]          =&gt; getMinMax(sft, s.property, filter, exact)</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        case s: SeqStat            =&gt; Some(new SeqStat(sft, s.stats.flatMap(getStat))).filter(_.stats.nonEmpty)</span>
+<span class="nc" id="L148">        case _ =&gt; None</span>
+      }
+<span class="nc" id="L150">      getStat(StatParser.parse(sft, query)).asInstanceOf[Option[T]]</span>
+    }
+  }
+
+<span class="nc" id="L154">  override def close(): Unit = metadata.close()</span>
+
+  /**
+    * Write stats
+    *
+    * @param typeName simple feature type name
+    * @param stats stats to write
+    */
+  protected def write(typeName: String, stats: Seq[WritableStat]): Unit
+
+  /**
+    * Gets keys and stats to write. Some stats end up getting split for writing.
+    *
+    * @param stat stat to write
+    * @param sft simple feature type
+    * @param merge merge or overwrite existing stats
+    * @return metadata keys and split stats
+    */
+  private def getStatsForWrite(stat: Stat, sft: SimpleFeatureType, merge: Boolean): Seq[WritableStat] = {
+<span class="nc" id="L173">    stat match {</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">      case s: SeqStat      =&gt; s.stats.flatMap(getStatsForWrite(_, sft, merge))</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">      case s: CountStat    =&gt; Seq(WritableStat(countKey(), s, merge))</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">      case s: MinMax[_]    =&gt; Seq(WritableStat(minMaxKey(s.property), s, merge))</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">      case s: TopK[_]      =&gt; Seq(WritableStat(topKKey(s.property), s, merge))</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">      case s: Histogram[_] =&gt; Seq(WritableStat(histogramKey(s.property), s, merge))</span>
+
+<span class="nc bnc" id="L180" title="All 2 branches missed.">      case s: Frequency[_] =&gt;</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        if (s.dtg.isEmpty) {</span>
+<span class="nc" id="L182">          Seq(WritableStat(frequencyKey(s.property), s, merge))</span>
+        } else {
+          // split up the frequency and store by week
+<span class="nc bnc" id="L185" title="All 2 branches missed.">          s.splitByTime.map { case (b, f) =&gt; WritableStat(frequencyKey(s.property, b), f, merge) }</span>
+        }
+
+<span class="nc bnc" id="L188" title="All 2 branches missed.">      case s: Z3Histogram  =&gt;</span>
+        // split up the z3 histogram and store by week
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        s.splitByTime.map { case (b, z) =&gt; WritableStat(histogramKey(s.geom, s.dtg, b), z, merge) }</span>
+
+<span class="nc" id="L192">      case _ =&gt; throw new UnsupportedOperationException(&quot;Only Count, Frequency, MinMax, TopK and Histogram stats are tracked&quot;)</span>
+    }
+  }
+
+  /**
+    * Determines the stats to calculate for a given schema.
+    *
+    * We always collect a total count stat.
+    * For the default geometry and default date, we collect a min/max and histogram.
+    * If there is both a default geometry and date, we collect a z3 histogram.
+    * For any indexed attributes, we collect a min/max, top-k, frequency and histogram.
+    * For any flagged attributes, we collect min/max and top-k
+    *
+    * @param sft simple feature type
+    * @param bounds lookup function for histogram bounds
+    * @return stat string
+    */
+  private def buildStatsFor(sft: SimpleFeatureType, bounds: String =&gt; Option[MinMax[Any]]): String = {
+    import GeoMesaStats._
+    import org.locationtech.geomesa.utils.geotools.RichAttributeDescriptors.RichAttributeDescriptor
+
+    // get the attributes that we will keep stats for
+
+<span class="nc" id="L215">    val stAttributesBuilder = Seq.newBuilder[String]</span>
+<span class="nc" id="L216">    val indexedAttributesBuilder = Seq.newBuilder[String]</span>
+
+<span class="nc" id="L218">    sft.getIndices.foreach { i =&gt;</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">      if (i.attributes.headOption.contains(sft.getGeomField)) {</span>
+<span class="nc" id="L220">        stAttributesBuilder ++= i.attributes</span>
+      } else {
+<span class="nc" id="L222">        i.attributes.headOption.foreach(indexedAttributesBuilder += _)</span>
+      }
+    }
+
+<span class="nc" id="L226">    val stAttributes = stAttributesBuilder.result().distinct</span>
+<span class="nc" id="L227">    val indexedAttributes = indexedAttributesBuilder.result().distinct.filter { a =&gt;</span>
+<span class="nc bnc" id="L228" title="All 4 branches missed.">      !stAttributes.contains(a) &amp;&amp; okForStats(sft.getDescriptor(a))</span>
+    }
+<span class="nc" id="L230">    val flaggedAttributes = sft.getAttributeDescriptors.asScala.collect {</span>
+<span class="nc bnc" id="L231" title="All 8 branches missed.">      case d if d.isKeepStats &amp;&amp; okForStats(d) =&gt; d.getLocalName</span>
+<span class="nc bnc" id="L232" title="All 4 branches missed.">    }.filter(a =&gt; !stAttributes.contains(a) &amp;&amp; !indexedAttributes.contains(a))</span>
+
+<span class="nc" id="L234">    val count = Stat.Count()</span>
+
+    // calculate min/max for all attributes
+<span class="nc" id="L237">    val minMax = (stAttributes ++ indexedAttributes ++ flaggedAttributes).distinct.map(Stat.MinMax)</span>
+
+    // calculate topk for indexed attributes, but not geom + date
+<span class="nc" id="L240">    val topK = (indexedAttributes ++ flaggedAttributes).distinct.map(Stat.TopK)</span>
+
+    // calculate frequencies only for indexed attributes
+    val frequencies = {
+<span class="nc" id="L244">      val descriptors = indexedAttributes.map(sft.getDescriptor)</span>
+      // calculate one frequency that's split by week, and one that isn't
+      // for queries with time bounds, the split by week will be more accurate
+      // for queries without time bounds, we save the overhead of merging the weekly splits
+<span class="nc" id="L248">      val withDates = sft.getDtgField match {</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        case None =&gt; Seq.empty</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        case Some(dtg) =&gt;</span>
+<span class="nc" id="L251">          val period = sft.getZ3Interval</span>
+<span class="nc" id="L252">          descriptors.map(d =&gt; Stat.Frequency(d.getLocalName, dtg, period, defaultPrecision(d.getType.getBinding)))</span>
+      }
+<span class="nc" id="L254">      val noDates = descriptors.map(d =&gt; Stat.Frequency(d.getLocalName, defaultPrecision(d.getType.getBinding)))</span>
+<span class="nc" id="L255">      withDates ++ noDates</span>
+    }
+
+    // calculate histograms for all indexed attributes and geom/date
+<span class="nc" id="L259">    val histograms = (stAttributes ++ indexedAttributes).distinct.map { attribute =&gt;</span>
+<span class="nc" id="L260">      val minMax = bounds(attribute)</span>
+<span class="nc" id="L261">      val cardinality = minMax.map(_.cardinality).getOrElse(0L)</span>
+      // estimate 10k entries per bin, but cap at 10k bins (~29k on disk)
+<span class="nc bnc" id="L263" title="All 6 branches missed.">      val size = if (attribute == sft.getGeomField) { MaxHistogramSize } else {</span>
+<span class="nc" id="L264">        math.min(MaxHistogramSize, math.max(DefaultHistogramSize, cardinality / 10000).toInt)</span>
+      }
+<span class="nc" id="L266">      val binding = sft.getDescriptor(attribute).getType.getBinding</span>
+<span class="nc" id="L267">      implicit val ct = ClassTag[Any](binding)</span>
+      // calculate the endpoints for the histogram
+      // the histogram will expand as needed, but this is a starting point
+<span class="nc bnc" id="L270" title="All 2 branches missed.">      val (lower, upper) = minMax match {</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        case None =&gt; defaultBounds(binding)</span>
+        // max has to be greater than min for the histogram bounds
+<span class="nc bnc" id="L273" title="All 4 branches missed.">        case Some(b) if Histogram.equivalent(b.min, b.max, size) =&gt; Histogram.buffer(b.min)</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        case Some(b) =&gt; b.bounds</span>
+      }
+
+<span class="nc" id="L277">      Stat.Histogram[Any](attribute, size, lower, upper)</span>
+    }
+
+    val z3Histogram = for {
+<span class="nc" id="L281">      geom &lt;- Option(sft.getGeomField).filter(stAttributes.contains)</span>
+<span class="nc" id="L282">      dtg  &lt;- sft.getDtgField.filter(stAttributes.contains)</span>
+    } yield {
+<span class="nc" id="L284">      Stat.Z3Histogram(geom, dtg, sft.getZ3Interval, MaxHistogramSize)</span>
+    }
+
+<span class="nc" id="L287">    Stat.SeqStat(Seq(count) ++ minMax ++ topK ++ histograms ++ frequencies ++ z3Histogram)</span>
+  }
+
+  /**
+    * Read a stat from the metadata
+    *
+    * @param sft simple feature type
+    * @param filter cql filter
+    * @param key metadata key to read
+    * @tparam T stat type
+    * @return
+    */
+  private def read[T &lt;: Stat](sft: SimpleFeatureType, filter: Filter, key: String): Option[T] = {
+<span class="nc" id="L300">    try {</span>
+<span class="nc bnc" id="L301" title="All 8 branches missed.">      val result = metadata.read(sft.getTypeName, key).collect { case s: T if !s.isEmpty =&gt; s }</span>
+<span class="nc bnc" id="L302" title="All 8 branches missed.">      if (result.isDefined &amp;&amp; filter != Filter.INCLUDE) {</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        logger.warn(s&quot;Ignoring filter for non-exact stat query: ${ECQL.toCQL(filter)}&quot;)</span>
+      }
+<span class="nc" id="L305">      result</span>
+    } catch {
+<span class="nc bnc" id="L307" title="All 4 branches missed.">      case NonFatal(e) =&gt; logger.error(&quot;Error reading existing stats:&quot;, e); None</span>
+    }
+  }
+
+  /**
+    * Read a stat from the metadata
+    *
+    * @param sft simple feature type
+    * @param filter cql filter
+    * @param keys metadata keys to read
+    * @tparam T stat type
+    * @return
+    */
+  private def read[T &lt;: Stat](sft: SimpleFeatureType, filter: Filter, keys: Seq[String]): Option[T] = {
+<span class="nc" id="L321">    try {</span>
+<span class="nc bnc" id="L322" title="All 8 branches missed.">      val seq = keys.flatMap(metadata.read(sft.getTypeName, _).collect { case s: T if !s.isEmpty =&gt; s })</span>
+<span class="nc" id="L323">      val result = Stat.combine(seq).filterNot(_.isEmpty)</span>
+<span class="nc bnc" id="L324" title="All 8 branches missed.">      if (result.isDefined &amp;&amp; filter != Filter.INCLUDE) {</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        logger.warn(s&quot;Ignoring filter for non-exact stat query: ${ECQL.toCQL(filter)}&quot;)</span>
+      }
+<span class="nc" id="L327">      result</span>
+    } catch {
+<span class="nc bnc" id="L329" title="All 4 branches missed.">      case NonFatal(e) =&gt; logger.error(&quot;Error reading existing stats:&quot;, e); None</span>
+    }
+  }
+
+  /**
+    * Extract time period bins from a filter. Used to look up stats that are split by time period
+    *
+    * @param sft simple feature type
+    * @param filter filter
+    * @return
+    */
+  private def extractBins(sft: SimpleFeatureType, filter: Filter): Option[Seq[Short]] = {
+<span class="nc" id="L341">    sft.getDtgField.flatMap { dtg =&gt;</span>
+<span class="nc" id="L342">      val intervals = FilterHelper.extractIntervals(filter, dtg)</span>
+      // don't consider gaps, just get the endpoints of the intervals
+<span class="nc bnc" id="L344" title="All 2 branches missed.">      val bounds = intervals.values.reduceLeftOption[Bounds[ZonedDateTime]] { case (left, right) =&gt;</span>
+<span class="nc" id="L345">        val lower = Bounds.smallerLowerBound(left.lower, right.lower)</span>
+<span class="nc" id="L346">        val upper = Bounds.largerUpperBound(left.upper, right.upper)</span>
+<span class="nc" id="L347">        Bounds(lower, upper)</span>
+      }
+<span class="nc" id="L349">      bounds.flatMap { d =&gt;</span>
+<span class="nc" id="L350">        for { lower &lt;- d.lower.value; upper &lt;- d.upper.value } yield {</span>
+<span class="nc" id="L351">          val lo = lower.toInstant.toEpochMilli</span>
+<span class="nc" id="L352">          val hi = upper.toInstant.toEpochMilli</span>
+<span class="nc" id="L353">          val timeToBinnedTime = BinnedTime.timeToBinnedTime(sft.getZ3Interval)</span>
+<span class="nc" id="L354">          Range.inclusive(timeToBinnedTime(lo).bin, timeToBinnedTime(hi).bin).map(_.toShort)</span>
+        }
+      }
+    }
+  }
+
+  /**
+    * Stat writer implementation
+    */
+<span class="nc bnc" id="L363" title="All 2 branches missed.">  protected class MetadataStatWriter extends GeoMesaStatWriter {</span>
+
+    override def analyze(sft: SimpleFeatureType): Seq[Stat] = {
+      import org.locationtech.geomesa.utils.geotools.GeoToolsDateFormat
+
+      // calculate the stats we'll be gathering based on the simple feature type attributes
+<span class="nc" id="L369">      val statString = buildStatsFor(sft, getMinMax(sft, _))</span>
+
+<span class="nc bnc" id="L371" title="All 2 branches missed.">      logger.debug(s&quot;Calculating stats for ${sft.getTypeName}: $statString&quot;)</span>
+
+<span class="nc" id="L373">      val stats = getStat[SeqStat](sft, statString, exact = true).getOrElse(new SeqStat(sft, Seq.empty))</span>
+
+<span class="nc bnc" id="L375" title="All 2 branches missed.">      logger.trace(s&quot;Stats for ${sft.getTypeName}: ${stats.stats.map(_.toJson).mkString(&quot;, &quot;)}&quot;)</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">      logger.debug(s&quot;Writing stats for ${sft.getTypeName}&quot;)</span>
+
+      // write the stats in one go - don't merge, this is the authoritative value
+<span class="nc" id="L379">      write(sft.getTypeName, getStatsForWrite(stats, sft, merge = false))</span>
+
+      // update our last run time
+<span class="nc" id="L382">      ds match {</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        case hm: HasGeoMesaMetadata[String] =&gt;</span>
+<span class="nc" id="L384">          val date = GeoToolsDateFormat.format(Instant.now().atZone(ZoneOffset.UTC))</span>
+<span class="nc" id="L385">          hm.metadata.insert(sft.getTypeName, GeoMesaMetadata.StatsGenerationKey, date)</span>
+<span class="nc" id="L386">        case _ =&gt; // no-op</span>
+      }
+
+<span class="nc" id="L389">      stats.stats</span>
+    }
+
+    override def updater(sft: SimpleFeatureType): StatUpdater =
+<span class="nc bnc" id="L393" title="All 2 branches missed.">      if (sft.statsEnabled) { new MetadataStatUpdater(sft) } else { NoopStatUpdater }</span>
+
+<span class="nc" id="L395">    override def clear(sft: SimpleFeatureType): Unit = metadata.delete(sft.getTypeName)</span>
+
+    override def rename(sft: SimpleFeatureType, previous: SimpleFeatureType): Unit = {
+      val names: Map[String, String] = {
+<span class="nc" id="L399">        val local = previous.getAttributeDescriptors.asScala.map(_.getLocalName).zipWithIndex.toMap</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        local.flatMap { case (name, i) =&gt;</span>
+<span class="nc" id="L401">          val update = sft.getDescriptor(i).getLocalName</span>
+<span class="nc bnc" id="L402" title="All 6 branches missed.">          if (update == name) { Map.empty[String, String] } else { Map(name -&gt; update) }</span>
+        }
+      }
+
+      def rename(stat: Stat): Option[Stat] = {
+<span class="nc" id="L407">        val copy: Option[Stat] = stat match {</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">          case _: CountStat =&gt;</span>
+<span class="nc" id="L409">            None</span>
+
+<span class="nc bnc" id="L411" title="All 2 branches missed.">          case s: MinMax[_] =&gt;</span>
+<span class="nc" id="L412">            names.get(s.property).map(n =&gt; new MinMax(sft, n)(s.defaults))</span>
+
+<span class="nc bnc" id="L414" title="All 2 branches missed.">          case s: TopK[_] =&gt;</span>
+<span class="nc" id="L415">            names.get(s.property).map(n =&gt; new TopK(sft, n))</span>
+
+<span class="nc bnc" id="L417" title="All 2 branches missed.">          case s: Histogram[AnyRef] =&gt;</span>
+<span class="nc" id="L418">            names.get(s.property).map(n =&gt; new Histogram(sft, n, s.length, (s.min, s.max))(s.defaults, s.ct))</span>
+
+<span class="nc bnc" id="L420" title="All 2 branches missed.">          case s: Frequency[_] =&gt;</span>
+<span class="nc bnc" id="L421" title="All 4 branches missed.">            if ((Seq(s.property) ++ s.dtg).forall(n =&gt; !names.contains(n))) { None } else {</span>
+<span class="nc" id="L422">              val name = names.getOrElse(s.property, s.property)</span>
+<span class="nc" id="L423">              val dtg = s.dtg.map(d =&gt; names.getOrElse(d, d))</span>
+<span class="nc" id="L424">              Some(new Frequency(sft, name, dtg, s.period, s.precision, s.eps, s.confidence)(s.ct))</span>
+            }
+
+<span class="nc bnc" id="L427" title="All 2 branches missed.">          case s: Z3Histogram =&gt;</span>
+<span class="nc bnc" id="L428" title="All 4 branches missed.">            if (Seq(s.geom, s.dtg).forall(n =&gt; !names.contains(n))) { None } else {</span>
+<span class="nc" id="L429">              val geom = names.getOrElse(s.geom, s.geom)</span>
+<span class="nc" id="L430">              val dtg = names.getOrElse(s.dtg, s.dtg)</span>
+<span class="nc" id="L431">              Some(new Z3Histogram(sft, geom, dtg, s.period, s.length))</span>
+            }
+
+<span class="nc bnc" id="L434" title="All 2 branches missed.">          case s: SeqStat =&gt;</span>
+<span class="nc" id="L435">            val children = s.stats.map(rename)</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            if (children.forall(_.isEmpty)) { None } else {</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">              Some(new SeqStat(sft, children.zip(s.stats).map { case (opt, default) =&gt; opt.getOrElse(default) }))</span>
+            }
+
+          case s =&gt;
+<span class="nc" id="L441">            throw new UnsupportedOperationException(s&quot;Unexpected stat: $s&quot;)</span>
+        }
+<span class="nc" id="L443">        copy.foreach(_ += stat)</span>
+<span class="nc" id="L444">        copy</span>
+      }
+
+<span class="nc bnc" id="L447" title="All 8 branches missed.">      if (names.nonEmpty || sft.getTypeName != previous.getTypeName) {</span>
+        val serializer =
+<span class="nc" id="L449">          Some(metadata)</span>
+<span class="nc bnc" id="L450" title="All 4 branches missed.">              .collect { case m: TableBasedMetadata[Stat] =&gt; m.serializer }</span>
+<span class="nc bnc" id="L451" title="All 4 branches missed.">              .collect { case s: StatsMetadataSerializer =&gt; s }</span>
+
+        // we need to set the old feature type in the serializer cache to read back our current values
+<span class="nc" id="L454">        serializer.foreach(s =&gt; s.cache.put(previous.getTypeName, StatSerializer(previous)))</span>
+<span class="nc" id="L455">        val old = try { metadata.scan(previous.getTypeName, &quot;&quot;, cache = false).toList } finally {</span>
+<span class="nc" id="L456">          serializer.foreach(s =&gt; s.cache.remove(previous.getTypeName)) // will re-load latest from data store</span>
+        }
+        // note: we can avoid a compaction by setting merge = true, since there won't be any previous values
+<span class="nc bnc" id="L459" title="All 6 branches missed.">        if (sft.getTypeName != previous.getTypeName) {</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">          old.foreach { case (key, stat) =&gt;</span>
+<span class="nc" id="L461">            val renamed = getStatsForWrite(rename(stat).getOrElse(stat), sft, merge = true)</span>
+<span class="nc" id="L462">            write(sft.getTypeName, renamed)</span>
+<span class="nc" id="L463">            metadata.remove(previous.getTypeName, key)</span>
+          }
+        } else {
+<span class="nc bnc" id="L466" title="All 2 branches missed.">          old.foreach { case (key, stat) =&gt;</span>
+<span class="nc" id="L467">            rename(stat).foreach { r =&gt;</span>
+<span class="nc" id="L468">              write(sft.getTypeName, getStatsForWrite(r, sft, merge = true))</span>
+<span class="nc" id="L469">              metadata.remove(previous.getTypeName, key)</span>
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+    * Stores stats as metadata entries
+    *
+    * @param sft simple feature type
+    */
+<span class="nc bnc" id="L482" title="All 6 branches missed.">  protected class MetadataStatUpdater(sft: SimpleFeatureType) extends StatUpdater with LazyLogging {</span>
+
+<span class="nc" id="L484">    private var stat: Stat = Stat(sft, buildStatsFor(sft, getMinMax(sft, _)))</span>
+
+<span class="nc" id="L486">    override def add(sf: SimpleFeature): Unit = stat.observe(sf)</span>
+
+<span class="nc" id="L488">    override def remove(sf: SimpleFeature): Unit = stat.unobserve(sf)</span>
+
+    override def close(): Unit = {
+<span class="nc bnc" id="L491" title="All 2 branches missed.">      if (!stat.isEmpty) {</span>
+<span class="nc" id="L492">        write(sft.getTypeName, getStatsForWrite(stat, sft, merge = true))</span>
+      }
+    }
+
+    override def flush(): Unit = {
+<span class="nc bnc" id="L497" title="All 2 branches missed.">      if (!stat.isEmpty) {</span>
+<span class="nc" id="L498">        write(sft.getTypeName, getStatsForWrite(stat, sft, merge = true))</span>
+      }
+      // reload the tracker - for long-held updaters, this will refresh the histogram ranges
+<span class="nc" id="L501">      stat = Stat(sft, buildStatsFor(sft, localBounds))</span>
+    }
+
+    /**
+      * Get the bounds we've seen so far in this updater, but don't re-load from Accumulo as that
+      * can be slow
+      *
+      * @param attribute attribute
+      * @return
+      */
+<span class="nc" id="L511">    private def localBounds(attribute: String): Option[MinMax[Any]] = {</span>
+<span class="nc" id="L512">      stat match {</span>
+<span class="nc bnc" id="L513" title="All 18 branches missed.">        case s: SeqStat =&gt; s.stats.collectFirst { case m: MinMax[Any] if m.property == attribute =&gt; m }</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        case _ =&gt; logger.error(s&quot;Expected to have a SeqStat but got: $stat&quot;); None</span>
+      }
+    }
+  }
+}
+
+<span class="nc" id="L520">object MetadataBackedStats {</span>
+
+<span class="nc" id="L522">  val CountKey           = &quot;stats-count&quot;</span>
+<span class="nc" id="L523">  val BoundsKeyPrefix    = &quot;stats-bounds&quot;</span>
+<span class="nc" id="L524">  val TopKKeyPrefix      = &quot;stats-topk&quot;</span>
+<span class="nc" id="L525">  val FrequencyKeyPrefix = &quot;stats-freq&quot;</span>
+<span class="nc" id="L526">  val HistogramKeyPrefix = &quot;stats-hist&quot;</span>
+
+  // gets the key for storing the count
+<span class="nc" id="L529">  private def countKey(): String = CountKey</span>
+
+  // gets the key for storing a min-max
+<span class="nc" id="L532">  private def minMaxKey(attribute: String): String = s&quot;$BoundsKeyPrefix-$attribute&quot;</span>
+
+  // gets the key for storing a min-max
+<span class="nc" id="L535">  private def topKKey(attribute: String): String = s&quot;$TopKKeyPrefix-$attribute&quot;</span>
+
+  // gets the key for storing a frequency attribute
+<span class="nc" id="L538">  private def frequencyKey(attribute: String): String = s&quot;$FrequencyKeyPrefix-$attribute&quot;</span>
+
+  // gets the key for storing a frequency attribute by time bin
+<span class="nc" id="L541">  private def frequencyKey(attribute: String, timeBin: Short): String = frequencyKey(s&quot;$attribute-$timeBin&quot;)</span>
+
+  // gets the key for storing a histogram
+<span class="nc" id="L544">  private def histogramKey(attribute: String): String = s&quot;$HistogramKeyPrefix-$attribute&quot;</span>
+
+  // gets the key for storing a Z3 histogram
+<span class="nc" id="L547">  private def histogramKey(geom: String, dtg: String, timeBin: Short): String = histogramKey(s&quot;$geom-$dtg-$timeBin&quot;)</span>
+
+<span class="nc bnc" id="L549" title="All 30 branches missed.">  case class WritableStat(key: String, stat: Stat, merge: Boolean)</span>
+
+  /**
+    * Stat serializer
+    *
+    * @param ds datastore
+    */
+<span class="nc" id="L556">  class StatsMetadataSerializer(ds: DataStore) extends MetadataSerializer[Stat] {</span>
+
+<span class="nc" id="L558">    private [MetadataBackedStats] val cache = new ConcurrentHashMap[String, StatSerializer]()</span>
+
+    private def serializer(typeName: String): StatSerializer = {
+<span class="nc" id="L561">      var serializer = cache.get(typeName)</span>
+<span class="nc bnc" id="L562" title="All 2 branches missed.">      if (serializer == null) {</span>
+<span class="nc" id="L563">        val sft = ds.getSchema(typeName)</span>
+<span class="nc bnc" id="L564" title="All 2 branches missed.">        if (sft == null) {</span>
+<span class="nc" id="L565">          throw new RuntimeException(s&quot;Trying to deserialize stats for type '$typeName' &quot; +</span>
+<span class="nc" id="L566">              &quot;but it doesn't exist in the datastore&quot;)</span>
+        }
+<span class="nc" id="L568">        serializer = StatSerializer(sft) // note: retrieves a cached value</span>
+<span class="nc" id="L569">        cache.put(typeName, serializer)</span>
+      }
+<span class="nc" id="L571">      serializer</span>
+    }
+
+    override def serialize(typeName: String, value: Stat): Array[Byte] =
+<span class="nc" id="L575">      serializer(typeName).serialize(value)</span>
+
+    override def deserialize(typeName: String, value: Array[Byte]): Stat =
+<span class="nc" id="L578">      serializer(typeName).deserialize(value, immutable = true)</span>
+  }
+<span class="nc" id="L580">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

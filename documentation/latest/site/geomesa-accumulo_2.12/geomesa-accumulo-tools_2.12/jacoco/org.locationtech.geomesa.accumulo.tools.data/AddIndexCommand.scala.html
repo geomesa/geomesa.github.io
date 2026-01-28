@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AddIndexCommand.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Accumulo Tools</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.accumulo.tools.data</a> &gt; <span class="el_source">AddIndexCommand.scala</span></div><h1>AddIndexCommand.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.accumulo.tools.data
+
+import com.beust.jcommander.{Parameter, Parameters}
+import org.apache.hadoop.util.ToolRunner
+import org.geotools.feature.simple.SimpleFeatureTypeBuilder
+import org.geotools.filter.text.ecql.ECQL
+import org.locationtech.geomesa.accumulo.data.AccumuloDataStore
+import org.locationtech.geomesa.accumulo.jobs.AccumuloJobUtils
+import org.locationtech.geomesa.accumulo.jobs.index.WriteIndexJob
+import org.locationtech.geomesa.accumulo.jobs.index.WriteIndexJob.WriteIndexArgs
+import org.locationtech.geomesa.accumulo.tools.data.AddIndexCommand.AddIndexParameters
+import org.locationtech.geomesa.accumulo.tools.{AccumuloDataStoreCommand, AccumuloDataStoreParams}
+import org.locationtech.geomesa.index.api.{GeoMesaFeatureIndex, GeoMesaFeatureIndexFactory}
+import org.locationtech.geomesa.tools._
+import org.locationtech.geomesa.tools.utils.Prompt
+import org.locationtech.geomesa.utils.conf.IndexId
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.{Configs, InternalConfigs}
+import org.locationtech.geomesa.utils.index.IndexMode
+
+import scala.util.control.NonFatal
+
+/**
+  *
+  * 1. Add the new index in write-only mode
+  * 2. Pause and indicate that the user should bounce live ingestion to pick up the changes -
+  *    after this it will be writing to both the new and old index
+  * 3. Migrate data through a m/r job, with an optional CQL filter for what gets migrated
+  * 4. Turn old index off, put new index in read/write mode
+  * 5. Pause and indicate that the user should bounce live ingestion again
+  */
+<span class="nc" id="L40">class AddIndexCommand extends AccumuloDataStoreCommand {</span>
+
+<span class="nc" id="L42">  override val name = &quot;add-index&quot;</span>
+<span class="nc" id="L43">  override val params = new AddIndexParameters</span>
+
+  override def execute(): Unit = {
+    // We instantiate the class at runtime to avoid classpath dependencies from commands that are not being used.
+<span class="nc" id="L47">    new AddIndexCommandExecutor(params).run()</span>
+  }
+}
+
+<span class="nc" id="L51">object AddIndexCommand {</span>
+
+  @Parameters(commandDescription = &quot;Add or update indices for an existing GeoMesa feature type&quot;)
+<span class="nc" id="L54">  class AddIndexParameters extends AccumuloDataStoreParams with RequiredTypeNameParam with OptionalCqlFilterParam {</span>
+    @Parameter(names = Array(&quot;--index&quot;), description = &quot;Name of index(es) to add - comma-separate or use multiple flags&quot;, required = true)
+<span class="nc" id="L56">    var indexNames: java.util.List[String] = _</span>
+
+    @Parameter(names = Array(&quot;--no-back-fill&quot;), description = &quot;Do not copy any existing data into the new index&quot;)
+<span class="nc" id="L59">    var noBackFill: java.lang.Boolean = _</span>
+  }
+}
+
+<span class="nc" id="L63">class AddIndexCommandExecutor(override val params: AddIndexParameters) extends AccumuloDataStoreCommand {</span>
+
+  import org.locationtech.geomesa.index.metadata.GeoMesaMetadata.AttributesKey
+  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+<span class="nc" id="L68">  override val name = &quot;&quot;</span>
+
+<span class="nc" id="L70">  override def execute(): Unit = withDataStore(addIndex)</span>
+
+  def addIndex(ds: AccumuloDataStore): Unit  = {
+
+    import scala.collection.JavaConverters._
+
+<span class="nc" id="L76">    val sft = Option(ds.getSchema(params.featureName)).map(SimpleFeatureTypes.mutable).orNull</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">    require(sft != null, s&quot;Schema '${params.featureName}' does not exist in the specified data store&quot;)</span>
+
+    val indices = {
+<span class="nc" id="L80">      val builder = new SimpleFeatureTypeBuilder()</span>
+<span class="nc" id="L81">      builder.init(sft)</span>
+<span class="nc" id="L82">      val copy = builder.buildFeatureType()</span>
+<span class="nc" id="L83">      copy.getUserData.putAll(sft.getUserData)</span>
+<span class="nc" id="L84">      copy.getUserData.remove(InternalConfigs.IndexVersions)</span>
+<span class="nc" id="L85">      copy.getUserData.put(Configs.EnabledIndices, params.indexNames.asScala.mkString(&quot;,&quot;))</span>
+<span class="nc" id="L86">      GeoMesaFeatureIndexFactory.indices(copy)</span>
+    }
+
+<span class="nc" id="L89">    val existing = ds.manager.indices(sft)</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">    require(indices.map(GeoMesaFeatureIndex.identifier).forall(i =&gt; !existing.map(_.identifier).contains(i)),</span>
+<span class="nc" id="L91">      s&quot;Requested indices already exist: ${existing.map(_.identifier).mkString(&quot;[&quot;, &quot;][&quot;, &quot;]&quot;)}&quot;)</span>
+
+<span class="nc" id="L93">    val toDisable = indices.flatMap { i =&gt;</span>
+<span class="nc bnc" id="L94" title="All 12 branches missed.">      existing.find(e =&gt; e.name == i.name &amp;&amp; e.attributes == i.attributes).map { e =&gt;</span>
+<span class="nc" id="L95">        (i, IndexId(e.name, e.version, e.attributes, e.mode))</span>
+      }
+    }
+
+<span class="nc bnc" id="L99" title="All 2 branches missed.">    if (toDisable.nonEmpty) {</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">      if (!Prompt.confirm(&quot;The following index versions will be replaced: &quot; +</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">        toDisable.map { case (n, o) =&gt; s&quot;[$o] by [${GeoMesaFeatureIndex.identifier(n)}]&quot; }.mkString(&quot;, &quot;) +</span>
+<span class="nc" id="L102">        &quot;Continue (y/n)? &quot;)) {</span>
+<span class="nc" id="L103">        return</span>
+      }
+    }
+<span class="nc bnc" id="L106" title="All 2 branches missed.">    if (!Prompt.confirm(&quot;If you are ingesting streaming data, you will be required to restart &quot; +</span>
+      &quot;the streaming ingestion when prompted. Continue (y/n)? &quot;)) {
+<span class="nc" id="L108">      return</span>
+    }
+
+    // write a backup meta-data entry in case the process fails part-way
+<span class="nc" id="L112">    val backupKey = s&quot;$AttributesKey.bak&quot;</span>
+<span class="nc" id="L113">    ds.metadata.insert(sft.getTypeName, backupKey, ds.metadata.readRequired(sft.getTypeName, AttributesKey))</span>
+
+<span class="nc bnc" id="L115" title="All 2 branches missed.">    val toKeep = sft.getIndices.filter(i =&gt; !toDisable.map(_._2).contains(i))</span>
+
+<span class="nc bnc" id="L117" title="All 4 branches missed.">    if (params.noBackFill != null &amp;&amp; params.noBackFill.booleanValue()) {</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">      Command.user.info(&quot;Adding new indices and disabling old ones&quot;)</span>
+<span class="nc" id="L119">      sft.setIndices(indices ++ toKeep)</span>
+<span class="nc" id="L120">      ds.updateSchema(sft.getTypeName, sft)</span>
+    } else {
+<span class="nc bnc" id="L122" title="All 2 branches missed.">      Command.user.info(&quot;Adding new indices in write-only mode&quot;)</span>
+
+      // add new index in write-only mode
+<span class="nc" id="L125">      sft.setIndices(indices.map(_.copy(mode = IndexMode.Write)) ++ sft.getIndices)</span>
+<span class="nc" id="L126">      ds.updateSchema(sft.getTypeName, sft)</span>
+
+      // wait for the user to bounce ingestion
+<span class="nc" id="L129">      Prompt.acknowledge(&quot;Indices have been added in write-only mode. To pick up the changes, &quot; +</span>
+        &quot;please bounce any streaming ingestion. Once ingestion has resumed, press 'enter' to continue.&quot;)
+
+      // run migration job
+<span class="nc bnc" id="L133" title="All 2 branches missed.">      Command.user.info(&quot;Running index back-fill job&quot;)</span>
+
+<span class="nc" id="L135">      val args = new WriteIndexArgs(Array.empty)</span>
+<span class="nc" id="L136">      args.inZookeepers = params.zookeepers</span>
+<span class="nc" id="L137">      args.inInstanceId = params.instance</span>
+<span class="nc" id="L138">      args.inUser       = params.user</span>
+<span class="nc" id="L139">      args.inPassword   = params.password</span>
+<span class="nc" id="L140">      args.inTableName  = params.catalog</span>
+<span class="nc" id="L141">      args.inFeature    = params.featureName</span>
+<span class="nc" id="L142">      args.inCql        = Option(params.cqlFilter).map(ECQL.toCQL).orNull</span>
+<span class="nc" id="L143">      args.indexNames.addAll(indices.map(GeoMesaFeatureIndex.identifier).asJava)</span>
+
+<span class="nc" id="L145">      val libjars = Some(AccumuloJobUtils.defaultLibJars, AccumuloJobUtils.defaultSearchPath)</span>
+<span class="nc" id="L146">      val result = try { ToolRunner.run(new WriteIndexJob(libjars), args.unparse()) } catch {</span>
+<span class="nc bnc" id="L147" title="All 4 branches missed.">        case NonFatal(e) =&gt; Command.user.error(&quot;Error running back-fill job:&quot;, e); -1</span>
+      }
+
+      def setReadWrite(): Unit = {
+<span class="nc bnc" id="L151" title="All 2 branches missed.">        Command.user.info(&quot;Setting index to read-write mode and disabling old indices&quot;)</span>
+        // set new indices to read-write and turn off disabled indices
+<span class="nc" id="L153">        sft.setIndices(indices.map(_.copy(mode = IndexMode.ReadWrite)) ++ toKeep)</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        Command.user.info(sft.getIndices.toString)</span>
+<span class="nc" id="L155">        ds.updateSchema(sft.getTypeName, sft)</span>
+      }
+
+<span class="nc bnc" id="L158" title="All 2 branches missed.">      if (result == 0) {</span>
+<span class="nc" id="L159">        setReadWrite()</span>
+      } else {
+        def readResponse(): String = {
+<span class="nc" id="L162">          Prompt.read(&quot;Index back-fill job failed. You may:\n&quot; +</span>
+              &quot;  1. Switch the indices to read-write mode without existing data (you may manually back-fill later)\n&quot; +
+<span class="nc" id="L164">              &quot;  2. Roll-back index creation\n&quot; +</span>
+              &quot;Select an option: &quot;)
+        }
+<span class="nc" id="L167">        var response: String = readResponse()</span>
+<span class="nc bnc" id="L168" title="All 12 branches missed.">        while (response != &quot;1&quot; &amp;&amp; response != &quot;2&quot;) {</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">          Command.user.error(&quot;Invalid response, please select 1 or 2&quot;)</span>
+<span class="nc" id="L170">          response = readResponse()</span>
+        }
+<span class="nc" id="L172">        response match {</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">          case &quot;1&quot; =&gt; setReadWrite()</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">          case &quot;2&quot; =&gt;</span>
+<span class="nc" id="L175">            val bak = ds.metadata.readRequired(sft.getTypeName, backupKey)</span>
+<span class="nc" id="L176">            ds.metadata.insert(sft.getTypeName, AttributesKey, bak)</span>
+        }
+      }
+    }
+
+    // final bounce
+<span class="nc bnc" id="L182" title="All 2 branches missed.">    Command.user.info(&quot;Operation complete. Please bounce any streaming ingestion to pick up the changes.&quot;)</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

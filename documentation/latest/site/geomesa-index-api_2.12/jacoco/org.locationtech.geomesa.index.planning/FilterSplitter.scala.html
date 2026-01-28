@@ -1,0 +1,395 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FilterSplitter.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Index API</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.index.planning</a> &gt; <span class="el_source">FilterSplitter.scala</span></div><h1>FilterSplitter.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.index.planning
+
+import com.typesafe.scalalogging.LazyLogging
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.geotools.api.filter._
+import org.geotools.util.factory.Hints
+import org.locationtech.geomesa.filter._
+import org.locationtech.geomesa.filter.visitor.IdDetectingFilterVisitor
+import org.locationtech.geomesa.index.api.{FilterPlan, FilterStrategy, GeoMesaFeatureIndex}
+import org.locationtech.geomesa.index.index.attribute.AttributeIndex
+import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
+
+import scala.collection.mutable.ArrayBuffer
+
+/**
+ * Class for splitting queries up based on Boolean clauses and the available query strategies.
+ */
+<span class="nc bnc" id="L26" title="All 4 branches missed.">class FilterSplitter(sft: SimpleFeatureType, indices: Seq[GeoMesaFeatureIndex[_, _]]) extends LazyLogging {</span>
+
+  import FilterSplitter._
+
+  import scala.collection.JavaConverters._
+
+  /**
+    * Splits the query up into different filter plans to be evaluated. Each filter plan will consist of one or
+    * more query plans. Each query plan will have a primary part (that would be used for query planning)
+    * and an optional secondary part (that would be applied as a secondary filter).
+    *
+    * Examples:
+    *
+    * bbox(geom) AND attr1 = ? =&gt;
+    *
+    * Seq(FilterPlan(Seq(QueryFilter(ST,Some([ geom bbox ]),Some([ attr1 = ? ])))))
+    *
+    * bbox(geom) OR attr1 = ? =&gt;
+    *
+    * Seq(FilterPlan(Seq(QueryFilter(ST,Some([ geom bbox ]),None), QueryFilter(ATTRIBUTE,Some([ attr1 = ? ]),None))))
+    *
+    * bbox(geom) AND dtg DURING ? AND attr1 = ? =&gt;
+    *
+    * Seq(FilterPlan(Seq(QueryFilter(Z3,Some([ geom bbox AND dtg during ? ]),Some([ attr1 = ? ])))),
+    *     FilterPlan(Seq(QueryFilter(ATTRIBUTE,Some([ attr1 = ? ]),Some([ geom bbox AND dtg during ? ])))))
+    *
+    * note: spatial and temporal filters are combined.
+    *
+    * (bbox(geom) OR geom INTERSECT) AND attr1 = ? =&gt;
+    *
+    * Seq(FilterPlan(Seq(QueryFilter(ST,Some([ geom bbox OR geom intersect ]),Some([ attr1 = ? ]))))
+    *     FilterPlan(Seq(QueryFilter(ATTRIBUTE,Seq([ attr1 = ? ]),Some([ geom bbox OR geom intersect ])))))
+    *
+    * note: ORs will not be split if they operate on a single attribute
+    *
+    */
+<span class="nc" id="L62">  def getQueryOptions(filter: Filter, hints: Hints = new Hints()): Seq[FilterPlan] = {</span>
+    // cnf gives us a top level AND with ORs as first children
+<span class="nc" id="L64">    rewriteFilterInCNF(filter) match {</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">      case a: And =&gt;</span>
+        // look for ORs across attributes, e.g. bbox OR dtg
+<span class="nc" id="L67">        val complex = ArrayBuffer.empty[Or]</span>
+<span class="nc" id="L68">        val simple = ArrayBuffer.empty[Filter]</span>
+<span class="nc" id="L69">        var permutations = 1</span>
+
+<span class="nc" id="L71">        a.getChildren.asScala.foreach {</span>
+<span class="nc bnc" id="L72" title="All 2 branches missed.">          case or: Or =&gt;</span>
+<span class="nc" id="L73">            val attributes = attributeAndIdCount(or, sft)</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">            if (attributes &gt; 1) {</span>
+<span class="nc" id="L75">              complex += or</span>
+<span class="nc" id="L76">              permutations *= attributes</span>
+            } else {
+<span class="nc" id="L78">              simple += or</span>
+            }
+
+          case f =&gt;
+<span class="nc" id="L82">            simple += f</span>
+        }
+
+<span class="nc bnc" id="L85" title="All 2 branches missed.">        if (complex.isEmpty) {</span>
+          // no cross-attribute ORs
+<span class="nc" id="L87">          getSimpleQueryOptions(a, hints).map(fs =&gt; FilterPlan(Seq(fs)))</span>
+        } else {
+          // we don't generally consider all the permutations available, as that takes exponential time
+          // instead, we consider the cross-attribute-ors and the rest of the query separately
+
+          // the cross-attribute or plans
+          // each option should just result in 1 filter plan since there are no ANDs
+<span class="nc" id="L94">          val complexOptions = complex.map(getQueryOptions(_, hints))</span>
+
+          // the non-cross-attribute ors, with the ors tacked on as secondary filters at the end
+<span class="nc bnc" id="L97" title="All 2 branches missed.">          lazy val simpleOptions = if (simple.isEmpty) { Seq.empty } else {</span>
+            getSimpleQueryOptions(andFilters(simple.toSeq), hints)
+<span class="nc" id="L99">                .map(s =&gt; FilterPlan(Seq(addSecondaryPredicates(s, complex.toSeq))))</span>
+          }
+<span class="nc bnc" id="L101" title="All 2 branches missed.">          lazy val expandReduceOptions =</span>
+            expandReduceOrOptions(rewriteFilterInDNF(filter).asInstanceOf[Or], hints)
+<span class="nc" id="L103">                .map(fp =&gt; FilterPlan(makeDisjoint(fp.strategies)))</span>
+
+<span class="nc bnc" id="L105" title="All 6 branches missed.">          if (complexOptions.forall(o =&gt; o.lengthCompare(1) == 0 &amp;&amp; o.head.strategies.forall(_.isPreferredScan))) {</span>
+            // if each of the complex options has a good scan available, return those plus the simple options
+<span class="nc" id="L107">            complexOptions.map(o =&gt; FilterPlan(o.head.strategies.map(addSecondaryPredicates(_, simple.toSeq)))).toSeq ++</span>
+<span class="nc" id="L108">                simpleOptions.toSeq</span>
+<span class="nc bnc" id="L109" title="All 4 branches missed.">          } else if (ExpandReduceThreshold.toInt.exists(_ &gt; permutations)) {</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">            logger.debug(s&quot;Using ${getExpandReduceLog(filter, permutations)}&quot;)</span>
+<span class="nc" id="L111">            expandReduceOptions</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">          } else if (simpleOptions.nonEmpty) {</span>
+            // if there's not a clear option for the complex scans, ignore them and just return the simple ones
+<span class="nc bnc" id="L114" title="All 2 branches missed.">            logger.warn(&quot;Not considering complex OR predicates in query planning: &quot; +</span>
+<span class="nc" id="L115">                s&quot;${complex.map(FilterHelper.toString).mkString(&quot;(&quot;, &quot;) AND (&quot;, &quot;)&quot;)}&quot;)</span>
+<span class="nc" id="L116">            simpleOptions</span>
+          } else {
+            // if there aren't any simple plans or clear options for the complex plans,
+            // fall back to the expand-reduce logic
+<span class="nc bnc" id="L120" title="All 2 branches missed.">            logger.warn(s&quot;Falling back to ${getExpandReduceLog(filter, permutations)}&quot;)</span>
+<span class="nc" id="L121">            expandReduceOptions</span>
+          }
+        }
+
+<span class="nc bnc" id="L125" title="All 2 branches missed.">      case o: Or =&gt;</span>
+        // there are no ands - just ors between fields
+        // this implies that each child has only a single property or ID
+        def getGroup(f: Filter): (Seq[String], Boolean) =
+<span class="nc" id="L129">          (FilterHelper.propertyNames(f, sft), FilterHelper.hasIdFilter(f))</span>
+
+        // group and then recombine the OR'd filters by the attribute they operate on
+<span class="nc" id="L132">        val groups = o.getChildren.asScala.groupBy(getGroup).values.map(g =&gt; ff.or(g.asJava)).toSeq</span>
+<span class="nc" id="L133">        val perAttributeOptions = groups.flatMap { g =&gt;</span>
+<span class="nc" id="L134">          val options = getSimpleQueryOptions(g, hints)</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">          require(options.length &lt; 2, s&quot;Expected only a single option for ${FilterHelper.toString(g)} but got $options&quot;)</span>
+<span class="nc" id="L136">          options.headOption</span>
+        }
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        if (perAttributeOptions.exists(_.isFullTableScan)) {</span>
+          // we have to do a full table scan for part of the query, just append everything to that
+<span class="nc" id="L140">          Seq(FilterPlan(Seq(fullTableScanOption(o, hints))))</span>
+        } else {
+<span class="nc" id="L142">          Seq(FilterPlan(makeDisjoint(perAttributeOptions)))</span>
+        }
+
+      case f =&gt;
+<span class="nc" id="L146">        getSimpleQueryOptions(f, hints).map(fs =&gt; FilterPlan(Seq(fs)))</span>
+    }
+  }
+
+  /**
+   * Gets options for a 'simple' filter, where each OR is on a single attribute, e.g.
+   *   (bbox1 OR bbox2) AND dtg
+   *   bbox AND dtg AND (attr1 = foo OR attr = bar)
+   * not:
+   *   bbox OR dtg
+   *
+   * Because the inputs are simple, each one can be satisfied with a single query filter.
+   * The returned values will each satisfy the query, using a different strategy.
+   *
+   * @param filter input filter
+   * @param hints query hints
+   * @return sequence of options, any of which can satisfy the query
+   */
+  private def getSimpleQueryOptions(filter: Filter, hints: Hints): Seq[FilterStrategy] = {
+    import org.locationtech.geomesa.index.conf.QueryHints.RichHints
+
+<span class="nc bnc" id="L167" title="All 6 branches missed.">    if (filter == Filter.EXCLUDE) { Seq.empty } else {</span>
+<span class="nc" id="L168">      val requestedPlan = hints.getRequestedIndex.flatMap { requested =&gt;</span>
+        // check by id and by name
+<span class="nc bnc" id="L170" title="All 8 branches missed.">        val index = indices.find(i =&gt; i.identifier == requested || i.name.equalsIgnoreCase(requested)).orElse {</span>
+          // back-compatibility for attr vs join index name
+<span class="nc bnc" id="L172" title="All 2 branches missed.">          if (!AttributeIndex.name.equalsIgnoreCase(requested)) { None } else {</span>
+<span class="nc bnc" id="L173" title="All 6 branches missed.">            indices.find(_.name == AttributeIndex.JoinIndexName)</span>
+          }
+        }
+<span class="nc" id="L176">        index.flatMap(_.getFilterStrategy(filter, hints)).map(Seq(_))</span>
+      }
+<span class="nc" id="L178">      requestedPlan.getOrElse {</span>
+<span class="nc" id="L179">        val preferredScans  = ArrayBuffer.empty[FilterStrategy]</span>
+<span class="nc" id="L180">        val acceptableScans = ArrayBuffer.empty[FilterStrategy]</span>
+<span class="nc" id="L181">        val fullTableScans  = ArrayBuffer.empty[FilterStrategy]</span>
+
+<span class="nc" id="L183">        indices.foreach { i =&gt;</span>
+<span class="nc" id="L184">          i.getFilterStrategy(filter, hints).foreach {</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">            case f if f.isFullTableScan =&gt; fullTableScans += f</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">            case f if f.isPreferredScan =&gt; preferredScans += f</span>
+<span class="nc" id="L187">            case f                      =&gt; acceptableScans += f</span>
+          }
+        }
+
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (preferredScans.nonEmpty) {</span>
+<span class="nc" id="L192">          preferredScans.toSeq</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        } else if (acceptableScans.nonEmpty) {</span>
+<span class="nc" id="L194">          acceptableScans.toSeq</span>
+        } else {
+<span class="nc" id="L196">          fullTableScans.take(1).toSeq</span>
+        }
+      }
+    }
+  }
+
+  /**
+    * Calculates all possible options for each part of the filter, then determines all permutations of
+    * the options. This can end up being expensive (O(2&amp;#94;n)), so is only used as a fall-back.
+    */
+  private def expandReduceOrOptions(filter: Or, hints: Hints): Seq[FilterPlan] = {
+
+    // for each child of the or, get the query options
+    // each filter plan should only have a single query filter
+    def getChildOptions: Seq[Seq[FilterPlan]] =
+<span class="nc" id="L211">      filter.getChildren.asScala.map(getSimpleQueryOptions(_, hints).map(fs =&gt; FilterPlan(Seq(fs))).toSeq).toSeq</span>
+
+    // combine the filter plans so that each plan has multiple query filters
+    // use the permutations of the different options for each child
+    // TODO GEOMESA-941 Fix algorithmically dangerous (2^N exponential runtime)
+    def reduceChildOptions(childOptions: Seq[Seq[FilterPlan]]): Seq[FilterPlan] =
+<span class="nc" id="L217">      childOptions.reduce { (left, right) =&gt;</span>
+<span class="nc" id="L218">        left.flatMap(l =&gt; right.map(r =&gt; FilterPlan(l.strategies ++ r.strategies)))</span>
+      }
+
+    // try to combine query filters in each filter plan if they have the same primary filter
+    // this avoids scanning the same ranges twice with different secondary predicates
+<span class="nc" id="L223">    def combineSecondaryFilters(options: Seq[FilterPlan]): Seq[FilterPlan] = options.map { r =&gt;</span>
+      // build up the result array instead of using a group by to preserve filter order
+<span class="nc" id="L225">      val groups = ArrayBuffer.empty[FilterStrategy]</span>
+<span class="nc" id="L226">      r.strategies.distinct.foreach { f =&gt;</span>
+<span class="nc bnc" id="L227" title="All 12 branches missed.">        val i = groups.indexWhere(g =&gt; g.index == f.index &amp;&amp; g.primary == f.primary)</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        if (i == -1) {</span>
+<span class="nc" id="L229">          groups.append(f)</span>
+        } else {
+<span class="nc" id="L231">          val current = groups(i).secondary match {</span>
+<span class="nc bnc" id="L232" title="All 4 branches missed.">            case Some(o: Or) =&gt; o.getChildren.asScala</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">            case Some(n) =&gt; Seq(n)</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">            case None =&gt; Seq.empty</span>
+          }
+<span class="nc bnc" id="L236" title="All 4 branches missed.">          groups.update(i, f.copy(secondary = orOption((current ++ f.secondary).toSeq), temporal = f.temporal &amp;&amp; groups(i).temporal))</span>
+        }
+      }
+<span class="nc" id="L239">      FilterPlan(groups.toSeq)</span>
+    }
+
+    // if a filter plan has any query filters that scan a subset of the range of a different query filter,
+    // then we can combine them, as we have to scan the larger range anyway
+<span class="nc" id="L244">    def mergeOverlappedFilters(options: Seq[FilterPlan]): Seq[FilterPlan] = options.map { filterPlan =&gt;</span>
+<span class="nc" id="L245">      val filters = ArrayBuffer[FilterStrategy](filterPlan.strategies: _*)</span>
+<span class="nc" id="L246">      var merged: FilterStrategy = null</span>
+<span class="nc" id="L247">      var i = 0</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">      while (i &lt; filters.length) {</span>
+<span class="nc" id="L249">        val toMerge = filters(i)</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (toMerge != null) {</span>
+<span class="nc" id="L251">          var j = 0</span>
+<span class="nc bnc" id="L252" title="All 4 branches missed.">          while (j &lt; filters.length &amp;&amp; merged == null) {</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">            if (i != j) {</span>
+<span class="nc" id="L254">              val mergeTo = filters(j)</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">              if (mergeTo != null) {</span>
+<span class="nc" id="L256">                merged = tryMerge(toMerge, mergeTo)</span>
+              }
+            }
+<span class="nc" id="L259">            j += 1</span>
+          }
+<span class="nc bnc" id="L261" title="All 2 branches missed.">          if (merged != null) {</span>
+            // remove the merged query filter and replace the one merged into
+<span class="nc" id="L263">            filters.update(i, null)</span>
+<span class="nc" id="L264">            filters.update(j - 1, merged)</span>
+<span class="nc" id="L265">            merged = null</span>
+          }
+        }
+<span class="nc" id="L268">        i += 1</span>
+      }
+
+      // if we have replaced anything, recreate the filter plan
+<span class="nc bnc" id="L272" title="All 2 branches missed.">      val overlapped = filters.filter(_ != null)</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">      if (overlapped.length &lt; filterPlan.strategies.length) {</span>
+<span class="nc" id="L274">        FilterPlan(overlapped.toSeq)</span>
+      } else {
+<span class="nc" id="L276">        filterPlan</span>
+      }
+    }
+
+<span class="nc" id="L280">    val childOpts   = getChildOptions</span>
+<span class="nc" id="L281">    val reducedOpts = reduceChildOptions(childOpts)</span>
+<span class="nc" id="L282">    val combinedSec = combineSecondaryFilters(reducedOpts)</span>
+<span class="nc" id="L283">    val merged      = mergeOverlappedFilters(combinedSec)</span>
+
+<span class="nc bnc" id="L285" title="All 2 branches missed.">    if (merged.nonEmpty) {</span>
+<span class="nc" id="L286">      merged</span>
+    } else {
+<span class="nc" id="L288">      Seq(FilterPlan(Seq(fullTableScanOption(filter, hints))))</span>
+    }
+  }
+
+  /**
+    * Will perform a full table scan - used when we don't have anything better. Currently z3, z2 and record
+    * tables support full table scans.
+    */
+  private def fullTableScanOption(filter: Filter, hints: Hints): FilterStrategy = {
+<span class="nc bnc" id="L297" title="All 6 branches missed.">    val secondary = if (filter == Filter.INCLUDE) { None } else { Some(filter) }</span>
+    // note: early return after we find a matching strategy
+<span class="nc" id="L299">    val iter = indices.iterator</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">    while (iter.hasNext) {</span>
+<span class="nc" id="L301">      iter.next().getFilterStrategy(Filter.INCLUDE, hints) match {</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        case None =&gt; // no-op</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        case Some(i) =&gt; return i.copy(secondary = secondary)</span>
+      }
+    }
+<span class="nc" id="L306">    throw new UnsupportedOperationException(s&quot;Configured indices do not support the query ${FilterHelper.toString(filter)}&quot;)</span>
+  }
+
+  private def addSecondaryPredicates(filter: FilterStrategy, predicates: Seq[Filter]): FilterStrategy =
+<span class="nc" id="L310">    filter.copy(secondary = andOption(filter.secondary.toSeq ++ predicates))</span>
+
+  private def getExpandReduceLog(filter: Filter, permutations: Int): String =
+<span class="nc" id="L313">    s&quot;expand/reduce query splitting with $permutations permutations for filter ${FilterHelper.toString(filter)}&quot;</span>
+
+}
+
+<span class="nc" id="L317">object FilterSplitter {</span>
+
+<span class="nc" id="L319">  val ExpandReduceThreshold: SystemProperty = SystemProperty(&quot;geomesa.query.processing.or.threshold&quot;)</span>
+
+  /**
+    * Gets the count of distinct attributes being queried - ID is treated as an attribute
+    */
+  def attributeAndIdCount(filter: Filter, sft: SimpleFeatureType): Int = {
+<span class="nc bnc" id="L325" title="All 2 branches missed.">    val idCount = if (filter.accept(new IdDetectingFilterVisitor, false).asInstanceOf[Boolean]) { 1 } else { 0 }</span>
+<span class="nc" id="L326">    FilterHelper.propertyNames(filter, sft).length + idCount</span>
+  }
+
+  /**
+   * Try to merge the two query filters. Return the merged query filter if successful, else null.
+   */
+  def tryMerge(toMerge: FilterStrategy, mergeTo: FilterStrategy): FilterStrategy = {
+<span class="nc bnc" id="L333" title="All 8 branches missed.">    if (mergeTo.primary.forall(_ == Filter.INCLUDE)) {</span>
+      // this is a full table scan, we can just append the OR to the secondary filter
+<span class="nc" id="L335">      mergeTo.copy(secondary = orOption(mergeTo.secondary.toSeq ++ toMerge.filter))</span>
+<span class="nc bnc" id="L336" title="All 12 branches missed.">    } else if (toMerge.index.name == AttributeIndex.name &amp;&amp; mergeTo.index.name == AttributeIndex.name) {</span>
+      // TODO extract this out into the API?
+<span class="nc" id="L338">      tryMergeAttrStrategy(toMerge, mergeTo)</span>
+    } else {
+      // overlapping geoms, date ranges, attribute ranges, etc will be handled when extracting bounds
+<span class="nc" id="L341">      null</span>
+    }
+  }
+
+  /**
+    * Tries to merge the two filters that are OR'd together into a single filter that can be queried in one pass.
+    * Will return the merged filter, or null if they can't be merged.
+    *
+    * We can merge filters if they have the same secondary filter AND:
+    *   1. One of them does not have a primary filter
+    *   2. They both have a primary filter on the same attribute
+    *
+    * @param toMerge first filter
+    * @param mergeTo second filter
+    * @return merged filter that satisfies both inputs, or null if that isn't possible
+    */
+  def tryMergeAttrStrategy(toMerge: FilterStrategy, mergeTo: FilterStrategy): FilterStrategy = {
+    // TODO this will be incorrect for multi-valued properties where we have an AND in the primary filter
+<span class="nc" id="L359">    val leftAttributes = toMerge.primary.map(FilterHelper.propertyNames(_, null))</span>
+<span class="nc" id="L360">    val rightAttributes = mergeTo.primary.map(FilterHelper.propertyNames(_, null))</span>
+
+<span class="nc bnc" id="L362" title="All 2 branches missed.">    val canMergePrimary = (leftAttributes, rightAttributes) match {</span>
+<span class="nc bnc" id="L363" title="All 10 branches missed.">      case (Some(left), Some(right)) =&gt; left.length == 1 &amp;&amp; right.length == 1 &amp;&amp; left.head == right.head</span>
+<span class="nc" id="L364">      case _ =&gt; true</span>
+    }
+
+<span class="nc bnc" id="L367" title="All 8 branches missed.">    if (canMergePrimary &amp;&amp; toMerge.secondary == mergeTo.secondary) {</span>
+<span class="nc" id="L368">      mergeTo.copy(primary = orOption(toMerge.primary.toSeq ++ mergeTo.primary))</span>
+    } else {
+<span class="nc" id="L370">      null</span>
+    }
+  }
+
+  /**
+    * Make a filter plan disjoint ORs - this way we don't have to deduplicate results
+    *
+    * @param strategies strategies
+    * @return same strategies with disjoint ORs
+    */
+  private def makeDisjoint(strategies: Seq[FilterStrategy]): Seq[FilterStrategy] = {
+<span class="nc bnc" id="L381" title="All 2 branches missed.">    if (strategies.lengthCompare(2) &lt; 0) { strategies } else {</span>
+      // A OR B OR C becomes... A OR (B NOT A) OR (C NOT A and NOT B)
+      // keep track of our current disjoint clause
+<span class="nc" id="L384">      val nots = ArrayBuffer.empty[Filter]</span>
+<span class="nc" id="L385">      strategies.map { filter =&gt;</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        val res = if (nots.isEmpty) { filter } else {</span>
+<span class="nc" id="L387">          filter.copy(secondary = Some(andFilters((nots ++ filter.secondary).toSeq)))</span>
+        }
+<span class="nc" id="L389">        nots ++= filter.filter.map(ff.not) // note - side effect</span>
+<span class="nc" id="L390">        res</span>
+      }
+    }
+  }
+<span class="nc" id="L394">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

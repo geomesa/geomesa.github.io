@@ -1,0 +1,314 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>GeoMessageSerializer.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Kafka Datastore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.kafka.utils</a> &gt; <span class="el_source">GeoMessageSerializer.scala</span></div><h1>GeoMessageSerializer.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.kafka.utils
+
+import com.typesafe.scalalogging.LazyLogging
+import org.apache.kafka.clients.producer.Partitioner
+import org.apache.kafka.common.Cluster
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.locationtech.geomesa.features.SerializationOption.SerializationOption
+import org.locationtech.geomesa.features.SerializationType.SerializationType
+import org.locationtech.geomesa.features.avro.AvroFeatureSerializer
+import org.locationtech.geomesa.features.kryo.KryoFeatureSerializer
+import org.locationtech.geomesa.features.{SerializationOption, SerializationType, SimpleFeatureSerializer}
+import org.locationtech.geomesa.kafka.utils.GeoMessage.{Change, Clear, Delete}
+import org.locationtech.geomesa.utils.index.ByteArrays
+
+import java.nio.charset.StandardCharsets
+import scala.util.Random
+import scala.util.control.NonFatal
+import scala.util.hashing.MurmurHash3
+
+/**
+  * Serialized `GeoMessage`s
+  *
+  * Current encoding (version 2/3), designed to work with kafka log compaction.
+  * See https://kafka.apache.org/10/documentation.html#design_compactionbasics
+  *
+  * Version 3 uses avro for serialized features, version 2 uses kryo
+  *
+  * change:
+  *   key: n bytes feature id
+  *   value: n bytes for serialized feature (without id)
+  *   headers: &quot;v&quot; -&gt; serialization version
+  *
+  * delete:
+  *   key: n bytes feature id
+  *   value: null - this allows for log compaction to delete the feature out
+  *   headers: &quot;v&quot; -&gt; serialization version
+  *
+  * clear:
+  *   key: empty
+  *   value: empty
+  *   headers: &quot;v&quot; -&gt; serialization version
+  *
+  * Version 1 legacy encoding:
+  *
+  * change:
+  *   key: 1 byte message version, 1 byte for message type ('C'), 8 byte long for epoch millis
+  *   value: n bytes for serialized feature (with id)
+  *
+  * delete:
+  *   key: 1 byte message version, 1 byte for message type ('D'), 8 byte long for epoch millis
+  *   value: n bytes for feature id
+  *
+  * clear:
+  *   key: 1 byte message version, 1 byte for message type ('X'), 8 byte long for epoch millis
+  *   value: empty
+  */
+<span class="nc" id="L65">object GeoMessageSerializer {</span>
+
+<span class="nc" id="L67">  val KryoVersion: Byte = 2</span>
+<span class="nc" id="L68">  val AvroVersion: Byte = 3</span>
+
+<span class="nc" id="L70">  val VersionHeader = &quot;v&quot;</span>
+
+<span class="nc" id="L72">  private val Empty = Array.empty[Byte]</span>
+
+<span class="nc" id="L74">  private[kafka] val DefaultOpts: Set[SerializationOption] =</span>
+<span class="nc" id="L75">    SerializationOption.builder.withoutId.withUserData.immutable.build()</span>
+
+  /**
+   * Create a message serializer
+   *
+   * @param sft simple feature type
+   * @param serialization serialization type (avro or kryo)
+   * @param opts extra serialization options
+   * @return
+   */
+  def apply(
+      sft: SimpleFeatureType,
+<span class="nc" id="L87">      serialization: SerializationType = SerializationType.KRYO,</span>
+<span class="nc" id="L88">      opts: Set[SerializationOption] = Set.empty): GeoMessageSerializer = {</span>
+<span class="nc" id="L89">    val options = DefaultOpts ++ opts</span>
+<span class="nc" id="L90">    val kryoSerializer = KryoFeatureSerializer.builder(sft).opts(options).build()</span>
+    // note: native vs non-native deserialization is handled automatically by the avro serializer, regardless of opts
+<span class="nc" id="L92">    val avroSerializer = AvroFeatureSerializer.builder(sft).opts(options).build()</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">    val (serializer, version) = serialization match {</span>
+<span class="nc bnc" id="L94" title="All 6 branches missed.">      case SerializationType.KRYO =&gt; (kryoSerializer, KryoVersion)</span>
+<span class="nc bnc" id="L95" title="All 6 branches missed.">      case SerializationType.AVRO =&gt; (avroSerializer, AvroVersion)</span>
+<span class="nc" id="L96">      case _ =&gt; throw new UnsupportedOperationException(s&quot;Unhandled serialization type '$serialization'&quot;)</span>
+    }
+<span class="nc" id="L98">    new GeoMessageSerializer(sft, serializer, kryoSerializer, avroSerializer, version)</span>
+  }
+
+  def partition(numPartitions: Int, toKey: =&gt; Array[Byte]): Int = {
+    // use the feature id if available, otherwise (for clear) use random shard
+<span class="nc bnc" id="L103" title="All 2 branches missed.">    if (numPartitions &lt; 2) { 0 } else {</span>
+<span class="nc" id="L104">      val key = toKey</span>
+<span class="nc bnc" id="L105" title="All 4 branches missed.">      if (key != null &amp;&amp; key.length &gt; 0) {</span>
+<span class="nc" id="L106">        Math.abs(MurmurHash3.bytesHash(key, MurmurHash3.arraySeed)) % numPartitions</span>
+      } else {
+<span class="nc" id="L108">        Random.nextInt(numPartitions)</span>
+      }
+    }
+  }
+
+  /**
+    * Ensures that updates to a given feature go to the same partition, so that they maintain order
+    */
+<span class="nc" id="L116">  class GeoMessagePartitioner extends Partitioner {</span>
+
+    override def partition(topic: String,
+                           key: Any,
+                           keyBytes: Array[Byte],
+                           value: Any,
+                           valueBytes: Array[Byte],
+                           cluster: Cluster): Int = {
+<span class="nc" id="L124">      val count = cluster.partitionsForTopic(topic).size</span>
+<span class="nc" id="L125">      try { GeoMessageSerializer.partition(count, keyBytes) } catch {</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        case NonFatal(e) =&gt;</span>
+<span class="nc" id="L127">          throw new IllegalArgumentException(</span>
+<span class="nc" id="L128">            s&quot;Unexpected message format: ${Option(keyBytes).map(ByteArrays.toHex).getOrElse(&quot;&quot;)} &quot; +</span>
+<span class="nc" id="L129">                s&quot;${Option(valueBytes).map(ByteArrays.toHex).getOrElse(&quot;&quot;)}&quot;, e)</span>
+      }
+
+    }
+
+<span class="nc" id="L134">    override def configure(configs: java.util.Map[String, _]): Unit = {}</span>
+
+<span class="nc" id="L136">    override def close(): Unit = {}</span>
+  }
+
+<span class="nc" id="L139">  class GeoMessageSerializerFactory(serialization: SerializationType, opts: Set[SerializationOption] = Set.empty) {</span>
+<span class="nc" id="L140">    def apply(sft: SimpleFeatureType): GeoMessageSerializer = GeoMessageSerializer.apply(sft, serialization, opts)</span>
+  }
+<span class="nc" id="L142">}</span>
+
+/**
+  * Serializes `GeoMessage`s
+  *
+  * @param sft simple feature type being serialized
+  * @param serializer serializer used for reading or writing messages
+  * @param kryo kryo serializer used for deserializing kryo messages
+  * @param avro avro serializer used for deserializing avro messages
+  * @param version version byte corresponding to the serializer type
+  */
+<span class="nc bnc" id="L153" title="All 4 branches missed.">class GeoMessageSerializer(sft: SimpleFeatureType,</span>
+<span class="nc" id="L154">                           val serializer: SimpleFeatureSerializer,</span>
+<span class="nc" id="L155">                           kryo: KryoFeatureSerializer,</span>
+<span class="nc" id="L156">                           avro: AvroFeatureSerializer,</span>
+<span class="nc" id="L157">                           version: Byte) extends LazyLogging {</span>
+
+<span class="nc" id="L159">  private val headers = Map(GeoMessageSerializer.VersionHeader -&gt; Array(version))</span>
+
+<span class="nc bnc" id="L161" title="All 4 branches missed.">  private lazy val serializerV1 = KryoFeatureSerializer.builder(sft).withUserData.immutable.build()</span>
+
+  /**
+    * Serializes a message
+    *
+    * @param msg message
+    * @return (serialized key, serialized value)
+    */
+  def serialize(msg: GeoMessage): (Array[Byte], Array[Byte], Map[String, Array[Byte]]) = {
+<span class="nc" id="L170">    msg match {</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">      case m: Change =&gt; serialize(m)</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">      case m: Delete =&gt; serialize(m)</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">      case m: Clear  =&gt; serialize(m)</span>
+<span class="nc" id="L174">      case _ =&gt; throw new IllegalArgumentException(s&quot;Invalid message: '$msg'&quot;)</span>
+    }
+  }
+
+  /**
+    * Deserializes a serialized `GeoMessage`
+    *
+    * @param key the serialized message key
+    * @param value the serialized message body
+    * @param timestamp the kafka message timestamp
+    * @return the deserialized message
+    */
+  def deserialize(
+      key: Array[Byte],
+      value: Array[Byte],
+<span class="nc" id="L189">      headers: Map[String, Array[Byte]] = Map.empty,</span>
+<span class="nc" id="L190">      timestamp: Long = System.currentTimeMillis()): GeoMessage = {</span>
+<span class="nc" id="L191">    try {</span>
+<span class="nc" id="L192">      headers.get(GeoMessageSerializer.VersionHeader) match {</span>
+<span class="nc bnc" id="L193" title="All 6 branches missed.">        case Some(h) if h.length == 1 &amp;&amp; h(0) == GeoMessageSerializer.KryoVersion =&gt; deserialize(key, value, kryo)</span>
+<span class="nc bnc" id="L194" title="All 6 branches missed.">        case Some(h) if h.length == 1 &amp;&amp; h(0) == GeoMessageSerializer.AvroVersion =&gt; deserialize(key, value, avro)</span>
+<span class="nc" id="L195">        case _ =&gt; tryDeserializeVersions(key, value)</span>
+      }
+    } catch {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">      case NonFatal(e) =&gt;</span>
+<span class="nc" id="L199">        throw new IllegalArgumentException(</span>
+<span class="nc" id="L200">          s&quot;Unexpected message format: ${Option(key).map(ByteArrays.toHex).getOrElse(&quot;&quot;)} &quot; +</span>
+<span class="nc" id="L201">              s&quot;${Option(value).map(ByteArrays.toHex).getOrElse(&quot;&quot;)}&quot;, e)</span>
+    }
+  }
+
+  /**
+    * Serializes a change message
+    *
+    * key: n bytes feature id
+    * value: n bytes for serialized feature (without id)
+    * headers: &quot;v&quot; -&gt; 1 byte message version
+    *
+    * @param msg msg
+    * @return (serialized key, serialized value, headers)
+    */
+  private def serialize(msg: Change): (Array[Byte], Array[Byte], Map[String, Array[Byte]]) =
+<span class="nc" id="L216">    (msg.feature.getID.getBytes(StandardCharsets.UTF_8), serializer.serialize(msg.feature), headers)</span>
+
+  /**
+    * Serializes a delete message
+    *
+    * key: n bytes feature id
+    * value: null
+    * headers: &quot;v&quot; -&gt; 1 byte message version
+    *
+    * @param msg msg
+    * @return (serialized key, serialized value, headers)
+    */
+  private def serialize(msg: Delete): (Array[Byte], Array[Byte], Map[String, Array[Byte]]) =
+<span class="nc" id="L229">    (msg.id.getBytes(StandardCharsets.UTF_8), null, headers)</span>
+
+  /**
+    * Serializes a clear message
+    *
+    * key: empty
+    * value: empty
+    * headers: &quot;v&quot; -&gt; 1 byte message version
+    *
+    * @param msg msg
+    * @return (serialized key, serialized value, headers)
+    */
+  private def serialize(msg: Clear): (Array[Byte], Array[Byte], Map[String, Array[Byte]]) =
+<span class="nc" id="L242">    (GeoMessageSerializer.Empty, GeoMessageSerializer.Empty, headers)</span>
+
+  /**
+    * Deserialize a message using the appropriate serializer
+    *
+    * @param key message key
+    * @param value message value
+    * @param deserializer deserializer appropriate for the message encoding
+    * @return
+    */
+  protected def deserialize(key: Array[Byte], value: Array[Byte], deserializer: SimpleFeatureSerializer): GeoMessage = {
+<span class="nc bnc" id="L253" title="All 6 branches missed.">    if (key.isEmpty &amp;&amp; (value == null || value.isEmpty)) { Clear } else {</span>
+<span class="nc" id="L254">      val id = new String(key, StandardCharsets.UTF_8)</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">      if (value == null) { Delete(id) } else { Change(deserializer.deserialize(id, value)) }</span>
+    }
+  }
+
+  /**
+    * Used to deserialize messages without headers, which may be caused by:
+    *
+    * a) version 1 messages
+    * b) an older kafka version that doesn't support message headers
+    *
+    * @param key message key
+    * @param value message value
+    * @return
+    */
+  private def tryDeserializeVersions(key: Array[Byte], value: Array[Byte]): GeoMessage = {
+<span class="nc bnc" id="L270" title="All 6 branches missed.">    if (key.length == 10 &amp;&amp; key(0) == 1 &amp;&amp; Seq('C', 'D', 'X').contains(key(1).toChar)) {</span>
+<span class="nc" id="L271">      try { deserializeV1(key, value) } catch {</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">        case NonFatal(e) =&gt;</span>
+<span class="nc" id="L273">          try { tryDeserializeTypes(key, value) } catch {</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            case NonFatal(suppressed) =&gt; e.addSuppressed(suppressed); throw e</span>
+          }
+      }
+    } else {
+<span class="nc" id="L278">      tryDeserializeTypes(key, value)</span>
+    }
+  }
+
+  /**
+    * Try to deserialize using both kryo and avro
+    *
+    * @param key message key
+    * @param value message value
+    * @return
+    */
+  private def tryDeserializeTypes(key: Array[Byte], value: Array[Byte]): GeoMessage = {
+<span class="nc" id="L290">    try { deserialize(key, value, serializer) } catch {</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">      case NonFatal(e) =&gt;</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        try { deserialize(key, value, if (serializer.eq(kryo)) { avro } else { kryo }) } catch {</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">          case NonFatal(suppressed) =&gt; e.addSuppressed(suppressed); throw e</span>
+        }
+    }
+  }
+
+  /**
+    * Deserialize version 1 messages
+    *
+    * @param key message key
+    * @param value message value
+    * @return
+    */
+  private def deserializeV1(key: Array[Byte], value: Array[Byte]): GeoMessage = {
+<span class="nc bnc" id="L306" title="All 4 branches missed.">    key(1).toChar match {</span>
+<span class="nc" id="L307">      case 'C' =&gt; Change(serializerV1.deserialize(value))</span>
+<span class="nc" id="L308">      case 'D' =&gt; Delete(new String(value, StandardCharsets.UTF_8))</span>
+<span class="nc" id="L309">      case 'X' =&gt; Clear</span>
+<span class="nc" id="L310">      case m   =&gt; throw new IllegalArgumentException(s&quot;Unknown message type: $m&quot; )</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

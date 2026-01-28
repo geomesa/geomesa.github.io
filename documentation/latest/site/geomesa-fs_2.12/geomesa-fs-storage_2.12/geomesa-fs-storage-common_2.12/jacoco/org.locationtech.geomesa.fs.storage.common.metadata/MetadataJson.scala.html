@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MetadataJson.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa FileSystem Storage Common</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.fs.storage.common.metadata</a> &gt; <span class="el_source">MetadataJson.scala</span></div><h1>MetadataJson.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.fs.storage.common // get pureconfig converters from common package
+package metadata
+
+import com.typesafe.config.{Config, ConfigFactory}
+import org.apache.hadoop.fs.Path
+import org.locationtech.geomesa.fs.storage.api.StorageMetadata.{PartitionMetadata, StorageFile}
+import org.locationtech.geomesa.fs.storage.api._
+import org.locationtech.geomesa.fs.storage.common.utils.PathCache
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes
+import org.locationtech.geomesa.utils.io.WithClose
+import org.locationtech.geomesa.utils.metrics.DebugLogProfiling
+import pureconfig.{ConfigSource, ConfigWriter}
+
+import java.io.InputStreamReader
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
+import scala.util.control.NonFatal
+
+/**
+  * File storing the connection parameters for a metadata instance
+  */
+<span class="nc" id="L30">object MetadataJson extends DebugLogProfiling {</span>
+
+<span class="nc" id="L32">  val MetadataPath = &quot;metadata.json&quot;</span>
+
+<span class="nc" id="L34">  private val cache = new ConcurrentHashMap[String, NamedOptions]()</span>
+
+  /**
+    * Read the metadata file at the given root path, if it exists
+    *
+    * @param context context
+    * @return
+    */
+  def readMetadata(context: FileSystemContext): Option[NamedOptions] = {
+<span class="nc" id="L43">    val key = context.root.toUri.toString</span>
+<span class="nc" id="L44">    var cached = cache.get(key)</span>
+<span class="nc bnc" id="L45" title="All 2 branches missed.">    if (cached == null) {</span>
+      // note: we may end up reading more than once, but doing it multiple times will only incur
+      // a slight performance penalty but not cause any incorrectness
+      // using an atomic operation or cache loader can cause problems, as we sometimes insert into the
+      // map during the load, which is not allowed
+<span class="nc" id="L50">      val file = new Path(context.root, MetadataPath)</span>
+<span class="nc bnc" id="L51" title="All 2 branches missed.">      if (PathCache.exists(context.fs, file)) {</span>
+<span class="nc" id="L52">        val config = profile(&quot;Loaded metadata configuration&quot;) {</span>
+<span class="nc" id="L53">          WithClose(new InputStreamReader(context.fs.open(file), StandardCharsets.UTF_8)) { in =&gt;</span>
+<span class="nc" id="L54">            ConfigFactory.load(ConfigFactory.parseReader(in, ParseOptions)) // call load to resolve sys props</span>
+          }
+        }
+<span class="nc bnc" id="L57" title="All 2 branches missed.">        if (config.hasPath(&quot;name&quot;)) {</span>
+<span class="nc" id="L58">          cached = profile(&quot;Parsed metadata configuration&quot;) {</span>
+<span class="nc" id="L59">            ConfigSource.fromConfig(config).loadOrThrow[NamedOptions]</span>
+          }
+<span class="nc" id="L61">          cache.put(key, cached)</span>
+<span class="nc" id="L62">        } else {</span>
+<span class="nc" id="L63">          context.fs.rename(file, new Path(context.root, s&quot;$MetadataPath.bak&quot;))</span>
+<span class="nc" id="L64">          PathCache.invalidate(context.fs, file)</span>
+<span class="nc" id="L65">          transitionMetadata(context, config).foreach { meta =&gt;</span>
+<span class="nc" id="L66">            cached = meta // will be set in the cache in the transition code</span>
+          }
+        }
+      }
+    }
+<span class="nc" id="L71">    Option(cached)</span>
+  }
+
+  /**
+    * Write a metadata file at the given root path
+    *
+    * @param context context
+    * @param metadata metadata configuration
+    */
+  def writeMetadata(context: FileSystemContext, metadata: NamedOptions): Unit = {
+<span class="nc" id="L81">    val file = new Path(context.root, MetadataPath)</span>
+<span class="nc bnc" id="L82" title="All 2 branches missed.">    if (PathCache.exists(context.fs, file, reload = true)) {</span>
+<span class="nc" id="L83">      throw new IllegalArgumentException(</span>
+<span class="nc" id="L84">        s&quot;Trying to create a new storage instance but metadata already exists at '$file'&quot;)</span>
+    }
+<span class="nc" id="L86">    val data = profile(&quot;Serialized metadata configuration&quot;) {</span>
+<span class="nc" id="L87">      ConfigWriter[NamedOptions].to(metadata).render(RenderOptions)</span>
+    }
+    // remove quotes around substitutions so that they resolve properly
+    // this logic relies on the fact that all strings will be quoted, and just puts another quote on
+    // either side of the expression (typesafe will concatenate them), i.e. &quot;foo ${bar}&quot; -&gt; &quot;foo &quot;${bar}&quot;&quot;
+<span class="nc" id="L92">    val interpolated = data.replaceAll(&quot;\\$\\{[a-zA-Z0-9_.]+}&quot;, &quot;\&quot;$0\&quot;&quot;)</span>
+<span class="nc" id="L93">    profile(&quot;Persisted metadata configuration&quot;) {</span>
+<span class="nc" id="L94">      WithClose(context.fs.create(file, false)) { out =&gt;</span>
+<span class="nc" id="L95">        out.write(interpolated.getBytes(StandardCharsets.UTF_8))</span>
+<span class="nc" id="L96">        out.hflush()</span>
+<span class="nc" id="L97">        out.hsync()</span>
+      }
+    }
+<span class="nc bnc" id="L100" title="All 6 branches missed.">    val toCache = if (data == interpolated) { metadata } else {</span>
+      // reload through ConfigFactory to resolve substitutions
+<span class="nc" id="L102">      ConfigSource.fromConfig(ConfigFactory.load(ConfigFactory.parseString(interpolated, ParseOptions)))</span>
+<span class="nc" id="L103">          .loadOrThrow[NamedOptions]</span>
+    }
+<span class="nc" id="L105">    cache.put(context.root.toUri.toString, toCache)</span>
+<span class="nc" id="L106">    PathCache.register(context.fs, file)</span>
+  }
+
+
+  /**
+    * Transition the old single-file metadata.json to the new append-log format
+    *
+    * @param context file system context
+    * @return
+    */
+  private def transitionMetadata(context: FileSystemContext, config: Config): Option[NamedOptions] = {
+    import scala.collection.JavaConverters._
+
+<span class="nc" id="L119">    try {</span>
+<span class="nc" id="L120">      val sft = SimpleFeatureTypes.createType(config.getConfig(&quot;featureType&quot;), path = None)</span>
+<span class="nc" id="L121">      val encoding = config.getString(&quot;encoding&quot;)</span>
+      val scheme = {
+<span class="nc" id="L123">        val schemeConfig = config.getConfig(&quot;partitionScheme&quot;)</span>
+<span class="nc" id="L124">        val schemeOpts = schemeConfig.getConfig(&quot;options&quot;)</span>
+<span class="nc" id="L125">        NamedOptions(schemeConfig.getString(&quot;scheme&quot;),</span>
+<span class="nc" id="L126">          schemeOpts.entrySet().asScala.map(e =&gt; e.getKey -&gt; schemeOpts.getString(e.getKey)).toMap)</span>
+      }
+<span class="nc" id="L128">      val leafStorage = scheme.options.get(&quot;leaf-storage&quot;).forall(_.toBoolean)</span>
+<span class="nc" id="L129">      val meta = Metadata(sft, encoding, scheme, leafStorage)</span>
+<span class="nc" id="L130">      val partitionConfig = config.getConfig(&quot;partitions&quot;)</span>
+
+<span class="nc" id="L132">      val defaults = FileBasedMetadata.LegacyOptions</span>
+<span class="nc" id="L133">      WithClose(new FileBasedMetadataFactory().create(context, defaults.options, meta)) { metadata =&gt;</span>
+<span class="nc" id="L134">        partitionConfig.root().entrySet().asScala.foreach { e =&gt;</span>
+<span class="nc" id="L135">          val name = e.getKey</span>
+<span class="nc" id="L136">          val files = partitionConfig.getStringList(name).asScala.map(StorageFile(_, 0L))</span>
+<span class="nc" id="L137">          metadata.addPartition(PartitionMetadata(name, files.toSeq, None, 0L))</span>
+        }
+      }
+
+<span class="nc" id="L141">      Some(defaults)</span>
+    } catch {
+<span class="nc bnc" id="L143" title="All 4 branches missed.">      case NonFatal(e) =&gt; logger.warn(&quot;Error transitioning old metadata format: &quot;, e); None</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

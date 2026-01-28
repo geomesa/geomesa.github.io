@@ -1,0 +1,604 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>JdbcMetadata.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa FileSystem Storage Common</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.fs.storage.common.metadata</a> &gt; <span class="el_source">JdbcMetadata.scala</span></div><h1>JdbcMetadata.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.fs.storage.common.metadata
+
+import com.typesafe.scalalogging.LazyLogging
+import org.apache.commons.dbcp2.{PoolableConnection, PoolingDataSource}
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.locationtech.geomesa.fs.storage.api.StorageMetadata.{PartitionMetadata, StorageFile, StorageFileAction}
+import org.locationtech.geomesa.fs.storage.api.{Metadata, PartitionScheme, PartitionSchemeFactory, StorageMetadata}
+import org.locationtech.geomesa.fs.storage.common.metadata.JdbcMetadata.MetadataTable
+import org.locationtech.geomesa.utils.io.WithClose
+import org.locationtech.geomesa.utils.text.StringSerialization
+
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
+import java.nio.charset.StandardCharsets
+import java.sql.{Connection, ResultSet, SQLException}
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+  * Storage metadata implementation backed by a SQL database. Currently tested with H2 and Postgres - other
+  * databases may have incompatibilities in the SQL syntax.
+  *
+  * Scheme consists of three tables and one seqeuence:
+  *
+  * `storage_meta`
+  *
+  * * Holds the base metadata (simple feature type, partition scheme, encoding, leaf storage) as a JSON clob
+  *
+  * ** root varchar(256) not null
+  * ** value text not null
+  * ** primary key (root)
+  *
+  * `storage_partitions_id_seq`
+  *
+  * * Sequence for partition action IDs
+  *
+  * `storage_partitions`
+  *
+  * * Holds add/remove partition actions. Tracks the type, count (features) and bounds of each action
+  *
+  * ** root varchar(256) not null
+  * ** name varchar(256) not null
+  * ** id int not null
+  * ** action char(1) not null
+  * ** features bigint
+  * ** bounds_xmin double precision
+  * ** bounds_xmax double precision
+  * ** bounds_ymin double precision
+  * ** bounds_ymax double precision
+  * ** primary key (root, name, id)
+  *
+  * `storage_partition_files`
+  *
+  * * Holds the files associated with each partition action
+  *
+  * ** root varchar(256) not null
+  * ** name varchar(256) not null
+  * ** id int not null - foreign key to `storage_partitions`
+  * ** file varchar(256) not null
+  * ** primary key (root, name, id, file)
+  *
+  * @param pool connection pool
+  * @param root storage root path
+  * @param sft simple feature type
+  * @param meta basic metadata config
+  **/
+<span class="nc" id="L73">class JdbcMetadata(</span>
+<span class="nc" id="L74">    pool: PoolingDataSource[PoolableConnection],</span>
+<span class="nc" id="L75">    root: String,</span>
+<span class="nc" id="L76">    val sft: SimpleFeatureType,</span>
+<span class="nc" id="L77">    meta: Metadata</span>
+<span class="nc" id="L78">  ) extends StorageMetadata {</span>
+
+  import JdbcMetadata.PartitionsTable
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L84">  override val scheme: PartitionScheme = PartitionSchemeFactory.load(sft, meta.scheme)</span>
+<span class="nc" id="L85">  override val encoding: String = meta.config(Metadata.Encoding)</span>
+<span class="nc" id="L86">  override val leafStorage: Boolean = meta.config(Metadata.LeafStorage).toBoolean</span>
+
+<span class="nc" id="L88">  private val kvs = new ConcurrentHashMap[String, String](meta.config.asJava)</span>
+
+<span class="nc" id="L90">  override def get(key: String): Option[String] = Option(kvs.get(key))</span>
+
+  override def set(key: String, value: String): Unit = {
+<span class="nc" id="L93">    kvs.put(key, value)</span>
+<span class="nc" id="L94">    WithClose(pool.getConnection()) { connection =&gt;</span>
+<span class="nc" id="L95">      MetadataTable.update(connection, root, meta.copy(config = kvs.asScala.toMap))</span>
+    }
+  }
+
+  override def getPartition(name: String): Option[PartitionMetadata] =
+<span class="nc" id="L100">    WithClose(pool.getConnection())(connection =&gt; PartitionsTable.select(connection, root, name))</span>
+
+  override def getPartitions(prefix: Option[String]): Seq[PartitionMetadata] =
+<span class="nc" id="L103">    WithClose(pool.getConnection())(connection =&gt; PartitionsTable.select(connection, root, prefix))</span>
+
+  override def addPartition(partition: PartitionMetadata): Unit =
+<span class="nc" id="L106">    WithClose(pool.getConnection())(connection =&gt; PartitionsTable.insert(connection, root, partition))</span>
+
+  override def removePartition(partition: PartitionMetadata): Unit =
+<span class="nc" id="L109">    WithClose(pool.getConnection())(connection =&gt; PartitionsTable.delete(connection, root, partition))</span>
+
+  override def setPartitions(partitions: Seq[PartitionMetadata]): Unit = {
+    // TODO execute as a transaction
+<span class="nc" id="L113">    WithClose(pool.getConnection()) { connection =&gt;</span>
+<span class="nc" id="L114">      PartitionsTable.clear(connection, root)</span>
+<span class="nc" id="L115">      partitions.foreach(PartitionsTable.insert(connection, root, _))</span>
+    }
+  }
+
+  override def compact(partition: Option[String], fileSize: Option[Long], threads: Int): Unit = {
+    // TODO execute as a transaction
+<span class="nc" id="L121">    WithClose(pool.getConnection()) { connection =&gt;</span>
+<span class="nc" id="L122">      partition match {</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        case None =&gt;</span>
+<span class="nc" id="L124">          val current = PartitionsTable.select(connection, root, None)</span>
+<span class="nc" id="L125">          PartitionsTable.clear(connection, root)</span>
+<span class="nc" id="L126">          current.foreach(PartitionsTable.insert(connection, root, _))</span>
+
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        case Some(p) =&gt;</span>
+<span class="nc" id="L129">          val current = PartitionsTable.select(connection, root, p)</span>
+<span class="nc" id="L130">          PartitionsTable.clear(connection, root, p)</span>
+<span class="nc" id="L131">          current.foreach(PartitionsTable.insert(connection, root, _))</span>
+      }
+    }
+  }
+
+<span class="nc" id="L136">  override def invalidate(): Unit = {}</span>
+
+<span class="nc" id="L138">  override def close(): Unit = pool.close()</span>
+}
+
+<span class="nc bnc" id="L141" title="All 4 branches missed.">object JdbcMetadata extends LazyLogging {</span>
+
+<span class="nc" id="L143">  val MetadataType = &quot;jdbc&quot;</span>
+
+<span class="nc" id="L145">  object Config {</span>
+<span class="nc" id="L146">    val UrlKey      = &quot;jdbc.url&quot;</span>
+<span class="nc" id="L147">    val DriverKey   = &quot;jdbc.driver&quot;</span>
+<span class="nc" id="L148">    val UserKey     = &quot;jdbc.user&quot;</span>
+<span class="nc" id="L149">    val PasswordKey = &quot;jdbc.password&quot;</span>
+
+<span class="nc" id="L151">    val MinIdleKey      = &quot;jdbc.pool.min-idle&quot;</span>
+<span class="nc" id="L152">    val MaxIdleKey      = &quot;jdbc.pool.max-idle&quot;</span>
+<span class="nc" id="L153">    val MaxSizeKey      = &quot;jdbc.pool.max-size&quot;</span>
+<span class="nc" id="L154">    val FairnessKey     = &quot;jdbc.pool.fairness&quot;</span>
+<span class="nc" id="L155">    val TestOnBorrowKey = &quot;jdbc.pool.test-on-borrow&quot;</span>
+<span class="nc" id="L156">    val TestOnCreateKey = &quot;jdbc.pool.test-on-create&quot;</span>
+<span class="nc" id="L157">    val TestWhileIdlKey = &quot;jdbc.pool.test-while-idle&quot;</span>
+  }
+
+<span class="nc" id="L160">  private val RootCol = &quot;\&quot;root\&quot;&quot;</span>
+<span class="nc" id="L161">  private val NameCol = &quot;\&quot;name\&quot;&quot;</span>
+<span class="nc" id="L162">  private val IdCol   = &quot;\&quot;id\&quot;&quot;</span>
+
+<span class="nc" id="L164">  private object MetadataTable {</span>
+
+<span class="nc" id="L166">    val TableName = &quot;storage_meta&quot;</span>
+
+<span class="nc" id="L168">    private val ValueCol = &quot;\&quot;value\&quot;&quot;</span>
+
+    private val CreateStatement: String =
+<span class="nc" id="L171">      s&quot;create table if not exists $TableName (&quot; +</span>
+<span class="nc" id="L172">          s&quot;$RootCol varchar(256) not null, &quot; +</span>
+<span class="nc" id="L173">          s&quot;$ValueCol text not null, &quot; +</span>
+<span class="nc" id="L174">          s&quot;primary key ($RootCol))&quot;</span>
+
+<span class="nc" id="L176">    private val InsertStatement: String = s&quot;insert into $TableName ($RootCol, $ValueCol) values (?, ?)&quot;</span>
+
+<span class="nc" id="L178">    private val UpdateStatement: String = s&quot;update $TableName set $ValueCol = ? where $RootCol = ?&quot;</span>
+
+<span class="nc" id="L180">    private val SelectStatement: String = s&quot;select $ValueCol from $TableName where $RootCol = ?&quot;</span>
+
+    def create(connection: Connection): Unit =
+<span class="nc" id="L183">      WithClose(connection.createStatement())(_.executeUpdate(CreateStatement))</span>
+
+    def insert(connection: Connection, root: String, metadata: Metadata): Unit = {
+<span class="nc" id="L186">      val serialized = new ByteArrayOutputStream()</span>
+<span class="nc" id="L187">      MetadataSerialization.serialize(serialized, metadata)</span>
+<span class="nc" id="L188">      WithClose(connection.prepareStatement(InsertStatement)) { statement =&gt;</span>
+<span class="nc" id="L189">        statement.setString(1, root)</span>
+<span class="nc" id="L190">        statement.setString(2, new String(serialized.toByteArray, StandardCharsets.UTF_8))</span>
+<span class="nc" id="L191">        statement.executeUpdate()</span>
+      }
+    }
+
+    def update(connection: Connection, root: String, metadata: Metadata): Unit = {
+<span class="nc" id="L196">      val serialized = new ByteArrayOutputStream()</span>
+<span class="nc" id="L197">      MetadataSerialization.serialize(serialized, metadata)</span>
+<span class="nc" id="L198">      WithClose(connection.prepareStatement(UpdateStatement)) { statement =&gt;</span>
+<span class="nc" id="L199">        statement.setString(1, new String(serialized.toByteArray, StandardCharsets.UTF_8))</span>
+<span class="nc" id="L200">        statement.setString(2, root)</span>
+<span class="nc" id="L201">        statement.executeUpdate()</span>
+      }
+    }
+
+    def select(connection: Connection, root: String): Option[Metadata] = {
+      try {
+<span class="nc" id="L207">        WithClose(connection.prepareStatement(SelectStatement)) { statement =&gt;</span>
+<span class="nc" id="L208">          statement.setString(1, root)</span>
+<span class="nc" id="L209">          WithClose(statement.executeQuery()) { results =&gt;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            if (!results.next) {</span>
+<span class="nc" id="L211">              None</span>
+            } else {
+<span class="nc" id="L213">              val serialized = new ByteArrayInputStream(results.getString(1).getBytes(StandardCharsets.UTF_8))</span>
+<span class="nc" id="L214">              Some(MetadataSerialization.deserialize(serialized))</span>
+            }
+          }
+        }
+      } catch {
+        case e: SQLException =&gt;
+          // not sure of a better way to check the existence of a table for an arbitrary SQL database
+          // solutions found online didn't work, at least for h2
+<span class="nc bnc" id="L222" title="All 2 branches missed.">          logger.debug(&quot;Error loading metadata (table may not exist?):&quot;, e); None</span>
+      }
+    }
+  }
+
+  /**
+    * An add/update/delete partition action. Files associated with each action are stored in the FilesTable
+    */
+<span class="nc" id="L230">  private object PartitionsTable {</span>
+
+<span class="nc" id="L232">    val TableName = &quot;storage_partitions&quot;</span>
+
+<span class="nc" id="L234">    private val ActionCol     = &quot;\&quot;action\&quot;&quot;</span>
+<span class="nc" id="L235">    private val CountCol      = &quot;\&quot;features\&quot;&quot;</span>
+<span class="nc" id="L236">    private val BoundsXMinCol = &quot;\&quot;bounds_xmin\&quot;&quot;</span>
+<span class="nc" id="L237">    private val BoundsXMaxCol = &quot;\&quot;bounds_xmax\&quot;&quot;</span>
+<span class="nc" id="L238">    private val BoundsYMinCol = &quot;\&quot;bounds_ymin\&quot;&quot;</span>
+<span class="nc" id="L239">    private val BoundsYMaxCol = &quot;\&quot;bounds_ymax\&quot;&quot;</span>
+
+<span class="nc" id="L241">    private val CreateSequence: String = s&quot;create sequence if not exists ${TableName}_${IdCol.replace(&quot;\&quot;&quot;, &quot;&quot;)}_seq&quot;</span>
+<span class="nc" id="L242">    private val NextIdStatement: String = s&quot;select nextval('${TableName}_${IdCol.replace(&quot;\&quot;&quot;, &quot;&quot;)}_seq')&quot;</span>
+
+    private val CreateStatement: String =
+<span class="nc" id="L245">      s&quot;create table if not exists $TableName (&quot; +</span>
+<span class="nc" id="L246">          s&quot;$RootCol varchar(256) not null, &quot; +</span>
+<span class="nc" id="L247">          s&quot;$NameCol varchar(256) not null, &quot; +</span>
+<span class="nc" id="L248">          s&quot;$IdCol int not null, &quot; +</span>
+<span class="nc" id="L249">          s&quot;$ActionCol char(1) not null, &quot; +</span>
+<span class="nc" id="L250">          s&quot;$CountCol bigint, &quot; +</span>
+<span class="nc" id="L251">          s&quot;$BoundsXMinCol double precision, &quot; +</span>
+<span class="nc" id="L252">          s&quot;$BoundsXMaxCol double precision, &quot; +</span>
+<span class="nc" id="L253">          s&quot;$BoundsYMinCol double precision, &quot; +</span>
+<span class="nc" id="L254">          s&quot;$BoundsYMaxCol double precision, &quot; +</span>
+<span class="nc" id="L255">          s&quot;primary key ($RootCol, $NameCol, $IdCol))&quot;</span>
+
+    private val InsertStatement: String =
+<span class="nc" id="L258">      s&quot;insert into $TableName &quot; +</span>
+<span class="nc" id="L259">          s&quot;($RootCol, $NameCol, $IdCol, $ActionCol, $CountCol, $BoundsXMinCol, $BoundsYMinCol, $BoundsXMaxCol, $BoundsYMaxCol)&quot; +</span>
+<span class="nc" id="L260">          &quot;values (?, ?, ?, ?, ?, ?, ?, ?, ?)&quot;</span>
+
+<span class="nc" id="L262">    private val ClearStatement: String = s&quot;delete from $TableName where $RootCol = ?&quot;</span>
+
+<span class="nc" id="L264">    private val ClearPartitionStatement: String = s&quot;delete from $TableName where $RootCol = ? and $NameCol = ?&quot;</span>
+
+    private val BaseSelect: String =
+<span class="nc" id="L267">      s&quot;select $TableName.$NameCol as $NameCol, $TableName.$IdCol as $IdCol, $ActionCol, $CountCol, &quot; +</span>
+<span class="nc" id="L268">          s&quot;$BoundsXMinCol, $BoundsYMinCol, $BoundsXMaxCol, $BoundsYMaxCol, &quot; +</span>
+<span class="nc" id="L269">          s&quot;${FilesTable.FileCol}, ${FilesTable.TypeCol}, ${FilesTable.TimeCol}, &quot; +</span>
+<span class="nc" id="L270">          s&quot;${FilesTable.SortCol}, ${FilesTable.BoundsCol} &quot; +</span>
+<span class="nc" id="L271">          s&quot;from $TableName, ${FilesTable.TableName} where $TableName.$RootCol = ? and &quot; +</span>
+<span class="nc" id="L272">          s&quot;$TableName.$RootCol = ${FilesTable.TableName}.$RootCol &quot; +</span>
+<span class="nc" id="L273">          s&quot;and $TableName.$IdCol = ${FilesTable.TableName}.$IdCol&quot;</span>
+
+<span class="nc" id="L275">    private val SelectStatement: String = s&quot;$BaseSelect and $TableName.$NameCol = ? order by $IdCol&quot;</span>
+
+<span class="nc" id="L277">    private val SelectPrefixStatement: String = s&quot;$BaseSelect and $TableName.$NameCol like ? order by $NameCol, $IdCol&quot;</span>
+
+<span class="nc" id="L279">    private val SelectAllStatement: String = s&quot;$BaseSelect order by $NameCol, $IdCol&quot;</span>
+
+    def create(connection: Connection): Unit = {
+<span class="nc" id="L282">      WithClose(connection.createStatement()){ statement =&gt;</span>
+<span class="nc" id="L283">        statement.executeUpdate(CreateSequence)</span>
+<span class="nc" id="L284">        statement.executeUpdate(CreateStatement)</span>
+      }
+<span class="nc" id="L286">      FilesTable.create(connection)</span>
+    }
+
+    def insert(connection: Connection, root: String, partition: PartitionMetadata): Unit =
+<span class="nc" id="L290">      write(connection, root, 'a', partition)</span>
+
+    def delete(connection: Connection, root: String, partition: PartitionMetadata): Unit =
+<span class="nc" id="L293">      write(connection, root, 'd', partition)</span>
+
+    def clear(connection: Connection, root: String): Unit = {
+<span class="nc" id="L296">      WithClose(connection.prepareStatement(ClearStatement)) { delete =&gt;</span>
+<span class="nc" id="L297">        delete.setString(1, root)</span>
+<span class="nc" id="L298">        delete.executeUpdate()</span>
+      }
+<span class="nc" id="L300">      FilesTable.clear(connection, root)</span>
+    }
+
+    def clear(connection: Connection, root: String, partition: String): Unit = {
+<span class="nc" id="L304">      WithClose(connection.prepareStatement(ClearPartitionStatement)) { delete =&gt;</span>
+<span class="nc" id="L305">        delete.setString(1, root)</span>
+<span class="nc" id="L306">        delete.setString(2, partition)</span>
+<span class="nc" id="L307">        delete.executeUpdate()</span>
+      }
+<span class="nc" id="L309">      FilesTable.clear(connection, root, partition)</span>
+    }
+
+    def select(connection: Connection, root: String, prefix: Option[String]): Seq[PartitionMetadata] = {
+<span class="nc" id="L313">      val configs = prefix match {</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        case None =&gt;</span>
+<span class="nc" id="L315">          WithClose(connection.prepareStatement(SelectAllStatement)) { select =&gt;</span>
+<span class="nc" id="L316">            select.setString(1, root)</span>
+<span class="nc" id="L317">            WithClose(select.executeQuery())(readConfigs)</span>
+          }
+
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        case Some(p) =&gt;</span>
+<span class="nc" id="L321">          WithClose(connection.prepareStatement(SelectPrefixStatement)) { select =&gt;</span>
+<span class="nc" id="L322">            select.setString(1, root)</span>
+<span class="nc" id="L323">            select.setString(2, s&quot;${p.replaceAllLiterally(&quot;%&quot;, &quot;[%]&quot;)}%&quot;)</span>
+<span class="nc" id="L324">            WithClose(select.executeQuery())(readConfigs)</span>
+          }
+      }
+<span class="nc" id="L327">      configs.groupBy(_.name).values.flatMap(mergePartitionConfigs).filter(_.files.nonEmpty).map(_.toMetadata).toList</span>
+    }
+
+    def select(connection: Connection, root: String, name: String): Option[PartitionMetadata] = {
+<span class="nc" id="L331">      val configs = WithClose(connection.prepareStatement(SelectStatement)) { select =&gt;</span>
+<span class="nc" id="L332">        select.setString(1, root)</span>
+<span class="nc" id="L333">        select.setString(2, name)</span>
+<span class="nc" id="L334">        WithClose(select.executeQuery())(readConfigs)</span>
+      }
+<span class="nc" id="L336">      mergePartitionConfigs(configs).map(_.toMetadata)</span>
+    }
+
+    private def write(connection: Connection, root: String, action: Char, partition: PartitionMetadata): Unit = {
+      // TODO insert as a single transaction
+<span class="nc" id="L341">      val id = WithClose(connection.prepareStatement(NextIdStatement)) { statement =&gt;</span>
+<span class="nc" id="L342">        WithClose(statement.executeQuery()) { rs =&gt; rs.next(); rs.getInt(1) }</span>
+      }
+<span class="nc" id="L344">      WithClose(connection.prepareStatement(InsertStatement)) { statement =&gt;</span>
+<span class="nc" id="L345">        statement.setString(1, root)</span>
+<span class="nc" id="L346">        statement.setString(2, partition.name)</span>
+<span class="nc" id="L347">        statement.setInt(3, id)</span>
+<span class="nc" id="L348">        statement.setString(4, action.toString)</span>
+<span class="nc" id="L349">        statement.setLong(5, partition.count)</span>
+<span class="nc" id="L350">        partition.bounds match {</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">          case Some(b) =&gt;</span>
+<span class="nc" id="L352">            statement.setDouble(6, b.xmin)</span>
+<span class="nc" id="L353">            statement.setDouble(7, b.ymin)</span>
+<span class="nc" id="L354">            statement.setDouble(8, b.xmax)</span>
+<span class="nc" id="L355">            statement.setDouble(9, b.ymax)</span>
+
+<span class="nc bnc" id="L357" title="All 2 branches missed.">          case None =&gt;</span>
+<span class="nc" id="L358">            statement.setNull(6, java.sql.Types.DOUBLE)</span>
+<span class="nc" id="L359">            statement.setNull(7, java.sql.Types.DOUBLE)</span>
+<span class="nc" id="L360">            statement.setNull(8, java.sql.Types.DOUBLE)</span>
+<span class="nc" id="L361">            statement.setNull(9, java.sql.Types.DOUBLE)</span>
+        }
+<span class="nc" id="L363">        statement.executeUpdate()</span>
+      }
+<span class="nc" id="L365">      FilesTable.insert(connection, root, partition.name, id, partition.files)</span>
+    }
+
+    private def readConfigs(results: ResultSet): Seq[PartitionConfig] = {
+<span class="nc bnc" id="L369" title="All 2 branches missed.">      if (!results.next()) {</span>
+<span class="nc" id="L370">        return Seq.empty</span>
+      }
+
+<span class="nc" id="L373">      val partitions = Seq.newBuilder[PartitionConfig]</span>
+
+<span class="nc" id="L375">      var partition = results.partition()</span>
+<span class="nc" id="L376">      var files = Seq.newBuilder[StorageFile] += results.file()</span>
+
+<span class="nc bnc" id="L378" title="All 2 branches missed.">      while (results.next()) {</span>
+<span class="nc bnc" id="L379" title="All 8 branches missed.">        if (results.name() == partition.name &amp;&amp; results.id() == partition.timestamp) {</span>
+<span class="nc" id="L380">          files += results.file()</span>
+<span class="nc" id="L381">        } else {</span>
+<span class="nc" id="L382">          partitions += partition.copy(files = files.result)</span>
+<span class="nc" id="L383">          partition = results.partition()</span>
+<span class="nc" id="L384">          files = Seq.newBuilder[StorageFile] += results.file()</span>
+        }
+      }
+
+<span class="nc" id="L388">      partitions += partition.copy(files = files.result)</span>
+<span class="nc" id="L389">      partitions.result</span>
+    }
+
+<span class="nc bnc" id="L392" title="All 12 branches missed.">    implicit class RichSelectResults(val results: ResultSet) extends AnyVal {</span>
+
+<span class="nc" id="L394">      def name(): String = results.getString(1)</span>
+<span class="nc" id="L395">      def id(): Int = results.getInt(2)</span>
+
+<span class="nc" id="L397">      def partition(): PartitionConfig = {</span>
+<span class="nc" id="L398">        val action = results.getString(3) match {</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">          case &quot;a&quot; =&gt; PartitionAction.Add</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">          case &quot;d&quot; =&gt; PartitionAction.Remove</span>
+<span class="nc" id="L401">          case a =&gt; throw new IllegalStateException(s&quot;Expected an action of 'a' or 'd' but got: $a&quot;)</span>
+        }
+<span class="nc" id="L403">        val bounds = Seq(results.getDouble(5), results.getDouble(6), results.getDouble(7), results.getDouble(8))</span>
+<span class="nc" id="L404">        PartitionConfig(name(), action, Seq.empty, results.getLong(4), bounds, id())</span>
+      }
+
+<span class="nc" id="L407">      def file(): StorageFile = {</span>
+<span class="nc" id="L408">        val name = results.getString(9)</span>
+<span class="nc" id="L409">        val action = results.getString(10) match {</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">          case &quot;a&quot; =&gt; StorageFileAction.Append</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">          case &quot;m&quot; =&gt; StorageFileAction.Modify</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">          case &quot;d&quot; =&gt; StorageFileAction.Delete</span>
+<span class="nc" id="L413">          case a =&gt; throw new IllegalStateException(s&quot;Expected an action of 'a', 'm', or 'd' but got: $a&quot;)</span>
+        }
+<span class="nc" id="L415">        val ts = results.getLong(11)</span>
+<span class="nc" id="L416">        val sort = Option(results.getString(12)).collect {</span>
+<span class="nc bnc" id="L417" title="All 4 branches missed.">          case s if s.nonEmpty =&gt; s.split(&quot;,&quot;).map(_.toInt).toSeq</span>
+        }
+<span class="nc" id="L419">        val bounds = Option(results.getString(13)).map { s =&gt;</span>
+<span class="nc bnc" id="L420" title="All 6 branches missed.">          StringSerialization.decodeSeq(s).grouped(3).toSeq.map { case Seq(i, lo, hi) =&gt; (i.toInt, lo, hi) }</span>
+        }
+<span class="nc" id="L422">        StorageFile(name, ts, action, sort.getOrElse(Seq.empty), bounds.getOrElse(Seq.empty))</span>
+      }
+    }
+  }
+
+  /**
+    * Files associated with an action. All access should be through PartitionsTable
+    */
+<span class="nc" id="L430">  private object FilesTable {</span>
+
+<span class="nc" id="L432">    val TableName = &quot;storage_partition_files&quot;</span>
+
+<span class="nc" id="L434">    private[JdbcMetadata] val FileCol   = &quot;file&quot;</span>
+<span class="nc" id="L435">    private[JdbcMetadata] val TypeCol   = &quot;typ&quot;</span>
+<span class="nc" id="L436">    private[JdbcMetadata] val TimeCol   = &quot;ts&quot;</span>
+<span class="nc" id="L437">    private[JdbcMetadata] val SortCol   = &quot;sort&quot;</span>
+<span class="nc" id="L438">    private[JdbcMetadata] val BoundsCol = &quot;bounds&quot;</span>
+
+    private val CreateStatement: String =
+<span class="nc" id="L441">      s&quot;create table if not exists $TableName (&quot; +</span>
+<span class="nc" id="L442">          s&quot;$RootCol varchar(256) not null, &quot; +</span>
+<span class="nc" id="L443">          s&quot;$NameCol varchar(256) not null, &quot; +</span>
+<span class="nc" id="L444">          s&quot;$IdCol int not null, &quot; +</span>
+<span class="nc" id="L445">          s&quot;$FileCol varchar(256) not null, &quot; +</span>
+<span class="nc" id="L446">          s&quot;$TypeCol char(1) not null, &quot; +</span>
+<span class="nc" id="L447">          s&quot;$TimeCol bigint, &quot; +</span>
+<span class="nc" id="L448">          s&quot;$SortCol varchar(256), &quot; +</span>
+<span class="nc" id="L449">          s&quot;$BoundsCol varchar(256), &quot; +</span>
+<span class="nc" id="L450">          s&quot;primary key ($RootCol, $NameCol, $IdCol, $FileCol))&quot;</span>
+
+    private val InsertStatement: String =
+<span class="nc" id="L453">      s&quot;insert into $TableName ($RootCol, $NameCol, $IdCol, $FileCol, $TypeCol, $TimeCol, $SortCol, $BoundsCol) &quot; +</span>
+<span class="nc" id="L454">          s&quot;values (?, ?, ?, ?, ?, ?, ?, ?)&quot;</span>
+
+<span class="nc" id="L456">    private val DeleteStatement: String =</span>
+<span class="nc" id="L457">      s&quot;delete from $TableName where $RootCol = ? and and $IdCol = ?&quot;</span>
+
+<span class="nc" id="L459">    private val SelectStatement: String =</span>
+<span class="nc" id="L460">      s&quot;select $FileCol, $TypeCol, $TimeCol, $SortCol, $BoundsCol from $TableName where $RootCol = ? and $IdCol = ?&quot;</span>
+
+<span class="nc" id="L462">    private val ClearStatement: String = s&quot;delete from $TableName where $RootCol = ?&quot;</span>
+
+<span class="nc" id="L464">    private val ClearPartitionStatement: String = s&quot;delete from $TableName where $RootCol = ? and $NameCol = ?&quot;</span>
+
+    def create(connection: Connection): Unit =
+<span class="nc" id="L467">      WithClose(connection.createStatement())(_.executeUpdate(CreateStatement))</span>
+
+    def insert(connection: Connection, root: String, name: String, id: Int, files: Seq[StorageFile]): Unit = {
+<span class="nc" id="L470">      WithClose(connection.prepareStatement(InsertStatement)) { statement =&gt;</span>
+<span class="nc" id="L471">        statement.setString(1, root)</span>
+<span class="nc" id="L472">        statement.setString(2, name)</span>
+<span class="nc" id="L473">        statement.setInt(3, id)</span>
+<span class="nc bnc" id="L474" title="All 2 branches missed.">        files.foreach { case StorageFile(file, timestamp, action, sort, bounds) =&gt;</span>
+<span class="nc" id="L475">          statement.setString(4, file)</span>
+<span class="nc" id="L476">          val char = action match {</span>
+<span class="nc bnc" id="L477" title="All 6 branches missed.">            case StorageFileAction.Append =&gt; &quot;a&quot;</span>
+<span class="nc bnc" id="L478" title="All 6 branches missed.">            case StorageFileAction.Modify =&gt; &quot;m&quot;</span>
+<span class="nc bnc" id="L479" title="All 6 branches missed.">            case StorageFileAction.Delete =&gt; &quot;d&quot;</span>
+<span class="nc" id="L480">            case _ =&gt; throw new UnsupportedOperationException(s&quot;Unexpected action: $action&quot;)</span>
+          }
+<span class="nc" id="L482">          statement.setString(5, char)</span>
+<span class="nc" id="L483">          statement.setLong(6, timestamp)</span>
+<span class="nc" id="L484">          statement.setString(7, sort.mkString(&quot;,&quot;))</span>
+<span class="nc" id="L485">          statement.setString(8,</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">            StringSerialization.encodeSeq(bounds.flatMap { case (i, lo, hi) =&gt; Seq(i.toString, lo, hi) }))</span>
+<span class="nc" id="L487">          statement.executeUpdate()</span>
+        }
+      }
+    }
+
+    def delete(connection: Connection, root: String, id: Int): Unit = {
+<span class="nc" id="L493">      WithClose(connection.prepareStatement(DeleteStatement)) { statement =&gt;</span>
+<span class="nc" id="L494">        statement.setString(1, root)</span>
+<span class="nc" id="L495">        statement.setInt(2, id)</span>
+<span class="nc" id="L496">        statement.executeUpdate()</span>
+      }
+    }
+
+    def select(connection: Connection, root: String, id: Int): Seq[StorageFile] = {
+<span class="nc" id="L501">      val files = Seq.newBuilder[StorageFile]</span>
+<span class="nc" id="L502">      WithClose(connection.prepareStatement(SelectStatement)) { select =&gt;</span>
+<span class="nc" id="L503">        select.setString(1, root)</span>
+<span class="nc" id="L504">        select.setInt(2, id)</span>
+<span class="nc" id="L505">        WithClose(select.executeQuery()) { results =&gt;</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">          while (results.next()) {</span>
+<span class="nc" id="L507">            val name = results.getString(1)</span>
+<span class="nc" id="L508">            val action = results.getString(2) match {</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">              case &quot;a&quot; =&gt; StorageFileAction.Append</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">              case &quot;m&quot; =&gt; StorageFileAction.Modify</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">              case &quot;d&quot; =&gt; StorageFileAction.Delete</span>
+<span class="nc" id="L512">              case a =&gt; throw new IllegalStateException(s&quot;Expected an action of 'a', 'm', or 'd' but got: $a&quot;)</span>
+            }
+<span class="nc" id="L514">            val ts = results.getLong(3)</span>
+<span class="nc" id="L515">            val sort = Option(results.getString(4)).collect {</span>
+<span class="nc bnc" id="L516" title="All 4 branches missed.">              case s if s.nonEmpty =&gt; s.split(&quot;,&quot;).map(_.toInt).toSeq</span>
+            }
+<span class="nc" id="L518">            val bounds = Option(results.getString(5)).map { s =&gt;</span>
+<span class="nc bnc" id="L519" title="All 6 branches missed.">              StringSerialization.decodeSeq(s).grouped(3).toSeq.map { case Seq(i, lo, hi) =&gt; (i.toInt, lo, hi) }</span>
+            }
+<span class="nc" id="L521">            files += StorageFile(name, ts, action, sort.getOrElse(Seq.empty), bounds.getOrElse(Seq.empty))</span>
+          }
+        }
+      }
+<span class="nc" id="L525">      files.result</span>
+    }
+
+    def clear(connection: Connection, root: String): Unit = {
+<span class="nc" id="L529">      WithClose(connection.prepareStatement(ClearStatement)) { delete =&gt;</span>
+<span class="nc" id="L530">        delete.setString(1, root)</span>
+<span class="nc" id="L531">        delete.executeUpdate()</span>
+      }
+    }
+
+    def clear(connection: Connection, root: String, partition: String): Unit = {
+<span class="nc" id="L536">      WithClose(connection.prepareStatement(ClearPartitionStatement)) { delete =&gt;</span>
+<span class="nc" id="L537">        delete.setString(1, root)</span>
+<span class="nc" id="L538">        delete.setString(2, partition)</span>
+<span class="nc" id="L539">        delete.executeUpdate()</span>
+      }
+    }
+
+    def updateSchema(connection: Connection): Unit = {
+<span class="nc" id="L544">      WithClose(connection.createStatement()) { statement =&gt;</span>
+<span class="nc" id="L545">        val cols = WithClose(statement.executeQuery(s&quot;select * from $TableName limit 1&quot;)) { results =&gt;</span>
+<span class="nc" id="L546">          results.getMetaData.getColumnCount</span>
+        }
+        def addTypeAndTime(): Unit = {
+<span class="nc" id="L549">          statement.executeUpdate(s&quot;alter table $TableName add column $TypeCol char(1)&quot;)</span>
+<span class="nc" id="L550">          statement.executeUpdate(s&quot;alter table $TableName add column $TimeCol bigint&quot;)</span>
+<span class="nc" id="L551">          statement.executeUpdate(s&quot;update $TableName set $TypeCol = 'a', $TimeCol = 0&quot;)</span>
+<span class="nc" id="L552">          statement.executeUpdate(s&quot;alter table $TableName alter column $TypeCol set not null&quot;)</span>
+        }
+        def addSortAndBounds(): Unit = {
+<span class="nc" id="L555">          statement.executeUpdate(s&quot;alter table $TableName add column $SortCol varchar(256)&quot;)</span>
+<span class="nc" id="L556">          statement.executeUpdate(s&quot;alter table $TableName add column $BoundsCol varchar(256)&quot;)</span>
+        }
+<span class="nc bnc" id="L558" title="All 2 branches missed.">        if (cols == 4) {</span>
+<span class="nc" id="L559">          addTypeAndTime()</span>
+<span class="nc" id="L560">          addSortAndBounds()</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">        } else if (cols == 6) {</span>
+<span class="nc" id="L562">          addSortAndBounds()</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">        } else if (cols != 8) {</span>
+<span class="nc" id="L564">          throw new IllegalStateException(s&quot;Unexpected schema detected for table $TableName: &quot; +</span>
+<span class="nc" id="L565">              s&quot;expected 8 columns, but found $cols&quot;)</span>
+        }
+      }
+    }
+  }
+
+  /**
+    * Loads metadata from an existing table
+    *
+    * @param pool connection pool
+    * @param root root path
+    * @return
+    */
+<span class="nc" id="L578">  def load(pool: PoolingDataSource[PoolableConnection], root: String): Option[Metadata] = {</span>
+<span class="nc" id="L579">    WithClose(pool.getConnection()) { connection =&gt;</span>
+<span class="nc" id="L580">      val metadata = MetadataTable.select(connection, root)</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">      if (metadata.isDefined) {</span>
+        // migrate old data schemas if needed
+<span class="nc" id="L583">        FilesTable.updateSchema(connection)</span>
+      }
+<span class="nc" id="L585">      metadata</span>
+    }
+  }
+
+  /**
+    * Persists metadata into a new table
+    *
+    * @param pool connection pool
+    * @param root root path
+    * @param metadata simple feature type, file encoding, partition scheme, etc
+    */
+  def create(pool: PoolingDataSource[PoolableConnection], root: String, metadata: Metadata): Unit = {
+<span class="nc" id="L597">    WithClose(pool.getConnection()) { connection =&gt;</span>
+<span class="nc" id="L598">      MetadataTable.create(connection)</span>
+<span class="nc" id="L599">      MetadataTable.insert(connection, root, metadata)</span>
+<span class="nc" id="L600">      PartitionsTable.create(connection)</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

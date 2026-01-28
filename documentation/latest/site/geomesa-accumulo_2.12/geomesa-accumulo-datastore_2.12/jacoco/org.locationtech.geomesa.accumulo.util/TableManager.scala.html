@@ -1,0 +1,294 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TableManager.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Accumulo DataStore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.accumulo.util</a> &gt; <span class="el_source">TableManager.scala</span></div><h1>TableManager.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.accumulo.util
+
+import com.github.benmanes.caffeine.cache.{Cache, Caffeine}
+import com.typesafe.scalalogging.LazyLogging
+import org.apache.accumulo.core.client.admin.{NewTableConfiguration, TimeType}
+import org.apache.accumulo.core.client.{AccumuloClient, NamespaceExistsException, TableExistsException}
+import org.apache.accumulo.core.conf.ClientProperty
+import org.locationtech.geomesa.accumulo.AccumuloProperties.TableProperties.{TableCacheExpiry, TableCreationSync}
+import org.locationtech.geomesa.accumulo.util.TableManager._
+import org.locationtech.geomesa.index.DistributedLockTimeout
+import org.locationtech.geomesa.index.utils.DistributedLocking
+import org.locationtech.geomesa.index.utils.DistributedLocking.LocalLocking
+import org.locationtech.geomesa.index.zk.ZookeeperLocking
+import org.locationtech.geomesa.utils.text.StringSerialization
+
+import java.io.Closeable
+import java.util.concurrent.TimeUnit
+import scala.util.control.NonFatal
+
+/**
+ * Manages table creation/deletion
+ *
+ * @param client accumulo client - note, this client must be cleaned up externally (as it's usually shared)
+ */
+<span class="nc" id="L33">class TableManager(client: AccumuloClient) {</span>
+
+<span class="nc" id="L35">  private val delegate: TableLock = TableSynchronization(TableCreationSync.get) match {</span>
+<span class="nc bnc" id="L36" title="All 6 branches missed.">    case TableSynchronization.ZooKeeper =&gt; new TableLockZk(client)</span>
+<span class="nc bnc" id="L37" title="All 6 branches missed.">    case TableSynchronization.Local     =&gt; new TableLockLocal(client)</span>
+<span class="nc bnc" id="L38" title="All 6 branches missed.">    case TableSynchronization.None      =&gt; new TableLockNone(client)</span>
+  }
+
+  /**
+   * Create table if it does not exist.
+   *
+   * Note: to avoid having to lock and check namespaces, the namespace for the table must already exist. Generally
+   * all tables for a data store share a namespace, and the namespace is created up front, so it will always exist.
+   *
+   * @param table table name
+   * @param useLogicalTime use logical table time
+   * @return true if table was created, false if table already exists
+   */
+<span class="nc" id="L51">  def ensureTableExists(table: String, useLogicalTime: Boolean = true): Boolean =</span>
+<span class="nc bnc" id="L52" title="All 2 branches missed.">    delegate.ensureTableExists(table, if (useLogicalTime) { TimeType.LOGICAL } else { TimeType.MILLIS })</span>
+
+  /**
+   * Create namespace if it does not exist
+   *
+   * @param namespace namespace
+   */
+<span class="nc" id="L59">  def ensureNamespaceExists(namespace: String): Unit = delegate.ensureNamespaceExists(namespace)</span>
+
+  /**
+   * Delete a table
+   *
+   * @param table table to delete
+   */
+<span class="nc" id="L66">  def deleteTable(table: String): Unit = delegate.deleteTable(table)</span>
+
+  // note: shadows IndexAdapter.renameTable
+  // noinspection ScalaUnusedSymbol
+<span class="nc" id="L70">  def renameTable(from: String, to: String): Unit = delegate.renameTable(from, to)</span>
+}
+
+<span class="nc" id="L73">object TableManager {</span>
+
+  /**
+   * Types of synchronization available
+   */
+<span class="nc" id="L78">  object TableSynchronization extends Enumeration {</span>
+
+<span class="nc" id="L80">    val ZooKeeper, Local, None = Value</span>
+
+    def apply(value: String): TableSynchronization.Value = {
+<span class="nc" id="L83">      Seq(ZooKeeper, Local, None).find(_.toString.equalsIgnoreCase(value)).getOrElse {</span>
+<span class="nc" id="L84">        throw new IllegalArgumentException(</span>
+<span class="nc" id="L85">          s&quot;No matching value for '$value' - available sync types: ${Seq(ZooKeeper, Local, None).mkString(&quot;, &quot;)}&quot;)</span>
+      }
+    }
+  }
+
+  /**
+   * No-op locking implementation of table utils
+   *
+   * @param client accumulo client
+   */
+<span class="nc" id="L95">  private class TableLockNone(client: AccumuloClient) extends TableLock(client) {</span>
+<span class="nc" id="L96">    override protected def acquireDistributedLock(key: String): Closeable = () =&gt; {}</span>
+<span class="nc" id="L97">    override protected def acquireDistributedLock(key: String, timeOut: Long): Option[Closeable] = Some(() =&gt; {})</span>
+  }
+
+  /**
+   * Local locking implementation of table utils
+   *
+   * @param client accumulo client
+   */
+<span class="nc" id="L105">  private class TableLockLocal(client: AccumuloClient) extends TableLock(client) with LocalLocking</span>
+
+  /**
+   * Distributed zookeeper locking implementation of table utils
+   *
+   * @param client accumulo client
+   */
+<span class="nc bnc" id="L112" title="All 4 branches missed.">  private class TableLockZk(client: AccumuloClient) extends TableLock(client) with ZookeeperLocking with LazyLogging {</span>
+
+<span class="nc" id="L114">    override protected val zookeepers: String =</span>
+<span class="nc" id="L115">      client.properties().getProperty(ClientProperty.INSTANCE_ZOOKEEPERS.getKey)</span>
+
+    override protected def onTableExists(table: String): Unit = {
+<span class="nc bnc" id="L118" title="All 2 branches missed.">      logger.warn(</span>
+<span class="nc" id="L119">        s&quot;TableExistsException when creating '$table' - this indicates another &quot; +</span>
+<span class="nc" id="L120">          &quot;GeoMesa client is creating tables in an unsafe manner&quot;)</span>
+    }
+
+    override protected def onNamespaceExists(namespace: String): Unit = {
+<span class="nc bnc" id="L124" title="All 2 branches missed.">      logger.warn(</span>
+<span class="nc" id="L125">        s&quot;NamespaceExistsException when creating '$namespace' - this indicates another &quot; +</span>
+<span class="nc" id="L126">          &quot;GeoMesa client is creating tables in an unsafe manner&quot;)</span>
+    }
+  }
+
+  /**
+   * Table utility class
+   *
+   * @param client accumulo client
+   */
+<span class="nc" id="L135">  private abstract class TableLock(client: AccumuloClient) extends DistributedLocking {</span>
+
+<span class="nc" id="L137">    private val timeoutMillis = DistributedLockTimeout.toDuration.map(_.toMillis).getOrElse {</span>
+      // note: this property has a valid default value so this exception should never be triggered
+<span class="nc" id="L139">      throw new IllegalArgumentException(s&quot;Couldn't convert '${DistributedLockTimeout.get}' to a duration&quot;)</span>
+    }
+
+    // note: value is not used here, we're treating this as a set
+<span class="nc" id="L143">    private val tableCache: Cache[String, java.lang.Boolean] =</span>
+<span class="nc" id="L144">      Caffeine.newBuilder().expireAfterWrite(TableCacheExpiry.toDuration.get.toMillis, TimeUnit.MILLISECONDS).build()</span>
+
+<span class="nc" id="L146">    private val nsCache: Cache[String, java.lang.Boolean] =</span>
+<span class="nc" id="L147">      Caffeine.newBuilder().expireAfterWrite(TableCacheExpiry.toDuration.get.toMillis, TimeUnit.MILLISECONDS).build()</span>
+
+    /**
+     * Create the table if it doesn't exist
+     *
+     * @param table table name
+     * @param timeType table time type
+     * @return true if table was created, false if it already exists
+     */
+    def ensureTableExists(table: String, timeType: TimeType): Boolean = {
+<span class="nc" id="L157">      var created = false</span>
+<span class="nc" id="L158">      var err: Throwable = null</span>
+
+      // noinspection ScalaUnusedSymbol
+      def load(ignoredKey: String): java.lang.Boolean = {
+<span class="nc" id="L162">        try {</span>
+<span class="nc" id="L163">          withLock(tablePath(table), timeoutMillis, {</span>
+<span class="nc" id="L164">            val tableOps = client.tableOperations()</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">            if (!tableOps.exists(table)) {</span>
+              try {
+<span class="nc" id="L167">                tableOps.create(table, new NewTableConfiguration().setTimeType(timeType))</span>
+<span class="nc" id="L168">                created = true</span>
+              } catch {
+<span class="nc" id="L170">                case _: TableExistsException =&gt; onTableExists(table)</span>
+              }
+<span class="nc" id="L172">              val start = System.currentTimeMillis()</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">              while (!tableOps.exists(table)) {</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">                if (System.currentTimeMillis() - start &gt; timeoutMillis) {</span>
+<span class="nc" id="L175">                  throw new RuntimeException(</span>
+<span class="nc" id="L176">                    s&quot;Tried to create table '$table', but it has not been created after timeout of ${timeoutMillis}ms&quot;)</span>
+                }
+<span class="nc" id="L178">                Thread.sleep(10)</span>
+              }
+            }
+          })
+<span class="nc" id="L182">          java.lang.Boolean.FALSE</span>
+        } catch {
+<span class="nc bnc" id="L184" title="All 2 branches missed.">          case NonFatal(e) =&gt; err = e; throw e</span>
+        }
+      }
+
+<span class="nc" id="L188">      tableCache.get(table, load)</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">      if (err != null) {</span>
+<span class="nc" id="L190">        throw err</span>
+      }
+<span class="nc" id="L192">      created</span>
+    }
+
+    /**
+     * Creates the namespace if it doesn't exist
+     *
+     * @param namespace namespace (or table name with namespace included)
+     * @return true if namespace was created, false if it already existed
+     */
+    def ensureNamespaceExists(namespace: String): Unit = {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">      val ns = namespace.takeWhile(_ != '.')</span>
+<span class="nc" id="L203">      var err: Throwable = null</span>
+
+      // noinspection ScalaUnusedSymbol
+      def load(ignoredKey: String): java.lang.Boolean = {
+<span class="nc" id="L207">        try {</span>
+<span class="nc" id="L208">          withLock(nsPath(ns), timeoutMillis, {</span>
+<span class="nc" id="L209">            val nsOps = client.namespaceOperations</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            if (!nsOps.exists(ns)) {</span>
+<span class="nc" id="L211">              try { nsOps.create(ns) } catch {</span>
+<span class="nc" id="L212">                case _: NamespaceExistsException =&gt; onNamespaceExists(ns)</span>
+              }
+<span class="nc" id="L214">              val start = System.currentTimeMillis()</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">              while (!nsOps.exists(ns)) {</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">                if (System.currentTimeMillis() - start &gt; timeoutMillis) {</span>
+<span class="nc" id="L217">                  throw new RuntimeException(</span>
+<span class="nc" id="L218">                    s&quot;Tried to create namespace '$ns', but it has not been created after timeout of ${timeoutMillis}ms&quot;)</span>
+                }
+<span class="nc" id="L220">                Thread.sleep(10)</span>
+              }
+            }
+          })
+<span class="nc" id="L224">          java.lang.Boolean.FALSE</span>
+        } catch {
+<span class="nc bnc" id="L226" title="All 2 branches missed.">          case NonFatal(e) =&gt; err = e; throw e</span>
+        }
+      }
+
+<span class="nc" id="L230">      nsCache.get(ns, load)</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">      if (err != null) {</span>
+<span class="nc" id="L232">        throw err</span>
+      }
+    }
+
+    /**
+     * Rename a table
+     *
+     * @param from current name
+     * @param to new name
+     */
+    def renameTable(from: String, to: String): Unit = {
+<span class="nc" id="L243">      withLock(tablePath(from), timeoutMillis, {</span>
+<span class="nc" id="L244">        val tableOps = client.tableOperations()</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        if (tableOps.exists(from)) {</span>
+<span class="nc" id="L246">          withLock(tablePath(to), timeoutMillis, {</span>
+<span class="nc" id="L247">            tableOps.rename(from, to)</span>
+<span class="nc" id="L248">            tableCache.put(to, java.lang.Boolean.FALSE)</span>
+          })
+        }
+<span class="nc" id="L251">        tableCache.invalidate(from)</span>
+      })
+    }
+
+    /**
+     * Delete a table
+     *
+     * @param table table to delete
+     */
+    def deleteTable(table: String): Unit = {
+<span class="nc" id="L261">      withLock(tablePath(table), timeoutMillis, {</span>
+<span class="nc" id="L262">        val tableOps = client.tableOperations()</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        if (tableOps.exists(table)) {</span>
+<span class="nc" id="L264">          tableOps.delete(table)</span>
+        }
+<span class="nc" id="L266">        tableCache.invalidate(table)</span>
+      })
+    }
+
+    // can happen sometimes with multiple threads but usually not a problem
+<span class="nc" id="L271">    protected def onTableExists(table: String): Unit = {}</span>
+    // can happen sometimes with multiple threads but usually not a problem
+<span class="nc" id="L273">    protected def onNamespaceExists(namespace: String): Unit = {}</span>
+
+    /**
+     * ZK path for acquiring a table lock
+     *
+     * @param table table name
+     * @return
+     */
+    private def tablePath(table: String): String =
+<span class="nc" id="L282">      s&quot;/org.locationtech.geomesa/table-locks/${StringSerialization.alphaNumericSafeString(table)}&quot;</span>
+
+    /**
+     * ZK path for acquiring a namespace lock
+     *
+     * @param namespace namespace
+     * @return
+     */
+    private def nsPath(namespace: String): String =
+<span class="nc" id="L291">      s&quot;/org.locationtech.geomesa/ns-locks/${StringSerialization.alphaNumericSafeString(namespace)}&quot;</span>
+  }
+<span class="nc" id="L293">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

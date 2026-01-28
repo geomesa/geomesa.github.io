@@ -1,0 +1,608 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>GeoMesaFeatureIndex.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Index API</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.index.api</a> &gt; <span class="el_source">GeoMesaFeatureIndex.scala</span></div><h1>GeoMesaFeatureIndex.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.index.api
+
+import com.typesafe.scalalogging.LazyLogging
+import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+import org.geotools.api.filter.{ExcludeFilter, Filter}
+import org.geotools.util.factory.Hints
+import org.locationtech.geomesa.filter.FilterHelper
+import org.locationtech.geomesa.index.api.WriteConverter.{TieredWriteConverter, WriteConverterImpl}
+import org.locationtech.geomesa.index.conf.QueryProperties
+import org.locationtech.geomesa.index.conf.partition.TablePartition
+import org.locationtech.geomesa.index.conf.splitter.TableSplitter
+import org.locationtech.geomesa.index.geotools.GeoMesaDataStore
+import org.locationtech.geomesa.index.index.NamedIndex
+import org.locationtech.geomesa.index.index.attribute.AttributeIndex
+import org.locationtech.geomesa.index.index.id.IdIndex
+import org.locationtech.geomesa.index.index.z2.{XZ2Index, Z2Index}
+import org.locationtech.geomesa.index.index.z3.{XZ3Index, Z3Index}
+import org.locationtech.geomesa.index.utils.{ExplainNull, Explainer}
+import org.locationtech.geomesa.utils.conf.IndexId
+import org.locationtech.geomesa.utils.index.ByteArrays
+import org.locationtech.geomesa.utils.index.IndexMode.IndexMode
+import org.locationtech.geomesa.utils.text.StringSerialization
+
+import java.nio.charset.StandardCharsets
+import java.util.UUID
+
+/**
+  * Represents a particular indexing strategy
+  *
+  * @param ds data store
+  * @param sft simple feature type stored in this index
+  * @param name name of the index
+  * @param version version of the index
+  * @param attributes attributes used to create the index keys
+  * @param mode mode of the index (read/write/both)
+  * @tparam T values extracted from a filter and used for creating ranges - extracted geometries, z-ranges, etc
+  * @tparam U a single key space index value, e.g. Long for a z-value, etc
+  */
+<span class="nc bnc" id="L47" title="All 4 branches missed.">abstract class GeoMesaFeatureIndex[T, U](val ds: GeoMesaDataStore[_],</span>
+<span class="nc" id="L48">                                         val sft: SimpleFeatureType,</span>
+<span class="nc" id="L49">                                         val name: String,</span>
+<span class="nc" id="L50">                                         val version: Int,</span>
+<span class="nc" id="L51">                                         val attributes: Seq[String],</span>
+<span class="nc" id="L52">                                         val mode: IndexMode) extends NamedIndex with LazyLogging {</span>
+
+  import org.locationtech.geomesa.index.api.GeoMesaFeatureIndex.{FullTableKeyRange, IdFromRow}
+  import org.locationtech.geomesa.index.conf.QueryHints.RichHints
+
+<span class="nc" id="L57">  protected val tableNameKey: String = GeoMesaFeatureIndex.baseTableNameKey(name, attributes, version)</span>
+
+  // note: needs to be lazy to allow subclasses to define keyspace
+<span class="nc bnc" id="L60" title="All 4 branches missed.">  protected lazy val idFromRow: IdFromRow = IdFromRow(sft, keySpace, tieredKeySpace)</span>
+
+  /**
+    * Unique (for the given sft) identifier string for this index.
+    *
+    * Can be parsed with `IndexId.parse`, although note that it does not include the read/write mode
+    */
+<span class="nc" id="L67">  val identifier: String = GeoMesaFeatureIndex.identifier(name, version, attributes)</span>
+
+  /**
+    * Is the feature id serialized with the feature? Needed for back-compatibility with old data formats
+    */
+<span class="nc" id="L72">  val serializedWithId: Boolean = false</span>
+
+  /**
+    * Primary key space used by this index
+    *
+    * @return
+    */
+  def keySpace: IndexKeySpace[T, U]
+
+  /**
+    * Tiered key space beyond the primary one, if any
+    *
+    * @return
+    */
+  def tieredKeySpace: Option[IndexKeySpace[_, _]]
+
+  /**
+    * The metadata key used to store the table name for this index
+    *
+    * @param partition partition
+    * @return
+    */
+<span class="nc" id="L94">  def tableNameKey(partition: Option[String] = None): String =</span>
+<span class="nc" id="L95">    partition.map(p =&gt; s&quot;$tableNameKey.$p&quot;).getOrElse(tableNameKey)</span>
+
+  /**
+    * Create the metadata entry for the initial index table or a new partition
+    *
+    * @param partition partition
+    * @return table name
+    */
+<span class="nc" id="L103">  def configureTableName(partition: Option[String] = None, limit: Option[Int] = None): String = {</span>
+<span class="nc" id="L104">    val key = tableNameKey(partition)</span>
+<span class="nc" id="L105">    ds.metadata.read(sft.getTypeName, key).getOrElse {</span>
+<span class="nc" id="L106">      val name = generateTableName(partition, limit)</span>
+<span class="nc" id="L107">      ds.metadata.insert(sft.getTypeName, key, name)</span>
+<span class="nc" id="L108">      name</span>
+    }
+  }
+
+  /**
+    * Deletes the entire index
+    *
+    * @param partition only delete a single partition, instead of the whole index
+    */
+<span class="nc" id="L117">  def deleteTableNames(partition: Option[String] = None): Seq[String] = {</span>
+<span class="nc" id="L118">    val tables = getTableNames(partition)</span>
+<span class="nc" id="L119">    partition match {</span>
+<span class="nc bnc" id="L120" title="All 2 branches missed.">      case Some(p) =&gt; ds.metadata.remove(sft.getTypeName, s&quot;$tableNameKey.$p&quot;)</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">      case None =&gt;</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">        ds.metadata.scan(sft.getTypeName, tableNameKey, cache = false).foreach { case (k, _) =&gt;</span>
+<span class="nc" id="L123">          ds.metadata.remove(sft.getTypeName, k)</span>
+        }
+    }
+<span class="nc" id="L126">    tables</span>
+  }
+
+  /**
+    * Gets the initial splits for a table
+    *
+    * @param partition partition, if any
+    * @return
+    */
+<span class="nc" id="L135">  def getSplits(partition: Option[String] = None): Seq[Array[Byte]] = {</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">    def nonEmpty(bytes: Seq[Array[Byte]]): Seq[Array[Byte]] = if (bytes.nonEmpty) { bytes } else { Seq(Array.empty) }</span>
+
+<span class="nc" id="L138">    val shards = nonEmpty(keySpace.sharding.shards)</span>
+<span class="nc" id="L139">    val splits = nonEmpty(TableSplitter.getSplits(sft, identifier, partition))</span>
+
+<span class="nc" id="L141">    val result = for (shard &lt;- shards; split &lt;- splits) yield { ByteArrays.concat(shard, split) }</span>
+
+    // drop the first split, which will otherwise be empty
+<span class="nc" id="L144">    result.drop(1)</span>
+  }
+
+  /**
+    * Gets the partitions for this index, assuming that the schema is partitioned
+    *
+    * @return
+    */
+  def getPartitions: Seq[String] = {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">    if (!TablePartition.partitioned(sft)) { Seq.empty } else {</span>
+<span class="nc" id="L154">      val offset = tableNameKey.length + 1</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">      ds.metadata.scan(sft.getTypeName, tableNameKey).map { case (k, _) =&gt; k.substring(offset) }</span>
+    }
+  }
+
+  /**
+   * Gets the single table name for this index. If this is a partitioned index, then the partition argument
+   * must be defined. A runtime exception will be thrown if multiple or zero tables are found.
+   *
+   * @param partition get the name for a particular partition, if the index is partitioned
+   * @return
+   */
+<span class="nc" id="L166">  def getTableName(partition: Option[String] = None): String = {</span>
+<span class="nc" id="L167">    val names = getTableNames(partition)</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">    if (names.lengthCompare(1) == 0) { names.head } else {</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">      val list = if (names.isEmpty) { &quot;&quot; } else { names.mkString(&quot;: &quot;, &quot;, &quot;, &quot;&quot;) }</span>
+<span class="nc" id="L170">      throw new RuntimeException(</span>
+<span class="nc" id="L171">        s&quot;Expected 1 table but found ${names.length} for index $identifier${partition.fold(&quot;&quot;)(p =&gt; s&quot; partition $p&quot;)}$list&quot;)</span>
+    }
+  }
+
+  /**
+    * Gets table names for this index
+    *
+    * @param partition get the name for a particular partition, or all partitions
+    * @return
+    */
+<span class="nc" id="L181">  def getTableNames(partition: Option[String] = None): Seq[String] = {</span>
+<span class="nc" id="L182">    partition match {</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">      case None =&gt; ds.metadata.scan(sft.getTypeName, tableNameKey).map(_._2)</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">      case Some(p) =&gt; ds.metadata.read(sft.getTypeName, s&quot;$tableNameKey.$p&quot;).toSeq</span>
+    }
+  }
+
+  /**
+    * Gets the tables that should be scanned to satisfy a query
+    *
+    * @param filter filter
+    * @return
+    */
+  def getTablesForQuery(filter: Option[Filter]): Seq[String] = {
+<span class="nc" id="L195">    val partitioned = for { f &lt;- filter; tp &lt;- TablePartition(ds, sft); partitions &lt;- tp.partitions(f) } yield {</span>
+<span class="nc" id="L196">      partitions.flatMap(p =&gt; getTableNames(Some(p)))</span>
+    }
+<span class="nc" id="L198">    partitioned.getOrElse(getTableNames())</span>
+  }
+
+  /**
+    * Creates a function to generate row keys from features
+    *
+    * @return
+    */
+  def createConverter(): WriteConverter[U] = {
+<span class="nc" id="L207">    tieredKeySpace match {</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">      case None =&gt; new WriteConverterImpl(keySpace)</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">      case Some(tier) =&gt; new TieredWriteConverter(keySpace, tier)</span>
+    }
+  }
+
+  /**
+    * Retrieve an ID from a row. All indices are assumed to encode the feature ID into the row key.
+    *
+    * The simple feature in the returned function signature is optional (null ok) - if provided the
+    * parsed UUID will be cached in the feature user data, if the sft is marked as using UUIDs
+    *
+    * @param row row bytes
+    * @param offset offset into the row bytes to the first valid byte for this row
+    * @param length number of valid bytes for this row
+    * @param feature simple feature (optional)
+    * @return
+    */
+  def getIdFromRow(row: Array[Byte], offset: Int, length: Int, feature: SimpleFeature): String =
+<span class="nc" id="L226">    idFromRow(row, offset, length, feature)</span>
+
+  /**
+    * Gets the offset (start) of the feature id from a row. All indices are assumed to encode the
+    * feature ID into the row key.
+    *
+    * @param row row bytes
+    * @param offset offset into the row bytes to the first valid byte for this row
+    * @param length number of valid bytes for this row
+    * @return
+    */
+  def getIdOffset(row: Array[Byte], offset: Int, length: Int): Int =
+<span class="nc" id="L238">    idFromRow.start(row, offset, length)</span>
+
+  /**
+    * Gets options for a 'simple' filter, where each OR is on a single attribute, e.g.
+    *   (bbox1 OR bbox2) AND dtg
+    *   bbox AND dtg AND (attr = foo OR attr = bar)
+    * not:
+    *   bbox OR dtg
+    *
+    * Because the input is simple, it can be satisfied with a single query filter.
+    *
+    * @param filter input filter
+    * @param hints query hints
+    * @return a filter strategy which can satisfy the query, if available
+    */
+  def getFilterStrategy(filter: Filter, hints: Hints): Option[FilterStrategy]
+
+  /**
+    * Plans the query
+    *
+    * @param filter filter strategy
+    * @param explain explainer
+    * @return
+    */
+<span class="nc" id="L262">  def getQueryStrategy(filter: FilterStrategy, explain: Explainer = ExplainNull): QueryStrategy = {</span>
+<span class="nc" id="L263">    val sharing = keySpace.sharing</span>
+<span class="nc" id="L264">    val indexValues = filter.primary.map(keySpace.getIndexValues(_, explain))</span>
+
+<span class="nc" id="L266">    val useFullFilter = keySpace.useFullFilter(indexValues, Some(ds.config), filter.hints)</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">    val ecql = if (useFullFilter) { filter.filter } else { filter.secondary }</span>
+
+<span class="nc" id="L269">    indexValues match {</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">      case None =&gt;</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        if (filter.filter.exists(_.isInstanceOf[ExcludeFilter])) {</span>
+<span class="nc" id="L272">          QueryStrategy(filter, Seq.empty, Seq.empty, Seq.empty, ecql, indexValues)</span>
+        } else {
+<span class="nc" id="L274">          val byteRanges = Seq(BoundedByteRange(sharing, ByteArrays.rowFollowingPrefix(sharing)))</span>
+<span class="nc" id="L275">          QueryStrategy(filter, byteRanges, FullTableKeyRange, Seq.empty, ecql, indexValues)</span>
+        }
+
+<span class="nc bnc" id="L278" title="All 2 branches missed.">      case Some(values) =&gt;</span>
+<span class="nc" id="L279">        val keyRanges = keySpace.getRanges(values).toSeq</span>
+<span class="nc" id="L280">        val bytes = keySpace.getRangeBytes(keyRanges.iterator, tieredKeySpace.isDefined).toSeq</span>
+<span class="nc" id="L281">        val tier = tieredKeySpace.orNull.asInstanceOf[IndexKeySpace[Any, Any]]</span>
+<span class="nc" id="L282">        val secondary = filter.secondary.orNull</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        lazy val tiers = {</span>
+<span class="nc" id="L284">          val multiplier = math.max(1, bytes.count(_.isInstanceOf[SingleRowByteRange]))</span>
+          tier.getRangeBytes(tier.getRanges(tier.getIndexValues(secondary, explain), multiplier)).toSeq
+        }
+
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        if (tier == null) {</span>
+<span class="nc" id="L289">          QueryStrategy(filter, bytes, keyRanges, Seq.empty, ecql, indexValues)</span>
+<span class="nc bnc" id="L290" title="All 4 branches missed.">        } else if (secondary == null || tiers.exists(_.isInstanceOf[UnboundedByteRange])) {</span>
+<span class="nc" id="L291">          val byteRanges = keySpace.getRangeBytes(keyRanges.iterator, tier = true).map {</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            case BoundedByteRange(lo, hi)      =&gt; BoundedByteRange(lo, ByteArrays.concat(hi, ByteRange.UnboundedUpperRange))</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">            case SingleRowByteRange(row)       =&gt; BoundedByteRange(row, ByteArrays.concat(row, ByteRange.UnboundedUpperRange))</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">            case UpperBoundedByteRange(lo, hi) =&gt; BoundedByteRange(lo, ByteArrays.concat(hi, ByteRange.UnboundedUpperRange))</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            case LowerBoundedByteRange(lo, hi) =&gt; BoundedByteRange(lo, hi)</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">            case UnboundedByteRange(lo, hi)    =&gt; BoundedByteRange(lo, hi)</span>
+<span class="nc" id="L297">            case r =&gt; throw new IllegalArgumentException(s&quot;Unexpected range type $r&quot;)</span>
+          }.toSeq
+<span class="nc" id="L299">          QueryStrategy(filter, byteRanges, keyRanges, Seq.empty, ecql, indexValues)</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        } else if (tiers.isEmpty) {</span>
+          // disjoint secondary filter
+<span class="nc" id="L302">          QueryStrategy(filter, Seq.empty, Seq.empty, Seq.empty, ecql, indexValues)</span>
+        } else {
+<span class="nc bnc" id="L304" title="All 2 branches missed.">          lazy val minTier = ByteRange.min(tiers)</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">          lazy val maxTier = ByteRange.max(tiers)</span>
+
+<span class="nc" id="L307">          val byteRanges = bytes.flatMap {</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">            case SingleRowByteRange(row) =&gt;</span>
+              // single row - we can use all the tiered ranges appended to the end
+<span class="nc" id="L310">              tiers.map {</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">                case BoundedByteRange(lo, hi) =&gt; BoundedByteRange(ByteArrays.concat(row, lo), ByteArrays.concat(row, hi))</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">                case SingleRowByteRange(trow) =&gt; SingleRowByteRange(ByteArrays.concat(row, trow))</span>
+              }
+
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            case BoundedByteRange(lo, hi) =&gt;</span>
+              // bounded ranges - we can use the min/max tier on the endpoints
+<span class="nc" id="L317">              Iterator.single(BoundedByteRange(ByteArrays.concat(lo, minTier), ByteArrays.concat(hi, maxTier)))</span>
+
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            case LowerBoundedByteRange(lo, hi) =&gt;</span>
+              // we can't use the upper tier
+<span class="nc" id="L321">              Iterator.single(BoundedByteRange(ByteArrays.concat(lo, minTier), hi))</span>
+
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            case UpperBoundedByteRange(lo, hi) =&gt;</span>
+              // we can't use the lower tier
+<span class="nc" id="L325">              Iterator.single(BoundedByteRange(lo, ByteArrays.concat(hi, maxTier)))</span>
+
+<span class="nc bnc" id="L327" title="All 2 branches missed.">            case UnboundedByteRange(lo, hi) =&gt;</span>
+              // we can't use either side of the tiers
+<span class="nc" id="L329">              Iterator.single(BoundedByteRange(lo, hi))</span>
+
+            case r =&gt;
+<span class="nc" id="L332">              throw new IllegalArgumentException(s&quot;Unexpected range type $r&quot;)</span>
+          }
+
+<span class="nc" id="L335">          QueryStrategy(filter, byteRanges, keyRanges, tiers, ecql, indexValues)</span>
+        }
+    }
+  }
+
+  /**
+   * Check that full table scans are allowed
+   *
+   * @param strategy strategy
+   * @param blockByDefault default behavior in case no system props are configured
+   * @return
+   */
+  private[index] def checkQueryBlock(strategy: QueryStrategy, blockByDefault: Boolean): Option[IllegalArgumentException] = {
+<span class="nc bnc" id="L348" title="All 2 branches missed.">    if (!isFullTableScan(strategy)) {</span>
+<span class="nc" id="L349">      return None</span>
+    }
+<span class="nc bnc" id="L351" title="All 2 branches missed.">    lazy val filterString = strategy.filter.filter.fold(&quot;INCLUDE&quot;)(FilterHelper.toString)</span>
+<span class="nc" id="L352">    val block = QueryProperties.blockFullTableScansForFeatureType(sft.getTypeName)</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">    if (block.getOrElse(blockByDefault)) {</span>
+<span class="nc" id="L354">      Some(new IllegalArgumentException(s&quot;Full-table scans are disabled. Query being stopped for ${sft.getTypeName}: $filterString&quot;))</span>
+    } else {
+<span class="nc bnc" id="L356" title="All 2 branches missed.">      lazy val warning = s&quot;Running full table scan for schema '${sft.getTypeName}' with filter: $filterString&quot;</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">      if (block.isDefined) {</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        logger.info(warning) // turn down log level if full table scans are explicitly allowed</span>
+      } else {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        logger.warn(warning)</span>
+      }
+<span class="nc" id="L362">      None</span>
+    }
+  }
+
+  /**
+   * Check if the strategy will scan the entire index table
+   *
+   * @param strategy strategy
+   * @return
+   */
+  private def isFullTableScan(strategy: QueryStrategy): Boolean = {
+<span class="nc bnc" id="L373" title="All 6 branches missed.">    strategy.keyRanges == FullTableKeyRange &amp;&amp;</span>
+<span class="nc bnc" id="L374" title="All 4 branches missed.">      !strategy.hints.getMaxFeatures.exists(_ &lt;= QueryProperties.BlockMaxThreshold.toInt.get)</span>
+  }
+
+  /**
+    * Creates a valid, unique string for the underlying table
+    *
+    * @param partition partition
+    * @param limit limit on the length of a table name in the underlying database
+    * @return
+    */
+<span class="nc" id="L384">  private def generateTableName(partition: Option[String] = None, limit: Option[Int] = None): String = {</span>
+    import StringSerialization.alphaNumericSafeString
+    import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+<span class="nc" id="L388">    val namespace = sft.getTablePrefix(name).getOrElse(ds.config.catalog)</span>
+<span class="nc" id="L389">    val prefix = (namespace +: Seq(sft.getTypeName, name).map(alphaNumericSafeString)).mkString(&quot;_&quot;)</span>
+<span class="nc" id="L390">    val suffix = s&quot;v$version${partition.map(p =&gt; s&quot;_$p&quot;).getOrElse(&quot;&quot;)}&quot;</span>
+
+<span class="nc" id="L392">    def build(attrs: Seq[String]): String = (prefix +: attrs :+ suffix).mkString(&quot;_&quot;)</span>
+
+<span class="nc" id="L394">    val full = build(attributes.map(alphaNumericSafeString))</span>
+
+<span class="nc" id="L396">    limit match {</span>
+<span class="nc bnc" id="L397" title="All 4 branches missed.">      case Some(lim) if full.lengthCompare(lim) &gt; 0 =&gt;</span>
+        // try using the attribute numbers instead
+<span class="nc" id="L399">        val nums = build(attributes.map(a =&gt; s&quot;${sft.indexOf(a)}&quot;))</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (nums.lengthCompare(lim) &lt;= 0) { nums } else {</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">          logger.warn(s&quot;Table name length exceeds configured limit ($lim), falling back to UUID: $full&quot;)</span>
+<span class="nc" id="L402">          IndexAdapter.truncateTableName(full, lim)</span>
+        }
+
+<span class="nc" id="L405">      case _ =&gt; full</span>
+    }
+  }
+
+<span class="nc" id="L409">  override def toString: String = s&quot;${getClass.getSimpleName}${attributes.mkString(&quot;(&quot;, &quot;,&quot;, &quot;)&quot;)}&quot;</span>
+
+<span class="nc" id="L411">  override def equals(other: Any): Boolean = other match {</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">    case that: GeoMesaFeatureIndex[_, _] =&gt;</span>
+<span class="nc bnc" id="L413" title="All 24 branches missed.">      identifier == that.identifier &amp;&amp; mode == that.mode &amp;&amp; ds == that.ds &amp;&amp; sft == that.sft</span>
+<span class="nc" id="L414">    case _ =&gt; false</span>
+  }
+
+  override def hashCode(): Int =
+<span class="nc bnc" id="L418" title="All 4 branches missed.">    Seq(identifier, ds, sft, mode).collect { case o if o != null =&gt; o.hashCode() }.foldLeft(0)((a, b) =&gt; 31 * a + b)</span>
+}
+
+<span class="nc" id="L421">object GeoMesaFeatureIndex {</span>
+
+  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+<span class="nc" id="L425">  private val FullTableKeyRange = Seq(UnboundedRange(null))</span>
+
+  /**
+    * Some predefined indexing schemes
+    */
+<span class="nc" id="L430">  object Schemes {</span>
+<span class="nc" id="L431">    val Z3TableScheme: List[String]  = List(Z3Index, IdIndex, AttributeIndex).map(_.name)</span>
+<span class="nc" id="L432">    val Z2TableScheme: List[String]  = List(Z2Index, IdIndex, AttributeIndex).map(_.name)</span>
+<span class="nc" id="L433">    val XZ3TableScheme: List[String] = List(XZ3Index, IdIndex, AttributeIndex).map(_.name)</span>
+<span class="nc" id="L434">    val XZ2TableScheme: List[String] = List(XZ2Index, IdIndex, AttributeIndex).map(_.name)</span>
+  }
+
+  /**
+    * Identifier string for an index. Can be parsed with `IndexId.parse`
+    *
+    * @param name name
+    * @param version version
+    * @param attributes attributes
+    * @return
+    */
+<span class="nc" id="L445">  def identifier(name: String, version: Int, attributes: Seq[String]): String =</span>
+<span class="nc" id="L446">    s&quot;$name:$version:${attributes.mkString(&quot;:&quot;)}&quot;</span>
+
+  /**
+    * Identifier string for an index. Can be parsed with `IndexId.parse`
+    *
+    * @param id id to encode
+    * @return
+    */
+<span class="nc" id="L454">  def identifier(id: IndexId): String = identifier(id.name, id.version, id.attributes)</span>
+
+  /**
+    * Identifier string for an index. Can be parsed with `IndexId.parse`
+    *
+    * @param index index
+    * @return
+    */
+<span class="nc" id="L462">  def identifier(index: GeoMesaFeatureIndex[_, _]): String = identifier(index.name, index.version, index.attributes)</span>
+
+  /**
+    * Base table name key used for storing in metadata
+    *
+    * @param name index name
+    * @param attributes index attributes
+    * @param version index version
+    * @return
+    */
+  def baseTableNameKey(name: String, attributes: Seq[String], version: Int): String = {
+<span class="nc bnc" id="L473" title="All 2 branches missed.">    val attrs = if (attributes.isEmpty) { &quot;&quot; } else {</span>
+<span class="nc" id="L474">      attributes.map(StringSerialization.alphaNumericSafeString).mkString(&quot;.&quot;, &quot;.&quot;, &quot;&quot;)</span>
+    }
+<span class="nc" id="L476">    s&quot;table.$name$attrs.v$version&quot;</span>
+  }
+
+  /**
+    * Converts a feature id to bytes, for indexing or querying
+    *
+    * @param sft simple feature type
+    * @return
+    */
+  def idToBytes(sft: SimpleFeatureType): String =&gt; Array[Byte] =
+<span class="nc bnc" id="L486" title="All 2 branches missed.">    if (sft.isUuidEncoded) { uuidToBytes } else { stringToBytes }</span>
+
+  /**
+    * Converts a byte array to a feature id. Return method takes an optional (null accepted) simple feature,
+    * which will be used to cache the parsed feature ID if it is a UUID.
+    *
+    * @param sft simple feature type
+    * @return (bytes, offset, length, SimpleFeature) =&gt; id
+    */
+  def idFromBytes(sft: SimpleFeatureType): (Array[Byte], Int, Int, SimpleFeature) =&gt; String =
+<span class="nc bnc" id="L496" title="All 2 branches missed.">    if (sft.isUuidEncoded) { uuidFromBytes } else { stringFromBytes }</span>
+
+  /**
+    * Trait for parsing feature ids out of row keys
+    */
+  sealed trait IdFromRow {
+
+    /**
+      * Return the id from the given row
+      *
+      * @param row row value as bytes
+      * @param offset start of the row in the byte array
+      * @param length length of the row in the byte array
+      * @param feature a simple feature used to cache the feature id, optional (may be null)
+      * @return the feature id
+      */
+    def apply(row: Array[Byte], offset: Int, length: Int, feature: SimpleFeature): String
+
+    /**
+      * Return the start index of the id in the row
+      *
+      * @param row row value as bytes
+      * @param offset start of the row in the byte array
+      * @param length length of the row in the byte array
+      * @return the start of the id in the row, relative to the row offset
+      */
+    def start(row: Array[Byte], offset: Int, length: Int): Int
+  }
+
+<span class="nc" id="L525">  object IdFromRow {</span>
+
+    def apply(
+        sft: SimpleFeatureType,
+        keySpace: IndexKeySpace[_, _],
+        tieredKeySpace: Option[IndexKeySpace[_, _]]): IdFromRow = {
+<span class="nc" id="L531">      val tieredLength = tieredKeySpace.map(_.indexKeyByteLength).getOrElse(Right(0))</span>
+<span class="nc bnc" id="L532" title="All 8 branches missed.">      (keySpace.indexKeyByteLength, tieredLength) match {</span>
+<span class="nc bnc" id="L533" title="All 4 branches missed.">        case (Right(i), Right(j)) =&gt;</span>
+<span class="nc" id="L534">          new FixedIdFromRow(idFromBytes(sft), i + j)</span>
+
+<span class="nc bnc" id="L536" title="All 4 branches missed.">        case (Right(i), Left(j)) =&gt;</span>
+<span class="nc" id="L537">          val dynamic: (Array[Byte], Int, Int) =&gt; Int = (row, offset, length) =&gt; i + j(row, offset + i, length - i)</span>
+<span class="nc" id="L538">          new DynamicIdFromRow(idFromBytes(sft), dynamic)</span>
+
+<span class="nc bnc" id="L540" title="All 4 branches missed.">        case (Left(i), Right(j)) =&gt;</span>
+<span class="nc" id="L541">          val dynamic: (Array[Byte], Int, Int) =&gt; Int = (row, offset, length) =&gt; i(row, offset, length - j) + j</span>
+<span class="nc" id="L542">          new DynamicIdFromRow(idFromBytes(sft), dynamic)</span>
+
+<span class="nc bnc" id="L544" title="All 4 branches missed.">        case (Left(i), Left(j))   =&gt;</span>
+          val dynamic: (Array[Byte], Int, Int) =&gt; Int =
+<span class="nc" id="L546">            (row, offset, length) =&gt; {</span>
+<span class="nc" id="L547">              val first = i(row, offset, length)</span>
+<span class="nc" id="L548">              j(row, offset + first, length - first)</span>
+            }
+<span class="nc" id="L550">          new DynamicIdFromRow(idFromBytes(sft), dynamic)</span>
+      }
+    }
+
+    /**
+      * Id is always at a fixed offset into the row
+      *
+      * @param idFromBytes deserialization for the feature id
+      * @param prefix the length of the fixed prefix preceding the feature id bytes
+      */
+<span class="nc" id="L560">    final class FixedIdFromRow(idFromBytes: (Array[Byte], Int, Int, SimpleFeature) =&gt; String, prefix: Int)</span>
+<span class="nc" id="L561">        extends IdFromRow {</span>
+
+      override def apply(row: Array[Byte], offset: Int, length: Int, feature: SimpleFeature): String =
+<span class="nc" id="L564">        idFromBytes(row, offset + prefix, length - prefix, feature)</span>
+
+<span class="nc" id="L566">      override def start(row: Array[Byte], offset: Int, length: Int): Int = prefix</span>
+    }
+
+    /**
+      * Id is dynamically located in the row
+      *
+      * @param idFromBytes deserialization of the feature id
+      * @param prefix a function to find the length of the prefix preceding the feature id bytes
+      */
+<span class="nc" id="L575">    final class DynamicIdFromRow(</span>
+<span class="nc" id="L576">        idFromBytes: (Array[Byte], Int, Int, SimpleFeature) =&gt; String,</span>
+<span class="nc" id="L577">        prefix: (Array[Byte], Int, Int) =&gt; Int</span>
+<span class="nc" id="L578">      ) extends IdFromRow {</span>
+
+      override def apply(row: Array[Byte], offset: Int, length: Int, feature: SimpleFeature): String = {
+<span class="nc" id="L581">        val prefix = this.prefix(row, offset, length)</span>
+<span class="nc" id="L582">        idFromBytes(row, offset + prefix, length - prefix, feature)</span>
+      }
+
+<span class="nc" id="L585">      override def start(row: Array[Byte], offset: Int, length: Int): Int = prefix(row, offset, length)</span>
+    }
+  }
+
+<span class="nc" id="L589">  private def uuidToBytes(id: String): Array[Byte] = {</span>
+<span class="nc" id="L590">    val uuid = UUID.fromString(id)</span>
+<span class="nc" id="L591">    ByteArrays.uuidToBytes(uuid.getMostSignificantBits, uuid.getLeastSignificantBits)</span>
+  }
+
+  private def uuidFromBytes(bytes: Array[Byte], offset: Int, ignored: Int, sf: SimpleFeature): String = {
+    import org.locationtech.geomesa.utils.geotools.Conversions.RichSimpleFeature
+<span class="nc" id="L596">    val uuid = ByteArrays.uuidFromBytes(bytes, offset)</span>
+<span class="nc bnc" id="L597" title="All 2 branches missed.">    if (sf != null) {</span>
+<span class="nc" id="L598">      sf.cacheUuid(uuid)</span>
+    }
+<span class="nc" id="L600">    new UUID(uuid._1, uuid._2).toString</span>
+  }
+
+<span class="nc" id="L603">  private def stringToBytes(id: String): Array[Byte] = id.getBytes(StandardCharsets.UTF_8)</span>
+
+  private def stringFromBytes(bytes: Array[Byte], offset: Int, length: Int, ignored: SimpleFeature): String =
+<span class="nc" id="L606">    new String(bytes, offset, length, StandardCharsets.UTF_8)</span>
+<span class="nc" id="L607">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

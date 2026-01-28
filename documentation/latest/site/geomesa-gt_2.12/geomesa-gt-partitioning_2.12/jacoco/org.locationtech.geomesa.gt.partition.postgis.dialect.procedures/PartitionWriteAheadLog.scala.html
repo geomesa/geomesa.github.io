@@ -1,0 +1,230 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PartitionWriteAheadLog.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa GeoTools Postgis Partitioning</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.gt.partition.postgis.dialect.procedures</a> &gt; <span class="el_source">PartitionWriteAheadLog.scala</span></div><h1>PartitionWriteAheadLog.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.gt.partition.postgis.dialect
+package procedures
+
+import org.locationtech.geomesa.gt.partition.postgis.dialect.PartitionedPostgisDialect.SftUserData
+import org.locationtech.geomesa.gt.partition.postgis.dialect.tables.{SequenceTable, UserDataTable}
+
+/**
+ * Partitions the write ahead table into the recent and/or main partition tables
+ */
+<span class="nc" id="L18">object PartitionWriteAheadLog extends SqlProcedure {</span>
+
+<span class="nc" id="L20">  override def name(info: TypeInfo): FunctionName = FunctionName(s&quot;${info.typeName}_partition_wa&quot;)</span>
+
+<span class="nc" id="L22">  override protected def createStatements(info: TypeInfo): Seq[String] = Seq(proc(info))</span>
+
+  private def proc(info: TypeInfo): String = {
+<span class="nc" id="L25">    s&quot;&quot;&quot;CREATE OR REPLACE PROCEDURE ${info.schema.quoted}.${name(info).quoted}(cur_time timestamp without time zone) LANGUAGE plpgsql AS</span>
+       |  $$BODY$$
+       |    DECLARE
+       |      seq_val smallint;
+       |      write_partition text;                        -- current partition receiving writes
+       |      min_dtg timestamp without time zone;         -- min date in our partitioned tables
+       |      main_cutoff timestamp without time zone;     -- max age of the records for main tables
+       |      write_ahead record;
+       |      partition_size int;                          -- size of the partition, in hours
+       |      partition_start timestamp without time zone; -- start bounds for the partition we're writing
+       |      partition_end timestamp without time zone;   -- end bounds for the partition we're writing
+       |      partition_name text;                         -- partition table name
+       |      partition_parent text;                       -- partition parent table name
+       |      partition_tablespace text;                   -- partition tablespace
+       |      index_tablespace text;                       -- index tablespace
+       |      table_wa_logging text;                       -- wa log options
+       |      pexists boolean;                             -- table exists check
+       |      unsorted_count bigint;
+       |    BEGIN
+       |      -- constants
+       |      SELECT COALESCE(
+<span class="nc" id="L46">       |        (SELECT value::int FROM ${info.schema.quoted}.${UserDataTable.Name.quoted}</span>
+<span class="nc" id="L47">       |          WHERE type_name = ${literal(info.typeName)} AND key = ${literal(SftUserData.IntervalHours.key)}),</span>
+<span class="nc" id="L48">       |        ${SftUserData.IntervalHours.default})</span>
+       |        INTO partition_size;
+<span class="nc" id="L50">       |      main_cutoff := ${info.schema.quoted}.truncate_to_partition(cur_time, partition_size) - make_interval(hours =&gt; partition_size);</span>
+       |
+<span class="nc" id="L52">       |      SELECT value from ${info.schema.quoted}.${SequenceTable.Name.quoted}</span>
+<span class="nc" id="L53">       |        WHERE type_name = ${literal(info.typeName)} INTO seq_val;</span>
+<span class="nc" id="L54">       |      write_partition := ${literal(info.tables.writeAhead.name.raw + &quot;_&quot;)} || lpad(seq_val::text, 3, '0');</span>
+       |
+       |      -- check for write ahead partitions and move the data into the time partitioned tables
+       |      FOR write_ahead IN
+       |        SELECT pg_class.relname AS name
+       |          FROM pg_catalog.pg_inherits
+       |          INNER JOIN pg_catalog.pg_class ON (pg_inherits.inhrelid = pg_class.oid)
+       |          INNER JOIN pg_catalog.pg_namespace ON (pg_class.relnamespace = pg_namespace.oid)
+<span class="nc" id="L62">       |          WHERE inhparent = ${info.tables.writeAhead.name.asRegclass}</span>
+       |          AND relname != write_partition
+       |          ORDER BY name
+       |      LOOP
+       |
+       |        RAISE INFO '% Checking write ahead table %', timeofday()::timestamp, write_ahead.name;
+       |        -- get a lock on the table - this mode won't prevent reads but will prevent writes
+       |        -- (there shouldn't be any writes though) and will synchronize this method
+<span class="nc" id="L70">       |        LOCK TABLE ONLY ${info.tables.mainPartitions.name.qualified} IN SHARE UPDATE EXCLUSIVE MODE;</span>
+<span class="nc" id="L71">       |        LOCK TABLE ONLY ${info.tables.spillPartitions.name.qualified} IN SHARE UPDATE EXCLUSIVE MODE;</span>
+<span class="nc" id="L72">       |        EXECUTE 'LOCK TABLE ${info.schema.quoted}.' || quote_ident(write_ahead.name) ||</span>
+       |          ' IN SHARE UPDATE EXCLUSIVE MODE';
+       |        RAISE INFO '% Locked write ahead table % for migration', timeofday()::timestamp, write_ahead.name;
+       |
+       |        -- wait until the table doesn't contain any recent records
+<span class="nc" id="L77">       |        EXECUTE 'SELECT EXISTS(SELECT 1 FROM ${info.schema.quoted}.' || quote_ident(write_ahead.name) ||</span>
+<span class="nc" id="L78">       |          ' WHERE ${info.cols.dtg.quoted} &gt;= ' || quote_literal(${info.schema.quoted}.truncate_to_ten_minutes(cur_time)) || ')'</span>
+       |          INTO pexists;
+       |
+       |        IF pexists THEN
+       |          -- should only happen if data is inserted with timestamps from the future
+       |          RAISE NOTICE '% Skipping write ahead table % due to min date', timeofday()::timestamp, write_ahead.name;
+       |        ELSE
+       |          partition_end := '-infinity'::timestamp without time zone;
+       |          LOOP
+       |            -- find the range of dates in the write ahead partition
+<span class="nc" id="L88">       |            EXECUTE 'SELECT min(${info.cols.dtg.quoted}) FROM ${info.schema.quoted}.' || quote_ident(write_ahead.name) ||</span>
+<span class="nc" id="L89">       |              ' WHERE ${info.cols.dtg.quoted} &gt;= ' || quote_literal(partition_end) INTO min_dtg;</span>
+       |            EXIT WHEN min_dtg IS NULL;
+       |
+       |            -- calculate the partition bounds for the min date
+       |            IF min_dtg &lt; main_cutoff THEN
+<span class="nc" id="L94">       |              partition_start := ${info.schema.quoted}.truncate_to_partition(min_dtg, partition_size);</span>
+       |              partition_end := partition_start + make_interval(hours =&gt; partition_size);
+<span class="nc" id="L96">       |              partition_parent := ${info.tables.mainPartitions.name.asLiteral};</span>
+       |              partition_name := partition_parent || '_' || to_char(partition_start, 'YYYY_MM_DD_HH24');
+<span class="nc" id="L98">       |              SELECT value FROM ${info.schema.quoted}.${UserDataTable.Name.quoted}</span>
+<span class="nc" id="L99">       |                WHERE type_name = ${literal(info.typeName)} AND key = ${literal(SftUserData.MainTableSpace.key)}</span>
+       |                INTO partition_tablespace;
+       |              IF partition_tablespace IS NULL THEN
+       |                index_tablespace := '';
+<span class="nc" id="L103">       |                partition_tablespace := '${info.tables.mainPartitions.storage.opts}';</span>
+       |              ELSE
+       |                index_tablespace := ' USING INDEX TABLESPACE '|| quote_ident(partition_tablespace);
+<span class="nc" id="L106">       |                partition_tablespace := '${info.tables.mainPartitions.storage.opts} TABLESPACE ' ||</span>
+       |                  quote_ident(partition_tablespace);
+       |              END IF;
+       |
+       |              -- check for existing partition and switch to spill table instead
+<span class="nc" id="L111">       |              SELECT EXISTS(SELECT FROM pg_tables WHERE schemaname = ${info.schema.asLiteral} AND tablename = partition_name)</span>
+       |                INTO pexists;
+       |              IF pexists THEN
+<span class="nc" id="L114">       |                partition_parent := ${info.tables.spillPartitions.name.asLiteral};</span>
+       |                partition_name := partition_parent || '_' || to_char(partition_start, 'YYYY_MM_DD_HH24');
+       |              END IF;
+       |            ELSE
+<span class="nc" id="L118">       |              partition_start := ${info.schema.quoted}.truncate_to_ten_minutes(min_dtg);</span>
+       |              partition_end := partition_start + INTERVAL '10 MINUTES';
+<span class="nc" id="L120">       |              partition_parent := ${info.tables.writeAheadPartitions.name.asLiteral};</span>
+       |              partition_name := partition_parent || '_' || to_char(partition_start, 'YYYY_MM_DD_HH24_MI');
+<span class="nc" id="L122">       |              SELECT value FROM ${info.schema.quoted}.${UserDataTable.Name.quoted}</span>
+<span class="nc" id="L123">       |                WHERE type_name = ${literal(info.typeName)} AND key = ${literal(SftUserData.WriteAheadPartitionsTableSpace.key)}</span>
+       |                INTO partition_tablespace;
+       |              IF partition_tablespace IS NULL THEN
+       |                index_tablespace := '';
+<span class="nc" id="L127">       |                partition_tablespace := '${info.tables.writeAheadPartitions.storage.opts}';</span>
+       |              ELSE
+       |                index_tablespace := ' USING INDEX TABLESPACE '|| quote_ident(partition_tablespace);
+<span class="nc" id="L130">       |                partition_tablespace := '${info.tables.writeAheadPartitions.storage.opts} TABLESPACE ' ||</span>
+       |                  quote_ident(partition_tablespace);
+       |              END IF;
+       |            END IF;
+       |
+       |            RAISE INFO '% Writing to partition %', timeofday()::timestamp, partition_name;
+       |
+<span class="nc" id="L137">       |            SELECT EXISTS(SELECT FROM pg_tables WHERE schemaname = ${info.schema.asLiteral} AND tablename = partition_name)</span>
+       |              INTO pexists;
+       |
+       |            -- create the partition table if it doesn't exist
+       |            -- note: normally the partition will not exist unless time-latent data was inserted
+       |            -- we create it unattached so that it doesn't lock the _recent table on insert
+       |            -- then we attach it after inserting the rows
+       |            -- since this is all within a transaction it should all happen &quot;at once&quot;
+       |            -- see https://www.postgresql.org/docs/13/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-MAINTENANCE
+       |
+       |            IF pexists THEN
+       |              -- copy rows from write ahead table to partition table
+       |              RAISE INFO '% Copying rows to partition %', timeofday()::timestamp, partition_name;
+<span class="nc" id="L150">       |              EXECUTE 'INSERT INTO ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |                ' SELECT * FROM ' || quote_ident(write_ahead.name) ||
+<span class="nc" id="L152">       |                '   WHERE ${info.cols.dtg.quoted} &gt;= ' || quote_literal(partition_start) ||</span>
+<span class="nc" id="L153">       |                '     AND ${info.cols.dtg.quoted} &lt; ' || quote_literal(partition_end) ||</span>
+<span class="nc" id="L154">       |                '   ORDER BY _st_sortablehash(${info.cols.geom.quoted})' ||</span>
+       |                '   ON CONFLICT DO NOTHING';
+       |              GET DIAGNOSTICS unsorted_count := ROW_COUNT;
+       |            ELSE
+       |              RAISE INFO '% Creating partition with insert % (unattached)', timeofday()::timestamp, partition_name;
+       |
+<span class="nc" id="L160">       |              SELECT value FROM ${info.schema.quoted}.${UserDataTable.Name.quoted}</span>
+<span class="nc" id="L161">       |                WHERE type_name = ${literal(info.typeName)} AND key = ${literal(SftUserData.WalLogEnabled.key)}</span>
+       |                INTO table_wa_logging;
+       |              IF table_wa_logging IS NULL OR NOT table_wa_logging::boolean THEN
+       |                table_wa_logging := '';
+       |              ELSE
+       |                table_wa_logging := 'UNLOGGED ';
+       |              END IF;
+       |
+       |              -- upper bounds are exclusive
+       |              -- use &quot;create table as&quot; (vs create then insert) for performance benefits related to WAL skipping
+<span class="nc" id="L171">       |              EXECUTE 'CREATE ' || table_wa_logging || 'TABLE ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |                partition_tablespace || ' AS SELECT * FROM ' || quote_ident(write_ahead.name) ||
+<span class="nc" id="L173">       |                '   WHERE ${info.cols.dtg.quoted} &gt;= ' || quote_literal(partition_start) ||</span>
+<span class="nc" id="L174">       |                '     AND ${info.cols.dtg.quoted} &lt; ' || quote_literal(partition_end) ||</span>
+<span class="nc" id="L175">       |                '   ORDER BY _st_sortablehash(${info.cols.geom.quoted})';</span>
+       |              GET DIAGNOSTICS unsorted_count := ROW_COUNT;
+<span class="nc" id="L177">       |              EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |                ' ADD CONSTRAINT ' || quote_ident(partition_name || '_pkey') ||
+<span class="nc" id="L179">       |                ' PRIMARY KEY (fid, ${info.cols.dtg.quoted})' || index_tablespace;</span>
+       |              -- creating a constraint allows it to be attached to the parent without any additional checks
+<span class="nc" id="L181">       |              EXECUTE 'ALTER TABLE  ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |                ' ADD CONSTRAINT ' || quote_ident(partition_name || '_constraint') ||
+<span class="nc" id="L183">       |                ' CHECK ( ${info.cols.dtg.quoted} &gt;= ' || quote_literal(partition_start) ||</span>
+<span class="nc" id="L184">       |                ' AND ${info.cols.dtg.quoted} &lt; ' || quote_literal(partition_end) || ' )';</span>
+       |            END IF;
+       |            RAISE INFO '% Done writing % rows to partition %', timeofday()::timestamp, unsorted_count, partition_name;
+       |
+<span class="nc" id="L188">       |            IF partition_parent = ${info.tables.spillPartitions.name.asLiteral} THEN</span>
+       |              -- store record of unsorted row counts which could negatively impact BRIN index scans
+<span class="nc" id="L190">       |              INSERT INTO ${info.tables.sortQueue.name.qualified}(partition_name, unsorted_count, enqueued)</span>
+       |                VALUES (partition_name, unsorted_count, now());
+       |              RAISE NOTICE 'Inserting % rows into spill partition %, queries may be impacted',
+       |                unsorted_count, partition_name;
+       |            END IF;
+       |
+       |            -- attach the partition table to the parent
+       |            IF NOT pexists THEN
+       |              RAISE INFO '% Attaching partition % to parent', timeofday()::timestamp, partition_name;
+<span class="nc" id="L199">       |              EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_parent) ||</span>
+<span class="nc" id="L200">       |                ' ATTACH PARTITION ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |                ' FOR VALUES FROM (' || quote_literal(partition_start) ||
+       |                ') TO (' || quote_literal(partition_end) || ' );';
+       |              -- once the table is attached we can drop the redundant constraint
+       |              -- however, this requires ACCESS EXCLUSIVE - since constraints are only checked on inserts
+       |              -- or updates, and partition tables are 'immutable' (only written to once), it shouldn't
+       |              -- affect anything to leave it. note that for 'spill' tables, there may be some redundant checks
+<span class="nc" id="L207">       |              -- EXECUTE 'ALTER TABLE ${info.schema.quoted}.' || quote_ident(partition_name) ||</span>
+       |              --  ' DROP CONSTRAINT ' || quote_ident(partition_name || '_constraint');
+       |              RAISE NOTICE 'A partition has been created %', partition_name;
+       |            END IF;
+       |
+       |            -- mark the partition to be analyzed in a separate thread
+<span class="nc" id="L213">       |            INSERT INTO ${info.tables.analyzeQueue.name.qualified}(partition_name, enqueued)</span>
+       |              VALUES (partition_name, now());
+       |          END LOOP;
+       |
+       |          RAISE INFO '% Dropping write ahead table %', timeofday()::timestamp, write_ahead.name;
+       |          -- requires ACCESS EXCLUSIVE lock
+       |          EXECUTE 'DROP TABLE ' || quote_ident(write_ahead.name);
+       |
+       |        END IF;
+       |
+       |        COMMIT; -- releases the lock
+       |      END LOOP;
+       |    END;
+       |  $$BODY$$;
+       |&quot;&quot;&quot;.stripMargin
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

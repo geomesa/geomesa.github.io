@@ -1,0 +1,410 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StatsBasedEstimator.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Index API</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.index.stats</a> &gt; <span class="el_source">StatsBasedEstimator.scala</span></div><h1>StatsBasedEstimator.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.index.stats
+
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.geotools.api.filter._
+import org.geotools.api.filter.expression.PropertyName
+import org.locationtech.geomesa.curve.{BinnedTime, Z2SFC, Z3SFC}
+import org.locationtech.geomesa.filter.Bounds.Bound
+import org.locationtech.geomesa.filter._
+import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+import org.locationtech.geomesa.utils.geotools._
+import org.locationtech.geomesa.zorder.sfcurve.IndexRange
+import org.locationtech.jts.geom.Geometry
+
+import java.time.ZonedDateTime
+import java.util.Date
+import scala.collection.JavaConverters._
+
+/**
+  * Estimate query counts based on cached stats.
+  *
+  * Although this trait only requires a generic GeoMesaStats implementation mixin, it has been written based
+  * on `MetadataBackedStats`. In particular, getCount(Filter.INCLUDE) is expected to look up the stat and
+  * not invoke any methods in this trait. Also, only Frequency and Z3Histograms are split out by time interval,
+  * so filters are only passed in when reading those two types.
+  */
+<span class="nc" id="L34">trait StatsBasedEstimator {</span>
+
+  stats: GeoMesaStats =&gt;
+
+  import StatsBasedEstimator.{ErrorThresholds, ZHistogramPrecision}
+
+  /**
+    * Estimates the count for a given filter, based off the per-attribute metadata we have stored
+    *
+    * @param sft simple feature type
+    * @param filter filter to apply - should have been run through QueryPlanFilterVisitor so all props are right
+    * @return estimated count, if available
+    */
+  protected def estimateCount(sft: SimpleFeatureType, filter: Filter): Option[Long] = {
+<span class="nc" id="L48">    filter match {</span>
+<span class="nc bnc" id="L49" title="All 6 branches missed.">      case Filter.INCLUDE =&gt; getCount(sft)</span>
+<span class="nc bnc" id="L50" title="All 6 branches missed.">      case Filter.EXCLUDE =&gt; Some(0L)</span>
+
+<span class="nc bnc" id="L52" title="All 2 branches missed.">      case a: And =&gt; estimateAndCount(sft, a)</span>
+<span class="nc bnc" id="L53" title="All 2 branches missed.">      case o: Or  =&gt; estimateOrCount(sft, o)</span>
+<span class="nc bnc" id="L54" title="All 2 branches missed.">      case n: Not =&gt; estimateNotCount(sft, n)</span>
+
+<span class="nc bnc" id="L56" title="All 2 branches missed.">      case i: Id =&gt; Some(i.getIdentifiers.size)</span>
+      case _ =&gt;
+        // single filter - equals, between, less than, etc
+<span class="nc" id="L59">        val attribute = FilterHelper.propertyNames(filter, sft).headOption</span>
+<span class="nc" id="L60">        attribute.flatMap(estimateAttributeCount(sft, filter, _))</span>
+    }
+  }
+
+  /**
+    * Estimate counts for AND filters. Since it's an AND, we calculate the child counts and
+    * return the minimum.
+    *
+    * We check for spatio-temporal filters first, as those are the only ones that operate on 2+ properties.
+    *
+    * @param sft simple feature type
+    * @param filter AND filter
+    * @return estimated count, if available
+    */
+  private def estimateAndCount(sft: SimpleFeatureType, filter: And): Option[Long] = {
+<span class="nc" id="L75">    val stCount = estimateSpatioTemporalCount(sft, filter)</span>
+    // note: we might over count if we get bbox1 AND bbox2, as we don't intersect them
+<span class="nc" id="L77">    val individualCounts = filter.getChildren.asScala.flatMap(estimateCount(sft, _))</span>
+<span class="nc" id="L78">    val counts = (stCount ++ individualCounts)</span>
+<span class="nc bnc" id="L79" title="All 2 branches missed.">    if (counts.isEmpty) { None } else { Some(counts.min) }</span>
+  }
+
+  /**
+    * Estimate counts for OR filters. Because this is an OR, we sum up the child counts
+    *
+    * @param sft simple feature type
+    * @param filter OR filter
+    * @return estimated count, if available
+    */
+  private def estimateOrCount(sft: SimpleFeatureType, filter: Or): Option[Long] = {
+    // estimate for each child separately and sum
+    // note that we might double count some values if the filter is complex
+<span class="nc" id="L92">    val counts = filter.getChildren.asScala.flatMap(estimateCount(sft, _))</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">    if (counts.isEmpty) { None } else { Some(counts.sum) }</span>
+  }
+
+  /**
+    * Estimates the count for NOT filters
+    *
+    * @param sft simple feature type
+    * @param filter filter
+    * @return count, if available
+    */
+  private def estimateNotCount(sft: SimpleFeatureType, filter: Not): Option[Long] = {
+<span class="nc" id="L104">    filter.getFilter match {</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">      case f: PropertyIsNull =&gt;</span>
+        // special handling for 'is not null'
+<span class="nc" id="L107">        f.getExpression match {</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">          case p: PropertyName =&gt; estimateRangeCount(sft, p.getPropertyName, Seq((None, None)))</span>
+<span class="nc" id="L109">          case _ =&gt; estimateCount(sft, Filter.INCLUDE) // not something we can handle...</span>
+        }
+
+      case f =&gt;
+        for {
+<span class="nc" id="L114">          all &lt;- estimateCount(sft, Filter.INCLUDE)</span>
+<span class="nc" id="L115">          neg &lt;- estimateCount(sft, f)</span>
+        } yield {
+<span class="nc" id="L117">          math.max(0, all - neg)</span>
+        }
+    }
+  }
+
+  /**
+    * Estimate spatio-temporal counts for an AND filter.
+    *
+    * @param sft simple feature type
+    * @param filter complex filter
+    * @return count, if available
+    */
+  private def estimateSpatioTemporalCount(sft: SimpleFeatureType, filter: And): Option[Long] = {
+    // currently we don't consider if the spatial predicate is actually AND'd with the temporal predicate...
+    // TODO add filterhelper method that accurately pulls out the st values
+    for {
+<span class="nc" id="L133">      geomField  &lt;- Option(sft.getGeomField)</span>
+<span class="nc bnc" id="L134" title="All 12 branches missed.">      dateField  &lt;- sft.getDtgField</span>
+<span class="nc" id="L135">      geometries =  FilterHelper.extractGeometries(filter, geomField, sft.isPoints)</span>
+<span class="nc" id="L136">      if geometries.nonEmpty</span>
+<span class="nc" id="L137">      intervals  =  FilterHelper.extractIntervals(filter, dateField)</span>
+<span class="nc" id="L138">      if intervals.nonEmpty</span>
+<span class="nc" id="L139">      bounds     &lt;- stats.getMinMax[Date](sft, dateField)</span>
+    } yield {
+<span class="nc bnc" id="L141" title="All 4 branches missed.">      if (geometries.disjoint || intervals.disjoint) { 0L } else {</span>
+        val inRangeIntervals = {
+<span class="nc" id="L143">          val minTime = bounds.min.getTime</span>
+<span class="nc" id="L144">          val maxTime = bounds.max.getTime</span>
+<span class="nc" id="L145">          intervals.values.filter { i =&gt;</span>
+<span class="nc bnc" id="L146" title="All 4 branches missed.">            i.lower.value.forall(_.toInstant.toEpochMilli &lt;= maxTime) &amp;&amp;</span>
+<span class="nc bnc" id="L147" title="All 4 branches missed.">                i.upper.value.forall(_.toInstant.toEpochMilli &gt;= minTime)</span>
+          }
+        }
+<span class="nc" id="L150">        val period = sft.getZ3Interval</span>
+<span class="nc" id="L151">        stats.getZ3Histogram(sft, geomField, dateField, period, 0, filter) match {</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">          case None =&gt; 0L</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">          case Some(histogram) =&gt;</span>
+            // time range for a chunk is 0 to 1 week (in seconds)
+<span class="nc" id="L155">            val sfc = Z3SFC(period)</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            val (tmin, tmax) = (sfc.time.min.toLong, sfc.time.max.toLong)</span>
+<span class="nc" id="L157">            val xy = geometries.values.map(GeometryUtils.bounds)</span>
+
+            def getIndices(t1: Long, t2: Long): Seq[Int] = {
+<span class="nc" id="L160">              val w = histogram.timeBins.head // z3 histogram bounds are fixed, so indices should be the same</span>
+<span class="nc" id="L161">              val zs = sfc.ranges(xy, Seq((t1, t2)), ZHistogramPrecision)</span>
+<span class="nc" id="L162">              zs.flatMap(r =&gt; histogram.directIndex(w, r.lower) to histogram.directIndex(w, r.upper))</span>
+            }
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            lazy val middleIndices = getIndices(tmin, tmax)</span>
+
+            // build up our indices by week so that we can deduplicate them afterwards
+<span class="nc" id="L167">            val timeBinsAndIndices = scala.collection.mutable.Map.empty[Short, Seq[Int]].withDefaultValue(Seq.empty)</span>
+
+<span class="nc" id="L169">            val dateToBins = BinnedTime.dateToBinnedTime(period)</span>
+<span class="nc" id="L170">            val boundsToDates = BinnedTime.boundsToIndexableDates(period)</span>
+<span class="nc" id="L171">            val binnedTimes = inRangeIntervals.map { interval =&gt;</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">              val (lower, upper) = boundsToDates(interval.bounds)</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">              val BinnedTime(lb, lt) = dateToBins(lower)</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">              val BinnedTime(ub, ut) = dateToBins(upper)</span>
+<span class="nc" id="L175">              (Range.inclusive(lb, ub).map(_.toShort), lt, ut)</span>
+            }
+
+            // the z3 index breaks time into 1 week chunks, so create a range for each week in our range
+<span class="nc bnc" id="L179" title="All 2 branches missed.">            binnedTimes.foreach { case (bins, lt, ut) =&gt;</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">              if (bins.length == 1) {</span>
+<span class="nc" id="L181">                timeBinsAndIndices(bins.head) ++= getIndices(lt, ut)</span>
+              } else {
+<span class="nc bnc" id="L183" title="All 4 branches missed.">                val head +: middle :+ last = bins.toList</span>
+<span class="nc" id="L184">                timeBinsAndIndices(head) ++= getIndices(lt, tmax)</span>
+<span class="nc" id="L185">                timeBinsAndIndices(last) ++= getIndices(tmin, ut)</span>
+<span class="nc" id="L186">                middle.foreach(m =&gt; timeBinsAndIndices(m) ++= middleIndices)</span>
+              }
+            }
+
+<span class="nc bnc" id="L190" title="All 2 branches missed.">            timeBinsAndIndices.map { case (b, indices) =&gt; indices.distinct.map(histogram.count(b, _)).sum }.sum</span>
+        }
+      }
+    }
+  }
+
+  /**
+    * Estimates the count for attribute filters (equals, less than, during, etc)
+    *
+    * @param sft simple feature type
+    * @param filter filter
+    * @param attribute attribute name to estimate
+    * @return count, if available
+    */
+  private def estimateAttributeCount(sft: SimpleFeatureType, filter: Filter, attribute: String): Option[Long] = {
+    import org.locationtech.geomesa.utils.geotools.RichAttributeDescriptors.RichAttributeDescriptor
+
+<span class="nc bnc" id="L207" title="All 6 branches missed.">    if (attribute == sft.getGeomField) {</span>
+<span class="nc" id="L208">      estimateSpatialCount(sft, filter)</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">    } else if (sft.getDtgField.contains(attribute)) {</span>
+<span class="nc" id="L210">      estimateTemporalCount(sft, filter)</span>
+    } else {
+      // we have an attribute filter
+      val extractedBounds = for {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        descriptor &lt;- Option(sft.getDescriptor(attribute))</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        binding    =  if (descriptor.isList) { descriptor.getListType() } else { descriptor.getType.getBinding }</span>
+      } yield {
+<span class="nc" id="L217">        FilterHelper.extractAttributeBounds(filter, attribute, binding.asInstanceOf[Class[Any]])</span>
+      }
+<span class="nc" id="L219">      extractedBounds.flatMap { bounds =&gt;</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        if (bounds.disjoint) {</span>
+<span class="nc" id="L221">          Some(0L) // disjoint range</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        } else if (!bounds.values.exists(_.isBounded)) {</span>
+<span class="nc" id="L223">          estimateCount(sft, Filter.INCLUDE) // inclusive filter</span>
+        } else {
+<span class="nc" id="L225">          val boundsValues = bounds.values.map(b =&gt; (b.lower.value, b.upper.value))</span>
+<span class="nc bnc" id="L226" title="All 10 branches missed.">          val (equalsBounds, rangeBounds) = boundsValues.partition { case (l, r) =&gt; l == r }</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">          val equalsCount = if (equalsBounds.isEmpty) { Some(0L) } else {</span>
+            // compare equals estimate with range estimate and take the smaller
+<span class="nc" id="L229">            val equals = estimateEqualsCount(sft, filter, attribute, equalsBounds.map(_._1.get))</span>
+<span class="nc" id="L230">            val range  = estimateRangeCount(sft, attribute, equalsBounds)</span>
+<span class="nc bnc" id="L231" title="All 6 branches missed.">            (equals, range) match {</span>
+<span class="nc bnc" id="L232" title="All 4 branches missed.">              case (Some(e), Some(r)) =&gt; Some(math.min(e, r))</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">              case (None, r) =&gt; r</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">              case (e, None) =&gt; e</span>
+            }
+          }
+<span class="nc bnc" id="L237" title="All 2 branches missed.">          val rangeCount = if (rangeBounds.isEmpty) { Some(0L) } else {</span>
+<span class="nc" id="L238">            estimateRangeCount(sft, attribute, rangeBounds)</span>
+          }
+<span class="nc" id="L240">          for { e &lt;- equalsCount; r &lt;- rangeCount } yield { e + r }</span>
+        }
+      }
+    }
+  }
+
+  /**
+    * Estimates counts from spatial predicates. Non-spatial predicates will be ignored.
+    *
+    * @param filter filter to evaluate
+    * @return estimated count, if available
+    */
+  private def estimateSpatialCount(sft: SimpleFeatureType, filter: Filter): Option[Long] = {
+<span class="nc" id="L253">    val geometries = FilterHelper.extractGeometries(filter, sft.getGeomField, sft.isPoints)</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">    if (geometries.isEmpty) {</span>
+<span class="nc" id="L255">      None</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">    } else if (geometries.disjoint) {</span>
+<span class="nc" id="L257">      Some(0L)</span>
+    } else {
+<span class="nc" id="L259">      val zero = GeometryUtils.zeroPoint</span>
+<span class="nc" id="L260">      stats.getHistogram[Geometry](sft, sft.getGeomField, 0, zero, zero).map { histogram =&gt;</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        val (zLo, zHi) = {</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">          val (xmin, ymin, _, _) = GeometryUtils.bounds(histogram.min)</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">          val (_, _, xmax, ymax) = GeometryUtils.bounds(histogram.max)</span>
+<span class="nc" id="L264">          (Z2SFC.index(xmin, ymin), Z2SFC.index(xmax, ymax))</span>
+        }
+<span class="nc bnc" id="L266" title="All 4 branches missed.">        def inRange(r: IndexRange) = r.lower &lt; zHi &amp;&amp; r.upper &gt; zLo</span>
+
+<span class="nc" id="L268">        val ranges = Z2SFC.ranges(geometries.values.map(GeometryUtils.bounds), ZHistogramPrecision)</span>
+<span class="nc" id="L269">        val indices = ranges.filter(inRange).flatMap { range =&gt;</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">          val loIndex = Some(histogram.directIndex(range.lower)).filter(_ != -1).getOrElse(0)</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">          val hiIndex = Some(histogram.directIndex(range.upper)).filter(_ != -1).getOrElse(histogram.length - 1)</span>
+<span class="nc" id="L272">          loIndex to hiIndex</span>
+        }
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        if (indices.isEmpty) { 0L } else { indices.distinct.map(histogram.count).sum }</span>
+      }
+    }
+  }
+
+  /**
+    * Estimates counts from temporal predicates. Non-temporal predicates will be ignored.
+    *
+    * @param sft simple feature type
+    * @param filter filter to evaluate
+    * @return estimated count, if available
+    */
+  private def estimateTemporalCount(sft: SimpleFeatureType, filter: Filter): Option[Long] = {
+    for {
+<span class="nc bnc" id="L288" title="All 4 branches missed.">      dateField &lt;- sft.getDtgField</span>
+<span class="nc" id="L289">      intervals =  FilterHelper.extractIntervals(filter, dateField)</span>
+<span class="nc" id="L290">      if intervals.nonEmpty</span>
+<span class="nc" id="L291">      histogram &lt;- stats.getHistogram[Date](sft, dateField, 0, new Date(), new Date())</span>
+    } yield {
+      def inRange(interval: Bounds[ZonedDateTime]) = {
+<span class="nc bnc" id="L294" title="All 4 branches missed.">        interval.lower.value.forall(_.toInstant.toEpochMilli &lt;= histogram.max.getTime) &amp;&amp;</span>
+<span class="nc bnc" id="L295" title="All 4 branches missed.">            interval.upper.value.forall(_.toInstant.toEpochMilli &gt;= histogram.min.getTime)</span>
+      }
+
+<span class="nc bnc" id="L298" title="All 2 branches missed.">      if (intervals.disjoint) { 0L } else {</span>
+<span class="nc" id="L299">        val indices = intervals.values.filter(inRange).flatMap { interval =&gt;</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">          val loIndex = interval.lower.value.map(i =&gt; histogram.indexOf(Date.from(i.toInstant))).filter(_ != -1).getOrElse(0)</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">          val hiIndex = interval.upper.value.map(i =&gt; histogram.indexOf(Date.from(i.toInstant))).filter(_ != -1).getOrElse(histogram.length - 1)</span>
+<span class="nc" id="L302">          loIndex to hiIndex</span>
+        }
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        if (indices.isEmpty) { 0L } else { indices.distinct.map(histogram.count).sum }</span>
+      }
+    }
+  }
+
+  /**
+    * Estimates an equals predicate. Uses frequency (count min sketch) for estimated value.
+    *
+    * @param sft simple feature type
+    * @param attribute attribute to evaluate
+    * @param values values to be estimated
+    * @return estimated count, if available.
+    */
+  private def estimateEqualsCount(
+      sft: SimpleFeatureType,
+      filter: Filter,
+      attribute: String,
+      values: Seq[Any]): Option[Long] = {
+<span class="nc" id="L322">    stats.getFrequency[Any](sft, attribute, 0, filter).map { freq =&gt;</span>
+      // frequency estimates will never return less than the actual number, but will often return more
+      // frequency has ~0.5% error rate based on the total number of features in the data set
+      // we adjust the raw estimate based on the absolute error rate
+
+<span class="nc" id="L327">      val absoluteError = math.floor(freq.size * freq.eps)</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">      val counts = if (absoluteError &lt; 1.0) { values.map(freq.count) } else {</span>
+<span class="nc" id="L329">        values.map { v =&gt;</span>
+<span class="nc" id="L330">          val estimate = freq.count(v)</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">          if (estimate == 0L) {</span>
+<span class="nc" id="L332">            0L</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">          } else if (estimate &gt; absoluteError) {</span>
+<span class="nc" id="L334">            val relativeError = absoluteError / estimate</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            estimate - (ErrorThresholds.dropWhile(_ &lt;= relativeError).head * 0.5 * absoluteError).toLong</span>
+          } else {
+<span class="nc" id="L337">            val relativeError = estimate / absoluteError</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">            (ErrorThresholds.dropWhile(_ &lt; relativeError).head * 0.5 * estimate).toLong</span>
+          }
+        }
+      }
+<span class="nc" id="L342">      counts.sum</span>
+    }
+  }
+
+  /**
+    * Estimates a potentially unbounded range predicate. Uses a binned histogram for estimated value.
+    *
+    * @param sft simple feature type
+    * @param attribute attribute to evaluate
+    * @param ranges ranges of values - may be unbounded (indicated by a None)
+    * @return estimated count, if available
+    */
+  private def estimateRangeCount(
+      sft: SimpleFeatureType,
+      attribute: String,
+      ranges: Seq[(Option[Any], Option[Any])]): Option[Long] = {
+<span class="nc" id="L358">    stats.getHistogram[Any](sft, attribute, 0, 0, 0).map { histogram =&gt;</span>
+<span class="nc bnc" id="L359" title="All 8 branches missed.">      val inRangeRanges = ranges.filter {</span>
+<span class="nc bnc" id="L360" title="All 4 branches missed.">        case (None, None)         =&gt; true // inclusive filter</span>
+<span class="nc bnc" id="L361" title="All 6 branches missed.">        case (Some(lo), None)     =&gt; histogram.defaults.min(lo, histogram.max) == lo</span>
+<span class="nc bnc" id="L362" title="All 6 branches missed.">        case (None, Some(up))     =&gt; histogram.defaults.max(up, histogram.min) == up</span>
+<span class="nc bnc" id="L363" title="All 4 branches missed.">        case (Some(lo), Some(up)) =&gt;</span>
+<span class="nc bnc" id="L364" title="All 4 branches missed.">          histogram.defaults.min(lo, histogram.max) == lo &amp;&amp; histogram.defaults.max(up, histogram.min) == up</span>
+      }
+<span class="nc bnc" id="L366" title="All 2 branches missed.">      val indices = inRangeRanges.flatMap { case (lower, upper) =&gt;</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">        val lowerIndex = lower.map(histogram.indexOf).filter(_ != -1).getOrElse(0)</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        val upperIndex = upper.map(histogram.indexOf).filter(_ != -1).getOrElse(histogram.length - 1)</span>
+<span class="nc" id="L369">        lowerIndex to upperIndex</span>
+      }
+<span class="nc bnc" id="L371" title="All 2 branches missed.">      if (indices.isEmpty) { 0L } else { indices.distinct.map(histogram.count).sum }</span>
+    }
+  }
+}
+
+<span class="nc" id="L376">object StatsBasedEstimator {</span>
+
+  // we only need enough precision to cover the number of bins (e.g. 2^n == bins), plus 2 for unused bits
+<span class="nc" id="L379">  val ZHistogramPrecision: Int = math.ceil(math.log(GeoMesaStats.MaxHistogramSize) / math.log(2)).toInt + 2</span>
+
+<span class="nc" id="L381">  val ErrorThresholds: Seq[Double] = Seq(0.1, 0.3, 0.5, 0.7, 0.9, 1.0)</span>
+
+  /**
+    * Extracts date bounds from a filter. None is used to indicate a disjoint date range, otherwise
+    * there will be a bounds object (which may be unbounded).
+    *
+    * @param sft simple feature type
+    * @param filter filter
+    * @return None, if disjoint filters, otherwise date bounds (which may be unbounded)
+    */
+  private [stats] def extractDates(sft: SimpleFeatureType, filter: Filter): Option[Bounds[Date]] = {
+<span class="nc" id="L392">    sft.getDtgField match {</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">      case None =&gt; Some(Bounds.everything)</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">      case Some(dtg) =&gt;</span>
+<span class="nc" id="L395">        val intervals = FilterHelper.extractIntervals(filter, dtg)</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        if (intervals.disjoint) { None } else {</span>
+          // don't consider gaps, just get the endpoints of the intervals
+<span class="nc bnc" id="L398" title="All 2 branches missed.">          val dateTimes = intervals.values.reduceOption[Bounds[ZonedDateTime]] { case (left, right) =&gt;</span>
+<span class="nc" id="L399">            val lower = Bounds.smallerLowerBound(left.lower, right.lower)</span>
+<span class="nc" id="L400">            val upper = Bounds.largerUpperBound(left.upper, right.upper)</span>
+<span class="nc" id="L401">            Bounds(lower, upper)</span>
+          }
+<span class="nc" id="L403">          val lower = dateTimes.map(d =&gt; Bound(d.lower.value.map(i =&gt; Date.from(i.toInstant)), d.lower.inclusive))</span>
+<span class="nc" id="L404">          val upper = dateTimes.map(d =&gt; Bound(d.upper.value.map(i =&gt; Date.from(i.toInstant)), d.upper.inclusive))</span>
+<span class="nc" id="L405">          Some(Bounds(lower.getOrElse(Bound.unbounded[Date]), upper.getOrElse(Bound.unbounded[Date])))</span>
+        }
+    }
+  }
+<span class="nc" id="L409">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

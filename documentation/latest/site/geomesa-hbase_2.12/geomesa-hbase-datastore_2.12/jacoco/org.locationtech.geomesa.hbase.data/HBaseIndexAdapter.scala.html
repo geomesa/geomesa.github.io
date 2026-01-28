@@ -1,0 +1,747 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HBaseIndexAdapter.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa HBase DataStore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.hbase.data</a> &gt; <span class="el_source">HBaseIndexAdapter.scala</span></div><h1>HBaseIndexAdapter.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.hbase.data
+
+import com.typesafe.scalalogging.{LazyLogging, StrictLogging}
+import org.apache.hadoop.fs.Path
+import org.apache.hadoop.hbase.client._
+import org.apache.hadoop.hbase.filter.MultiRowRangeFilter.RowRange
+import org.apache.hadoop.hbase.filter.{FilterList, KeyOnlyFilter, MultiRowRangeFilter, Filter =&gt; HFilter}
+import org.apache.hadoop.hbase.io.compress.Compression
+import org.apache.hadoop.hbase.io.compress.Compression.Algorithm
+import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding
+import org.apache.hadoop.hbase.regionserver.BloomType
+import org.apache.hadoop.hbase.security.visibility.CellVisibility
+import org.apache.hadoop.hbase.{Coprocessor, NamespaceDescriptor, TableName}
+import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
+import org.geotools.api.filter.Filter
+import org.locationtech.geomesa.filter.factory.FastFilterFactory
+import org.locationtech.geomesa.hbase.HBaseSystemProperties
+import org.locationtech.geomesa.hbase.HBaseSystemProperties.{CoprocessorPath, CoprocessorUrl, TableAvailabilityTimeout}
+import org.locationtech.geomesa.hbase.aggregators.HBaseArrowAggregator.HBaseArrowResultsToFeatures
+import org.locationtech.geomesa.hbase.aggregators.HBaseBinAggregator.HBaseBinResultsToFeatures
+import org.locationtech.geomesa.hbase.aggregators.HBaseDensityAggregator.HBaseDensityResultsToFeatures
+import org.locationtech.geomesa.hbase.aggregators.HBaseStatsAggregator.HBaseStatsResultsToFeatures
+import org.locationtech.geomesa.hbase.aggregators.{HBaseArrowAggregator, HBaseBinAggregator, HBaseDensityAggregator, HBaseStatsAggregator}
+import org.locationtech.geomesa.hbase.data.HBaseQueryPlan._
+import org.locationtech.geomesa.hbase.rpc.coprocessor.GeoMesaCoprocessor
+import org.locationtech.geomesa.hbase.rpc.filter._
+import org.locationtech.geomesa.index.api.IndexAdapter.{BaseIndexWriter, RequiredVisibilityWriter}
+import org.locationtech.geomesa.index.api.QueryPlan.{FeatureReducer, IndexResultsToFeatures, ResultsToFeatures}
+import org.locationtech.geomesa.index.api.WritableFeature.FeatureWrapper
+import org.locationtech.geomesa.index.api._
+import org.locationtech.geomesa.index.conf.{ColumnGroups, QueryHints}
+import org.locationtech.geomesa.index.index.id.IdIndex
+import org.locationtech.geomesa.index.iterators.StatsScan
+import org.locationtech.geomesa.index.planning.LocalQueryRunner.LocalProcessor
+import org.locationtech.geomesa.index.utils.Explainer
+import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+import org.locationtech.geomesa.utils.index.ByteArrays
+import org.locationtech.geomesa.utils.io.{CloseWithLogging, FlushWithLogging, IsFlushableImplicits, WithClose}
+import org.locationtech.geomesa.utils.text.StringSerialization
+
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.TimeUnit
+import java.util.regex.Pattern
+import java.util.{Collections, Locale, UUID}
+import scala.util.control.NonFatal
+import scala.util.{Random, Try}
+
+<span class="nc" id="L56">class HBaseIndexAdapter(ds: HBaseDataStore) extends IndexAdapter[HBaseDataStore] with StrictLogging {</span>
+
+  import HBaseIndexAdapter._
+  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+  import scala.collection.JavaConverters._
+
+<span class="nc bnc" id="L63" title="All 4 branches missed.">  lazy private val dynamicJarPath: Option[Path] = try {</span>
+    val conf = ds.connection.getConfiguration
+    // the jar should be under hbase.dynamic.jars.dir to enable filters, so look there
+    val dir = new Path(conf.get(&quot;hbase.dynamic.jars.dir&quot;))
+    WithClose(dir.getFileSystem(conf)) { fs =&gt;
+<span class="nc bnc" id="L68" title="All 2 branches missed.">      if (!fs.getFileStatus(dir).isDirectory) { None } else {</span>
+<span class="nc" id="L69">        fs.listStatus(dir).collectFirst {</span>
+<span class="nc bnc" id="L70" title="All 4 branches missed.">          case s if distributedJarNamePattern.matcher(s.getPath.getName).matches() =&gt; s.getPath</span>
+        }
+      }
+    }
+  } catch {
+    case NonFatal(e) =&gt; logger.warn(&quot;Error checking dynamic jar path:&quot;, e); None
+  }
+
+  override def createTable(
+      index: GeoMesaFeatureIndex[_, _],
+      partition: Option[String],
+      splits: =&gt; Seq[Array[Byte]]): Unit = {
+    // write table name to metadata
+<span class="nc" id="L83">    val name = TableName.valueOf(index.configureTableName(partition, tableNameLimit))</span>
+
+<span class="nc" id="L85">    WithClose(ds.connection.getAdmin) { admin =&gt;</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">      if (!admin.tableExists(name)) {</span>
+<span class="nc bnc" id="L87" title="All 2 branches missed.">        logger.debug(s&quot;Creating table $name&quot;)</span>
+
+<span class="nc" id="L89">        val conf = admin.getConfiguration</span>
+
+<span class="nc" id="L91">        val compression = index.sft.getCompression.map { alg =&gt;</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">          logger.debug(s&quot;Setting compression '$alg' on table $name for feature ${index.sft.getTypeName}&quot;)</span>
+          // note: all compression types in HBase are case-sensitive and lower-cased
+<span class="nc" id="L94">          Compression.getCompressionAlgorithmByName(alg.toLowerCase(Locale.US))</span>
+        }
+
+<span class="nc" id="L97">        val cols = groups.apply(index.sft).map(_._1)</span>
+<span class="nc" id="L98">        val bloom = Some(BloomType.NONE)</span>
+<span class="nc bnc" id="L99" title="All 6 branches missed.">        val encoding = if (index.name == IdIndex.name) { None } else { Some(DataBlockEncoding.FAST_DIFF) }</span>
+
+<span class="nc bnc" id="L101" title="All 2 branches missed.">        val coprocessor = if (!ds.config.remoteFilter) { None } else {</span>
+          // if the coprocessors are installed site-wide don't register them in the table descriptor.
+          // this key is CoprocessorHost.USER_REGION_COPROCESSOR_CONF_KEY - but don't want to pull in
+          // a dependency on hbase-server just for this constant
+<span class="nc" id="L105">          val installed = Option(conf.get(&quot;hbase.coprocessor.user.region.classes&quot;))</span>
+<span class="nc" id="L106">          val names = installed.map(_.split(&quot;:&quot;).toSet).getOrElse(Set.empty[String])</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">          if (names.contains(CoprocessorClass)) { None } else {</span>
+            // noinspection ScalaDeprecation
+<span class="nc" id="L109">            def urlFromSysProp: Option[Path] = CoprocessorUrl.option.orElse(CoprocessorPath.option).map(new Path(_))</span>
+<span class="nc" id="L110">            val coprocessorUrl = ds.config.coprocessors.url.orElse(urlFromSysProp).orElse(dynamicJarPath)</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">            logger.debug(s&quot;Using coprocessor path ${coprocessorUrl.orNull}&quot;)</span>
+            // TODO: Warn if the path given is different from paths registered in other coprocessors
+            // if so, other tables would need updating
+<span class="nc" id="L114">            Some(CoprocessorClass -&gt; coprocessorUrl)</span>
+          }
+        }
+<span class="nc" id="L117">        val metadata = index.sft.getTableProps</span>
+
+        try {
+<span class="nc" id="L120">          createTableAsync(admin, name, cols, bloom, compression, encoding, None, coprocessor, splits, metadata)</span>
+        } catch {
+<span class="nc" id="L122">          case _: org.apache.hadoop.hbase.TableExistsException =&gt; // ignore, another thread created it for us</span>
+        }
+      }
+
+<span class="nc" id="L126">      waitForTable(admin, name)</span>
+    }
+  }
+
+  override def renameTable(from: String, to: String): Unit = {
+<span class="nc" id="L131">    WithClose(ds.connection.getAdmin) { admin =&gt;</span>
+<span class="nc" id="L132">      val existing = TableName.valueOf(from)</span>
+<span class="nc" id="L133">      val renamed = TableName.valueOf(to)</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">      if (admin.tableExists(existing)) {</span>
+        // renaming in hbase requires creating a snapshot and using that to create the new table
+<span class="nc" id="L136">        val snapshot = StringSerialization.alphaNumericSafeString(UUID.randomUUID().toString)</span>
+<span class="nc" id="L137">        admin.disableTable(existing)</span>
+<span class="nc" id="L138">        admin.snapshot(snapshot, existing)</span>
+<span class="nc" id="L139">        admin.cloneSnapshot(snapshot, renamed)</span>
+<span class="nc" id="L140">        admin.deleteSnapshot(snapshot)</span>
+<span class="nc" id="L141">        admin.deleteTable(existing)</span>
+<span class="nc" id="L142">        waitForTable(admin, renamed)</span>
+      }
+    }
+  }
+
+  override def deleteTables(tables: Seq[String]): Unit = {
+<span class="nc" id="L148">    WithClose(ds.connection.getAdmin) { admin =&gt;</span>
+      def deleteOne(name: String): Unit = {
+<span class="nc" id="L150">        val table = TableName.valueOf(name)</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">        if (admin.tableExists(table)) {</span>
+<span class="nc" id="L152">          admin.disableTableAsync(table)</span>
+<span class="nc" id="L153">          val timeout = TableAvailabilityTimeout.toUnboundedDuration.filter(_.isFinite)</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">          logger.debug(s&quot;Waiting for table '$table' to be disabled with &quot; +</span>
+<span class="nc" id="L155">              s&quot;${timeout.map(t =&gt; s&quot;a timeout of $t&quot;).getOrElse(&quot;no timeout&quot;)}&quot;)</span>
+<span class="nc" id="L156">          val stop = timeout.map(t =&gt; System.currentTimeMillis() + t.toMillis)</span>
+<span class="nc bnc" id="L157" title="All 6 branches missed.">          while (!admin.isTableDisabled(table) &amp;&amp; stop.forall(_ &gt; System.currentTimeMillis())) {</span>
+<span class="nc" id="L158">            Thread.sleep(1000)</span>
+          }
+          // no async operation, but timeout can be controlled through hbase-site.xml &quot;hbase.client.sync.wait.timeout.msec&quot;
+<span class="nc" id="L161">          admin.deleteTable(table)</span>
+        }
+      }
+<span class="nc" id="L164">      tables.toList.map(t =&gt; CachedThreadPool.submit(() =&gt; deleteOne(t))).foreach(_.get)</span>
+    }
+  }
+
+  override def clearTables(tables: Seq[String], prefix: Option[Array[Byte]]): Unit = {
+    def clearOne(name: String): Unit = {
+<span class="nc" id="L170">      val tableName = TableName.valueOf(name)</span>
+<span class="nc" id="L171">      WithClose(ds.connection.getTable(tableName)) { table =&gt;</span>
+<span class="nc" id="L172">        val scan = new Scan().setFilter(new KeyOnlyFilter)</span>
+<span class="nc" id="L173">        prefix.foreach(scan.setStartStopRowForPrefixScan)</span>
+<span class="nc" id="L174">        ds.applySecurity(scan)</span>
+<span class="nc" id="L175">        val mutateParams = new BufferedMutatorParams(tableName)</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        WithClose(table.getScanner(scan), ds.connection.getBufferedMutator(mutateParams)) { case (scanner, mutator) =&gt;</span>
+<span class="nc" id="L177">          scanner.iterator.asScala.grouped(10000).foreach { result =&gt;</span>
+            // TODO GEOMESA-2546 set delete visibilities
+<span class="nc" id="L179">            val deletes = result.map(r =&gt; new Delete(r.getRow))</span>
+<span class="nc" id="L180">            mutator.mutate(deletes.asJava)</span>
+          }
+        }
+      }
+    }
+<span class="nc" id="L185">    tables.toList.map(t =&gt; CachedThreadPool.submit(() =&gt; clearOne(t))).foreach(_.get)</span>
+  }
+
+  override def createQueryPlan(strategy: QueryStrategy): HBaseQueryPlan = {
+
+    import org.locationtech.geomesa.index.conf.QueryHints.RichHints
+
+<span class="nc" id="L192">    val byteRanges = strategy.ranges</span>
+<span class="nc" id="L193">    val hints = strategy.hints</span>
+<span class="nc" id="L194">    val index = strategy.index</span>
+
+    // index api defines empty start/end for open-ended range
+    // index api defines start row inclusive, end row exclusive
+    // both these conventions match the conventions for hbase scan objects
+<span class="nc" id="L199">    val ranges = byteRanges.map {</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">      case BoundedByteRange(start, stop) =&gt; new RowRange(start, true, stop, false)</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">      case SingleRowByteRange(row)       =&gt; new RowRange(row, true, ByteArrays.rowFollowingRow(row), false)</span>
+    }
+<span class="nc" id="L203">    val small = byteRanges.headOption.exists(_.isInstanceOf[SingleRowByteRange])</span>
+
+<span class="nc" id="L205">    val tables = index.getTablesForQuery(strategy.filter.filter).map(TableName.valueOf)</span>
+
+    // check for an empty query plan, if there are no tables or ranges to scan
+    def empty(reducer: Option[FeatureReducer]): Option[HBaseQueryPlan] =
+<span class="nc bnc" id="L209" title="All 4 branches missed.">      if (tables.isEmpty || ranges.isEmpty) { Some(EmptyPlan(ds, strategy, reducer)) } else { None }</span>
+
+<span class="nc bnc" id="L211" title="All 2 branches missed.">    if (!ds.config.remoteFilter) {</span>
+      // everything is done client side
+      // note: we use the full filter here, since we can't use the z3 server-side filter
+      // for some attribute queries we wouldn't need the full filter...
+<span class="nc bnc" id="L215" title="All 2 branches missed.">      val (colFamily, schema) = groups.group(index.sft, hints.getTransformDefinition, strategy.filter.filter)</span>
+      // re-optimize the filter to account for the colFamily/schema being used
+      val ecql = {
+<span class="nc" id="L218">        val f = strategy.filter.filter</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if (colFamily.eq(ColumnGroups.Default)) { f } else { f.map(FastFilterFactory.optimize(schema, _)) }</span>
+      }
+      // note: we assume visibility filtering is still done server-side as it's part of core hbase
+<span class="nc" id="L222">      val processor = LocalProcessor(schema, hints, None)</span>
+<span class="nc" id="L223">      empty(processor.reducer).getOrElse {</span>
+<span class="nc" id="L224">        val scans = configureScans(tables, ranges, small, colFamily, Seq.empty, coprocessor = false)</span>
+<span class="nc" id="L225">        LocalProcessorScanPlan(ds, strategy, ranges, scans, ecql, processor, hints.getProjection)</span>
+      }
+    } else {
+<span class="nc" id="L228">      val ecql = strategy.ecql</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">      val (colFamily, schema) = groups.group(index.sft, hints.getTransformDefinition, ecql)</span>
+<span class="nc" id="L230">      val projection = hints.getProjection</span>
+<span class="nc" id="L231">      val indexFilter = strategy.values.flatMap(IndexFilters(index, _))</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">      lazy val returnSchema = hints.getTransformSchema.getOrElse(schema)</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">      lazy val scans = {</span>
+        val transform = hints.getTransform
+        val cqlFilter = if (ecql.isEmpty &amp;&amp; transform.isEmpty &amp;&amp; hints.getSampling.isEmpty) { Seq.empty } else {
+          Seq((CqlTransformFilter.Priority, CqlTransformFilter(schema, index, ecql, transform, hints)))
+        }
+<span class="nc" id="L238">        val filters = (cqlFilter ++ indexFilter).sortBy(_._1).map(_._2)</span>
+        configureScans(tables, ranges, small, colFamily, filters, coprocessor = false)
+      }
+
+      def coprocessorPlan(options: Map[String, String], toFeatures: ResultsToFeatures[Array[Byte]], reducer: Option[FeatureReducer]): CoprocessorPlan = {
+<span class="nc" id="L243">        val coprocessorOptions = Map(GeoMesaCoprocessor.YieldOpt -&gt; String.valueOf(ds.config.coprocessors.yieldPartialResults))</span>
+<span class="nc" id="L244">        val scans = configureScans(tables, ranges, small, colFamily, indexFilter.toSeq.map(_._2), coprocessor = true)</span>
+<span class="nc" id="L245">        CoprocessorPlan(ds, strategy, ranges, scans, options ++ coprocessorOptions, toFeatures, reducer, hints.getMaxFeatures, projection)</span>
+      }
+
+      def semiLocalPlan(): LocalProcessorScanPlan = {
+        // note: transforms are handled in the cqlTransformFilter
+<span class="nc" id="L250">        val processor = LocalProcessor(returnSchema, QueryHints.Internal.clearTransforms(hints), None)</span>
+<span class="nc" id="L251">        LocalProcessorScanPlan(ds, strategy, ranges, scans, None, processor, projection)</span>
+      }
+
+<span class="nc bnc" id="L254" title="All 2 branches missed.">      if (hints.isDensityQuery) {</span>
+<span class="nc" id="L255">        empty(None).getOrElse {</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">          if (ds.config.coprocessors.enabled.density) {</span>
+<span class="nc" id="L257">            val options = HBaseDensityAggregator.configure(schema, index, ecql, hints)</span>
+<span class="nc" id="L258">            val results = new HBaseDensityResultsToFeatures()</span>
+<span class="nc" id="L259">            coprocessorPlan(options, results, None)</span>
+          } else {
+<span class="nc" id="L261">            semiLocalPlan()</span>
+          }
+        }
+<span class="nc bnc" id="L264" title="All 2 branches missed.">      } else if (hints.isArrowQuery) {</span>
+<span class="nc" id="L265">        val config = HBaseArrowAggregator.configure(schema, index, ds.stats, strategy.filter.filter, ecql, hints)</span>
+<span class="nc" id="L266">        val reducer = Some(config.reduce)</span>
+<span class="nc" id="L267">        empty(reducer).getOrElse {</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">          if (ds.config.coprocessors.enabled.arrow) {</span>
+<span class="nc" id="L269">            val options = config.config</span>
+<span class="nc" id="L270">            val results = new HBaseArrowResultsToFeatures()</span>
+<span class="nc" id="L271">            coprocessorPlan(options, results, reducer)</span>
+          } else {
+<span class="nc" id="L273">            semiLocalPlan()</span>
+          }
+        }
+<span class="nc bnc" id="L276" title="All 2 branches missed.">      } else if (hints.isStatsQuery) {</span>
+<span class="nc" id="L277">        val reducer = Some(StatsScan.StatsReducer(returnSchema, hints))</span>
+<span class="nc" id="L278">        empty(reducer).getOrElse {</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">          if (ds.config.coprocessors.enabled.stats) {</span>
+<span class="nc" id="L280">            val options = HBaseStatsAggregator.configure(schema, index, ecql, hints)</span>
+<span class="nc" id="L281">            val results = new HBaseStatsResultsToFeatures()</span>
+<span class="nc" id="L282">            coprocessorPlan(options, results, reducer)</span>
+          } else {
+<span class="nc" id="L284">            semiLocalPlan()</span>
+          }
+        }
+<span class="nc bnc" id="L287" title="All 2 branches missed.">      } else if (hints.isBinQuery) {</span>
+<span class="nc" id="L288">        empty(None).getOrElse {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">          if (ds.config.coprocessors.enabled.bin) {</span>
+<span class="nc" id="L290">            val options = HBaseBinAggregator.configure(schema, index, ecql, hints)</span>
+<span class="nc" id="L291">            val results = new HBaseBinResultsToFeatures()</span>
+<span class="nc" id="L292">            coprocessorPlan(options, results, None)</span>
+          } else {
+<span class="nc" id="L294">            semiLocalPlan()</span>
+          }
+        }
+      } else {
+<span class="nc" id="L298">        empty(None).getOrElse {</span>
+<span class="nc" id="L299">          val resultsToFeatures = new HBaseResultsToFeatures(index, returnSchema)</span>
+<span class="nc" id="L300">          ScanPlan(ds, strategy, ranges, scans, resultsToFeatures, hints.getSortFields, hints.getMaxFeatures, projection)</span>
+        }
+      }
+    }
+  }
+
+  override def createWriter(
+      sft: SimpleFeatureType,
+      indices: Seq[GeoMesaFeatureIndex[_, _]],
+      partition: Option[String],
+      atomic: Boolean): HBaseIndexWriter = {
+<span class="nc bnc" id="L311" title="All 2 branches missed.">    require(!atomic, &quot;HBase data store does not currently support atomic writes&quot;)</span>
+<span class="nc" id="L312">    val wrapper = WritableFeature.wrapper(sft, groups)</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">    if (sft.isVisibilityRequired) {</span>
+<span class="nc" id="L314">      new HBaseIndexWriter(ds, indices, wrapper, partition) with RequiredVisibilityWriter</span>
+    } else {
+<span class="nc" id="L316">      new HBaseIndexWriter(ds, indices, wrapper, partition)</span>
+    }
+  }
+
+  override def getStrategyCost(strategy: FilterStrategy, explain: Explainer): Option[Long] =
+<span class="nc" id="L321">    ds.stats.getCount(strategy.index.sft, strategy.primary.getOrElse(Filter.INCLUDE))</span>
+
+  /**
+   * Configure the hbase scan
+   *
+   * @param tables tables being scanned, used for region location information
+   * @param ranges ranges to scan, non-empty. needs to be mutable as we will sort it in place
+   * @param small whether 'small' ranges (i.e. gets)
+   * @param colFamily col family to scan
+   * @param filters scan filters
+   * @param coprocessor is this a coprocessor scan or not
+   * @return
+   */
+  private def configureScans(
+      tables: Seq[TableName],
+      ranges: Seq[RowRange],
+      small: Boolean,
+      colFamily: Array[Byte],
+      filters: Seq[HFilter],
+      coprocessor: Boolean): Seq[TableScan] = {
+<span class="nc" id="L341">    val cacheBlocks = HBaseSystemProperties.ScannerBlockCaching.toBoolean.get // has a default value so .get is safe</span>
+<span class="nc" id="L342">    val cacheSize = HBaseSystemProperties.ScannerCaching.toInt</span>
+
+<span class="nc bnc" id="L344" title="All 2 branches missed.">    logger.debug(s&quot;HBase client scanner: block caching: $cacheBlocks, caching: $cacheSize&quot;)</span>
+
+<span class="nc bnc" id="L346" title="All 4 branches missed.">    if (small &amp;&amp; !coprocessor) {</span>
+<span class="nc" id="L347">      val filter = filters match {</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">        case Nil    =&gt; None</span>
+<span class="nc bnc" id="L349" title="All 6 branches missed.">        case Seq(f) =&gt; Some(f)</span>
+<span class="nc" id="L350">        case f      =&gt; Some(new FilterList(f: _*))</span>
+      }
+      // note: we have to copy the ranges for each table scan
+<span class="nc" id="L353">      tables.map { table =&gt;</span>
+<span class="nc" id="L354">        val scans = ranges.map { r =&gt;</span>
+<span class="nc" id="L355">          val scan = new Scan().withStartRow(r.getStartRow).withStopRow(r.getStopRow)</span>
+<span class="nc" id="L356">          scan.addFamily(colFamily).setCacheBlocks(cacheBlocks).setSmall(true)</span>
+<span class="nc" id="L357">          filter.foreach(scan.setFilter)</span>
+<span class="nc" id="L358">          cacheSize.foreach(scan.setCaching)</span>
+<span class="nc" id="L359">          ds.applySecurity(scan)</span>
+<span class="nc" id="L360">          scan</span>
+        }
+<span class="nc" id="L362">        TableScan(table, scans)</span>
+      }
+    } else {
+      // split and group ranges by region server
+      // note: we have to copy the ranges for each table scan anyway
+      val rangesPerTable: Seq[(TableName, collection.Map[String, java.util.List[RowRange]])] =
+<span class="nc" id="L368">        tables.map(t =&gt; t -&gt; groupRangesByRegion(t, ranges))</span>
+
+      def createGroup(group: java.util.List[RowRange]): Scan = {
+<span class="nc" id="L371">        val scan = new Scan().withStartRow(group.get(0).getStartRow).withStopRow(group.get(group.size() - 1).getStopRow)</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        val mrrf = if (group.size() &lt; 2) { filters } else {</span>
+          // TODO GEOMESA-1806
+          // currently, the MultiRowRangeFilter constructor will call sortAndMerge a second time
+          // this is unnecessary as we have already sorted and merged
+          // note: mrrf first priority
+<span class="nc" id="L377">          filters.+:(new MultiRowRangeFilter(group))</span>
+        }
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        scan.setFilter(if (mrrf.lengthCompare(1) &gt; 0) { new FilterList(mrrf: _*) } else { mrrf.headOption.orNull })</span>
+<span class="nc" id="L380">        scan.addFamily(colFamily).setCacheBlocks(cacheBlocks)</span>
+<span class="nc" id="L381">        cacheSize.foreach(scan.setCaching)</span>
+
+        // apply visibilities
+<span class="nc" id="L384">        ds.applySecurity(scan)</span>
+
+<span class="nc" id="L386">        scan</span>
+      }
+
+<span class="nc bnc" id="L389" title="All 2 branches missed.">      rangesPerTable.map { case (table, rangesPerRegion) =&gt;</span>
+        val maxRangesPerGroup = {
+          def calcMax(maxPerGroup: Int, threads: Int): Int = {
+<span class="nc" id="L392">            val totalRanges = rangesPerRegion.values.map(_.size).sum</span>
+<span class="nc" id="L393">            math.min(maxPerGroup, math.max(1, math.ceil(totalRanges.toDouble / threads).toInt))</span>
+          }
+<span class="nc bnc" id="L395" title="All 2 branches missed.">          if (coprocessor) {</span>
+<span class="nc" id="L396">            calcMax(ds.config.coprocessors.maxRangesPerExtendedScan, ds.config.coprocessors.threads)</span>
+          } else {
+<span class="nc" id="L398">            calcMax(ds.config.queries.maxRangesPerExtendedScan, ds.config.queries.threads)</span>
+          }
+        }
+
+<span class="nc" id="L402">        val groupedScans = Seq.newBuilder[Scan]</span>
+
+<span class="nc bnc" id="L404" title="All 2 branches missed.">        rangesPerRegion.foreach { case (_, list) =&gt;</span>
+          // our ranges are non-overlapping, so just sort them but don't bother merging them
+<span class="nc" id="L406">          Collections.sort(list)</span>
+
+<span class="nc" id="L408">          var i = 0</span>
+<span class="nc bnc" id="L409" title="All 2 branches missed.">          while (i &lt; list.size()) {</span>
+<span class="nc" id="L410">            val groupSize = math.min(maxRangesPerGroup, list.size() - i)</span>
+<span class="nc" id="L411">            groupedScans += createGroup(list.subList(i, i + groupSize))</span>
+<span class="nc" id="L412">            i += groupSize</span>
+          }
+        }
+
+        // shuffle the ranges, otherwise our threads will tend to all hit the same region server at once
+<span class="nc" id="L417">        TableScan(table, Random.shuffle(groupedScans.result))</span>
+      }
+    }
+  }
+
+  /**
+   * Split and group ranges by region server
+   *
+   * @param table table being scanned
+   * @param ranges ranges to group
+   * @return
+   */
+  private def groupRangesByRegion(
+      table: TableName,
+      ranges: Seq[RowRange]): scala.collection.Map[String, java.util.List[RowRange]] = {
+<span class="nc" id="L432">    val rangesPerRegion = scala.collection.mutable.Map.empty[String, java.util.List[RowRange]]</span>
+<span class="nc" id="L433">    WithClose(ds.connection.getRegionLocator(table)) { locator =&gt;</span>
+<span class="nc" id="L434">      ranges.foreach(groupRange(locator, _, rangesPerRegion))</span>
+    }
+<span class="nc" id="L436">    rangesPerRegion</span>
+  }
+
+  /**
+   * Group the range based on the region server hosting it. Splits ranges as needed if they span
+   * more than one region
+   *
+   * @param locator region locator
+   * @param range range to group
+   * @param result collected results
+   */
+  @scala.annotation.tailrec
+  private def groupRange(
+      locator: RegionLocator,
+      range: RowRange,
+<span class="nc" id="L451">      result: scala.collection.mutable.Map[String, java.util.List[RowRange]]): Unit = {</span>
+<span class="nc" id="L452">    var encodedName: String = null</span>
+<span class="nc" id="L453">    var split: Array[Byte] = null</span>
+<span class="nc" id="L454">    try {</span>
+<span class="nc" id="L455">      val regionInfo = locator.getRegionLocation(range.getStartRow).getRegionInfo</span>
+<span class="nc" id="L456">      encodedName = regionInfo.getEncodedName</span>
+<span class="nc" id="L457">      val regionEndKey = regionInfo.getEndKey // note: this is exclusive</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">      if (regionEndKey.nonEmpty &amp;&amp;</span>
+<span class="nc bnc" id="L459" title="All 4 branches missed.">          (range.getStopRow.isEmpty || ByteArrays.ByteOrdering.compare(regionEndKey, range.getStopRow) &lt;= 0)) {</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">        if (ByteArrays.ByteOrdering.compare(range.getStartRow, regionEndKey) &lt; 0) {</span>
+<span class="nc" id="L461">          split = regionEndKey</span>
+        } else {
+<span class="nc bnc" id="L463" title="All 2 branches missed.">          logger.warn(s&quot;HBase region location does not correspond to requested range:\n&quot; +</span>
+<span class="nc" id="L464">              s&quot;  requested row: ${ByteArrays.toHex(range.getStartRow)}\n&quot; +</span>
+<span class="nc" id="L465">              s&quot;  region: $encodedName ${ByteArrays.toHex(regionInfo.getStartKey)} :: ${ByteArrays.toHex(regionEndKey)}&quot;)</span>
+        }
+      }
+    } catch {
+<span class="nc bnc" id="L469" title="All 4 branches missed.">      case NonFatal(e) =&gt; logger.warn(s&quot;Error checking range location for '$range''&quot;, e)</span>
+    }
+<span class="nc" id="L471">    val buffer = result.getOrElseUpdate(encodedName, new java.util.ArrayList())</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">    if (split == null) {</span>
+<span class="nc" id="L473">      buffer.add(range)</span>
+    } else {
+      // split the range based on the current region
+<span class="nc" id="L476">      buffer.add(new RowRange(range.getStartRow, true, split, false))</span>
+<span class="nc" id="L477">      groupRange(locator, new RowRange(split, true, range.getStopRow, false), result)</span>
+    }
+  }
+}
+
+<span class="nc bnc" id="L482" title="All 4 branches missed.">object HBaseIndexAdapter extends LazyLogging {</span>
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L486">  private val distributedJarNamePattern = Pattern.compile(&quot;^geomesa-hbase-distributed-runtime.*\\.jar$&quot;)</span>
+
+  // these are in the geomesa-hbase-server module, so not accessible directly
+<span class="nc" id="L489">  val CoprocessorClass = &quot;org.locationtech.geomesa.hbase.server.coprocessor.GeoMesaCoprocessor&quot;</span>
+<span class="nc" id="L490">  val AggregatorPackage = &quot;org.locationtech.geomesa.hbase.server.common&quot;</span>
+
+<span class="nc" id="L492">  val durability: Durability = HBaseSystemProperties.WalDurability.option match {</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">    case Some(value) =&gt;</span>
+<span class="nc" id="L494">      Durability.values.find(_.toString.equalsIgnoreCase(value)).getOrElse {</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">        logger.error(s&quot;Invalid HBase WAL durability setting: $value. Falling back to default durability&quot;)</span>
+<span class="nc" id="L496">        Durability.USE_DEFAULT</span>
+      }
+<span class="nc bnc" id="L498" title="All 2 branches missed.">    case None =&gt; Durability.USE_DEFAULT</span>
+  }
+
+  /**
+   * Create a new table
+   *
+   * @param admin admin connection to hbase
+   * @param name table name
+   * @param colFamilies column families
+   * @param bloom bloom filter
+   * @param compression compression
+   * @param encoding data block encoding
+   * @param coprocessor coprocessor class and optional jar path
+   * @param splits initial table splits (empty for no splits)
+   */
+  def createTableAsync(
+      admin: Admin,
+      name: TableName,
+      colFamilies: Seq[Array[Byte]],
+      bloom: Option[BloomType],
+      compression: Option[Algorithm],
+      encoding: Option[DataBlockEncoding],
+      inMemory: Option[Boolean],
+      coprocessor: Option[(String, Option[Path])],
+      splits: Seq[Array[Byte]],
+      metadata: Map[String, String],
+    ): Unit = {
+
+<span class="nc" id="L526">    val namespace = name.getNamespaceAsString</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">    if (namespace != null &amp;&amp;</span>
+<span class="nc bnc" id="L528" title="All 6 branches missed.">        namespace != NamespaceDescriptor.DEFAULT_NAMESPACE_NAME_STR &amp;&amp;</span>
+<span class="nc bnc" id="L529" title="All 6 branches missed.">        namespace != NamespaceDescriptor.SYSTEM_NAMESPACE_NAME_STR &amp;&amp;</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        Try(Option(admin.getNamespaceDescriptor(namespace))).getOrElse(None).isEmpty) {</span>
+<span class="nc" id="L531">      admin.createNamespace(NamespaceDescriptor.create(namespace).build())</span>
+    }
+
+<span class="nc" id="L534">    val builder = TableDescriptorBuilder.newBuilder(name)</span>
+<span class="nc" id="L535">    val columnFamilyDescriptors = colFamilies.map { colFamily =&gt;</span>
+<span class="nc" id="L536">      val builder = ColumnFamilyDescriptorBuilder.newBuilder(colFamily)</span>
+<span class="nc" id="L537">      bloom.foreach(builder.setBloomFilterType)</span>
+<span class="nc" id="L538">      compression.foreach(builder.setCompressionType)</span>
+<span class="nc" id="L539">      encoding.foreach(builder.setDataBlockEncoding)</span>
+<span class="nc" id="L540">      inMemory.foreach(builder.setInMemory)</span>
+<span class="nc" id="L541">      builder.build()</span>
+    }
+<span class="nc" id="L543">    builder.setColumnFamilies(columnFamilyDescriptors.asJava)</span>
+<span class="nc bnc" id="L544" title="All 2 branches missed.">    coprocessor.foreach { case (clas, path) =&gt;</span>
+      val descriptor =
+<span class="nc" id="L546">        CoprocessorDescriptorBuilder.newBuilder(clas)</span>
+<span class="nc" id="L547">          .setPriority(Coprocessor.PRIORITY_USER)</span>
+<span class="nc" id="L548">          .setJarPath(path.fold[String](null)(_.toString))</span>
+          .build()
+<span class="nc" id="L550">      builder.setCoprocessor(descriptor)</span>
+    }
+<span class="nc bnc" id="L552" title="All 2 branches missed.">    metadata.foreach { case (k, v) =&gt; builder.setValue(k, v) }</span>
+<span class="nc" id="L553">    admin.createTableAsync(builder.build(), splits.toArray)</span>
+  }
+
+  /**
+   * Waits for a table to come online after being created
+   *
+   * @param admin hbase admin
+   * @param table table name
+   */
+  def waitForTable(admin: Admin, table: TableName): Unit = {
+<span class="nc bnc" id="L563" title="All 2 branches missed.">    if (!admin.isTableAvailable(table)) {</span>
+<span class="nc" id="L564">      val timeout = TableAvailabilityTimeout.toUnboundedDuration.filter(_.isFinite)</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">      logger.debug(s&quot;Waiting for table '$table' to become available with &quot; +</span>
+<span class="nc" id="L566">          s&quot;${timeout.map(t =&gt; s&quot;a timeout of $t&quot;).getOrElse(&quot;no timeout&quot;)}&quot;)</span>
+<span class="nc" id="L567">      val stop = timeout.map(t =&gt; System.currentTimeMillis() + t.toMillis)</span>
+<span class="nc bnc" id="L568" title="All 6 branches missed.">      while (!admin.isTableAvailable(table) &amp;&amp; stop.forall(_ &gt; System.currentTimeMillis())) {</span>
+<span class="nc" id="L569">        Thread.sleep(1000)</span>
+      }
+    }
+  }
+
+  /**
+    * Deserializes row bytes into simple features
+    *
+    * @param _index index
+    * @param _sft sft
+    */
+<span class="nc" id="L580">  class HBaseResultsToFeatures(_index: GeoMesaFeatureIndex[_, _], _sft: SimpleFeatureType) extends</span>
+<span class="nc" id="L581">    IndexResultsToFeatures[Result](_index, _sft) {</span>
+
+<span class="nc" id="L583">    def this() = this(null, null) // no-arg constructor required for serialization</span>
+
+    override def apply(result: Result): SimpleFeature = {
+<span class="nc" id="L586">      val cell = result.rawCells()(0)</span>
+<span class="nc" id="L587">      val id = index.getIdFromRow(cell.getRowArray, cell.getRowOffset, cell.getRowLength, null)</span>
+<span class="nc" id="L588">      serializer.deserialize(id, cell.getValueArray, cell.getValueOffset, cell.getValueLength)</span>
+    }
+  }
+
+  /**
+    * Writer for hbase
+    *
+    * @param ds datastore
+    * @param indices indices to write to
+    * @param partition partition to write to
+    */
+<span class="nc" id="L599">  class HBaseIndexWriter(</span>
+<span class="nc" id="L600">      ds: HBaseDataStore,</span>
+<span class="nc" id="L601">      indices: Seq[GeoMesaFeatureIndex[_, _]],</span>
+      wrapper: FeatureWrapper[WritableFeature],
+<span class="nc" id="L603">      partition: Option[String]</span>
+<span class="nc" id="L604">    ) extends BaseIndexWriter(indices, wrapper) {</span>
+
+    import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+<span class="nc" id="L608">    private val batchSize = HBaseSystemProperties.WriteBatchSize.toLong</span>
+<span class="nc" id="L609">    private val flushTimeout = HBaseSystemProperties.WriteFlushTimeout.toLong</span>
+<span class="nc" id="L610">    private val deleteVis = HBaseSystemProperties.DeleteVis.option.map(new CellVisibility(_))</span>
+
+<span class="nc" id="L612">    private val pools = {</span>
+      // mimic config from default hbase connection
+<span class="nc" id="L614">      val maxThreads = math.max(1, ds.connection.getConfiguration.getInt(&quot;hbase.htable.threads.max&quot;, Int.MaxValue))</span>
+<span class="nc" id="L615">      Array.fill(indices.length)(new CachedThreadPool(maxThreads))</span>
+    }
+
+<span class="nc" id="L618">    private val mutators = indices.toArray.map { index =&gt;</span>
+      // should always be writing to a single table here
+<span class="nc" id="L620">      val table = index.getTableName(partition)</span>
+<span class="nc" id="L621">      val params = new BufferedMutatorParams(TableName.valueOf(table))</span>
+<span class="nc" id="L622">      batchSize.foreach(params.writeBufferSize)</span>
+<span class="nc" id="L623">      flushTimeout.foreach(params.setWriteBufferPeriodicFlushTimeoutMs)</span>
+
+      // We have to pass a pool explicitly and close it after manually,
+      // cause of HBase issue where pools got leaked and never closed
+      // (in case of long running Spark jobs 24+ hours the workers go out of memory without custom pool)
+<span class="nc" id="L628">      params.pool(pools(indices.indexOf(index)))</span>
+<span class="nc" id="L629">      ds.connection.getBufferedMutator(params)</span>
+    }
+
+<span class="nc" id="L632">    private val expiration = indices.headOption.flatMap(_.sft.getFeatureExpiration).orNull</span>
+
+<span class="nc" id="L634">    private var i = 0</span>
+
+    override protected def append(feature: WritableFeature, values: Array[RowKeyValue[_]]): Unit = {
+<span class="nc bnc" id="L637" title="All 2 branches missed.">      val ttl = if (expiration != null) {</span>
+<span class="nc" id="L638">        val t = expiration.expires(feature.feature) - System.currentTimeMillis</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        if (t &gt; 0) {</span>
+<span class="nc" id="L640">          t</span>
+        }
+        else {
+<span class="nc bnc" id="L643" title="All 2 branches missed.">          logger.warn(&quot;Feature is already past its TTL; not added to database&quot;)</span>
+<span class="nc" id="L644">          return</span>
+        }
+      } else {
+<span class="nc" id="L647">        0L</span>
+      }
+
+<span class="nc" id="L650">      i = 0</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">      while (i &lt; values.length) {</span>
+<span class="nc" id="L652">        val mutator = mutators(i)</span>
+<span class="nc" id="L653">        values(i) match {</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">          case kv: SingleRowKeyValue[_] =&gt;</span>
+<span class="nc" id="L655">            kv.values.foreach { value =&gt;</span>
+<span class="nc" id="L656">              val put = new Put(kv.row)</span>
+<span class="nc" id="L657">              put.addImmutable(value.cf, value.cq, value.value)</span>
+<span class="nc bnc" id="L658" title="All 2 branches missed.">              if (!value.vis.isEmpty) {</span>
+<span class="nc" id="L659">                put.setCellVisibility(new CellVisibility(new String(value.vis, StandardCharsets.UTF_8)))</span>
+              }
+<span class="nc" id="L661">              put.setDurability(durability)</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">              if (ttl &gt; 0) put.setTTL(ttl)</span>
+<span class="nc" id="L663">              mutator.mutate(put)</span>
+            }
+
+<span class="nc bnc" id="L666" title="All 2 branches missed.">          case mkv: MultiRowKeyValue[_] =&gt;</span>
+<span class="nc" id="L667">            mkv.rows.foreach { row =&gt;</span>
+<span class="nc" id="L668">              mkv.values.foreach { value =&gt;</span>
+<span class="nc" id="L669">                val put = new Put(row)</span>
+<span class="nc" id="L670">                put.addImmutable(value.cf, value.cq, value.value)</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">                if (!value.vis.isEmpty) {</span>
+<span class="nc" id="L672">                  put.setCellVisibility(new CellVisibility(new String(value.vis, StandardCharsets.UTF_8)))</span>
+                }
+<span class="nc" id="L674">                put.setDurability(durability)</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">                if (ttl &gt; 0) put.setTTL(ttl)</span>
+<span class="nc" id="L676">                mutator.mutate(put)</span>
+              }
+            }
+        }
+<span class="nc" id="L680">        i += 1</span>
+      }
+    }
+
+    override protected def update(
+        feature: WritableFeature,
+        values: Array[RowKeyValue[_]],
+        previous: WritableFeature,
+        previousValues: Array[RowKeyValue[_]]): Unit = {
+<span class="nc" id="L689">      delete(previous, previousValues)</span>
+      // for updates, ensure that our timestamps don't clobber each other
+<span class="nc" id="L691">      flush()</span>
+<span class="nc" id="L692">      Thread.sleep(1)</span>
+<span class="nc" id="L693">      append(feature, values)</span>
+    }
+
+    override protected def delete(feature: WritableFeature, values: Array[RowKeyValue[_]]): Unit = {
+<span class="nc" id="L697">      i = 0</span>
+<span class="nc bnc" id="L698" title="All 2 branches missed.">      while (i &lt; values.length) {</span>
+<span class="nc" id="L699">        val mutator = mutators(i)</span>
+<span class="nc" id="L700">        values(i) match {</span>
+<span class="nc bnc" id="L701" title="All 2 branches missed.">          case kv: SingleRowKeyValue[_] =&gt;</span>
+<span class="nc" id="L702">            kv.values.foreach { value =&gt;</span>
+<span class="nc" id="L703">              val del = new Delete(kv.row)</span>
+<span class="nc" id="L704">              del.addFamily(value.cf) // note: passing in the column qualifier seems to keep deletes from working</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">              if (!value.vis.isEmpty) {</span>
+<span class="nc" id="L706">                del.setCellVisibility(new CellVisibility(new String(value.vis, StandardCharsets.UTF_8)))</span>
+              } else {
+<span class="nc" id="L708">                deleteVis.foreach(del.setCellVisibility)</span>
+              }
+<span class="nc" id="L710">              mutator.mutate(del)</span>
+            }
+
+<span class="nc bnc" id="L713" title="All 2 branches missed.">          case mkv: MultiRowKeyValue[_] =&gt;</span>
+<span class="nc" id="L714">            mkv.rows.foreach { row =&gt;</span>
+<span class="nc" id="L715">              mkv.values.foreach { value =&gt;</span>
+<span class="nc" id="L716">                val del = new Delete(row)</span>
+<span class="nc" id="L717">                del.addFamily(value.cf) // note: passing in the column qualifier seems to keep deletes from working</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">                if (!value.vis.isEmpty) {</span>
+<span class="nc" id="L719">                  del.setCellVisibility(new CellVisibility(new String(value.vis, StandardCharsets.UTF_8)))</span>
+                } else {
+<span class="nc" id="L721">                  deleteVis.foreach(del.setCellVisibility)</span>
+                }
+<span class="nc" id="L723">                mutator.mutate(del)</span>
+              }
+            }
+        }
+<span class="nc" id="L727">        i += 1</span>
+      }
+    }
+
+<span class="nc" id="L731">    override def flush(): Unit = FlushWithLogging.raise(mutators)(BufferedMutatorIsFlushable.arrayIsFlushable)</span>
+
+    override def close(): Unit = {
+<span class="nc" id="L734">      try { CloseWithLogging.raise(mutators) } finally {</span>
+<span class="nc" id="L735">        CloseWithLogging(pools)</span>
+      }
+<span class="nc bnc" id="L737" title="All 8 branches missed.">      if (!pools.foldLeft(true) { case (terminated, pool) =&gt; terminated &amp;&amp; pool.awaitTermination(60, TimeUnit.SECONDS) }) {</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">        logger.warn(&quot;Failed to terminate thread pool after 60 seconds&quot;)</span>
+      }
+    }
+  }
+
+<span class="nc" id="L743">  object BufferedMutatorIsFlushable extends IsFlushableImplicits[BufferedMutator] {</span>
+<span class="nc" id="L744">    override protected def flush(f: BufferedMutator): Try[Unit] = Try(f.flush())</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,371 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AccumuloDataStore.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Accumulo DataStore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.accumulo.data</a> &gt; <span class="el_source">AccumuloDataStore.scala</span></div><h1>AccumuloDataStore.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+
+package org.locationtech.geomesa.accumulo.data
+
+import org.apache.accumulo.core.client._
+import org.apache.accumulo.core.conf.ClientProperty
+import org.apache.accumulo.core.iterators.SortedKeyValueIterator
+import org.apache.accumulo.core.security.Authorizations
+import org.apache.hadoop.security.UserGroupInformation
+import org.geotools.api.data.Query
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.geotools.api.filter.Filter
+import org.locationtech.geomesa.accumulo.data.AccumuloDataStoreFactory.AccumuloDataStoreConfig
+import org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan.EmptyPlan
+import org.locationtech.geomesa.accumulo.data.stats._
+import org.locationtech.geomesa.accumulo.index._
+import org.locationtech.geomesa.accumulo.iterators.{AgeOffIterator, DtgAgeOffIterator, ProjectVersionIterator, VisibilityIterator}
+import org.locationtech.geomesa.filter.FilterHelper
+import org.locationtech.geomesa.index.api.{FilterStrategy, GeoMesaFeatureIndex, QueryStrategy}
+import org.locationtech.geomesa.index.geotools.GeoMesaDataStore
+import org.locationtech.geomesa.index.index.attribute.AttributeIndex
+import org.locationtech.geomesa.index.index.id.IdIndex
+import org.locationtech.geomesa.index.index.z2.{XZ2Index, Z2Index}
+import org.locationtech.geomesa.index.index.z3.{XZ3Index, Z3Index}
+import org.locationtech.geomesa.index.metadata.MetadataStringSerializer
+import org.locationtech.geomesa.index.utils.Explainer
+import org.locationtech.geomesa.index.zk.ZookeeperLocking
+import org.locationtech.geomesa.utils.conf.FeatureExpiration.{FeatureTimeExpiration, IngestTimeExpiration}
+import org.locationtech.geomesa.utils.conf.{FeatureExpiration, IndexId}
+import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.AttributeOptions
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.Configs.OverrideDtgJoin
+import org.locationtech.geomesa.utils.hadoop.HadoopUtils
+import org.locationtech.geomesa.utils.index.{GeoMesaSchemaValidator, IndexCoverage, IndexMode, VisibilityLevel}
+import org.locationtech.geomesa.utils.io.{CloseWithLogging, WithClose}
+
+import scala.util.control.NonFatal
+
+/**
+ * This class handles DataStores which are stored in Accumulo Tables. To be clear, one table may
+ * contain multiple features addressed by their featureName.
+ *
+ * @param client Accumulo client
+ * @param config configuration values
+ */
+<span class="nc" id="L53">class AccumuloDataStore(val client: AccumuloClient, override val config: AccumuloDataStoreConfig)</span>
+<span class="nc" id="L54">    extends GeoMesaDataStore[AccumuloDataStore](config) with ZookeeperLocking {</span>
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L58">  override val metadata = new AccumuloBackedMetadata(client, config.catalog, MetadataStringSerializer, config.queries.consistency)</span>
+
+<span class="nc" id="L60">  override val adapter: AccumuloIndexAdapter = new AccumuloIndexAdapter(this)</span>
+
+<span class="nc" id="L62">  override val stats: AccumuloGeoMesaStats = AccumuloGeoMesaStats(this)</span>
+
+  override protected def zookeepers: String =
+<span class="nc" id="L65">    client.properties().getProperty(ClientProperty.INSTANCE_ZOOKEEPERS.getKey)</span>
+
+  // If on a secured cluster, create a thread to periodically renew Kerberos tgt
+<span class="nc" id="L68">  private val kerberosTgtRenewer = {</span>
+<span class="nc" id="L69">    val enabled = try { UserGroupInformation.isSecurityEnabled } catch {</span>
+      case e: Throwable =&gt; logger.error(&quot;Error checking for hadoop security&quot;, e); false
+    }
+<span class="nc bnc" id="L72" title="All 2 branches missed.">    if (enabled) { Some(HadoopUtils.kerberosTicketRenewer()) } else { None }</span>
+  }
+
+  // some convenience operations
+
+  /**
+    * Gets the authorizations for the current user. This may change, so the results shouldn't be cached
+    *
+    * @return
+    */
+<span class="nc" id="L82">  def auths: Authorizations = new Authorizations(config.authProvider.getAuthorizations.asScala.toSeq: _*)</span>
+
+  @deprecated(&quot;Use `client`&quot;)
+<span class="nc" id="L85">  def connector: AccumuloClient = client</span>
+
+  override def delete(): Unit = {
+    // note: don't delete the query audit table
+<span class="nc bnc" id="L89" title="All 6 branches missed.">    val toDelete = getTypeNames.toSeq.flatMap(getAllTableNames).distinct.filter(_ != config.auditWriter.table)</span>
+<span class="nc" id="L90">    adapter.deleteTables(toDelete)</span>
+  }
+
+  override def getAllTableNames(typeName: String): Seq[String] = {
+<span class="nc" id="L94">    val others = Seq(stats.metadata.table) :+ config.auditWriter.table</span>
+<span class="nc" id="L95">    super.getAllTableNames(typeName) ++ others</span>
+  }
+
+  // data store hooks
+
+  override protected def transitionIndices(sft: SimpleFeatureType): Unit = {
+    // note: versions already correspond to accumulo index versions
+<span class="nc" id="L102">    val dtg = sft.getDtgField.toSeq</span>
+<span class="nc" id="L103">    val geom = Option(sft.getGeomField).toSeq</span>
+<span class="nc" id="L104">    val indices = sft.getIndices.flatMap {</span>
+<span class="nc bnc" id="L105" title="All 6 branches missed.">      case id if id.name == IdIndex.name  =&gt; Seq(id) // no update needed</span>
+<span class="nc bnc" id="L106" title="All 6 branches missed.">      case id if id.name == &quot;records&quot;     =&gt; Seq(id.copy(name = IdIndex.name))</span>
+<span class="nc bnc" id="L107" title="All 6 branches missed.">      case id if id.name == Z3Index.name  =&gt; Seq(id.copy(attributes = geom ++ dtg))</span>
+<span class="nc bnc" id="L108" title="All 6 branches missed.">      case id if id.name == XZ3Index.name =&gt; Seq(id.copy(attributes = geom ++ dtg))</span>
+<span class="nc bnc" id="L109" title="All 6 branches missed.">      case id if id.name == Z2Index.name  =&gt; Seq(id.copy(attributes = geom))</span>
+<span class="nc bnc" id="L110" title="All 6 branches missed.">      case id if id.name == XZ2Index.name =&gt; Seq(id.copy(attributes = geom))</span>
+<span class="nc bnc" id="L111" title="All 6 branches missed.">      case id if id.name == AttributeIndex.name =&gt;</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">        lazy val fields = if (id.version &lt; 4) { dtg } else { geom ++ dtg }</span>
+<span class="nc" id="L113">        sft.getAttributeDescriptors.asScala.flatMap { d =&gt;</span>
+<span class="nc" id="L114">          val index = d.getUserData.remove(AttributeOptions.OptIndex).asInstanceOf[String]</span>
+<span class="nc bnc" id="L115" title="All 6 branches missed.">          if (index == null || index.equalsIgnoreCase(IndexCoverage.NONE.toString) || index.equalsIgnoreCase(&quot;false&quot;)) {</span>
+<span class="nc" id="L116">            Seq.empty</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">          } else if (index.equalsIgnoreCase(IndexCoverage.FULL.toString)) {</span>
+<span class="nc" id="L118">            Seq(id.copy(name = AttributeIndex.name, attributes = Seq(d.getLocalName) ++ fields))</span>
+<span class="nc bnc" id="L119" title="All 4 branches missed.">          } else if (index.equalsIgnoreCase(IndexCoverage.JOIN.toString) || java.lang.Boolean.valueOf(index)) {</span>
+<span class="nc" id="L120">            Seq(id.copy(name = JoinIndex.name, attributes = Seq(d.getLocalName) ++ fields))</span>
+          } else {
+<span class="nc" id="L122">            throw new IllegalStateException(s&quot;Expected an index coverage or boolean but got: $index&quot;)</span>
+          }
+        }
+    }
+<span class="nc" id="L126">    sft.setIndices(indices)</span>
+  }
+
+  override protected def loadIteratorVersions: Set[String] = {
+    // just check the first table available
+<span class="nc" id="L131">    val versions = getTypeNames.iterator.flatMap { typeName =&gt;</span>
+<span class="nc" id="L132">      getAllIndexTableNames(typeName).iterator.flatMap { table =&gt;</span>
+<span class="nc" id="L133">        try {</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">          if (client.tableOperations().exists(table)) {</span>
+<span class="nc" id="L135">            WithClose(client.createScanner(table, new Authorizations())) { scanner =&gt;</span>
+<span class="nc" id="L136">              config.queries.consistency.foreach(scanner.setConsistencyLevel)</span>
+<span class="nc" id="L137">              ProjectVersionIterator.scanProjectVersion(scanner).iterator</span>
+            }
+          } else {
+<span class="nc" id="L140">            Iterator.empty</span>
+          }
+        } catch {
+<span class="nc bnc" id="L143" title="All 2 branches missed.">          case NonFatal(_) =&gt; Iterator.empty</span>
+        }
+      }
+    }
+<span class="nc bnc" id="L147" title="All 2 branches missed.">    versions.find(_ != null).toSet</span>
+  }
+
+  override protected def preSchemaCreate(sft: SimpleFeatureType): Unit = {
+    import org.locationtech.geomesa.index.conf.SchemaProperties.ValidateDistributedClasspath
+
+    // call super first so that user data keys are updated
+<span class="nc" id="L154">    super.preSchemaCreate(sft)</span>
+
+<span class="nc bnc" id="L156" title="All 2 branches missed.">    def getNamespace(prefix: String): String = prefix.indexOf('.') match {</span>
+<span class="nc" id="L157">      case -1 =&gt; &quot;&quot;</span>
+<span class="nc" id="L158">      case i  =&gt; prefix.substring(0, i)</span>
+    }
+
+<span class="nc" id="L161">    val prefixes = Seq(config.catalog) ++ sft.getIndices.flatMap(i =&gt; sft.getTablePrefix(i.name))</span>
+<span class="nc" id="L162">    prefixes.map(getNamespace).distinct.foreach { namespace =&gt;</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">      if (namespace.nonEmpty) {</span>
+<span class="nc" id="L164">        adapter.ensureNamespaceExists(namespace)</span>
+      }
+      // validate that the accumulo runtime is available
+<span class="nc" id="L167">      val canLoad = client.namespaceOperations().testClassLoad(namespace,</span>
+<span class="nc" id="L168">        classOf[ProjectVersionIterator].getName, classOf[SortedKeyValueIterator[_, _]].getName)</span>
+
+<span class="nc bnc" id="L170" title="All 2 branches missed.">      if (!canLoad) {</span>
+<span class="nc" id="L171">        val msg = s&quot;Could not load GeoMesa distributed code from the Accumulo classpath&quot;</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        logger.error(s&quot;$msg for catalog ${config.catalog}&quot;)</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (ValidateDistributedClasspath.toBoolean.contains(true)) {</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">          val nsMsg = if (namespace.isEmpty) { &quot;&quot; } else { s&quot; for the namespace '$namespace'&quot; }</span>
+<span class="nc" id="L175">          throw new RuntimeException(s&quot;$msg. You may override this check by setting the system property &quot; +</span>
+<span class="nc" id="L176">            s&quot;'${ValidateDistributedClasspath.property}=false'. Otherwise, please verify that the appropriate &quot; +</span>
+<span class="nc" id="L177">            s&quot;JARs are installed$nsMsg - see https://www.geomesa.org/documentation/stable/user/accumulo/install.html&quot; +</span>
+<span class="nc" id="L178">            &quot;#installing-the-accumulo-distributed-runtime-library&quot;)</span>
+        }
+      }
+    }
+
+<span class="nc bnc" id="L183" title="All 8 branches missed.">    if (sft.getVisibilityLevel == VisibilityLevel.Attribute &amp;&amp; sft.getAttributeCount &gt; 255) {</span>
+<span class="nc" id="L184">      throw new IllegalArgumentException(&quot;Attribute level visibility only supports up to 255 attributes&quot;)</span>
+    }
+
+<span class="nc" id="L187">    sft.getDtgField.foreach { dtg =&gt;</span>
+<span class="nc bnc" id="L188" title="All 10 branches missed.">      if (sft.getIndices.exists(i =&gt; i.name == JoinIndex.name &amp;&amp; i.attributes.headOption.contains(dtg))) {</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        if (!GeoMesaSchemaValidator.declared(sft, OverrideDtgJoin)) {</span>
+<span class="nc" id="L190">          throw new IllegalArgumentException(&quot;Trying to create a schema with a partial (join) attribute index &quot; +</span>
+<span class="nc" id="L191">              s&quot;on the default date field '$dtg'. This may cause whole-world queries with time bounds to be much &quot; +</span>
+<span class="nc" id="L192">              &quot;slower. If this is intentional, you may override this check by putting Boolean.TRUE into the &quot; +</span>
+<span class="nc" id="L193">              s&quot;SimpleFeatureType user data under the key '$OverrideDtgJoin' before calling createSchema, or by &quot; +</span>
+<span class="nc" id="L194">              s&quot;setting the system property '$OverrideDtgJoin' to 'true'. Otherwise, please either specify a &quot; +</span>
+<span class="nc" id="L195">              &quot;full attribute index or remove it entirely.&quot;)</span>
+        }
+      }
+    }
+  }
+
+  override protected def onSchemaCreated(sft: SimpleFeatureType): Unit = {
+<span class="nc" id="L202">    super.onSchemaCreated(sft)</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">    if (sft.statsEnabled) {</span>
+      // configure the stats combining iterator on the table for this sft
+<span class="nc" id="L205">      adapter.ensureTableExists(stats.metadata.table)</span>
+<span class="nc" id="L206">      stats.configureStatCombiner(client, sft)</span>
+    }
+<span class="nc" id="L208">    sft.getFeatureExpiration.foreach {</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">      case IngestTimeExpiration(ttl) =&gt;</span>
+<span class="nc" id="L210">        val tableOps = client.tableOperations()</span>
+<span class="nc" id="L211">        getAllIndexTableNames(sft.getTypeName).filter(tableOps.exists).foreach { table =&gt;</span>
+<span class="nc" id="L212">          AgeOffIterator.set(tableOps, table, sft, ttl)</span>
+        }
+
+<span class="nc bnc" id="L215" title="All 2 branches missed.">      case FeatureTimeExpiration(dtg, _, ttl) =&gt;</span>
+<span class="nc" id="L216">        val tableOps = client.tableOperations()</span>
+<span class="nc" id="L217">        manager.indices(sft).foreach { index =&gt;</span>
+<span class="nc" id="L218">          val indexSft = index match {</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            case joinIndex: AttributeJoinIndex =&gt; joinIndex.indexSft</span>
+<span class="nc" id="L220">            case _ =&gt; sft</span>
+          }
+<span class="nc" id="L222">          DtgAgeOffIterator.set(tableOps, indexSft, index, ttl, dtg)</span>
+        }
+
+      case e =&gt;
+<span class="nc" id="L226">        throw new IllegalArgumentException(s&quot;Unexpected feature expiration: $e&quot;)</span>
+    }
+  }
+
+  @throws(classOf[IllegalArgumentException])
+  override protected def preSchemaUpdate(sft: SimpleFeatureType, previous: SimpleFeatureType): Unit = {
+<span class="nc bnc" id="L232" title="All 8 branches missed.">    if (sft.getVisibilityLevel == VisibilityLevel.Attribute &amp;&amp; sft.getAttributeCount &gt; 255) {</span>
+<span class="nc" id="L233">      throw new IllegalArgumentException(&quot;Attribute level visibility only supports up to 255 attributes&quot;)</span>
+    }
+
+    // check for attributes flagged 'index=join' and convert them to sft-level user data
+<span class="nc" id="L237">    sft.getAttributeDescriptors.asScala.foreach { d =&gt;</span>
+<span class="nc" id="L238">      val index = d.getUserData.get(AttributeOptions.OptIndex).asInstanceOf[String]</span>
+<span class="nc bnc" id="L239" title="All 4 branches missed.">      if (index != null &amp;&amp; index.equalsIgnoreCase(IndexCoverage.JOIN.toString)) {</span>
+<span class="nc" id="L240">        d.getUserData.remove(AttributeOptions.OptIndex) // remove it so it's not processed again</span>
+<span class="nc bnc" id="L241" title="All 6 branches missed.">        val fields = Seq(d.getLocalName) ++ Option(sft.getGeomField) ++ sft.getDtgField.filter(_ != d.getLocalName)</span>
+<span class="nc" id="L242">        val attribute = IndexId(JoinIndex.name, JoinIndex.version, fields, IndexMode.ReadWrite)</span>
+<span class="nc" id="L243">        val existing = sft.getIndices.map(GeoMesaFeatureIndex.identifier)</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">        if (!existing.contains(GeoMesaFeatureIndex.identifier(attribute))) {</span>
+<span class="nc" id="L245">          sft.setIndices(sft.getIndices :+ attribute)</span>
+        }
+      }
+    }
+
+    // check any previous age-off - previously age-off wasn't tied to the sft metadata
+<span class="nc bnc" id="L251" title="All 4 branches missed.">    if (!sft.isFeatureExpirationEnabled &amp;&amp; !previous.isFeatureExpirationEnabled) {</span>
+      // explicitly set age-off in the feature type if found
+<span class="nc" id="L253">      val tableOps = client.tableOperations()</span>
+<span class="nc" id="L254">      val tables = getAllIndexTableNames(previous.getTypeName).filter(tableOps.exists)</span>
+<span class="nc" id="L255">      val ageOff = tables.foldLeft[Option[FeatureExpiration]](None) { (res, table) =&gt;</span>
+<span class="nc" id="L256">        res.orElse(AgeOffIterator.expiry(tableOps, table))</span>
+      }
+<span class="nc" id="L258">      val configured = ageOff.orElse {</span>
+<span class="nc" id="L259">        tables.foldLeft[Option[FeatureExpiration]](None) { (res, table) =&gt;</span>
+<span class="nc" id="L260">          res.orElse(DtgAgeOffIterator.expiry(tableOps, previous, table))</span>
+        }
+      }
+<span class="nc" id="L263">      configured.foreach(sft.setFeatureExpiration)</span>
+    }
+
+<span class="nc" id="L266">    super.preSchemaUpdate(sft, previous)</span>
+  }
+
+  override protected def onSchemaUpdated(sft: SimpleFeatureType, previous: SimpleFeatureType): Unit = {
+<span class="nc" id="L270">    super.onSchemaUpdated(sft, previous)</span>
+
+<span class="nc bnc" id="L272" title="All 2 branches missed.">    if (previous.statsEnabled) {</span>
+<span class="nc" id="L273">      stats.removeStatCombiner(client, previous)</span>
+    }
+<span class="nc bnc" id="L275" title="All 2 branches missed.">    if (sft.statsEnabled) {</span>
+<span class="nc" id="L276">      adapter.ensureTableExists(stats.metadata.table)</span>
+<span class="nc" id="L277">      stats.configureStatCombiner(client, sft)</span>
+    }
+
+<span class="nc" id="L280">    val tableOps = client.tableOperations()</span>
+<span class="nc" id="L281">    val previousTables = getAllIndexTableNames(previous.getTypeName).filter(tableOps.exists)</span>
+<span class="nc" id="L282">    val tables = getAllIndexTableNames(sft.getTypeName).filter(tableOps.exists)</span>
+
+<span class="nc bnc" id="L284" title="All 2 branches missed.">    if (previous.isVisibilityRequired != sft.isVisibilityRequired) {</span>
+<span class="nc" id="L285">      previousTables.foreach(VisibilityIterator.clear(tableOps, _))</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">      if (sft.isVisibilityRequired) {</span>
+<span class="nc" id="L287">        tables.foreach(VisibilityIterator.set(tableOps, _))</span>
+      }
+    }
+
+<span class="nc" id="L291">    previousTables.foreach { table =&gt;</span>
+<span class="nc" id="L292">      AgeOffIterator.clear(tableOps, table)</span>
+<span class="nc" id="L293">      DtgAgeOffIterator.clear(tableOps, table)</span>
+    }
+
+<span class="nc" id="L296">    sft.getFeatureExpiration.foreach {</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">      case IngestTimeExpiration(ttl) =&gt;</span>
+<span class="nc" id="L298">        tables.foreach(AgeOffIterator.set(tableOps, _, sft, ttl))</span>
+
+<span class="nc bnc" id="L300" title="All 2 branches missed.">      case FeatureTimeExpiration(dtg, _, ttl) =&gt;</span>
+<span class="nc" id="L301">        manager.indices(sft).foreach { index =&gt;</span>
+<span class="nc" id="L302">          val indexSft = index match {</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            case joinIndex: AttributeJoinIndex =&gt; joinIndex.indexSft</span>
+<span class="nc" id="L304">            case _ =&gt; sft</span>
+          }
+<span class="nc" id="L306">          DtgAgeOffIterator.set(tableOps, indexSft, index, ttl, dtg)</span>
+        }
+
+<span class="nc" id="L309">      case e =&gt; throw new IllegalArgumentException(s&quot;Unexpected feature expiration: $e&quot;)</span>
+    }
+  }
+
+  override def getQueryPlan(query: Query, index: Option[String], explainer: Explainer): Seq[AccumuloQueryPlan] =
+<span class="nc" id="L314">    super.getQueryPlan(query, index, explainer).asInstanceOf[Seq[AccumuloQueryPlan]]</span>
+
+  // methods specific to accumulo
+
+  /**
+   * Gets a query plan that can be satisfied via AccumuloInputFormat - e.g. only 1 table and configuration.
+   *
+   * @param query query
+   * @return
+   */
+  def getSingleQueryPlan(query: Query): AccumuloQueryPlan = {
+    // disable join plans as those have multiple tables
+<span class="nc" id="L326">    JoinIndex.AllowJoinPlans.set(false)</span>
+
+    try {
+<span class="nc bnc" id="L329" title="All 2 branches missed.">      lazy val fallbackIndex = {</span>
+        val schema = getSchema(query.getTypeName)
+        manager.indices(schema, IndexMode.Read).headOption.getOrElse {
+<span class="nc" id="L332">          throw new IllegalStateException(s&quot;Schema '${schema.getTypeName}' does not have any readable indices&quot;)</span>
+        }
+      }
+
+<span class="nc" id="L336">      val queryPlans = getQueryPlan(query)</span>
+
+<span class="nc bnc" id="L338" title="All 2 branches missed.">      if (queryPlans.isEmpty) {</span>
+        val filter =
+<span class="nc" id="L340">          FilterStrategy(fallbackIndex, None, Some(Filter.EXCLUDE), temporal = false, Float.PositiveInfinity, query.getHints)</span>
+<span class="nc" id="L341">        EmptyPlan(QueryStrategy(filter, Seq.empty, Seq.empty, Seq.empty, filter.filter, None))</span>
+      } else {
+        val qps =
+<span class="nc bnc" id="L344" title="All 2 branches missed.">          if (queryPlans.lengthCompare(1) == 0) { queryPlans } else {</span>
+            // this query requires multiple scans, which we can't execute from some input formats
+            // instead, fall back to a full table scan
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            logger.warn(&quot;Desired query plan requires multiple scans - falling back to full table scan&quot;)</span>
+<span class="nc" id="L348">            getQueryPlan(query, Some(fallbackIndex.identifier))</span>
+          }
+<span class="nc bnc" id="L350" title="All 6 branches missed.">        if (qps.lengthCompare(1) &gt; 0 || qps.exists(_.tables.lengthCompare(1) &gt; 0)) {</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">          logger.error(&quot;The query being executed requires multiple scans, which is not currently &quot; +</span>
+<span class="nc" id="L352">            &quot;supported by GeoMesa. Your result set will be partially incomplete. &quot; +</span>
+<span class="nc" id="L353">            s&quot;Query: ${FilterHelper.toString(query.getFilter)}&quot;)</span>
+        }
+<span class="nc" id="L355">        qps.head</span>
+      }
+    } finally {
+      // make sure we reset the thread locals
+<span class="nc" id="L359">      JoinIndex.AllowJoinPlans.remove()</span>
+    }
+  }
+
+  override def dispose(): Unit = {
+    try {
+<span class="nc" id="L365">      super.dispose()</span>
+    } finally {
+<span class="nc" id="L367">      CloseWithLogging(kerberosTgtRenewer.toSeq ++ Seq(client))</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AccumuloAtomicIndexWriter.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Accumulo DataStore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.accumulo.data.writer.tx</a> &gt; <span class="el_source">AccumuloAtomicIndexWriter.scala</span></div><h1>AccumuloAtomicIndexWriter.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.accumulo.data.writer
+package tx
+
+import org.apache.accumulo.core.client.{ConditionalWriter, ConditionalWriterConfig, IsolatedScanner}
+import org.apache.accumulo.core.conf.ClientProperty
+import org.apache.accumulo.core.data.{Key, PartialKey}
+import org.apache.hadoop.io.Text
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.locationtech.geomesa.accumulo.data.AccumuloDataStore
+import org.locationtech.geomesa.accumulo.data.writer.tx.ConditionalWriteException.ConditionalWriteStatus
+import org.locationtech.geomesa.accumulo.data.writer.tx.MutationBuilder.{AppendBuilder, DeleteBuilder, UpdateBuilder}
+import org.locationtech.geomesa.index.api.IndexAdapter.BaseIndexWriter
+import org.locationtech.geomesa.index.api.WritableFeature.FeatureWrapper
+import org.locationtech.geomesa.index.api._
+import org.locationtech.geomesa.utils.io.{CloseQuietly, WithClose}
+
+import java.util.concurrent.TimeUnit
+import scala.collection.mutable.ArrayBuffer
+
+/**
+ * Accumulo atomic index writer implementation
+ *
+ * @param ds data store
+ * @param sft simple feature type
+ * @param indices indices to write to
+ * @param wrapper feature wrapper
+ * @param partition partition to write to (if partitioned schema)
+ */
+<span class="nc" id="L37">class AccumuloAtomicIndexWriter(</span>
+<span class="nc" id="L38">    ds: AccumuloDataStore,</span>
+    sft: SimpleFeatureType,
+<span class="nc" id="L40">    indices: Seq[GeoMesaFeatureIndex[_, _]],</span>
+    wrapper: FeatureWrapper[WritableFeature],
+<span class="nc" id="L42">    partition: Option[String]</span>
+<span class="nc" id="L43">  ) extends BaseIndexWriter[WritableFeature](indices, wrapper) {</span>
+
+  import scala.collection.JavaConverters._
+
+  // should always be writing to a single table here
+<span class="nc" id="L48">  private val tables = indices.map(_.getTableName(partition))</span>
+
+<span class="nc" id="L50">  private val writers: Array[ConditionalWriter] = {</span>
+<span class="nc" id="L51">    val config = new ConditionalWriterConfig()</span>
+<span class="nc" id="L52">    config.setAuthorizations(ds.auths)</span>
+<span class="nc" id="L53">    val maxThreads = ClientProperty.BATCH_WRITER_THREADS_MAX.getInteger(ds.client.properties())</span>
+<span class="nc bnc" id="L54" title="All 2 branches missed.">    if (maxThreads != null) {</span>
+<span class="nc" id="L55">      config.setMaxWriteThreads(maxThreads)</span>
+    }
+<span class="nc" id="L57">    val timeout = ClientProperty.BATCH_WRITER_TIMEOUT_MAX.getTimeInMillis(ds.client.properties())</span>
+<span class="nc bnc" id="L58" title="All 2 branches missed.">    if (timeout != null) {</span>
+<span class="nc" id="L59">      config.setTimeout(timeout, TimeUnit.MILLISECONDS)</span>
+    }
+<span class="nc" id="L61">    tables.map(ds.client.createConditionalWriter(_, config)).toArray</span>
+  }
+
+<span class="nc" id="L64">  private val colFamilyMappings = indices.map(ColumnFamilyMapper.apply).toArray</span>
+<span class="nc" id="L65">  private val visCache = new VisibilityCache()</span>
+
+  override protected def append(feature: WritableFeature, values: Array[RowKeyValue[_]]): Unit =
+<span class="nc" id="L68">    mutate(feature.feature.getID, buildMutations(values, AppendBuilder.apply))</span>
+
+  override protected def delete(feature: WritableFeature, values: Array[RowKeyValue[_]]): Unit =
+<span class="nc" id="L71">    mutate(feature.feature.getID, buildMutations(values, DeleteBuilder.apply))</span>
+
+  override protected def update(
+      feature: WritableFeature,
+      values: Array[RowKeyValue[_]],
+      previous: WritableFeature,
+      previousValues: Array[RowKeyValue[_]]): Unit = {
+<span class="nc" id="L78">    val mutations = Array.ofDim[Seq[MutationBuilder]](values.length)</span>
+    // note: these are temporary conditions - we update them below
+<span class="nc" id="L80">    val updates = buildMutations(values, AppendBuilder.apply)</span>
+<span class="nc" id="L81">    val deletes = buildMutations(previousValues, DeleteBuilder.apply)</span>
+<span class="nc" id="L82">    var i = 0</span>
+<span class="nc bnc" id="L83" title="All 2 branches missed.">    while (i &lt; values.length) {</span>
+<span class="nc" id="L84">      val dels = ArrayBuffer(deletes(i): _*)</span>
+<span class="nc" id="L85">      val puts = updates(i).map { mutations =&gt;</span>
+        // find any previous values that will be updated
+<span class="nc" id="L87">        val d = dels.indexWhere(p =&gt; java.util.Arrays.equals(p.row, mutations.row))</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">        if (d == -1) { mutations } else {</span>
+          // note: side-effect
+<span class="nc" id="L90">          val toUpdate = dels.remove(d)</span>
+          // any previous values that are overwritten are added as conditions on the put
+          // any previous values that aren't overwritten need to be deleted
+<span class="nc" id="L93">          val remaining = toUpdate.kvs.filterNot(kv =&gt; mutations.kvs.exists(_.equalKey(kv)))</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">          if (remaining.nonEmpty) {</span>
+<span class="nc" id="L95">            dels.append(toUpdate.copy(kvs = remaining))</span>
+          }
+<span class="nc" id="L97">          UpdateBuilder(mutations.row, mutations.kvs, toUpdate.kvs)</span>
+        }
+      }
+      // note: order here is important, we need puts to operate before deletes in order for conditions to succeed
+<span class="nc" id="L101">      mutations(i) = puts ++ dels</span>
+<span class="nc" id="L102">      i += 1</span>
+    }
+<span class="nc" id="L104">    mutate(feature.feature.getID, mutations)</span>
+  }
+
+  /**
+   * Apply the mutations
+   *
+   * @param id feature id
+   * @param mutations mutations to apply
+   */
+  @throws[ConditionalWriteException]
+  private def mutate(id: String, mutations: Array[Seq[MutationBuilder]]): Unit = {
+<span class="nc" id="L115">    val errors = ArrayBuffer.empty[ConditionalWriteStatus]</span>
+<span class="nc" id="L116">    val successes = ArrayBuffer.empty[(Int, MutationBuilder)]</span>
+<span class="nc" id="L117">    var i = 0</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">    while (i &lt; mutations.length) {</span>
+      // note: mutations need to be applied in order so that conditions are correct
+<span class="nc" id="L120">      mutations(i).foreach { m =&gt;</span>
+<span class="nc" id="L121">        val status = writers(i).write(m.apply()).getStatus</span>
+<span class="nc bnc" id="L122" title="All 6 branches missed.">        if (status == ConditionalWriter.Status.ACCEPTED ||</span>
+<span class="nc bnc" id="L123" title="All 8 branches missed.">            (status == ConditionalWriter.Status.UNKNOWN &amp;&amp; verifyWrite(tables(i), m))) {</span>
+<span class="nc" id="L124">          successes += i -&gt; m</span>
+        } else {
+<span class="nc" id="L126">          errors += ConditionalWriteStatus(indices(i), m.name, status)</span>
+        }
+      }
+<span class="nc" id="L129">      i += 1</span>
+    }
+<span class="nc bnc" id="L131" title="All 2 branches missed.">    if (errors.nonEmpty) {</span>
+      // revert any writes we made
+<span class="nc bnc" id="L133" title="All 2 branches missed.">      successes.foreach { case (i, m) =&gt;</span>
+        // note: if these are rejected, some other update has come through and we don't want to overwrite it
+<span class="nc" id="L135">        writers(i).write(m.invert())</span>
+      }
+<span class="nc" id="L137">      throw ConditionalWriteException(id, errors.toSeq)</span>
+    }
+  }
+
+  /**
+   * Verify if a mutation was successfully applied or not
+   *
+   * @param table table being mutated
+   * @param mutation mutation being applied
+   * @return true if the current state of the table reflects the mutation's intended result
+   */
+  private def verifyWrite(table: String, mutation: MutationBuilder): Boolean = {
+<span class="nc" id="L149">    WithClose(new IsolatedScanner(ds.client.createScanner(table, ds.auths))) { scanner =&gt;</span>
+<span class="nc" id="L150">      val key = new Key(mutation.row)</span>
+<span class="nc" id="L151">      scanner.setRange(new org.apache.accumulo.core.data.Range(key, true, key.followingKey(PartialKey.ROW), false))</span>
+<span class="nc" id="L152">      val found = scanner.iterator().asScala.toList</span>
+<span class="nc" id="L153">      mutation.apply().getUpdates.asScala.forall { update =&gt;</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (update.isDeleted) {</span>
+<span class="nc" id="L155">          found.forall { entry =&gt;</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            !compare(entry.getKey.getColumnFamily, update.getColumnFamily) ||</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">                !compare(entry.getKey.getColumnQualifier, update.getColumnQualifier) ||</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">                !compare(entry.getKey.getColumnVisibility, update.getColumnVisibility) ||</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">                entry.getKey.isDeleted</span>
+          }
+        } else {
+<span class="nc" id="L162">          found.exists { entry =&gt;</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">            compare(entry.getKey.getColumnFamily, update.getColumnFamily) &amp;&amp;</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">                compare(entry.getKey.getColumnQualifier, update.getColumnQualifier) &amp;&amp;</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">                compare(entry.getKey.getColumnVisibility, update.getColumnVisibility) &amp;&amp;</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">                entry.getValue.compareTo(update.getValue) == 0</span>
+          }
+        }
+      }
+    }
+  }
+
+  private def buildMutations[T &lt;: MutationBuilder](
+      values: Array[RowKeyValue[_]],
+      builderFactory: (Array[Byte], Seq[MutationValue]) =&gt; T): Array[Seq[T]] = {
+<span class="nc" id="L176">    val mutations = Array.ofDim[Seq[T]](values.length)</span>
+<span class="nc" id="L177">    var i = 0</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">    while (i &lt; values.length) {</span>
+<span class="nc" id="L179">      mutations(i) = values(i) match {</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">        case kv: SingleRowKeyValue[_] =&gt;</span>
+<span class="nc" id="L181">          val values = kv.values.map { v =&gt;</span>
+<span class="nc" id="L182">            MutationValue(colFamilyMappings(i)(v.cf), v.cq, visCache(v.vis), v.value)</span>
+          }
+<span class="nc" id="L184">          Seq(builderFactory(kv.row, values))</span>
+
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        case mkv: MultiRowKeyValue[_] =&gt;</span>
+<span class="nc" id="L187">          mkv.rows.map { row =&gt;</span>
+<span class="nc" id="L188">            val values = mkv.values.map { v =&gt;</span>
+<span class="nc" id="L189">              MutationValue(colFamilyMappings(i)(v.cf), v.cq, visCache(v.vis), v.value)</span>
+            }
+<span class="nc" id="L191">            builderFactory(row, values)</span>
+          }
+      }
+<span class="nc" id="L194">      i += 1</span>
+    }
+<span class="nc" id="L196">    mutations</span>
+  }
+
+<span class="nc bnc" id="L199" title="All 2 branches missed.">  private def compare(text: Text, bytes: Array[Byte]): Boolean = text.compareTo(bytes, 0, bytes.length) == 0</span>
+
+<span class="nc" id="L201">  override def flush(): Unit = {} // there is no batching here, every single write gets flushed</span>
+
+<span class="nc" id="L203">  override def close(): Unit = CloseQuietly(writers).foreach(e =&gt; throw e)</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

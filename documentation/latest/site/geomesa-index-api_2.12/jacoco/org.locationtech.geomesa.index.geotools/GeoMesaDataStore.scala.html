@@ -1,0 +1,707 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>GeoMesaDataStore.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Index API</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.index.geotools</a> &gt; <span class="el_source">GeoMesaDataStore.scala</span></div><h1>GeoMesaDataStore.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.index.geotools
+
+import com.github.benmanes.caffeine.cache.{AsyncCacheLoader, AsyncLoadingCache, CacheLoader, Caffeine}
+import com.typesafe.scalalogging.LazyLogging
+import org.geotools.api.data._
+import org.geotools.api.feature.`type`.AttributeDescriptor
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.geotools.api.filter.Filter
+import org.locationtech.geomesa.index.FlushableFeatureWriter
+import org.locationtech.geomesa.index.api._
+import org.locationtech.geomesa.index.conf.QueryHints
+import org.locationtech.geomesa.index.conf.partition.TablePartition
+import org.locationtech.geomesa.index.geotools.GeoMesaDataStore.{SchemaCompatibility, VersionKey}
+import org.locationtech.geomesa.index.geotools.GeoMesaDataStoreFactory.GeoMesaDataStoreConfig
+import org.locationtech.geomesa.index.index.attribute.AttributeIndex
+import org.locationtech.geomesa.index.index.id.IdIndex
+import org.locationtech.geomesa.index.planning.DataStoreQueryRunner
+import org.locationtech.geomesa.index.stats.HasGeoMesaStats
+import org.locationtech.geomesa.index.utils.{ExplainLogging, Explainer}
+import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+import org.locationtech.geomesa.utils.conf.SemanticVersion.MinorOrdering
+import org.locationtech.geomesa.utils.conf.{GeoMesaProperties, IndexId, SemanticVersion}
+import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypeComparator.TypeComparison
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.{AttributeOptions, Configs, InternalConfigs}
+import org.locationtech.geomesa.utils.geotools.converters.FastConverter
+import org.locationtech.geomesa.utils.index.IndexMode
+import org.locationtech.geomesa.utils.io.CloseWithLogging
+
+import java.io.IOException
+import java.util.Collections
+import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
+import scala.util.Try
+import scala.util.control.NonFatal
+
+/**
+ * Abstract base class for data store implementations on top of distributed databases
+ *
+ * @param config common datastore configuration options - subclasses can extend this
+ * @tparam DS type of this data store
+ */
+<span class="nc" id="L51">abstract class GeoMesaDataStore[DS &lt;: GeoMesaDataStore[DS]](val config: GeoMesaDataStoreConfig)</span>
+<span class="nc" id="L52">    extends MetadataBackedDataStore(config) with HasGeoMesaStats {</span>
+
+  this: DS =&gt;
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L58">  private val registry = config.metrics.map(_.register())</span>
+
+<span class="nc" id="L60">  private val runner = new DataStoreQueryRunner(this)</span>
+
+<span class="nc" id="L62">  val manager: IndexManager = new IndexManager(this)</span>
+
+  // abstract methods to be implemented by subclasses
+
+  def adapter: IndexAdapter[DS]
+
+  /**
+    * Returns all tables that may be created for the simple feature type. Note that some of these
+    * tables may be shared with other simple feature types, and the tables may not all currently exist.
+    *
+    * @param typeName simple feature type name
+    * @return
+    */
+<span class="nc" id="L75">  def getAllTableNames(typeName: String): Seq[String] = Seq(config.catalog) ++ getAllIndexTableNames(typeName)</span>
+
+  /**
+    * Returns all index tables that may be created for the simple feature type. Note that some of these
+    * tables may be shared with other simple feature types, and the tables may not all currently exist.
+    *
+    * @param typeName simple feature type name
+    * @return
+    */
+  def getAllIndexTableNames(typeName: String): Seq[String] =
+<span class="nc" id="L85">    Option(getSchema(typeName)).toSeq.flatMap(sft =&gt; manager.indices(sft).flatMap(_.getTableNames()))</span>
+
+  /**
+    * Optimized method to delete everything (all tables) associated with this datastore
+    * (index tables and catalog table)
+    * NB: We are *not* currently deleting the query table and/or query information.
+    */
+  def delete(): Unit = {
+<span class="nc" id="L93">    val types = getTypeNames</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">    val tables = if (types.length == 0) Array(config.catalog) else {</span>
+<span class="nc" id="L95">      types.flatMap(getAllTableNames).distinct</span>
+    }
+<span class="nc" id="L97">    adapter.deleteTables(tables)</span>
+<span class="nc" id="L98">    metadata.resetCache()</span>
+  }
+
+  // hooks to allow extended functionality
+
+  /**
+    * Gets iterator versions as a string. Subclasses with distributed classpaths should override and implement.
+    *
+    * @return iterator versions
+    */
+<span class="nc" id="L108">  protected def loadIteratorVersions: Set[String] = Set.empty</span>
+
+  /**
+    * Update the local value for `sft.getIndices`. Only needed for legacy data stores with old index metadata
+    * encoding
+    *
+    * @param sft simple feature type
+    */
+  protected def transitionIndices(sft: SimpleFeatureType): Unit =
+<span class="nc" id="L117">    throw new UnsupportedOperationException(&quot;This data store does not support legacy index formats - please create a new schema&quot;)</span>
+
+  @throws(classOf[IllegalArgumentException])
+<span class="nc" id="L120">  override protected def preSchemaCreate(sft: SimpleFeatureType): Unit = {</span>
+    // check for old user data keys and re-map them
+<span class="nc bnc" id="L122" title="All 2 branches missed.">    InternalConfigs.DeprecatedConfigMappings.foreach { case (from, to) =&gt;</span>
+<span class="nc" id="L123">      val v = sft.getUserData.remove(from)</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">      if (v != null) {</span>
+<span class="nc" id="L125">        sft.getUserData.put(to, v)</span>
+      }
+    }
+
+    // validate column groups
+<span class="nc" id="L130">    adapter.groups.validate(sft)</span>
+
+    // disable table sharing, no longer supported
+    // noinspection ScalaDeprecation
+<span class="nc bnc" id="L134" title="All 2 branches missed.">    if (sft.isTableSharing) {</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">      logger.warn(&quot;Table sharing is no longer supported - disabling table sharing&quot;)</span>
+<span class="nc" id="L136">      sft.getUserData.remove(Configs.TableSharing)</span>
+<span class="nc" id="L137">      sft.getUserData.remove(InternalConfigs.TableSharingPrefix)</span>
+    }
+
+    // configure the indices to use
+<span class="nc bnc" id="L141" title="All 2 branches missed.">    if (sft.getIndices.isEmpty) {</span>
+<span class="nc" id="L142">      val indices = GeoMesaFeatureIndexFactory.indices(sft)</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">      if (indices.isEmpty) {</span>
+<span class="nc" id="L144">        throw new IllegalArgumentException(&quot;There are no available indices that support the schema &quot; +</span>
+<span class="nc" id="L145">            SimpleFeatureTypes.encodeType(sft))</span>
+      }
+<span class="nc" id="L147">      sft.setIndices(indices)</span>
+    }
+
+    // try to create the indices up front to ensure they are valid for the sft
+<span class="nc" id="L151">    GeoMesaFeatureIndexFactory.create(this, sft, sft.getIndices)</span>
+
+    // remove the enabled indices after configuration so we don't persist them
+<span class="nc" id="L154">    sft.getUserData.remove(SimpleFeatureTypes.Configs.EnabledIndices)</span>
+    // remove any 'index' flags in the attribute metadata, they have already been captured in the indices above
+<span class="nc" id="L156">    sft.getAttributeDescriptors.asScala.foreach(_.getUserData.remove(AttributeOptions.OptIndex))</span>
+
+    // for partitioned schemas, persist the table partitioning keys
+<span class="nc bnc" id="L159" title="All 2 branches missed.">    if (sft.isPartitioned) {</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">      InternalConfigs.PartitionConfigMappings.foreach { case (from, to) =&gt;</span>
+<span class="nc" id="L161">        Option(sft.getUserData.get(from)).foreach(sft.getUserData.put(to, _))</span>
+      }
+<span class="nc bnc" id="L163" title="All 2 branches missed.">      InternalConfigs.PartitionConfigPrefixMappings.foreach { case (from, to) =&gt;</span>
+<span class="nc bnc" id="L164" title="All 4 branches missed.">        sft.getUserData.asScala.toMap.collect {</span>
+<span class="nc bnc" id="L165" title="All 8 branches missed.">          case (k: String, v) if k.startsWith(from) =&gt; sft.getUserData.put(to + k.substring(from.length), v)</span>
+        }
+      }
+    }
+
+    // set stats enabled based on the data store config if not explicitly set
+<span class="nc bnc" id="L171" title="All 2 branches missed.">    if (!sft.getUserData.containsKey(SimpleFeatureTypes.Configs.StatsEnabled)) {</span>
+<span class="nc" id="L172">      sft.setStatsEnabled(config.generateStats)</span>
+    }
+
+<span class="nc" id="L175">    sft.getFeatureExpiration // validate any configured age-off</span>
+  }
+
+  @throws(classOf[IllegalArgumentException])
+  override protected def preSchemaUpdate(sft: SimpleFeatureType, previous: SimpleFeatureType): Unit = {
+<span class="nc" id="L180">    updateSchemaUserData(sft, previous)</span>
+    // try to create the new indices to ensure they are valid for the sft
+<span class="nc" id="L182">    try { GeoMesaFeatureIndexFactory.create(this, sft, sft.getIndices) } catch {</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">      case NonFatal(e) =&gt; throw new IllegalArgumentException(s&quot;Error configuring new feature index:&quot;, e)</span>
+    }
+    // validate any configured age-off
+<span class="nc" id="L186">    sft.getFeatureExpiration</span>
+  }
+
+  // create the index tables (if not using partitioned tables)
+  override protected def onSchemaCreated(sft: SimpleFeatureType): Unit = {
+<span class="nc" id="L191">    val indices = manager.indices(sft)</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">    if (sft.isPartitioned) {</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">      logger.debug(s&quot;Delaying creation of partitioned indices ${indices.map(_.identifier).mkString(&quot;, &quot;)}&quot;)</span>
+    } else {
+<span class="nc bnc" id="L195" title="All 2 branches missed.">      logger.debug(s&quot;Creating indices ${indices.map(_.identifier).mkString(&quot;, &quot;)}&quot;)</span>
+<span class="nc" id="L196">      indices.toList.map(i =&gt; CachedThreadPool.submit(() =&gt; adapter.createTable(i, None, i.getSplits(None)))).foreach(_.get)</span>
+    }
+  }
+
+  // create the new index tables (if not using partitioned tables)
+  override protected def onSchemaUpdated(sft: SimpleFeatureType, previous: SimpleFeatureType): Unit = {
+<span class="nc" id="L202">    val partitioned = TablePartition.partitioned(sft)</span>
+
+    // check for column renaming
+<span class="nc bnc" id="L205" title="All 2 branches missed.">    val colMap = getColumnMap(previous, sft).map { case (k, v) =&gt; (v, k) }</span>
+
+    // rewrite the table name keys for the renamed cols
+<span class="nc bnc" id="L208" title="All 2 branches missed.">    if (colMap.nonEmpty) {</span>
+<span class="nc" id="L209">      sft.getIndices.foreach { i =&gt;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        if (i.attributes.exists(colMap.contains)) {</span>
+<span class="nc" id="L211">          val prev = i.copy(attributes = i.attributes.map(a =&gt; colMap.getOrElse(a, a)))</span>
+<span class="nc" id="L212">          val old = manager.index(previous, GeoMesaFeatureIndex.identifier(prev))</span>
+<span class="nc" id="L213">          val index = GeoMesaFeatureIndexFactory.create(this, sft, Seq(i)).headOption.getOrElse {</span>
+<span class="nc" id="L214">            throw new IllegalArgumentException(</span>
+<span class="nc" id="L215">              s&quot;Error configuring new feature index: ${GeoMesaFeatureIndex.identifier(i)}&quot;)</span>
+          }
+<span class="nc bnc" id="L217" title="All 2 branches missed.">          val partitions = if (!partitioned) { Seq(None) } else {</span>
+            // have to use the old table name key but the new sft name for looking up the partitions
+<span class="nc" id="L219">            val tableNameKey = old.tableNameKey(Some(&quot;&quot;))</span>
+<span class="nc" id="L220">            val offset = tableNameKey.length</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            metadata.scan(sft.getTypeName, tableNameKey).map { case (k, _) =&gt; Some(k.substring(offset)) }</span>
+          }
+<span class="nc" id="L223">          partitions.foreach { p =&gt;</span>
+<span class="nc" id="L224">            metadata.read(sft.getTypeName, old.tableNameKey(p)).foreach { v =&gt;</span>
+<span class="nc" id="L225">              metadata.insert(sft.getTypeName, index.tableNameKey(p), v)</span>
+            }
+          }
+        }
+      }
+    }
+
+    // configure any new indices
+<span class="nc bnc" id="L233" title="All 2 branches missed.">    if (partitioned) {</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">      logger.debug(&quot;Delaying creation of partitioned indices&quot;)</span>
+<span class="nc" id="L235">    } else {</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">      logger.debug(s&quot;Ensuring indices ${manager.indices(sft).map(_.identifier).mkString(&quot;, &quot;)}&quot;)</span>
+<span class="nc" id="L237">      manager.indices(sft).toList.map(i =&gt; CachedThreadPool.submit(() =&gt; adapter.createTable(i, None, i.getSplits(None)))).foreach(_.get)</span>
+    }
+
+    // update stats
+<span class="nc bnc" id="L241" title="All 2 branches missed.">    if (previous.statsEnabled) {</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">      if (!sft.statsEnabled) {</span>
+<span class="nc" id="L243">        stats.writer.clear(previous)</span>
+<span class="nc bnc" id="L244" title="All 8 branches missed.">      } else if (sft.getTypeName != previous.getTypeName || colMap.nonEmpty) {</span>
+<span class="nc" id="L245">        stats.writer.rename(sft, previous)</span>
+      }
+    }
+
+    // rename tables to match the new sft name
+<span class="nc bnc" id="L250" title="All 12 branches missed.">    if (sft.getTypeName != previous.getTypeName || sft.getIndices != previous.getIndices) {</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">      if (FastConverter.convertOrElse[java.lang.Boolean](sft.getUserData.get(Configs.UpdateRenameTables), false)) {</span>
+<span class="nc" id="L252">        manager.indices(sft).foreach { index =&gt;</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">          val partitions = if (partitioned) { index.getPartitions.map(Option.apply) } else { Seq(None) }</span>
+<span class="nc" id="L254">          partitions.foreach { partition =&gt;</span>
+<span class="nc" id="L255">            val key = index.tableNameKey(partition)</span>
+<span class="nc" id="L256">            metadata.read(sft.getTypeName, key).foreach { table =&gt;</span>
+<span class="nc" id="L257">              metadata.remove(sft.getTypeName, key)</span>
+<span class="nc" id="L258">              val renamed = index.configureTableName(partition, adapter.tableNameLimit)</span>
+<span class="nc bnc" id="L259" title="All 6 branches missed.">              if (renamed != table) {</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                logger.debug(s&quot;Renaming table from '$table' to '$renamed'&quot;)</span>
+<span class="nc" id="L261">                adapter.renameTable(table, renamed)</span>
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // delete the index tables
+  override protected def onSchemaDeleted(sft: SimpleFeatureType): Unit = {
+    def deleteFull(index: GeoMesaFeatureIndex[_, _]): Unit =
+<span class="nc" id="L273">      adapter.deleteTables(index.deleteTableNames(None))</span>
+    def deleteShared(index: GeoMesaFeatureIndex[_, _]): Unit = {
+<span class="nc bnc" id="L275" title="All 2 branches missed.">      if (index.keySpace.sharing.isEmpty) { deleteFull(index) } else {</span>
+<span class="nc" id="L276">        adapter.clearTables(index.deleteTableNames(None), Some(index.keySpace.sharing))</span>
+      }
+    }
+
+<span class="nc" id="L280">    val indices = manager.indices(sft).toList</span>
+    // noinspection ScalaDeprecation
+<span class="nc bnc" id="L282" title="All 12 branches missed.">    if (sft.isTableSharing &amp;&amp; getTypeNames.exists(t =&gt; t != sft.getTypeName &amp;&amp; getSchema(t).isTableSharing)) {</span>
+<span class="nc" id="L283">      indices.map(i =&gt; CachedThreadPool.submit(() =&gt; deleteShared(i))).foreach(_.get)</span>
+    } else {
+<span class="nc" id="L285">      indices.map(i =&gt; CachedThreadPool.submit(() =&gt; deleteFull(i))).foreach(_.get)</span>
+    }
+<span class="nc bnc" id="L287" title="All 2 branches missed.">    if (sft.statsEnabled) {</span>
+<span class="nc" id="L288">      stats.writer.clear(sft)</span>
+    }
+  }
+
+  // methods from org.geotools.api.data.DataStore
+
+  /**
+   * @see org.geotools.api.data.DataStore#getSchema(java.lang.String)
+   * @param typeName feature type name
+   * @return feature type, or null if it does not exist
+   */
+  override def getSchema(typeName: String): SimpleFeatureType = {
+<span class="nc" id="L300">    var sft = super.getSchema(typeName)</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">    if (sft != null) {</span>
+      // ensure index metadata is correct
+<span class="nc bnc" id="L303" title="All 10 branches missed.">      if (sft.getIndices.exists(i =&gt; i.attributes.isEmpty &amp;&amp; i.name != IdIndex.name)) {</span>
+<span class="nc" id="L304">        sft = SimpleFeatureTypes.mutable(sft)</span>
+        // migrate index metadata to standardized versions and attributes
+<span class="nc" id="L306">        transitionIndices(sft)</span>
+<span class="nc" id="L307">        sft = SimpleFeatureTypes.immutable(sft)</span>
+        // validate indices
+<span class="nc" id="L309">        try { manager.indices(sft) } catch {</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">          case NonFatal(e) =&gt;</span>
+<span class="nc" id="L311">            throw new IllegalStateException(s&quot;The schema ${sft.getTypeName} was written with a older &quot; +</span>
+<span class="nc" id="L312">                &quot;version of GeoMesa that is no longer supported. You may continue to use an older client, or &quot; +</span>
+<span class="nc" id="L313">                s&quot;manually edit the metadata for '${InternalConfigs.IndexVersions}' to exclude the invalid indices.&quot;, e)</span>
+        }
+      } else {
+        // validate indices
+<span class="nc" id="L317">        try { manager.indices(sft) } catch {</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">          case NonFatal(e) =&gt;</span>
+<span class="nc" id="L319">            val versions = sft.getIndices.map(i =&gt; s&quot;${i.name}:${i.version}&quot;).mkString(&quot;,&quot;)</span>
+<span class="nc" id="L320">            val available = GeoMesaFeatureIndexFactory.available(sft).map(i =&gt; s&quot;${i._1}:${i._2}&quot;).mkString(&quot;,&quot;)</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            logger.error(s&quot;Trying to access schema ${sft.getTypeName} with invalid index versions '$versions' - &quot; +</span>
+<span class="nc" id="L322">                s&quot;available indices are '$available'&quot;, e)</span>
+<span class="nc" id="L323">            throw new IllegalStateException(s&quot;The schema ${sft.getTypeName} was written with a newer &quot; +</span>
+<span class="nc" id="L324">                &quot;version of GeoMesa than this client can handle. Please ensure that you are using the &quot; +</span>
+<span class="nc" id="L325">                &quot;same GeoMesa jar versions across your entire workflow. For more information, see &quot; +</span>
+<span class="nc" id="L326">                &quot;https://www.geomesa.org/documentation/stable/user/upgrade.html&quot;)</span>
+        }
+      }
+
+      // check for sft-level stats flag and set it if not present
+<span class="nc bnc" id="L331" title="All 2 branches missed.">      if (!sft.getUserData.containsKey(SimpleFeatureTypes.Configs.StatsEnabled)) {</span>
+<span class="nc" id="L332">        val extra = Collections.singletonMap(SimpleFeatureTypes.Configs.StatsEnabled, config.generateStats.toString)</span>
+<span class="nc" id="L333">        sft = SimpleFeatureTypes.immutable(sft, extra)</span>
+      }
+
+      // get the remote version if it's available, but don't wait for it
+<span class="nc" id="L337">      GeoMesaDataStore.versions.get(VersionKey(this)).getNow(Right(None)) match {</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        case Left(e) =&gt; throw e</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        case Right(version) =&gt;</span>
+<span class="nc" id="L340">          version.foreach { v =&gt;</span>
+<span class="nc" id="L341">            val userData = Collections.singletonMap[AnyRef, AnyRef](InternalConfigs.RemoteVersion, v.toString)</span>
+<span class="nc" id="L342">            sft = SimpleFeatureTypes.immutable(sft, userData)</span>
+          }
+      }
+    }
+<span class="nc" id="L346">    sft</span>
+  }
+
+  /**
+   * @see org.geotools.api.data.DataStore#getFeatureSource(java.lang.String)
+   * @param typeName simple feature type name
+   * @return featureStore, suitable for reading and writing
+   */
+  override def getFeatureSource(typeName: String): GeoMesaFeatureStore = {
+<span class="nc" id="L355">    val sft = getSchema(typeName)</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">    if (sft == null) {</span>
+<span class="nc" id="L357">      throw new IOException(s&quot;Schema '$typeName' has not been initialized. Please call 'createSchema' first.&quot;)</span>
+    }
+<span class="nc" id="L359">    new GeoMesaFeatureStore(this, sft)</span>
+  }
+
+  override private[geomesa] def getFeatureReader(
+      sft: SimpleFeatureType,
+      transaction: Transaction,
+      query: Query): GeoMesaFeatureReader = {
+<span class="nc bnc" id="L366" title="All 6 branches missed.">    if (transaction != Transaction.AUTO_COMMIT) {</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">      logger.warn(&quot;Ignoring transaction - not supported&quot;)</span>
+    }
+<span class="nc" id="L369">    GeoMesaFeatureReader(sft, query, runner, config.audit)</span>
+  }
+
+  /**
+    * Internal method to get a feature writer without reloading the simple feature type. We don't expose this
+    * widely as we want to ensure that the sft has been loaded from our catalog
+    *
+    * @param sft simple feature type
+    * @param filter if defined, will do an updating write, otherwise will do an appending write
+    * @return
+    */
+  override private[geomesa] def getFeatureWriter(
+      sft: SimpleFeatureType,
+      transaction: Transaction,
+      filter: Option[Filter]): FlushableFeatureWriter = {
+<span class="nc bnc" id="L384" title="All 6 branches missed.">    val atomic = transaction == AtomicWriteTransaction.INSTANCE</span>
+<span class="nc bnc" id="L385" title="All 8 branches missed.">    if (!atomic &amp;&amp; transaction != Transaction.AUTO_COMMIT) {</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">      logger.warn(&quot;Ignoring transaction - not supported&quot;)</span>
+    }
+<span class="nc" id="L388">    GeoMesaFeatureWriter(this, sft, manager.indices(sft, mode = IndexMode.Write), filter, atomic)</span>
+  }
+
+  /**
+    * Writes to the specified indices
+    *
+    * @param typeName feature type name
+    * @param indices indices to write
+    * @return
+    */
+  def getIndexWriterAppend(typeName: String, indices: Seq[GeoMesaFeatureIndex[_, _]]): FlushableFeatureWriter = {
+<span class="nc" id="L399">    val sft = getSchema(typeName)</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">    if (sft == null) {</span>
+<span class="nc" id="L401">      throw new IOException(s&quot;Schema '$typeName' has not been initialized. Please call 'createSchema' first.&quot;)</span>
+    }
+<span class="nc" id="L403">    GeoMesaFeatureWriter(this, sft, indices, None, atomic = false)</span>
+  }
+
+  /**
+   * Cleanup any open connections, etc. Equivalent to java.io.Closeable.close()
+   *
+   * @see org.geotools.data.DataAccess#dispose()
+   */
+  override def dispose(): Unit = {
+<span class="nc" id="L412">    Try(GeoMesaDataStore.liveStores.get(VersionKey(config.catalog, getClass)).remove(this))</span>
+<span class="nc" id="L413">    CloseWithLogging(stats)</span>
+<span class="nc" id="L414">    CloseWithLogging(config.audit)</span>
+<span class="nc" id="L415">    CloseWithLogging(registry)</span>
+<span class="nc" id="L416">    super.dispose()</span>
+  }
+
+  // end methods from org.geotools.api.data.DataStore
+
+  // other public methods
+
+  /**
+   * Gets the query plan for a given query. The query plan consists of the tables, ranges, iterators etc
+   * required to run a query against the data store.
+   *
+   * @param query query to execute
+   * @param index hint on the index to use to satisfy the query
+   * @return query plans
+   */
+<span class="nc" id="L431">  def getQueryPlan(query: Query, index: Option[String] = None, explainer: Explainer = new ExplainLogging): Seq[QueryPlan] = {</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">    require(query.getTypeName != null, &quot;Type name is required in the query&quot;)</span>
+<span class="nc" id="L433">    val sft = getSchema(query.getTypeName)</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">    if (sft == null) {</span>
+<span class="nc" id="L435">      throw new IOException(s&quot;Schema '${query.getTypeName}' has not been initialized. Please call 'createSchema' first.&quot;)</span>
+    }
+<span class="nc" id="L437">    index.foreach(query.getHints.put(QueryHints.QUERY_INDEX, _))</span>
+<span class="nc" id="L438">    runner.query(sft, query, explainer).plans.toList</span>
+  }
+
+  /**
+    * Gets the geomesa version
+    *
+    * @return client version
+    */
+<span class="nc" id="L446">  def getClientVersion: SemanticVersion = SemanticVersion(GeoMesaProperties.ProjectVersion, lenient = true)</span>
+
+  /**
+    * Gets the geomesa version
+    *
+    * @return iterator version, if data store has iterators
+    */
+  def getDistributedVersion: Option[SemanticVersion] = {
+<span class="nc" id="L454">    GeoMesaDataStore.versions.get(VersionKey(this)).get() match {</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">      case Right(v) =&gt; v</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">      case Left(e)  =&gt; throw e</span>
+    }
+  }
+
+  /**
+   * Checks a simple feature type against an existing schema
+   *
+   * @param typeName type name
+   * @param sft udpated simple feature type
+   * @return
+   */
+  def checkSchemaCompatibility(typeName: String, sft: SimpleFeatureType): SchemaCompatibility = {
+<span class="nc" id="L468">    val previous = getSchema(typeName)</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">    if (previous == null) {</span>
+<span class="nc" id="L470">      new SchemaCompatibility.DoesNotExist(this, sft)</span>
+    } else {
+<span class="nc" id="L472">      validateSchemaUpdate(previous, sft) match {</span>
+<span class="nc bnc" id="L473" title="All 4 branches missed.">        case Right(TypeComparison.Compatible(extension, renamed, _)) =&gt;</span>
+<span class="nc" id="L474">          val copy = SimpleFeatureTypes.copy(sft)</span>
+<span class="nc" id="L475">          updateSchemaUserData(copy, previous)</span>
+<span class="nc bnc" id="L476" title="All 10 branches missed.">          if (!extension &amp;&amp; !renamed &amp;&amp; copy.getUserData == previous.getUserData) {</span>
+<span class="nc" id="L477">            SchemaCompatibility.Unchanged</span>
+          } else {
+<span class="nc" id="L479">            new SchemaCompatibility.Compatible(this, typeName, sft)</span>
+          }
+
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        case Left(e) =&gt;</span>
+<span class="nc" id="L483">          SchemaCompatibility.Incompatible(e)</span>
+      }
+    }
+  }
+
+  // end public methods
+
+  /**
+   * Updates the user data for a schema update prior to persistence. Handles converting existing
+   * user data based on new/updated attributes, copying existing user data over, etc. Feature
+   * type will be updated in place
+   *
+   * @param sft schema update
+   * @param previous existing schema
+   * @return
+   */
+  private def updateSchemaUserData(sft: SimpleFeatureType, previous: SimpleFeatureType): Unit = {
+
+    // check for column renaming
+<span class="nc" id="L502">    val colMap = getColumnMap(previous, sft)</span>
+
+<span class="nc" id="L504">    def remapCol(name: String): String = colMap.getOrElse(name, name)</span>
+
+    // check for attributes flagged 'index' and convert them to sft-level user data
+    def indexed(d: AttributeDescriptor): Boolean = {
+<span class="nc" id="L508">      d.getUserData.get(AttributeOptions.OptIndex) match {</span>
+<span class="nc bnc" id="L509" title="All 4 branches missed.">        case i: String if Seq(&quot;true&quot;, &quot;full&quot;).exists(_.equalsIgnoreCase(i)) =&gt; true</span>
+<span class="nc bnc" id="L510" title="All 4 branches missed.">        case i if i == null || Seq(&quot;false&quot;, &quot;none&quot;).exists(_.equalsIgnoreCase(i.toString)) =&gt; false</span>
+<span class="nc" id="L511">        case i =&gt; throw new IllegalArgumentException(s&quot;Configured index coverage '$i' is not valid: expected 'true'&quot;)</span>
+      }
+    }
+<span class="nc" id="L514">    sft.getAttributeDescriptors.asScala.foreach { d =&gt;</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">      if (indexed(d)) {</span>
+        val existing = {
+<span class="nc" id="L517">          val explicit = sft.getIndices</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">          if (explicit.nonEmpty) { explicit } else { previous.getIndices }</span>
+        }
+<span class="nc bnc" id="L520" title="All 14 branches missed.">        if (!existing.exists(e =&gt; e.name == AttributeIndex.name &amp;&amp; remapCol(e.attributes.head) == d.getLocalName)) {</span>
+<span class="nc" id="L521">          val fields = Seq(d.getLocalName) ++ Option(sft.getGeomField) ++ sft.getDtgField</span>
+<span class="nc" id="L522">          val id = IndexId(AttributeIndex.name, AttributeIndex.version, fields, IndexMode.ReadWrite)</span>
+<span class="nc" id="L523">          sft.setIndices(existing :+ id)</span>
+        }
+      }
+    }
+
+    // check for new indices and 'enabled indices' changes
+    val indices = {
+<span class="nc bnc" id="L530" title="All 2 branches missed.">      val enabled = if (!sft.getUserData.containsKey(Configs.EnabledIndices)) { Seq.empty } else {</span>
+<span class="nc" id="L531">        GeoMesaFeatureIndexFactory.indices(sft)</span>
+      }
+<span class="nc" id="L533">      val remapped = (previous.getIndices ++ sft.getIndices).map(i =&gt; i.copy(attributes = i.attributes.map(remapCol)))</span>
+<span class="nc" id="L534">      (remapped ++ enabled).foldLeft(Seq.empty[IndexId]) { (sum, next) =&gt;</span>
+        // note: ignore index version
+<span class="nc bnc" id="L536" title="All 14 branches missed.">        if (sum.exists(i =&gt; i.name == next.name &amp;&amp; i.attributes == next.attributes)) { sum } else { sum :+ next }</span>
+      }
+    }
+<span class="nc bnc" id="L539" title="All 6 branches missed.">    if (indices != previous.getIndices) {</span>
+<span class="nc" id="L540">      sft.setIndices(indices)</span>
+    }
+
+    // preserve any existing user data but overwrite any keys we redefine
+<span class="nc" id="L544">    val userData = new java.util.HashMap[AnyRef, AnyRef](previous.getUserData)</span>
+<span class="nc" id="L545">    userData.putAll(sft.getUserData)</span>
+<span class="nc" id="L546">    sft.getUserData.putAll(userData)</span>
+    // remove enabled indices as we don't need to persist it
+<span class="nc" id="L548">    sft.getUserData.remove(Configs.EnabledIndices)</span>
+    // remove any null/empty keys as a way to delete existing user data
+<span class="nc bnc" id="L550" title="All 16 branches missed.">    sft.getUserData.asScala.collect { case (k, null | &quot;&quot;) =&gt; k }.foreach(sft.getUserData.remove)</span>
+    // remove any 'index' flags in the attribute user data - we need them above for checking enabled indices
+<span class="nc" id="L552">    sft.getAttributeDescriptors.asScala.foreach(_.getUserData.remove(AttributeOptions.OptIndex))</span>
+  }
+
+  /**
+   * Gets a map of column renames, for use during schema updates
+   *
+   * @param previous previous feature type
+   * @param sft updated feature type
+   * @return map of old name -&gt; new name
+   */
+  private def getColumnMap(previous: SimpleFeatureType, sft: SimpleFeatureType): Map[String, String] = {
+<span class="nc bnc" id="L563" title="All 2 branches missed.">    previous.getAttributeDescriptors.asScala.zipWithIndex.toMap.flatMap { case (prev, i) =&gt;</span>
+<span class="nc" id="L564">      val cur = sft.getDescriptor(i)</span>
+<span class="nc bnc" id="L565" title="All 6 branches missed.">      if (prev.getLocalName != cur.getLocalName) {</span>
+<span class="nc" id="L566">        Map(prev.getLocalName -&gt; cur.getLocalName)</span>
+      } else {
+<span class="nc" id="L568">        Map.empty[String, String]</span>
+      }
+    }
+  }
+}
+
+<span class="nc bnc" id="L574" title="All 4 branches missed.">object GeoMesaDataStore extends LazyLogging {</span>
+
+  import org.locationtech.geomesa.index.conf.SchemaProperties.{CheckDistributedVersion, ValidateDistributedClasspath}
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L580">  private val liveStores = new ConcurrentHashMap[VersionKey, java.util.Set[GeoMesaDataStore[_]]]()</span>
+
+<span class="nc" id="L582">  private val loader: AsyncCacheLoader[VersionKey, Either[Exception, Option[SemanticVersion]]] =</span>
+<span class="nc" id="L583">    new CacheLoader[VersionKey, Either[Exception, Option[SemanticVersion]]]() {</span>
+      override def load(key: VersionKey): Either[Exception, Option[SemanticVersion]] = {
+<span class="nc bnc" id="L585" title="All 2 branches missed.">        if (CheckDistributedVersion.toBoolean.contains(false)) { Right(None) } else {</span>
+<span class="nc" id="L586">          val ds = Option(liveStores.get(key)).flatMap(_.asScala.find(_.getTypeNames.nonEmpty)).orNull</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">          if (ds == null) {</span>
+            // short-circuit load - should try again next time cache is accessed
+<span class="nc" id="L589">            throw new RuntimeException(&quot;Can't load remote versions if there are no feature types&quot;)</span>
+          }
+<span class="nc" id="L591">          val clientVersion = ds.getClientVersion</span>
+          // use lenient parsing to account for versions like 1.3.5.1
+<span class="nc" id="L593">          val iterVersions = ds.loadIteratorVersions.map(v =&gt; SemanticVersion(v, lenient = true))</span>
+
+<span class="nc" id="L595">          def message: String = &quot;Classpath errors detected: configured server-side iterators do not match &quot; +</span>
+<span class="nc" id="L596">              s&quot;client version. Client version: $clientVersion, server versions: ${iterVersions.mkString(&quot;, &quot;)}&quot;</span>
+
+          // take the newest one if there are multiple - probably an update went partially awry, so it's
+          // likely to match more tablet servers than the lower version
+<span class="nc bnc" id="L600" title="All 2 branches missed.">          val version = iterVersions.reduceLeftOption((left, right) =&gt; if (right &gt; left) { right } else { left })</span>
+
+          // ensure matching versions
+          // return an error if the user has enabled strict checking and it's not a patch/pre-release version mismatch
+          // otherwise just log a warning
+<span class="nc bnc" id="L605" title="All 8 branches missed.">          if (iterVersions.forall(_ == clientVersion)) {</span>
+<span class="nc" id="L606">            Right(version)</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">          } else if (ValidateDistributedClasspath.toBoolean.contains(false) ||</span>
+<span class="nc bnc" id="L608" title="All 4 branches missed.">              iterVersions.forall(MinorOrdering.compare(_, clientVersion) == 0)) {</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">            logger.warn(message)</span>
+<span class="nc" id="L610">            Right(version)</span>
+          } else {
+<span class="nc" id="L612">            Left(new RuntimeException(s&quot;$message. You may override this check by setting the system property &quot; +</span>
+<span class="nc" id="L613">                s&quot;'-D${ValidateDistributedClasspath.property}=false'&quot;))</span>
+          }
+        }
+      }
+    }
+
+<span class="nc" id="L619">  private val versions: AsyncLoadingCache[VersionKey, Either[Exception, Option[SemanticVersion]]] =</span>
+<span class="nc" id="L620">    Caffeine.newBuilder().refreshAfterWrite(1, TimeUnit.DAYS).buildAsync(loader)</span>
+
+  /**
+    * Kick off an asynchronous call to load remote iterator versions
+    *
+    * @param ds datastore
+    */
+  def initRemoteVersion(ds: GeoMesaDataStore[_]): Unit = {
+<span class="nc" id="L628">    val key = VersionKey(ds)</span>
+<span class="nc" id="L629">    val loader = new java.util.function.Function[VersionKey, java.util.Set[GeoMesaDataStore[_]]]() {</span>
+      override def apply(t: VersionKey): java.util.Set[GeoMesaDataStore[_]] =
+<span class="nc" id="L631">        Collections.newSetFromMap(new ConcurrentHashMap[GeoMesaDataStore[_], java.lang.Boolean])</span>
+    }
+<span class="nc" id="L633">    liveStores.computeIfAbsent(key, loader).add(ds)</span>
+    // can't get remote version if there aren't any tables
+<span class="nc bnc" id="L635" title="All 2 branches missed.">    if (ds.getTypeNames.length &gt; 0) {</span>
+<span class="nc" id="L636">      versions.get(key)</span>
+    }
+  }
+
+  sealed trait SchemaCompatibility {
+
+    /**
+     * Ensures that the schema matches the existing schema in the data store, or throws an error if
+     * the schemas are incompatible
+     */
+    def apply(): Unit
+  }
+
+<span class="nc" id="L649">  object SchemaCompatibility {</span>
+
+    /**
+     * Indicates that the schema is equal to the existing schema in the data store
+     */
+<span class="nc" id="L654">    case object Unchanged extends SchemaCompatibility {</span>
+<span class="nc" id="L655">      override def apply(): Unit = {}</span>
+    }
+
+    /**
+     * Indicates that the schema does not exist in the data store
+     *
+     * @param ds data store
+     * @param sft schema
+     */
+<span class="nc" id="L664">    class DoesNotExist(ds: GeoMesaDataStore[_], val sft: SimpleFeatureType) extends SchemaCompatibility {</span>
+<span class="nc" id="L665">      override def apply(): Unit = ds.createSchema(sft)</span>
+    }
+
+<span class="nc" id="L668">    object DoesNotExist {</span>
+<span class="nc" id="L669">      def unapply(arg: DoesNotExist): Option[SimpleFeatureType] = Some(arg.sft)</span>
+    }
+
+    /**
+     * Indicates that the schema is not equal to the existing schema, but is compatible
+     *
+     * @param ds data store
+     * @param typeName type name
+     * @param update the updated schema with all appropriate metadata
+     */
+<span class="nc" id="L679">    class Compatible(ds: GeoMesaDataStore[_], val typeName: String, val update: SimpleFeatureType)</span>
+<span class="nc" id="L680">        extends SchemaCompatibility {</span>
+<span class="nc" id="L681">      override def apply(): Unit = ds.updateSchema(typeName, update)</span>
+    }
+
+<span class="nc" id="L684">    object Compatible {</span>
+<span class="nc" id="L685">      def unapply(arg: Compatible): Option[(String, SimpleFeatureType)] = Some(arg.typeName, arg.update)</span>
+    }
+
+    /**
+     * Indicates that the schema is not compatible with the existing schema in the data store
+     *
+     * @param error error message
+     */
+<span class="nc bnc" id="L693" title="All 18 branches missed.">    case class Incompatible(error: Throwable) extends SchemaCompatibility {</span>
+<span class="nc" id="L694">      override def apply(): Unit = throw error</span>
+    }
+  }
+
+  /**
+    * Cache key that for looking up remote versions
+    */
+<span class="nc bnc" id="L701" title="All 25 branches missed.">  private case class VersionKey(catalog: String, clas: Class[_])</span>
+
+<span class="nc" id="L703">  private object VersionKey{</span>
+<span class="nc" id="L704">    def apply(ds: GeoMesaDataStore[_]): VersionKey = VersionKey(ds.config.catalog, ds.getClass)</span>
+  }
+<span class="nc" id="L706">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

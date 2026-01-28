@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HBaseDataStore.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa HBase DataStore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.hbase.data</a> &gt; <span class="el_source">HBaseDataStore.scala</span></div><h1>HBaseDataStore.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.hbase.data
+
+import org.apache.hadoop.hbase.TableName
+import org.apache.hadoop.hbase.client._
+import org.apache.hadoop.hbase.filter.FilterList
+import org.apache.hadoop.hbase.security.visibility.Authorizations
+import org.apache.hadoop.hbase.zookeeper.ZKConfig
+import org.geotools.api.data.Query
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.locationtech.geomesa.hbase.aggregators.HBaseVersionAggregator
+import org.locationtech.geomesa.hbase.data.HBaseConnectionPool.ConnectionWrapper
+import org.locationtech.geomesa.hbase.data.HBaseDataStoreFactory.HBaseDataStoreConfig
+import org.locationtech.geomesa.hbase.rpc.coprocessor.GeoMesaCoprocessor
+import org.locationtech.geomesa.index.geotools.GeoMesaDataStore
+import org.locationtech.geomesa.index.index.attribute.AttributeIndex
+import org.locationtech.geomesa.index.index.id.IdIndex
+import org.locationtech.geomesa.index.index.z2.{XZ2Index, Z2Index}
+import org.locationtech.geomesa.index.index.z3.{XZ3Index, Z3Index}
+import org.locationtech.geomesa.index.metadata.{GeoMesaMetadata, MetadataStringSerializer}
+import org.locationtech.geomesa.index.stats.{GeoMesaStats, RunnableStats}
+import org.locationtech.geomesa.index.utils._
+import org.locationtech.geomesa.index.zk.ZookeeperLocking
+import org.locationtech.geomesa.security.AuthorizationsProvider
+import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+import org.locationtech.geomesa.utils.conf.IndexId
+import org.locationtech.geomesa.utils.geotools.SimpleFeatureTypes.AttributeOptions
+import org.locationtech.geomesa.utils.index.IndexCoverage
+import org.locationtech.geomesa.utils.io.WithClose
+
+import java.util.Collections
+import scala.util.control.NonFatal
+
+<span class="nc" id="L41">class HBaseDataStore(con: ConnectionWrapper, override val config: HBaseDataStoreConfig)</span>
+<span class="nc" id="L42">    extends GeoMesaDataStore[HBaseDataStore](config) with ZookeeperLocking {</span>
+
+  import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L48">  val connection: Connection = con.connection</span>
+
+<span class="nc" id="L50">  override val metadata: GeoMesaMetadata[String] =</span>
+<span class="nc" id="L51">    new HBaseBackedMetadata(connection, TableName.valueOf(config.catalog), MetadataStringSerializer)</span>
+
+<span class="nc" id="L53">  override val adapter: HBaseIndexAdapter = new HBaseIndexAdapter(this)</span>
+
+<span class="nc" id="L55">  override val stats: GeoMesaStats = new RunnableStats(this)</span>
+
+  // zookeeper locking
+<span class="nc" id="L58">  override protected val zookeepers: String = ZKConfig.getZKQuorumServersString(connection.getConfiguration)</span>
+
+  override def getQueryPlan(query: Query, index: Option[String], explainer: Explainer): Seq[HBaseQueryPlan] =
+<span class="nc" id="L61">    super.getQueryPlan(query, index, explainer).asInstanceOf[Seq[HBaseQueryPlan]]</span>
+
+  def applySecurity(query: org.apache.hadoop.hbase.client.Query): Unit =
+<span class="nc" id="L64">    authOpt.foreach(query.setAuthorizations)</span>
+
+  def applySecurity(queries: Iterable[org.apache.hadoop.hbase.client.Query]): Unit =
+<span class="nc" id="L67">    authOpt.foreach(a =&gt; queries.foreach(_.setAuthorizations(a)))</span>
+
+<span class="nc" id="L69">  override def dispose(): Unit = try { super.dispose() } finally { con.close() }</span>
+
+  override protected def loadIteratorVersions: Set[String] = {
+    // just check the first table available
+<span class="nc" id="L73">    val versions = getTypeNames.iterator.map(getSchema).flatMap { sft =&gt;</span>
+<span class="nc" id="L74">      manager.indices(sft).iterator.flatMap { index =&gt;</span>
+<span class="nc" id="L75">        index.getTableNames().flatMap { table =&gt;</span>
+<span class="nc" id="L76">          try {</span>
+<span class="nc" id="L77">            val name = TableName.valueOf(table)</span>
+<span class="nc bnc" id="L78" title="All 2 branches missed.">            if (connection.getAdmin.tableExists(name)) {</span>
+<span class="nc" id="L79">              val options = HBaseVersionAggregator.configure(sft, index)</span>
+<span class="nc" id="L80">              val scan = new Scan().setFilter(new FilterList())</span>
+<span class="nc" id="L81">              val pool = new CachedThreadPool(config.coprocessors.threads)</span>
+              try {
+<span class="nc" id="L83">                WithClose(GeoMesaCoprocessor.execute(connection, name, scan, options, pool)) { bytes =&gt;</span>
+<span class="nc" id="L84">                  bytes.map(_.toStringUtf8).toList.iterator // force evaluation of the iterator before closing it</span>
+                }
+              } finally {
+<span class="nc" id="L87">                pool.shutdown()</span>
+              }
+            } else {
+<span class="nc" id="L90">              Iterator.empty</span>
+            }
+          } catch {
+<span class="nc bnc" id="L93" title="All 2 branches missed.">            case NonFatal(_) =&gt; Iterator.empty</span>
+          }
+        }
+      }
+    }
+<span class="nc bnc" id="L98" title="All 2 branches missed.">    versions.find(_ != null).toSet</span>
+  }
+
+  override protected def transitionIndices(sft: SimpleFeatureType): Unit = {
+<span class="nc" id="L102">    val dtg = sft.getDtgField.toSeq</span>
+<span class="nc" id="L103">    val geom = Option(sft.getGeomField).toSeq</span>
+
+<span class="nc" id="L105">    val indices = Seq.newBuilder[IndexId]</span>
+<span class="nc" id="L106">    val tableNameKeys = Seq.newBuilder[(String, String)]</span>
+
+<span class="nc" id="L108">    sft.getIndices.foreach {</span>
+<span class="nc bnc" id="L109" title="All 6 branches missed.">      case id if id.name == IdIndex.name =&gt;</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        require(id.version == 1, s&quot;Expected index version of 1 but got: $id&quot;)</span>
+<span class="nc" id="L111">        indices += id.copy(version = 3)</span>
+<span class="nc" id="L112">        tableNameKeys += ((s&quot;table.${IdIndex.name}.v1&quot;, s&quot;table.${IdIndex.name}.v3&quot;))</span>
+
+<span class="nc bnc" id="L114" title="All 6 branches missed.">      case id if id.name == Z3Index.name =&gt;</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        require(id.version &lt;= 2, s&quot;Expected index version of 1 or 2 but got: $id&quot;)</span>
+<span class="nc" id="L116">        indices += id.copy(attributes = geom ++ dtg, version = id.version + 3)</span>
+<span class="nc" id="L117">        tableNameKeys += ((s&quot;table.${Z3Index.name}.v${id.version}&quot;, s&quot;table.${Z3Index.name}.v${id.version + 3}&quot;))</span>
+
+<span class="nc bnc" id="L119" title="All 6 branches missed.">      case id if id.name == XZ3Index.name =&gt;</span>
+<span class="nc bnc" id="L120" title="All 2 branches missed.">        require(id.version == 1, s&quot;Expected index version of 1 but got: $id&quot;)</span>
+<span class="nc" id="L121">        indices += id.copy(attributes = geom ++ dtg)</span>
+
+<span class="nc bnc" id="L123" title="All 6 branches missed.">      case id if id.name == Z2Index.name =&gt;</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        require(id.version &lt;= 2, s&quot;Expected index version of 1 or 2 but got: $id&quot;)</span>
+<span class="nc" id="L125">        indices += id.copy(attributes = geom, version = id.version + 2)</span>
+<span class="nc" id="L126">        tableNameKeys += ((s&quot;table.${Z2Index.name}.v${id.version}&quot;, s&quot;table.${Z2Index.name}.v${id.version + 2}&quot;))</span>
+
+<span class="nc bnc" id="L128" title="All 6 branches missed.">      case id if id.name == XZ2Index.name =&gt;</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        require(id.version == 1, s&quot;Expected index version of 1 but got: $id&quot;)</span>
+<span class="nc" id="L130">        indices += id.copy(attributes = geom)</span>
+
+<span class="nc bnc" id="L132" title="All 6 branches missed.">      case id if id.name == AttributeIndex.name =&gt;</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        require(id.version &lt;= 5, s&quot;Expected index version of 1-5 but got: $id&quot;)</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        lazy val fields = if (id.version == 1) { dtg } else { geom ++ dtg }</span>
+<span class="nc" id="L135">        sft.getAttributeDescriptors.asScala.foreach { d =&gt;</span>
+<span class="nc" id="L136">          val index = d.getUserData.remove(AttributeOptions.OptIndex).asInstanceOf[String]</span>
+<span class="nc bnc" id="L137" title="All 6 branches missed.">          if (index == null || index.equalsIgnoreCase(&quot;false&quot;) || index.equalsIgnoreCase(IndexCoverage.NONE.toString)) {</span>
+            // no-op
+<span class="nc bnc" id="L139" title="All 4 branches missed.">          } else if (java.lang.Boolean.valueOf(index) || index.equalsIgnoreCase(IndexCoverage.FULL.toString) ||</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">              index.equalsIgnoreCase(IndexCoverage.JOIN.toString)) {</span>
+<span class="nc" id="L141">            indices += id.copy(attributes = Seq(d.getLocalName) ++ fields, version = id.version + 2)</span>
+          } else {
+<span class="nc" id="L143">            throw new IllegalStateException(s&quot;Expected an index coverage or boolean but got: $index&quot;)</span>
+          }
+        }
+<span class="nc" id="L146">        tableNameKeys ++=</span>
+<span class="nc" id="L147">            Seq(s&quot;table.${AttributeIndex.name}.v${id.version}&quot;, &quot;tables.idx.attr.name&quot;)</span>
+<span class="nc" id="L148">                .map((_, s&quot;table.${AttributeIndex.name}.v${id.version + 2}&quot;))</span>
+    }
+
+<span class="nc" id="L151">    sft.setIndices(indices.result)</span>
+
+    // update metadata keys for tables
+<span class="nc bnc" id="L154" title="All 2 branches missed.">    tableNameKeys.result.foreach { case (from, to) =&gt;</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">      metadata.scan(sft.getTypeName, from, cache = false).foreach { case (key, name) =&gt;</span>
+<span class="nc" id="L156">        metadata.insert(sft.getTypeName, to + key.substring(from.length), name)</span>
+<span class="nc" id="L157">        metadata.remove(sft.getTypeName, key)</span>
+      }
+    }
+  }
+
+  private def authOpt: Option[Authorizations] = {
+<span class="nc" id="L163">    Option(config.authProvider.getAuthorizations).map { auths =&gt;</span>
+      // HBase seems to treat and empty collection as no auths
+      // which forces it to default to the user's full set of auths
+<span class="nc bnc" id="L166" title="All 2 branches missed.">      new Authorizations(if (auths.isEmpty) { HBaseDataStore.EmptyAuths } else { auths })</span>
+    }
+  }
+}
+
+<span class="nc" id="L171">object HBaseDataStore {</span>
+
+<span class="nc" id="L173">  val EmptyAuths: java.util.List[String] = Collections.singletonList(&quot;&quot;)</span>
+
+<span class="nc" id="L175">  object NoAuthsProvider extends AuthorizationsProvider {</span>
+<span class="nc" id="L176">    override def getAuthorizations: java.util.List[String] = null</span>
+<span class="nc" id="L177">    override def configure(params: java.util.Map[String, _]): Unit = {}</span>
+  }
+<span class="nc" id="L179">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

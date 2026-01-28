@@ -1,0 +1,287 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>GeoMesaAccumuloInputFormat.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Accumulo Jobs</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.accumulo.jobs.mapreduce</a> &gt; <span class="el_source">GeoMesaAccumuloInputFormat.scala</span></div><h1>GeoMesaAccumuloInputFormat.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * Portions Crown Copyright (c) 2016-2025 Dstl
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.accumulo.jobs.mapreduce
+
+import com.typesafe.scalalogging.LazyLogging
+import org.apache.accumulo.core.client.IteratorSetting.Column
+import org.apache.accumulo.core.conf.ClientProperty
+import org.apache.accumulo.core.data.{Key, Value}
+import org.apache.accumulo.core.security.Authorizations
+import org.apache.accumulo.hadoop.mapreduce.AccumuloInputFormat
+import org.apache.accumulo.hadoopImpl.mapreduce.RangeInputSplit
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.io.{Text, Writable}
+import org.apache.hadoop.mapreduce._
+import org.geotools.api.data.Query
+import org.geotools.api.feature.simple.SimpleFeature
+import org.locationtech.geomesa.accumulo.AccumuloProperties.AccumuloMapperProperties
+import org.locationtech.geomesa.accumulo.data.{AccumuloDataStore, AccumuloDataStoreFactory, AccumuloDataStoreParams, AccumuloQueryPlan}
+import org.locationtech.geomesa.accumulo.jobs.mapreduce.GeoMesaAccumuloInputFormat.{GeoMesaRecordReader, GroupedSplit}
+import org.locationtech.geomesa.index.api.QueryPlan.ResultsToFeatures
+import org.locationtech.geomesa.jobs.GeoMesaConfigurator
+import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
+import org.locationtech.geomesa.utils.io.WithStore
+
+import java.io._
+import java.net.{URL, URLClassLoader}
+import java.util.AbstractMap.SimpleImmutableEntry
+import java.util.Map.Entry
+import java.util.{Collections, Locale}
+import scala.collection.mutable.ArrayBuffer
+
+/**
+  * Input format that allows processing of simple features from GeoMesa based on a CQL query
+  */
+<span class="nc bnc" id="L42" title="All 4 branches missed.">class GeoMesaAccumuloInputFormat extends InputFormat[Text, SimpleFeature] with LazyLogging {</span>
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L46">  private val delegate = new AccumuloInputFormat()</span>
+
+  /**
+    * Gets splits for a job.
+    *
+    * Our delegated AccumuloInputFormat creates a split for each range - because we set a lot of ranges in
+    * geomesa, that creates too many mappers. Instead, we try to group the ranges by tservers. We use the
+    * location assignment of the tablets to tservers to determine the number of splits returned.
+    */
+  override def getSplits(context: JobContext): java.util.List[InputSplit] = {
+<span class="nc" id="L56">    val accumuloSplits = delegate.getSplits(context)</span>
+    // Get the appropriate number of mapper splits using the following priority
+    // 1. Get splits from AccumuloMapperProperties.DESIRED_ABSOLUTE_SPLITS (geomesa.mapreduce.splits.max)
+    // 2. Get splits from #tserver locations * AccumuloMapperProperties.DESIRED_SPLITS_PER_TSERVER (geomesa.mapreduce.splits.tserver.max)
+    // 3. Get splits from AccumuloInputFormat.getSplits(context)
+    def positive(prop: SystemProperty): Option[Int] = {
+<span class="nc" id="L62">      val int = prop.toInt</span>
+<span class="nc bnc" id="L63" title="All 4 branches missed.">      if (int.exists(_ &lt; 1)) {</span>
+<span class="nc" id="L64">        throw new IllegalArgumentException(s&quot;${prop.property} contains an invalid int: ${prop.get}&quot;)</span>
+      }
+<span class="nc" id="L66">      int</span>
+    }
+
+<span class="nc" id="L69">    val grpSplitsMax = positive(AccumuloMapperProperties.DESIRED_ABSOLUTE_SPLITS)</span>
+
+<span class="nc bnc" id="L71" title="All 2 branches missed.">    lazy val grpSplitsPerTServer = positive(AccumuloMapperProperties.DESIRED_SPLITS_PER_TSERVER).flatMap { perTS =&gt;</span>
+<span class="nc" id="L72">      val numLocations = accumuloSplits.asScala.flatMap(_.getLocations).distinct.length</span>
+<span class="nc bnc" id="L73" title="All 2 branches missed.">      if (numLocations &lt; 1) { None } else { Some(numLocations * perTS) }</span>
+    }
+
+<span class="nc" id="L76">    grpSplitsMax.orElse(grpSplitsPerTServer) match {</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">      case Some(numberOfSplits) =&gt;</span>
+<span class="nc bnc" id="L78" title="All 2 branches missed.">        logger.debug(s&quot;Using desired splits with result of $numberOfSplits splits&quot;)</span>
+<span class="nc" id="L79">        val splitSize: Int = math.ceil(accumuloSplits.size().toDouble / numberOfSplits).toInt</span>
+<span class="nc bnc" id="L80" title="All 2 branches missed.">        accumuloSplits.asScala.groupBy(_.getLocations.head).flatMap { case (location, splits) =&gt;</span>
+<span class="nc" id="L81">          splits.grouped(splitSize).map { group =&gt;</span>
+<span class="nc" id="L82">            val split = new GroupedSplit()</span>
+<span class="nc" id="L83">            split.location = location</span>
+<span class="nc" id="L84">            split.splits.append(group.map(f =&gt; f.asInstanceOf[RangeInputSplit]).toSeq: _*)</span>
+<span class="nc" id="L85">            split.asInstanceOf[InputSplit]</span>
+          }
+<span class="nc" id="L87">        }.toList.asJava</span>
+
+<span class="nc bnc" id="L89" title="All 2 branches missed.">      case None =&gt;</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        logger.debug(s&quot;Using default Accumulo Splits with ${accumuloSplits.size} splits&quot;)</span>
+<span class="nc" id="L91">        accumuloSplits</span>
+    }
+  }
+
+  override def createRecordReader(split: InputSplit, context: TaskAttemptContext): GeoMesaRecordReader = {
+<span class="nc" id="L96">    val toFeatures = GeoMesaConfigurator.getResultsToFeatures[Entry[Key, Value]](context.getConfiguration)</span>
+<span class="nc" id="L97">    new GeoMesaRecordReader(toFeatures, delegate.createRecordReader(split, context))</span>
+  }
+}
+
+<span class="nc bnc" id="L101" title="All 4 branches missed.">object GeoMesaAccumuloInputFormat extends LazyLogging {</span>
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L105">  val SYS_PROP_SPARK_LOAD_CP = &quot;org.locationtech.geomesa.spark.load-classpath&quot;</span>
+
+  /**
+   * Configure the input format based on a query
+   *
+   * @param conf configuration to update
+   * @param params data store parameters
+   * @param query query
+   */
+  def configure(conf: Configuration, params: java.util.Map[String, _], query: Query): Unit = {
+    // get the query plan to set up the iterators, ranges, etc
+<span class="nc" id="L116">    val plan = WithStore[AccumuloDataStore](params) { ds =&gt;</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">      require(ds != null, &quot;Invalid data store parameters&quot;)</span>
+<span class="nc" id="L118">      ds.getSingleQueryPlan(query)</span>
+    }
+<span class="nc" id="L120">    configure(conf, params, plan)</span>
+  }
+
+  /**
+   * Configure the input format based on a query plan
+   *
+   * @param conf configuration to update
+   * @param params data store parameters
+   * @param plan query plan
+   */
+  def configure(conf: Configuration, params: java.util.Map[String, _], plan: AccumuloQueryPlan): Unit = {
+<span class="nc" id="L131">    val auths = AccumuloDataStoreParams.AuthsParam.lookupOpt(params).map(a =&gt; new Authorizations(a.split(&quot;,&quot;): _*))</span>
+<span class="nc" id="L132">    configure(conf, params, plan, auths)</span>
+  }
+
+  /**
+   * Configure the input format based on a query plan
+   *
+   * @param conf configuration to update
+   * @param params data store parameters
+   * @param plan query plan
+   */
+  def configure(
+      conf: Configuration,
+      params: java.util.Map[String, _],
+      plan: AccumuloQueryPlan,
+      auths: Option[Authorizations]): Unit = {
+    // all accumulo input config methods requires a job
+    // assertion: only the JobConf is updated - to get credentials pass in a JobConf instead of Configuration
+<span class="nc" id="L149">    val job = new Job(conf)</span>
+<span class="nc" id="L150">    job.setInputFormatClass(classOf[GeoMesaAccumuloInputFormat])</span>
+
+<span class="nc" id="L152">    val props = AccumuloDataStoreFactory.buildAccumuloClientConfig(params)</span>
+    // TODO verify kerberos still works
+<span class="nc bnc" id="L154" title="All 2 branches missed.">    if (ClientProperty.AUTH_TYPE.getValue(props).toLowerCase(Locale.US).contains(&quot;kerberos&quot;)) {</span>
+<span class="nc" id="L155">      props.put(ClientProperty.SASL_ENABLED.getKey, &quot;true&quot;)</span>
+      // // note: for Kerberos, this will create a DelegationToken for us and add it to the Job credentials
+      // AbstractInputFormat.setConnectorInfo(job, user, token)
+    }
+
+    // use the query plan to set the accumulo input format options
+<span class="nc bnc" id="L161" title="All 2 branches missed.">    require(plan.tables.lengthCompare(1) == 0, s&quot;Can only query from a single table: ${plan.tables.mkString(&quot;, &quot;)}&quot;)</span>
+
+<span class="nc" id="L163">    val builder = AccumuloInputFormat.configure().clientProperties(props).table(plan.tables.head).batchScan(true)</span>
+<span class="nc" id="L164">    auths.foreach(builder.auths)</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">    if (plan.ranges.nonEmpty) {</span>
+<span class="nc" id="L166">      builder.ranges(plan.ranges.asJava)</span>
+    }
+<span class="nc" id="L168">    plan.columnFamily.foreach { colFamily =&gt;</span>
+<span class="nc" id="L169">      builder.fetchColumns(Collections.singletonList(new Column(colFamily)))</span>
+    }
+<span class="nc" id="L171">    plan.iterators.foreach(builder.addIterator)</span>
+<span class="nc" id="L172">    builder.store(job)</span>
+
+    // add the configurations back into the original conf
+<span class="nc" id="L175">    conf.addResource(job.getConfiguration)</span>
+
+<span class="nc" id="L177">    GeoMesaConfigurator.setResultsToFeatures(conf, plan.resultsToFeatures)</span>
+<span class="nc" id="L178">    plan.reducer.foreach(GeoMesaConfigurator.setReducer(conf, _))</span>
+<span class="nc" id="L179">    plan.sort.foreach(GeoMesaConfigurator.setSorting(conf, _))</span>
+<span class="nc" id="L180">    plan.projection.foreach(GeoMesaConfigurator.setProjection(conf, _))</span>
+  }
+
+  /**
+   * This takes any jars that have been loaded by spark in the context classloader and makes them
+   * available to the general classloader. This is required as not all classes (even spark ones) check
+   * the context classloader.
+   */
+  def ensureSparkClasspath(): Unit = {
+<span class="nc" id="L189">    val sysLoader = ClassLoader.getSystemClassLoader</span>
+<span class="nc" id="L190">    val ccl = Thread.currentThread().getContextClassLoader</span>
+<span class="nc bnc" id="L191" title="All 4 branches missed.">    if (ccl == null || !ccl.getClass.getCanonicalName.startsWith(&quot;org.apache.spark.&quot;)) {</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">      logger.debug(&quot;No spark context classloader found&quot;)</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">    } else if (!ccl.isInstanceOf[URLClassLoader]) {</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">      logger.warn(s&quot;Found context classloader, but can't handle type ${ccl.getClass.getCanonicalName}&quot;)</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">    } else if (!sysLoader.isInstanceOf[URLClassLoader]) {</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">      logger.warn(s&quot;Found context classloader, but can't add to type ${sysLoader.getClass.getCanonicalName}&quot;)</span>
+    } else {
+      // hack to get around protected visibility of addURL
+      // this might fail if there is a security manager present
+<span class="nc" id="L200">      val addUrl = classOf[URLClassLoader].getDeclaredMethod(&quot;addURL&quot;, classOf[URL])</span>
+<span class="nc" id="L201">      addUrl.setAccessible(true)</span>
+<span class="nc" id="L202">      val sysUrls = sysLoader.asInstanceOf[URLClassLoader].getURLs.map(_.toString).toSet</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">      val (dupeUrls, newUrls) = ccl.asInstanceOf[URLClassLoader].getURLs.filterNot(_.toString.contains(&quot;__app__.jar&quot;)).partition(url =&gt; sysUrls.contains(url.toString))</span>
+<span class="nc" id="L204">      newUrls.foreach(addUrl.invoke(sysLoader, _))</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">      logger.debug(s&quot;Loaded ${newUrls.length} urls from context classloader into system classloader &quot; +</span>
+<span class="nc" id="L206">          s&quot;and ignored ${dupeUrls.length} that are already loaded&quot;)</span>
+    }
+  }
+
+  /**
+    * Record reader that delegates to accumulo record readers and transforms the key/values coming back into
+    * simple features.
+    *
+    * @param toFeatures results to features
+    * @param reader delegate reader
+    */
+<span class="nc" id="L217">  class GeoMesaRecordReader(toFeatures: ResultsToFeatures[Entry[Key, Value]], reader: RecordReader[Key, Value])</span>
+<span class="nc" id="L218">      extends RecordReader[Text, SimpleFeature] {</span>
+
+<span class="nc" id="L220">    private val key = new Text()</span>
+
+<span class="nc" id="L222">    private var currentFeature: SimpleFeature = _</span>
+
+    override def initialize(split: InputSplit, context: TaskAttemptContext): Unit =
+<span class="nc" id="L225">      reader.initialize(split, context)</span>
+
+<span class="nc" id="L227">    override def getProgress: Float = reader.getProgress</span>
+
+    override def nextKeyValue(): Boolean = {
+<span class="nc bnc" id="L230" title="All 2 branches missed.">      if (reader.nextKeyValue()) {</span>
+<span class="nc" id="L231">        currentFeature = toFeatures.apply(new SimpleImmutableEntry(reader.getCurrentKey, reader.getCurrentValue))</span>
+<span class="nc" id="L232">        key.set(currentFeature.getID)</span>
+<span class="nc" id="L233">        true</span>
+      } else {
+<span class="nc" id="L235">        false</span>
+      }
+    }
+
+<span class="nc" id="L239">    override def getCurrentKey: Text = key</span>
+
+<span class="nc" id="L241">    override def getCurrentValue: SimpleFeature = currentFeature</span>
+
+<span class="nc" id="L243">    override def close(): Unit = reader.close()</span>
+  }
+
+  /**
+    * Input split that groups a series of RangeInputSplits. Has to implement Hadoop Writable, thus the vars and
+    * mutable state.
+    */
+<span class="nc" id="L250">  class GroupedSplit extends InputSplit with Writable {</span>
+
+    // if we're running in spark, we need to load the context classpath before anything else,
+    // otherwise we get classloading and serialization issues
+<span class="nc bnc" id="L254" title="All 2 branches missed.">    if (sys.env.get(GeoMesaAccumuloInputFormat.SYS_PROP_SPARK_LOAD_CP).exists(_.toBoolean)) {</span>
+<span class="nc" id="L255">      GeoMesaAccumuloInputFormat.ensureSparkClasspath()</span>
+    }
+
+<span class="nc" id="L258">    private [mapreduce] var location: String = _</span>
+<span class="nc" id="L259">    private [mapreduce] val splits: ArrayBuffer[RangeInputSplit] = ArrayBuffer.empty</span>
+
+<span class="nc" id="L261">    override def getLength: Long = splits.foldLeft(0L)((l: Long, r: RangeInputSplit) =&gt; l + r.getLength)</span>
+
+<span class="nc bnc" id="L263" title="All 2 branches missed.">    override def getLocations: Array[String] = if (location == null) { Array.empty } else { Array(location) }</span>
+
+    override def write(out: DataOutput): Unit = {
+<span class="nc" id="L266">      out.writeUTF(location)</span>
+<span class="nc" id="L267">      out.writeInt(splits.length)</span>
+<span class="nc" id="L268">      splits.foreach(_.write(out))</span>
+    }
+
+    override def readFields(in: DataInput): Unit = {
+<span class="nc" id="L272">      location = in.readUTF()</span>
+<span class="nc" id="L273">      splits.clear()</span>
+<span class="nc" id="L274">      var i = 0</span>
+<span class="nc" id="L275">      val size = in.readInt()</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">      while (i &lt; size) {</span>
+<span class="nc" id="L277">        val split = new RangeInputSplit()</span>
+<span class="nc" id="L278">        split.readFields(in)</span>
+<span class="nc" id="L279">        splits.append(split)</span>
+<span class="nc" id="L280">        i = i + 1</span>
+      }
+    }
+
+<span class="nc" id="L284">    override def toString = s&quot;mapreduce.GroupedSplit[$location](${splits.length})&quot;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

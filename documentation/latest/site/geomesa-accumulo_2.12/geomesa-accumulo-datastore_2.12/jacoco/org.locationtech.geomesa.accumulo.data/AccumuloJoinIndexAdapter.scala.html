@@ -1,0 +1,309 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AccumuloJoinIndexAdapter.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Accumulo DataStore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.accumulo.data</a> &gt; <span class="el_source">AccumuloJoinIndexAdapter.scala</span></div><h1>AccumuloJoinIndexAdapter.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.accumulo.data
+
+import org.apache.accumulo.core.client.IteratorSetting
+import org.apache.accumulo.core.data.{Key, Range, Value}
+import org.apache.hadoop.io.Text
+import org.geotools.api.feature.simple.SimpleFeatureType
+import org.geotools.api.filter.Filter
+import org.geotools.feature.simple.SimpleFeatureTypeBuilder
+import org.geotools.util.factory.Hints
+import org.locationtech.geomesa.accumulo.data.AccumuloIndexAdapter.AccumuloResultsToFeatures
+import org.locationtech.geomesa.accumulo.data.AccumuloQueryPlan._
+import org.locationtech.geomesa.accumulo.data.writer.ColumnFamilyMapper
+import org.locationtech.geomesa.accumulo.index.AttributeJoinIndex
+import org.locationtech.geomesa.accumulo.iterators.ArrowIterator.AccumuloArrowResultsToFeatures
+import org.locationtech.geomesa.accumulo.iterators.BinAggregatingIterator.AccumuloBinResultsToFeatures
+import org.locationtech.geomesa.accumulo.iterators.DensityIterator.AccumuloDensityResultsToFeatures
+import org.locationtech.geomesa.accumulo.iterators.StatsIterator.AccumuloStatsResultsToFeatures
+import org.locationtech.geomesa.accumulo.iterators._
+import org.locationtech.geomesa.filter.{andOption, partitionPrimarySpatials, partitionPrimaryTemporals}
+import org.locationtech.geomesa.index.api.QueryPlan.{FeatureReducer, ResultsToFeatures}
+import org.locationtech.geomesa.index.api._
+import org.locationtech.geomesa.index.conf.QueryHints
+import org.locationtech.geomesa.index.index.attribute.AttributeIndex
+import org.locationtech.geomesa.index.index.id.IdIndex
+import org.locationtech.geomesa.index.iterators.StatsScan
+import org.locationtech.geomesa.index.planning.LocalQueryRunner.LocalProcessor
+import org.locationtech.geomesa.index.stats.Stat
+import org.locationtech.geomesa.utils.index.{ByteArrays, IndexMode, VisibilityLevel}
+
+import java.util.Map.Entry
+import scala.util.Try
+
+/**
+  * Mixin trait to add join support to the normal attribute index class
+  */
+<span class="nc" id="L44">object AccumuloJoinIndexAdapter {</span>
+
+  import org.locationtech.geomesa.index.conf.QueryHints.RichHints
+
+  /**
+   * Create a query plan against a join index - if possible, will use the reduced index-values to scan
+   * the single table, otherwise will require a join against the id index
+   *
+   * @param ds data store
+   * @param index index
+   * @param strategy query strategy
+   * @param tables tables to scan
+   * @param ranges ranges to scan
+   * @param colFamily column family to scan, optional
+   * @param schema simple feature schema being scanned
+   * @param ecql secondary push-down predicates
+   * @param hints query hints
+   * @param numThreads query threads
+   * @return
+   */
+  def createQueryPlan(
+      ds: AccumuloDataStore,
+      index: AttributeJoinIndex,
+      strategy: QueryStrategy,
+      tables: Seq[String],
+      ranges: Seq[org.apache.accumulo.core.data.Range],
+      colFamily: Option[Text],
+      schema: SimpleFeatureType,
+      ecql: Option[Filter],
+      hints: Hints,
+      numThreads: Int): AccumuloQueryPlan = {
+
+    // TODO seems like this should be using 'schema' here, which may be a reduced version of the indexSft due to col groups
+<span class="nc" id="L77">    val indexSft = index.indexSft</span>
+<span class="nc" id="L78">    val transform = hints.getTransformSchema</span>
+
+    // for queries that don't require a join, creates a regular batch scan plan
+    def plan(
+        iters: Seq[IteratorSetting],
+        kvsToFeatures: ResultsToFeatures[Entry[Key, Value]],
+        reduce: Option[FeatureReducer]): BatchScanPlan = {
+      // add the attribute-level vis iterator if necessary
+<span class="nc" id="L86">      val iterators = visibilityIter(index) ++ iters</span>
+<span class="nc" id="L87">      val sort = hints.getSortFields</span>
+<span class="nc" id="L88">      val max = hints.getMaxFeatures</span>
+<span class="nc" id="L89">      val project = hints.getProjection</span>
+<span class="nc" id="L90">      BatchScanPlan(ds, strategy, tables, ranges, iterators, colFamily, kvsToFeatures, reduce, sort, max, project, numThreads)</span>
+    }
+
+    // used when remote processing is disabled
+<span class="nc" id="L94">    def localPlan(overrides: Option[Seq[IteratorSetting]] = None): BatchScanLocalProcessorPlan = {</span>
+<span class="nc" id="L95">      val iters = visibilityIter(index) ++ overrides.getOrElse(FilterTransformIterator.configure(indexSft, index, ecql, hints).toSeq)</span>
+<span class="nc" id="L96">      val processor = LocalProcessor(transform.getOrElse(indexSft), QueryHints.Internal.clearTransforms(hints), None)</span>
+<span class="nc" id="L97">      val projection = hints.getProjection</span>
+<span class="nc" id="L98">      BatchScanLocalProcessorPlan(ds, strategy, tables, ranges, iters, colFamily, processor, projection, numThreads)</span>
+    }
+
+<span class="nc bnc" id="L101" title="All 2 branches missed.">    val qp = if (hints.isBinQuery) {</span>
+      // check to see if we can execute against the index values
+<span class="nc bnc" id="L103" title="All 2 branches missed.">      if (indexSft.indexOf(hints.getBinTrackIdField) != -1 &amp;&amp;</span>
+<span class="nc bnc" id="L104" title="All 4 branches missed.">          hints.getBinGeomField.forall(indexSft.indexOf(_) != -1) &amp;&amp;</span>
+<span class="nc bnc" id="L105" title="All 4 branches missed.">          hints.getBinLabelField.forall(indexSft.indexOf(_) != -1) &amp;&amp;</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">          index.supportsFilter(ecql)) {</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        if (ds.config.remote.bin) {</span>
+<span class="nc" id="L108">          val binIter = BinAggregatingIterator.configure(indexSft, index, ecql, hints)</span>
+<span class="nc" id="L109">          plan(Seq(binIter), new AccumuloBinResultsToFeatures(), None)</span>
+        } else {
+<span class="nc" id="L111">          localPlan()</span>
+        }
+      } else {
+        // have to do a join against the record table
+<span class="nc" id="L115">        createJoinPlan(ds, index, strategy, tables, ranges, colFamily, ecql, hints)</span>
+      }
+<span class="nc bnc" id="L117" title="All 2 branches missed.">    } else if (hints.isArrowQuery) {</span>
+      // check to see if we can execute against the index values
+<span class="nc bnc" id="L119" title="All 2 branches missed.">      if (index.canUseIndexSchema(ecql, transform)) {</span>
+<span class="nc bnc" id="L120" title="All 2 branches missed.">        if (ds.config.remote.arrow) {</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">          val (arrowIter, reduce) = ArrowIterator.configure(indexSft, index, ds.stats, strategy.filter.filter, ecql, hints)</span>
+<span class="nc" id="L122">          plan(Seq(arrowIter), new AccumuloArrowResultsToFeatures(), Some(reduce))</span>
+        } else {
+<span class="nc" id="L124">          localPlan()</span>
+        }
+<span class="nc bnc" id="L126" title="All 2 branches missed.">      } else if (index.canUseIndexSchemaPlusKey(ecql, transform)) {</span>
+<span class="nc" id="L127">        val transformSft = transform.getOrElse {</span>
+<span class="nc" id="L128">          throw new IllegalStateException(&quot;Must have a transform for attribute key plus value scan&quot;)</span>
+        }
+        // first filter and apply the transform
+<span class="nc" id="L131">        val filterTransformIter = FilterTransformIterator.configure(indexSft, index, ecql, hints, 23).get</span>
+        // next add the attribute value from the row key
+<span class="nc" id="L133">        val rowValueIter = AttributeKeyValueIterator.configure(index.asInstanceOf[AttributeIndex], transformSft, 24)</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        if (ds.config.remote.arrow) {</span>
+          // clear the transforms as we've already accounted for them
+<span class="nc" id="L136">          val newHints = new Hints(hints)</span>
+<span class="nc" id="L137">          newHints.clearTransforms()</span>
+          // finally apply the arrow iterator on the resulting features
+<span class="nc bnc" id="L139" title="All 2 branches missed.">          val (arrowIter, reduce) = ArrowIterator.configure(transformSft, index, ds.stats, None, None, newHints)</span>
+<span class="nc" id="L140">          val iters = Seq(filterTransformIter, rowValueIter, arrowIter)</span>
+<span class="nc" id="L141">          plan(iters, new AccumuloArrowResultsToFeatures(), Some(reduce))</span>
+        } else {
+<span class="nc" id="L143">          localPlan(Some(Seq(filterTransformIter, rowValueIter)))</span>
+        }
+      } else {
+        // have to do a join against the record table
+<span class="nc" id="L147">        createJoinPlan(ds, index, strategy, tables, ranges, colFamily, ecql, hints)</span>
+      }
+<span class="nc bnc" id="L149" title="All 2 branches missed.">    } else if (hints.isDensityQuery) {</span>
+      // check to see if we can execute against the index values
+<span class="nc" id="L151">      val weightIsAttribute = hints.getDensityWeight.contains(index.attributes.head)</span>
+<span class="nc bnc" id="L152" title="All 8 branches missed.">      if (index.supportsFilter(ecql) &amp;&amp; (weightIsAttribute || hints.getDensityWeight.forall(indexSft.indexOf(_) != -1))) {</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        if (ds.config.remote.density) {</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">          val iters = if (weightIsAttribute) {</span>
+            // create a transform sft with the attribute added
+            val transform = {
+<span class="nc" id="L157">              val builder = new SimpleFeatureTypeBuilder()</span>
+<span class="nc" id="L158">              builder.setNamespaceURI(null: String)</span>
+<span class="nc" id="L159">              builder.setName(indexSft.getTypeName + &quot;--attr&quot;)</span>
+<span class="nc" id="L160">              builder.setAttributes(indexSft.getAttributeDescriptors)</span>
+<span class="nc" id="L161">              builder.add(index.sft.getDescriptor(index.attributes.head))</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">              if (indexSft.getGeometryDescriptor != null) {</span>
+<span class="nc" id="L163">                builder.setDefaultGeometry(indexSft.getGeometryDescriptor.getLocalName)</span>
+              }
+<span class="nc" id="L165">              builder.setCRS(indexSft.getCoordinateReferenceSystem)</span>
+<span class="nc" id="L166">              val tmp = builder.buildFeatureType()</span>
+<span class="nc" id="L167">              tmp.getUserData.putAll(indexSft.getUserData)</span>
+<span class="nc" id="L168">              tmp</span>
+            }
+            // priority needs to be between vis iter (21) and density iter (25)
+<span class="nc" id="L171">            val keyValueIter = AttributeKeyValueIterator.configure(index.asInstanceOf[AttributeIndex], transform, 23)</span>
+<span class="nc" id="L172">            val densityIter = DensityIterator.configure(transform, index, ecql, hints)</span>
+<span class="nc" id="L173">            Seq(keyValueIter, densityIter)</span>
+          } else {
+<span class="nc" id="L175">            Seq(DensityIterator.configure(indexSft, index, ecql, hints))</span>
+          }
+<span class="nc" id="L177">          plan(iters, new AccumuloDensityResultsToFeatures(), None)</span>
+        } else {
+<span class="nc" id="L179">          localPlan()</span>
+        }
+      } else {
+        // have to do a join against the record table
+<span class="nc" id="L183">        createJoinPlan(ds, index, strategy, tables, ranges, colFamily, ecql, hints)</span>
+      }
+<span class="nc bnc" id="L185" title="All 2 branches missed.">    } else if (hints.isStatsQuery) {</span>
+      // check to see if we can execute against the index values
+<span class="nc bnc" id="L187" title="All 4 branches missed.">      if (Try(Stat(indexSft, hints.getStatsQuery)).isSuccess &amp;&amp; index.supportsFilter(ecql)) {</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        if (ds.config.remote.stats) {</span>
+<span class="nc" id="L189">          val statsIter = StatsIterator.configure(indexSft, index, ecql, hints)</span>
+<span class="nc" id="L190">          val reduce = Some(StatsScan.StatsReducer(indexSft, hints))</span>
+<span class="nc" id="L191">          plan(Seq(statsIter), new AccumuloStatsResultsToFeatures(), reduce)</span>
+        } else {
+<span class="nc" id="L193">          localPlan()</span>
+        }
+      } else {
+        // have to do a join against the record table
+<span class="nc" id="L197">        createJoinPlan(ds, index, strategy, tables, ranges, colFamily, ecql, hints)</span>
+      }
+<span class="nc bnc" id="L199" title="All 2 branches missed.">    } else if (index.canUseIndexSchema(ecql, transform)) {</span>
+      // we can use the index value
+      // transform has to be non-empty to get here and can only include items
+      // in the index value (not the index keys aka the attribute indexed)
+<span class="nc" id="L203">      val transformSft = transform.getOrElse {</span>
+<span class="nc" id="L204">        throw new IllegalStateException(&quot;Must have a transform for attribute value scan&quot;)</span>
+      }
+<span class="nc" id="L206">      val fti = FilterTransformIterator.configure(indexSft, index, ecql, hints.getTransform, hints.getSampling)</span>
+      // need to use transform to convert key/values
+<span class="nc" id="L208">      val toFeatures = AccumuloResultsToFeatures(index, transformSft)</span>
+<span class="nc" id="L209">      plan(fti.toSeq, toFeatures, None)</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">    } else if (index.canUseIndexSchemaPlusKey(ecql, transform)) {</span>
+      // we can use the index PLUS the value
+<span class="nc" id="L212">      val transformSft = transform.getOrElse {</span>
+<span class="nc" id="L213">        throw new IllegalStateException(&quot;Must have a transform for attribute key plus value scan&quot;)</span>
+      }
+<span class="nc" id="L215">      val fti = FilterTransformIterator.configure(indexSft, index, ecql, hints.getTransform, hints.getSampling)</span>
+<span class="nc" id="L216">      val iters = fti.toSeq :+ AttributeKeyValueIterator.configure(index.asInstanceOf[AttributeIndex], transformSft)</span>
+      // need to use transform to convert key/values
+<span class="nc" id="L218">      val toFeatures = AccumuloResultsToFeatures(index, transformSft)</span>
+<span class="nc" id="L219">      plan(iters, toFeatures, None)</span>
+    } else {
+      // have to do a join against the record table
+<span class="nc" id="L222">      createJoinPlan(ds, index, strategy, tables, ranges, colFamily, ecql, hints)</span>
+    }
+
+<span class="nc bnc" id="L225" title="All 2 branches missed.">    if (ranges.nonEmpty) { qp } else { EmptyPlan(strategy, qp.reducer) }</span>
+  }
+
+  /**
+    * Gets a query plan comprised of a join against the record table. This is the slowest way to
+    * execute a query, so we avoid it if possible.
+    */
+  private def createJoinPlan(
+      ds: AccumuloDataStore,
+      index: AttributeJoinIndex,
+      strategy: QueryStrategy,
+      tables: Seq[String],
+      ranges: Seq[org.apache.accumulo.core.data.Range],
+      colFamily: Option[Text],
+      ecql: Option[Filter],
+      hints: Hints): AccumuloQueryPlan = {
+    import org.locationtech.geomesa.filter.ff
+    import org.locationtech.geomesa.index.conf.QueryHints.RichHints
+    import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+
+    // apply any secondary filters or transforms against the record table
+<span class="nc bnc" id="L246" title="All 6 branches missed.">    val recordIndex = ds.manager.indices(index.sft, IndexMode.Read).find(_.name == IdIndex.name).getOrElse {</span>
+<span class="nc" id="L247">      throw new RuntimeException(&quot;Id index does not exist for join query: &quot; +</span>
+<span class="nc" id="L248">          ds.manager.indices(index.sft, IndexMode.Read).map(_.identifier).mkString(&quot;, &quot;))</span>
+    }
+
+    // break out the st filter to evaluate against the attribute table
+<span class="nc" id="L252">    val (stFilter, ecqlFilter) = ecql.map { f =&gt;</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">      val (geomFilters, otherFilters) = partitionPrimarySpatials(f, index.sft)</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">      val (temporalFilters, nonSTFilters) = partitionPrimaryTemporals(otherFilters, index.sft)</span>
+<span class="nc" id="L255">      (andOption(geomFilters ++ temporalFilters), andOption(nonSTFilters))</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">    }.getOrElse((None, None))</span>
+
+<span class="nc bnc" id="L258" title="All 2 branches missed.">    val (recordColFamily, recordSchema) = {</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">      val (cf, s) = ds.adapter.groups.group(index.sft, hints.getTransformDefinition, ecqlFilter)</span>
+<span class="nc" id="L260">      (Some(new Text(ColumnFamilyMapper(recordIndex)(cf))), s)</span>
+    }
+
+    // since each range is a single row, it wouldn't be very efficient to do any aggregating scans
+    // instead, handle them with the local query runner
+<span class="nc" id="L265">    val resultSft = hints.getTransformSchema.getOrElse(index.sft)</span>
+    val recordIterators = {
+<span class="nc" id="L267">      val recordIter = FilterTransformIterator.configure(recordSchema, recordIndex, ecqlFilter, hints).toSeq</span>
+<span class="nc bnc" id="L268" title="All 6 branches missed.">      if (index.sft.getVisibilityLevel != VisibilityLevel.Attribute) { recordIter } else {</span>
+<span class="nc" id="L269">        Seq(KryoVisibilityRowEncoder.configure(recordSchema)) ++ recordIter</span>
+      }
+    }
+<span class="nc" id="L272">    val recordToFeatures = AccumuloResultsToFeatures(recordIndex, resultSft)</span>
+    // transforms are handled by the recordIter
+<span class="nc" id="L274">    val processor = LocalProcessor(resultSft, QueryHints.Internal.clearTransforms(hints), None)</span>
+
+<span class="nc" id="L276">    val recordTables = recordIndex.getTablesForQuery(strategy.filter.filter)</span>
+<span class="nc" id="L277">    val recordThreads = ds.config.queries.recordThreads</span>
+
+    // function to join the attribute index scan results to the record table
+    // have to pull the feature id from the row
+    val joinFunction: JoinFunction = {
+<span class="nc" id="L282">      val prefix = index.sft.getTableSharingBytes</span>
+<span class="nc" id="L283">      val idToBytes = GeoMesaFeatureIndex.idToBytes(index.sft)</span>
+<span class="nc" id="L284">      kv =&gt; {</span>
+<span class="nc" id="L285">        val row = kv.getKey.getRow</span>
+<span class="nc" id="L286">        new Range(new Text(ByteArrays.concat(prefix, idToBytes(index.getIdFromRow(row.getBytes, 0, row.getLength, null)))))</span>
+      }
+    }
+
+    val joinQuery =
+<span class="nc" id="L291">      BatchScanPlan(ds, strategy, recordTables, Seq.empty, recordIterators, recordColFamily, recordToFeatures,</span>
+<span class="nc" id="L292">        None, None, None, None, recordThreads)</span>
+
+<span class="nc" id="L294">    val attributeIters = visibilityIter(index) ++</span>
+<span class="nc" id="L295">        FilterTransformIterator.configure(index.indexSft, index, stFilter, None, hints.getSampling).toSeq</span>
+
+<span class="nc" id="L297">    JoinPlan(ds, strategy, tables, ranges, attributeIters, colFamily, recordThreads, joinFunction, joinQuery,</span>
+<span class="nc" id="L298">      processor, hints.getProjection)</span>
+  }
+
+  private def visibilityIter(index: AttributeJoinIndex): Seq[IteratorSetting] = {
+    import org.locationtech.geomesa.utils.geotools.RichSimpleFeatureType.RichSimpleFeatureType
+<span class="nc" id="L303">    index.sft.getVisibilityLevel match {</span>
+<span class="nc bnc" id="L304" title="All 6 branches missed.">      case VisibilityLevel.Feature   =&gt; Seq.empty</span>
+<span class="nc bnc" id="L305" title="All 6 branches missed.">      case VisibilityLevel.Attribute =&gt; Seq(KryoVisibilityRowEncoder.configure(index.indexSft))</span>
+    }
+  }
+<span class="nc" id="L308">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

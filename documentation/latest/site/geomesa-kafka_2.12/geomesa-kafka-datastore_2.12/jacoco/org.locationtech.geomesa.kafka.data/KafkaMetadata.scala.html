@@ -1,0 +1,275 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaMetadata.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa Kafka Datastore</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.kafka.data</a> &gt; <span class="el_source">KafkaMetadata.scala</span></div><h1>KafkaMetadata.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.kafka.data
+
+import org.apache.kafka.clients.admin._
+import org.apache.kafka.clients.producer.ProducerRecord
+import org.apache.kafka.common.config.ConfigResource
+import org.apache.kafka.common.errors.{InterruptException, TopicExistsException, WakeupException}
+import org.locationtech.geomesa.index.metadata.{KeyValueStoreMetadata, MetadataSerializer}
+import org.locationtech.geomesa.kafka.data.KafkaDataStore.KafkaDataStoreConfig
+import org.locationtech.geomesa.kafka.versions.{KafkaAdminVersions, KafkaConsumerVersions}
+import org.locationtech.geomesa.utils.collection.CloseableIterator
+import org.locationtech.geomesa.utils.concurrent.{CachedThreadPool, LazyCloseable}
+import org.locationtech.geomesa.utils.io.CloseWithLogging
+
+import java.io.Closeable
+import java.nio.charset.StandardCharsets
+import java.time.Duration
+import java.time.temporal.ChronoUnit
+import java.util.concurrent._
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.{Collections, UUID}
+import scala.util.Try
+import scala.util.control.NonFatal
+
+/**
+ * Stores metadata in a Kafka topic
+ *
+ * @param config data store config
+ * @param serializer serializer
+ * @tparam T type param
+ */
+<span class="nc bnc" id="L39" title="All 8 branches missed.">class KafkaMetadata[T](val config: KafkaDataStoreConfig, val serializer: MetadataSerializer[T])</span>
+<span class="nc" id="L40">    extends KeyValueStoreMetadata[T] {</span>
+
+  import KafkaMetadata.{CleanupPolicyConfig, CompactCleanupPolicy}
+  import org.apache.kafka.clients.consumer.ConsumerConfig.{AUTO_OFFSET_RESET_CONFIG, GROUP_ID_CONFIG}
+
+  import scala.collection.JavaConverters._
+
+<span class="nc" id="L47">  private val producer = new LazyProducer(KafkaDataStore.producer(config.brokers, config.producers.properties))</span>
+<span class="nc" id="L48">  private val consumer = new LazyCloseable(new TopicMap())</span>
+
+  override protected def checkIfTableExists: Boolean = {
+<span class="nc" id="L51">    adminClientOp(config) { adminClient =&gt;</span>
+<span class="nc" id="L52">      val exists = adminClient.listTopics().names().get.contains(config.catalog)</span>
+<span class="nc bnc" id="L53" title="All 2 branches missed.">      if (exists){</span>
+        // ensure that the topic has compaction enabled, in case it was created externally
+<span class="nc" id="L55">        ensureCompactionPolicy(adminClient)</span>
+      }
+<span class="nc" id="L57">      exists</span>
+    }
+  }
+
+<span class="nc" id="L61">  override protected def createTable(): Unit = synchronized {</span>
+    val newTopic =
+<span class="nc" id="L63">      new NewTopic(config.catalog, 1, config.topics.replication.toShort)</span>
+<span class="nc" id="L64">          .configs(Collections.singletonMap(CleanupPolicyConfig, CompactCleanupPolicy))</span>
+<span class="nc" id="L65">    adminClientOp(config) { adminClient =&gt;</span>
+<span class="nc" id="L66">      try {</span>
+<span class="nc" id="L67">        adminClient.createTopics(Collections.singletonList(newTopic)).all().get()</span>
+      } catch {
+<span class="nc bnc" id="L69" title="All 4 branches missed.">        case e: ExecutionException if e.getCause.isInstanceOf[TopicExistsException] =&gt;</span>
+          // already created somewhere else
+          // ensure that the topic has compaction enabled, in case it was created externally
+<span class="nc" id="L72">          ensureCompactionPolicy(adminClient)</span>
+      }
+    }
+  }
+
+  override protected def createEmptyBackup(timestamp: String): KafkaMetadata[T] =
+<span class="nc" id="L78">    new KafkaMetadata(config.copy(catalog = s&quot;${config.catalog}_${timestamp}_bak&quot;), serializer)</span>
+
+  override protected def write(rows: Seq[(Array[Byte], Array[Byte])]): Unit = {
+<span class="nc bnc" id="L81" title="All 2 branches missed.">    rows.foreach { case (row, value) =&gt;</span>
+<span class="nc" id="L82">      producer.instance.send(new ProducerRecord(config.catalog, row, value))</span>
+    }
+<span class="nc" id="L84">    producer.instance.flush()</span>
+  }
+
+  override protected def delete(rows: Seq[Array[Byte]]): Unit = {
+<span class="nc" id="L88">    rows.foreach { row =&gt;</span>
+<span class="nc" id="L89">      producer.instance.send(new ProducerRecord(config.catalog, row, null))</span>
+    }
+<span class="nc" id="L91">    producer.instance.flush()</span>
+  }
+
+<span class="nc" id="L94">  override protected def scanValue(row: Array[Byte]): Option[Array[Byte]] = consumer.instance.get(row)</span>
+
+  override protected def scanRows(prefix: Option[Array[Byte]]): CloseableIterator[(Array[Byte], Array[Byte])] = {
+<span class="nc" id="L97">    prefix match {</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">      case None =&gt; consumer.instance.all()</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">      case Some(p) =&gt; consumer.instance.prefix(p)</span>
+    }
+  }
+
+  override def close(): Unit = {
+<span class="nc" id="L104">    CloseWithLogging(Seq(producer, consumer))</span>
+<span class="nc" id="L105">    super.close()</span>
+  }
+
+  /**
+   * Ensure that the topic has a cleanup policy of 'compact', so that feature types aren't aged off
+   *
+   * @param adminClient admin client
+   */
+  private def ensureCompactionPolicy(adminClient: AdminClient): Unit = {
+<span class="nc" id="L114">    val catalogResource = new ConfigResource(ConfigResource.Type.TOPIC, config.catalog)</span>
+<span class="nc" id="L115">    val catalogConfigs = adminClient.describeConfigs(Collections.singleton(catalogResource)).all().get().values()</span>
+<span class="nc" id="L116">    val isCompact = catalogConfigs.asScala.exists { config =&gt;</span>
+<span class="nc bnc" id="L117" title="All 8 branches missed.">      config.get(CleanupPolicyConfig) != null &amp;&amp; config.get(CleanupPolicyConfig).value() == CompactCleanupPolicy</span>
+    }
+<span class="nc bnc" id="L119" title="All 2 branches missed.">    if (!isCompact) {</span>
+<span class="nc" id="L120">      val catalogConfigEntry = new ConfigEntry(CleanupPolicyConfig, CompactCleanupPolicy)</span>
+<span class="nc" id="L121">      val alterOps = Collections.singleton(new AlterConfigOp(catalogConfigEntry, AlterConfigOp.OpType.SET))</span>
+<span class="nc" id="L122">      adminClient.incrementalAlterConfigs(Collections.singletonMap(catalogResource, alterOps)).all().get()</span>
+    }
+  }
+
+  /**
+   * Models the topic as a map of key-value pairs
+   */
+<span class="nc bnc" id="L129" title="All 2 branches missed.">  private class TopicMap extends Runnable with Closeable {</span>
+
+<span class="nc" id="L131">    private val groupId = UUID.randomUUID().toString</span>
+<span class="nc" id="L132">    private val poll = Duration.of(100, ChronoUnit.MILLIS)</span>
+
+<span class="nc" id="L134">    private val state = new ConcurrentHashMap[KeyBytes, Array[Byte]]()</span>
+<span class="nc" id="L135">    private val complete = new CountDownLatch(1)</span>
+<span class="nc" id="L136">    private val closed = new AtomicBoolean(false)</span>
+
+<span class="nc" id="L138">    private val consumer =</span>
+<span class="nc" id="L139">      KafkaDataStore.consumer(config.brokers,</span>
+<span class="nc" id="L140">        config.consumers.properties ++ Map(GROUP_ID_CONFIG -&gt; groupId, AUTO_OFFSET_RESET_CONFIG -&gt; &quot;earliest&quot;))</span>
+
+<span class="nc" id="L142">    private var future: Future[_] = _</span>
+
+<span class="nc" id="L144">    KafkaConsumerVersions.subscribe(consumer, config.catalog)</span>
+<span class="nc" id="L145">    doInitialLoad()</span>
+
+    override def run(): Unit = {
+      try {
+<span class="nc" id="L149">        var interrupted = Thread.currentThread().isInterrupted</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        while (!interrupted) {</span>
+<span class="nc" id="L151">          try {</span>
+<span class="nc" id="L152">            val result = KafkaConsumerVersions.poll(consumer, poll)</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            if (!result.isEmpty) {</span>
+<span class="nc" id="L154">              val records = result.iterator()</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">              while (records.hasNext) {</span>
+<span class="nc" id="L156">                val r = records.next()</span>
+<span class="nc" id="L157">                val v = r.value()</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">                if (v == null) {</span>
+<span class="nc" id="L159">                  state.remove(KeyBytes(r.key()))</span>
+                } else {
+<span class="nc" id="L161">                  state.put(KeyBytes(r.key()), v)</span>
+                }
+              }
+<span class="nc" id="L164">              consumer.commitAsync()</span>
+            }
+          } catch {
+<span class="nc bnc" id="L167" title="All 8 branches missed.">            case _: WakeupException | _: InterruptException | _: InterruptedException =&gt; interrupted = true</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">            case NonFatal(e) =&gt;</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">              logger.warn(s&quot;Consumer [$groupId] error receiving message from topic:&quot;, e)</span>
+<span class="nc" id="L170">              Thread.sleep(1000)</span>
+          }
+        }
+      } finally {
+<span class="nc" id="L174">        complete.countDown()</span>
+      }
+    }
+
+    private def doInitialLoad(): Unit = {
+<span class="nc" id="L179">      try {</span>
+<span class="nc" id="L180">        val offsets = scala.collection.mutable.Map.empty[Int, Long]</span>
+        // noinspection RedundantCollectionConversion
+<span class="nc" id="L182">        val partitions = consumer.partitionsFor(config.catalog).asScala.map(_.partition).toSeq</span>
+        // note: end offsets are the *next* offset that will be returned, so subtract one to track the last offset
+        // we will actually consume
+<span class="nc" id="L185">        offsets ++=</span>
+<span class="nc" id="L186">            KafkaConsumerVersions.endOffsets(consumer, config.catalog, partitions)</span>
+<span class="nc bnc" id="L187" title="All 8 branches missed.">                .collect { case (p, o) if o &gt; 0 =&gt; (p, o - 1) }</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        while (offsets.nonEmpty) {</span>
+<span class="nc" id="L189">          val result = KafkaConsumerVersions.poll(consumer, poll)</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">          if (!result.isEmpty) {</span>
+<span class="nc" id="L191">            val records = result.iterator()</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">            while (records.hasNext) {</span>
+<span class="nc" id="L193">              val r = records.next()</span>
+<span class="nc" id="L194">              val v = r.value()</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">              if (v == null) {</span>
+<span class="nc" id="L196">                state.remove(KeyBytes(r.key()))</span>
+              } else {
+<span class="nc" id="L198">                state.put(KeyBytes(r.key()), v)</span>
+              }
+<span class="nc bnc" id="L200" title="All 4 branches missed.">              if (offsets.get(r.partition()).exists(o =&gt; r.offset() &gt;= o)) {</span>
+<span class="nc" id="L201">                offsets.remove(r.partition())</span>
+              }
+            }
+<span class="nc" id="L204">            consumer.commitAsync()</span>
+          }
+        }
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        lazy val stateStrings =</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">          state.asScala.map { case (k, v) =&gt; new String(k.bytes, StandardCharsets.UTF_8) -&gt; new String(v, StandardCharsets.UTF_8)}</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        logger.debug(s&quot;Completed initial load of catalog '${config.catalog}': \n  ${stateStrings.mkString(&quot;\n  &quot;)}&quot;)</span>
+
+<span class="nc" id="L211">        future = CachedThreadPool.submit(this)</span>
+<span class="nc" id="L212">        sys.addShutdownHook(future.cancel(true)) // prevent consumer from hanging if ds isn't disposed properly</span>
+      } catch {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        case NonFatal(e) =&gt; complete.countDown(); throw e</span>
+      }
+    }
+
+<span class="nc" id="L218">    def get(key: Array[Byte]): Option[Array[Byte]] = Option(state.get(KeyBytes(key)))</span>
+
+    def all(): CloseableIterator[(Array[Byte], Array[Byte])] =
+<span class="nc bnc" id="L221" title="All 2 branches missed.">      CloseableIterator(state.asScala.iterator.map { case (k, v) =&gt; k.bytes -&gt; v })</span>
+
+    def prefix(prefix: Array[Byte]): CloseableIterator[(Array[Byte], Array[Byte])] =
+<span class="nc bnc" id="L224" title="All 2 branches missed.">      all().filter { case (k, _) =&gt; k.startsWith(prefix) }</span>
+
+    override def close(): Unit = {
+      try {
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        if (future != null) {</span>
+<span class="nc" id="L229">          future.cancel(true)</span>
+        }
+<span class="nc" id="L231">        complete.await(10, TimeUnit.SECONDS)</span>
+      } finally {
+        // avoid checking consumer assignment if consumer is already closed, which will throw an error
+<span class="nc bnc" id="L234" title="All 2 branches missed.">        if (closed.compareAndSet(false, true)) {</span>
+<span class="nc" id="L235">          cleanupConsumer()</span>
+        }
+      }
+    }
+
+    private def cleanupConsumer(): Unit = {
+      try {
+<span class="nc" id="L242">        val topics = consumer.assignment()</span>
+<span class="nc" id="L243">        consumer.unsubscribe()</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">        if (!topics.isEmpty) {</span>
+<span class="nc" id="L245">          Try(adminClientOp(config)(KafkaAdminVersions.deleteConsumerGroupOffsets(_, groupId, topics))).failed.foreach { e =&gt;</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">            logger.warn(&quot;Error deleting consumer group offsets:&quot;, e)</span>
+          }
+        }
+      } finally {
+<span class="nc" id="L250">        consumer.close()</span>
+      }
+    }
+  }
+
+  /**
+   * Supports using a byte array as a map key
+   *
+   * @param bytes bytes
+   */
+<span class="nc bnc" id="L260" title="All 12 branches missed.">  private case class KeyBytes(bytes: Array[Byte]) {</span>
+<span class="nc" id="L261">    override def hashCode(): Int = java.util.Arrays.hashCode(bytes)</span>
+    override def equals(obj: Any): Boolean = {
+<span class="nc" id="L263">      obj match {</span>
+<span class="nc bnc" id="L264" title="All 4 branches missed.">        case KeyBytes(other) =&gt; java.util.Arrays.equals(bytes, other)</span>
+<span class="nc" id="L265">        case _ =&gt; false</span>
+      }
+    }
+  }
+}
+
+<span class="nc" id="L271">object KafkaMetadata {</span>
+<span class="nc" id="L272">  private val CleanupPolicyConfig = &quot;cleanup.policy&quot;</span>
+<span class="nc" id="L273">  private val CompactCleanupPolicy = &quot;compact&quot;</span>
+<span class="nc" id="L274">}</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

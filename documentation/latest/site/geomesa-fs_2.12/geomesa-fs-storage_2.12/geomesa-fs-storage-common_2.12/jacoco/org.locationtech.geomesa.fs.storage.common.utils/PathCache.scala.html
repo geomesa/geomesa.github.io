@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang=""><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PathCache.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GeoMesa FileSystem Storage Common</a> &gt; <a href="index.source.html" class="el_package">org.locationtech.geomesa.fs.storage.common.utils</a> &gt; <span class="el_source">PathCache.scala</span></div><h1>PathCache.scala</h1><pre class="source lang-java linenums">/***********************************************************************
+ * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Apache License, Version 2.0
+ * which accompanies this distribution and is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ ***********************************************************************/
+
+package org.locationtech.geomesa.fs.storage.common.utils
+
+import com.github.benmanes.caffeine.cache.{CacheLoader, Caffeine, LoadingCache}
+import com.typesafe.scalalogging.LazyLogging
+import org.apache.hadoop.fs.{FileStatus, FileSystem, Path, RemoteIterator}
+import org.locationtech.geomesa.utils.conf.GeoMesaSystemProperties.SystemProperty
+
+import java.io.FileNotFoundException
+import java.lang
+import java.lang.reflect.Method
+import java.util.concurrent.{CompletableFuture, Executor, TimeUnit}
+import java.util.function.BiConsumer
+
+/**
+  * Caches file statuses to avoid repeated file system operations. Status expires after a
+  * configurable period, by default 10 minutes.
+  */
+<span class="nc bnc" id="L26" title="All 4 branches missed.">object PathCache extends LazyLogging {</span>
+
+<span class="nc" id="L28">  val CacheDurationProperty: SystemProperty = SystemProperty(&quot;geomesa.fs.file.cache.duration&quot;, &quot;15 minutes&quot;)</span>
+
+<span class="nc" id="L30">  private val duration = CacheDurationProperty.toDuration.get.toMillis</span>
+
+  // cache for checking existence of files
+<span class="nc" id="L33">  private val pathCache: LoadingCache[(FileSystem, Path), lang.Boolean] =</span>
+<span class="nc" id="L34">    Caffeine.newBuilder().expireAfterWrite(duration, TimeUnit.MILLISECONDS).build(</span>
+<span class="nc" id="L35">      new CacheLoader[(FileSystem, Path), java.lang.Boolean]() {</span>
+<span class="nc" id="L36">        override def load(key: (FileSystem, Path)): java.lang.Boolean = key._1.exists(key._2)</span>
+      }
+    )
+
+  // cache for checking directory contents
+<span class="nc" id="L41">  private val listCache: LoadingCache[(FileSystem, Path), Stream[FileStatus]] =</span>
+<span class="nc" id="L42">    Caffeine.newBuilder().expireAfterWrite(duration, TimeUnit.MILLISECONDS).build(</span>
+<span class="nc" id="L43">      new CacheLoader[(FileSystem, Path), Stream[FileStatus]]() {</span>
+        override def load(key: (FileSystem, Path)): Stream[FileStatus] =
+<span class="nc" id="L45">          RemoteIterator(key._1.listStatusIterator(key._2)).toStream</span>
+      }
+    )
+
+  // cache for individual file status
+<span class="nc" id="L50">  private val statusCache: LoadingCache[(FileSystem, Path), FileStatus] =</span>
+<span class="nc" id="L51">    Caffeine.newBuilder().expireAfterWrite(duration, TimeUnit.MILLISECONDS).build(</span>
+<span class="nc" id="L52">      new CacheLoader[(FileSystem, Path), FileStatus]() {</span>
+        override def load(key: (FileSystem, Path)): FileStatus = {
+<span class="nc" id="L54">          try { key._1.getFileStatus(key._2) } catch {</span>
+<span class="nc" id="L55">              case _: FileNotFoundException =&gt; null</span>
+          }
+        }
+
+        override def asyncLoad(key: (FileSystem, Path), executor: Executor): CompletableFuture[FileStatus] = {
+<span class="nc" id="L60">          super.asyncLoad(key, executor)</span>
+<span class="nc" id="L61">            .whenCompleteAsync(new ListCacheRefresh(key), executor)</span>
+            .asInstanceOf[CompletableFuture[FileStatus]]
+        }
+
+        override def asyncReload(
+            key: (FileSystem, Path),
+            oldValue: FileStatus,
+            executor: Executor): CompletableFuture[FileStatus] = {
+<span class="nc" id="L69">          super.asyncReload(key, oldValue, executor)</span>
+<span class="nc" id="L70">            .whenCompleteAsync(new ListCacheRefresh(key), executor)</span>
+            .asInstanceOf[CompletableFuture[FileStatus]]
+        }
+      }
+    )
+
+  // we use reflection to get around Caffeine 2.x/3.x API differences in some environments
+<span class="nc bnc" id="L77" title="All 6 branches missed.">  private val refresh: Method = classOf[LoadingCache[_, _]].getMethods.find(_.getName == &quot;refresh&quot;).getOrElse {</span>
+<span class="nc bnc" id="L78" title="All 2 branches missed.">    logger.warn(&quot;Could not get refresh cache method - cache operations will be less efficient&quot;)</span>
+<span class="nc" id="L79">    null</span>
+  }
+
+  /**
+    * Register a path as existing
+    *
+    * @param fs file system
+    * @param path path
+    */
+  def register(fs: FileSystem, path: Path): Unit = {
+<span class="nc" id="L89">    pathCache.put((fs, path), java.lang.Boolean.TRUE)</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">    if (refresh != null) {</span>
+<span class="nc" id="L91">      refresh.invoke(statusCache, (fs, path)) // also triggers listCache update</span>
+    }
+  }
+
+  /**
+    * Check to see if a path exists
+    *
+    * @param fs file system
+    * @param path path
+    * @param reload reload the file status from the underlying file system before checking
+    * @return
+    */
+<span class="nc" id="L103">  def exists(fs: FileSystem, path: Path, reload: Boolean = false): Boolean = {</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">    if (reload) {</span>
+<span class="nc" id="L105">      invalidate(fs, path)</span>
+    }
+<span class="nc" id="L107">    pathCache.get((fs, path)).booleanValue()</span>
+  }
+
+  /**
+    * Gets the file status for a path. Path must exist.
+    *
+    * @param fs file system
+    * @param path path
+    * @return
+    */
+<span class="nc" id="L117">  def status(fs: FileSystem, path: Path, reload: Boolean = false): FileStatus = {</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">    if (reload) {</span>
+<span class="nc" id="L119">      invalidate(fs, path)</span>
+    }
+<span class="nc" id="L121">    statusCache.get((fs, path))</span>
+  }
+
+  /**
+    * List the children of a path
+    *
+    * @param fs file system
+    * @param dir directory path
+    * @return
+    */
+<span class="nc" id="L131">  def list(fs: FileSystem, dir: Path, reload: Boolean = false): Iterator[FileStatus] = {</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">    if (reload) {</span>
+<span class="nc" id="L133">      invalidate(fs, dir)</span>
+    }
+<span class="nc" id="L135">    listCache.get((fs, dir)).iterator</span>
+  }
+
+  /**
+    * Invalidate any cached values for the path - they will be re-loaded on next access
+    *
+    * @param fs file system
+    * @param path path
+    */
+  def invalidate(fs: FileSystem, path: Path): Unit = {
+<span class="nc" id="L145">    Seq(pathCache, statusCache, listCache).foreach(_.invalidate((fs, path)))</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">    if (path.getParent != null) {</span>
+<span class="nc" id="L147">      listCache.invalidate((fs, path.getParent))</span>
+    }
+  }
+
+<span class="nc" id="L151">  object RemoteIterator {</span>
+<span class="nc" id="L152">    def apply[T](iter: RemoteIterator[T]): Iterator[T] = new Iterator[T] {</span>
+<span class="nc" id="L153">      override def hasNext: Boolean = iter.hasNext</span>
+<span class="nc" id="L154">      override def next(): T = iter.next</span>
+    }
+  }
+
+<span class="nc" id="L158">  private class ListCacheRefresh(key: (FileSystem, Path)) extends BiConsumer[FileStatus, Throwable] {</span>
+    override def accept(status: FileStatus, u: Throwable): Unit = {
+<span class="nc bnc" id="L160" title="All 2 branches missed.">      if (status != null) { // could be null if load fails</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        val (fs, path) = key</span>
+<span class="nc" id="L162">        val parent = path.getParent</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (parent != null) {</span>
+<span class="nc" id="L164">          listCache.asMap().computeIfPresent((fs, parent), load(status)_)</span>
+        }
+      }
+    }
+
+    // noinspection ScalaUnusedSymbol
+    private def load(status: FileStatus)(ignored: (FileSystem, Path), list: Stream[FileStatus]): Stream[FileStatus] =
+<span class="nc bnc" id="L171" title="All 6 branches missed.">      list.filterNot(f =&gt; f.getPath == status.getPath) :+ status</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>
