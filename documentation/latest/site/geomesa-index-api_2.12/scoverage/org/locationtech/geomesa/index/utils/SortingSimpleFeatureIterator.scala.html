@@ -33,292 +33,397 @@
 </span>9 <span style=''>package org.locationtech.geomesa.index.utils
 </span>10 <span style=''>
 </span>11 <span style=''>import com.typesafe.scalalogging.LazyLogging
-</span>12 <span style=''>import org.geotools.api.feature.simple.SimpleFeature
+</span>12 <span style=''>import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
 </span>13 <span style=''>import org.locationtech.geomesa.features.kryo.KryoFeatureSerializer
 </span>14 <span style=''>import org.locationtech.geomesa.features.{SerializationOption, SimpleFeatureSerializer}
 </span>15 <span style=''>import org.locationtech.geomesa.index.conf.QueryProperties
 </span>16 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
-</span>17 <span style=''>import org.locationtech.geomesa.utils.geotools.SimpleFeatureOrdering
-</span>18 <span style=''>import org.locationtech.geomesa.utils.index.ByteArrays
-</span>19 <span style=''>import org.locationtech.geomesa.utils.io.{CloseQuietly, Sizable, WithClose}
-</span>20 <span style=''>
-</span>21 <span style=''>import java.io.{File, FileInputStream, FileOutputStream}
-</span>22 <span style=''>import java.nio.file.Files
-</span>23 <span style=''>import java.util.concurrent.atomic.AtomicBoolean
-</span>24 <span style=''>import scala.collection.mutable.ArrayBuffer
-</span>25 <span style=''>import scala.util.Random
+</span>17 <span style=''>import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+</span>18 <span style=''>import org.locationtech.geomesa.utils.geotools.SimpleFeatureOrdering
+</span>19 <span style=''>import org.locationtech.geomesa.utils.index.ByteArrays
+</span>20 <span style=''>import org.locationtech.geomesa.utils.io.{CloseQuietly, Sizable, WithClose}
+</span>21 <span style=''>
+</span>22 <span style=''>import java.io.{File, FileInputStream, FileOutputStream}
+</span>23 <span style=''>import java.nio.file.Files
+</span>24 <span style=''>import java.util.concurrent.atomic.AtomicBoolean
+</span>25 <span style=''>import java.util.concurrent.{Callable, Future}
 </span>26 <span style=''>import scala.util.control.NonFatal
-</span>27 <span style=''>
-</span>28 <span style=''>/**
-</span>29 <span style=''>  * In memory sorting of simple features, with optional spill to disk
-</span>30 <span style=''>  *
-</span>31 <span style=''>  * @param features unsorted feature iterator
-</span>32 <span style=''>  * @param sortBy attributes to sort by, in the form: (name, reverse).
-</span>33 <span style=''>  *               for sort by feature id (e.g. natural sort), use an empty string for name
-</span>34 <span style=''>  */
-</span>35 <span style=''>class SortingSimpleFeatureIterator(features: CloseableIterator[SimpleFeature], sortBy: Seq[(String, Boolean)])
-</span>36 <span style=''>    extends CloseableIterator[SimpleFeature] {
-</span>37 <span style=''>
-</span>38 <span style=''>  import SortingSimpleFeatureIterator.{sortInMemory, sortWithSpillover}
-</span>39 <span style=''>
-</span>40 <span style=''>  private val closed = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
-</span>41 <span style=''>
-</span>42 <span style=''>  private lazy val sorted: CloseableIterator[SimpleFeature] = {
-</span>43 <span style=''>    if (closed.get || !features.hasNext) { features } else {
-</span>44 <span style=''>      val head = features.next()
-</span>45 <span style=''>      if (closed.get || !features.hasNext) { CloseableIterator.single(head, features.close()) } else {
-</span>46 <span style=''>        val ordering = SimpleFeatureOrdering(head.getFeatureType, sortBy)
-</span>47 <span style=''>        QueryProperties.SortMemoryThreshold.toBytes match {
-</span>48 <span style=''>          case None =&gt; sortInMemory(head, features, ordering, closed)
-</span>49 <span style=''>          case Some(threshold) =&gt; sortWithSpillover(head, features, ordering, closed, threshold)
-</span>50 <span style=''>        }
-</span>51 <span style=''>      }
-</span>52 <span style=''>    }
-</span>53 <span style=''>  }
-</span>54 <span style=''>
-</span>55 <span style=''>  override def hasNext: Boolean = </span><span style='background: #AEF1AE'>sorted.hasNext</span><span style=''>
-</span>56 <span style=''>
-</span>57 <span style=''>  override def next(): SimpleFeature = </span><span style='background: #AEF1AE'>sorted.next()</span><span style=''>
-</span>58 <span style=''>
-</span>59 <span style=''>  override def close(): Unit = {
-</span>60 <span style=''>    if (</span><span style='background: #AEF1AE'>closed.compareAndSet(false, true)</span><span style=''>) {
-</span>61 <span style=''>      </span><span style='background: #AEF1AE'>sorted.close()</span><span style=''> // also closes original features iterator
-</span>62 <span style=''>    }
-</span>63 <span style=''>  }
-</span>64 <span style=''>}
-</span>65 <span style=''>
-</span>66 <span style=''>object SortingSimpleFeatureIterator extends LazyLogging {
-</span>67 <span style=''>
-</span>68 <span style=''>  import scala.collection.JavaConverters._
-</span>69 <span style=''>
-</span>70 <span style=''>  /**
-</span>71 <span style=''>   * Sorts the iterator in memory
-</span>72 <span style=''>   *
-</span>73 <span style=''>   * @param head head of iterator
-</span>74 <span style=''>   * @param tail tail of iterator
-</span>75 <span style=''>   * @param ordering ordering
-</span>76 <span style=''>   * @param closed checked to determine if we should stop sorting and return early
-</span>77 <span style=''>   * @return
-</span>78 <span style=''>   */
-</span>79 <span style=''>  private def sortInMemory(
-</span>80 <span style=''>      head: SimpleFeature,
-</span>81 <span style=''>      tail: CloseableIterator[SimpleFeature],
-</span>82 <span style=''>      ordering: Ordering[SimpleFeature],
-</span>83 <span style=''>      closed: AtomicBoolean): CloseableIterator[SimpleFeature] = {
-</span>84 <span style=''>    // use ArrayList for sort-in-place of the underlying array
-</span>85 <span style=''>    val list = </span><span style='background: #AEF1AE'>new java.util.ArrayList[SimpleFeature](100)</span><span style=''>
-</span>86 <span style=''>    </span><span style='background: #AEF1AE'>list.add(head)</span><span style=''>
-</span>87 <span style=''>
-</span>88 <span style=''>    while (</span><span style='background: #AEF1AE'>tail.hasNext &amp;&amp; !closed.get</span><span style=''>) {
-</span>89 <span style=''>      </span><span style='background: #AEF1AE'>list.add(tail.next())</span><span style=''>
-</span>90 <span style=''>    }
-</span>91 <span style=''>
-</span>92 <span style=''>    if (</span><span style='background: #AEF1AE'>closed.get</span><span style=''>) {
-</span>93 <span style=''>      // don't bother sorting, just return an empty iterator
-</span>94 <span style=''>      </span><span style='background: #F0ADAD'>CloseableIterator(Iterator.empty, tail.close())</span><span style=''>
-</span>95 <span style=''>    } else </span><span style='background: #AEF1AE'>{
-</span>96 <span style=''></span><span style='background: #AEF1AE'>      list.sort(ordering)
-</span>97 <span style=''></span><span style='background: #AEF1AE'>      CloseableIterator(list.iterator.asScala, tail.close())
-</span>98 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>99 <span style=''>  }
-</span>100 <span style=''>
-</span>101 <span style=''>  /**
-</span>102 <span style=''>   * Sorts the iterator in memory, but spills over to disk if the size in memory exceeds the specified threshold
-</span>103 <span style=''>   *
-</span>104 <span style=''>   * @param head head of iterator
-</span>105 <span style=''>   * @param tail tail of iterator
-</span>106 <span style=''>   * @param ordering ordering
-</span>107 <span style=''>   * @param closed checked to determine if we should stop sorting and return early
-</span>108 <span style=''>   * @param threshold max memory to use before spilling to disk
-</span>109 <span style=''>   * @return
-</span>110 <span style=''>   */
-</span>111 <span style=''>  private def sortWithSpillover(
-</span>112 <span style=''>      head: SimpleFeature,
-</span>113 <span style=''>      tail: CloseableIterator[SimpleFeature],
-</span>114 <span style=''>      ordering: Ordering[SimpleFeature],
-</span>115 <span style=''>      closed: AtomicBoolean,
-</span>116 <span style=''>      threshold: Long): CloseableIterator[SimpleFeature] = {
-</span>117 <span style=''>
-</span>118 <span style=''>    // grouping ID for tmp files, doesn't have to be unique
-</span>119 <span style=''>    lazy val id = {
-</span>120 <span style=''>      val name = head.getFeatureType.getTypeName.replaceAll(&quot;[^A-Za-z0-9_-]&quot;, &quot;&quot;).take(20)
-</span>121 <span style=''>      f&quot;$name-${Random.nextInt(10000)}%04d&quot;
-</span>122 <span style=''>    }
-</span>123 <span style=''>
-</span>124 <span style=''>    val sizable: FeatureIsSizable[SimpleFeature] = head match {
-</span>125 <span style=''>      case _: SimpleFeature with Sizable =&gt;
-</span>126 <span style=''>        </span><span style='background: #AEF1AE'>SizableFeatureIsSizable.asInstanceOf[FeatureIsSizable[SimpleFeature]]</span><span style=''>
-</span>127 <span style=''>      case _ </span><span style='background: #F0ADAD'>=&gt;
-</span>128 <span style=''></span><span style='background: #F0ADAD'>        // currently, all of our uses of this class pass in Sizable features... this means we missed one
-</span>129 <span style=''></span><span style='background: #F0ADAD'>        logger.warn(
-</span>130 <span style=''></span><span style='background: #F0ADAD'>          s&quot;Feature class '${head.getClass.getName}' doesn't implement Sizable - &quot; +
-</span>131 <span style=''></span><span style='background: #F0ADAD'>              &quot;using estimated size for memory threshold calculations&quot;)
-</span>132 <span style=''></span><span style='background: #F0ADAD'>        UnSizableFeatureIsSizable</span><span style=''>
-</span>133 <span style=''>    }
-</span>134 <span style=''>
-</span>135 <span style=''>    val files = </span><span style='background: #AEF1AE'>ArrayBuffer.empty[File]</span><span style=''> // tmp files we create when we exceed in-memory threshold
-</span>136 <span style=''>    lazy val serializer = KryoFeatureSerializer(head.getFeatureType, SerializationOption.WithUserData)
-</span>137 <span style=''>    // use ArrayList for sort-in-place of the underlying array
-</span>138 <span style=''>    val list = </span><span style='background: #AEF1AE'>new java.util.ArrayList[SimpleFeature](1000)</span><span style=''>
-</span>139 <span style=''>    </span><span style='background: #AEF1AE'>list.add(head)</span><span style=''>
-</span>140 <span style=''>    var size = </span><span style='background: #AEF1AE'>sizable.sizeOf(head)</span><span style=''>
-</span>141 <span style=''>
-</span>142 <span style=''>    while (</span><span style='background: #AEF1AE'>tail.hasNext &amp;&amp; !closed.get</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>143 <span style=''></span><span style='background: #AEF1AE'>      if (size &gt;= threshold) {
-</span>144 <span style=''></span><span style='background: #AEF1AE'>        // write out the sorted list to disk
-</span>145 <span style=''></span><span style='background: #AEF1AE'>        list.sort(ordering)
-</span>146 <span style=''></span><span style='background: #AEF1AE'>        val file = Files.createTempFile(s&quot;gm-sort-$id-&quot;, &quot;.kryo&quot;).toFile
-</span>147 <span style=''></span><span style='background: #AEF1AE'>        files += file
-</span>148 <span style=''></span><span style='background: #AEF1AE'>        logger.trace(s&quot;Created temp sort file '${file.getAbsolutePath}'&quot;)
-</span>149 <span style=''></span><span style='background: #AEF1AE'>        WithClose(new FileOutputStream(file)) { os =&gt;
-</span>150 <span style=''></span><span style='background: #AEF1AE'>          var i = 0
-</span>151 <span style=''></span><span style='background: #AEF1AE'>          while (i &lt; list.size()) {
-</span>152 <span style=''></span><span style='background: #AEF1AE'>            val bytes = serializer.serialize(list.get(i))
-</span>153 <span style=''></span><span style='background: #AEF1AE'>            os.write(ByteArrays.toBytes(bytes.length))
-</span>154 <span style=''></span><span style='background: #AEF1AE'>            os.write(bytes)
-</span>155 <span style=''></span><span style='background: #AEF1AE'>            i += 1
-</span>156 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>157 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>158 <span style=''></span><span style='background: #AEF1AE'>        list.clear()
-</span>159 <span style=''></span><span style='background: #AEF1AE'>        size = 0
-</span>160 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>161 <span style=''></span><span style='background: #AEF1AE'>      val next = tail.next()
-</span>162 <span style=''></span><span style='background: #AEF1AE'>      list.add(next)
-</span>163 <span style=''></span><span style='background: #AEF1AE'>      size += sizable.sizeOf(next)
-</span>164 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>165 <span style=''>
-</span>166 <span style=''>    if (</span><span style='background: #AEF1AE'>closed.get</span><span style=''>) </span><span style='background: #F0ADAD'>{
-</span>167 <span style=''></span><span style='background: #F0ADAD'>      files.foreach { file =&gt;
-</span>168 <span style=''></span><span style='background: #F0ADAD'>        try {
-</span>169 <span style=''></span><span style='background: #F0ADAD'>          if (!file.delete()) {
-</span>170 <span style=''></span><span style='background: #F0ADAD'>            logger.warn(s&quot;Unable to delete tmp file '${file.getAbsolutePath}''&quot;)
-</span>171 <span style=''></span><span style='background: #F0ADAD'>            file.deleteOnExit()
-</span>172 <span style=''></span><span style='background: #F0ADAD'>          }
-</span>173 <span style=''></span><span style='background: #F0ADAD'>        } catch {
-</span>174 <span style=''></span><span style='background: #F0ADAD'>          case NonFatal(e) =&gt; logger.warn(s&quot;Unable to delete tmp file '${file.getAbsolutePath}''&quot;, e)
-</span>175 <span style=''></span><span style='background: #F0ADAD'>        }
-</span>176 <span style=''></span><span style='background: #F0ADAD'>      }
-</span>177 <span style=''></span><span style='background: #F0ADAD'>      // don't bother sorting, just return an empty iterator
-</span>178 <span style=''></span><span style='background: #F0ADAD'>      CloseableIterator(Iterator.empty, tail.close())
-</span>179 <span style=''></span><span style='background: #F0ADAD'>    }</span><span style=''> else </span><span style='background: #AEF1AE'>{
-</span>180 <span style=''></span><span style='background: #AEF1AE'>      if (!list.isEmpty) {
-</span>181 <span style=''></span><span style='background: #AEF1AE'>        list.sort(ordering)
-</span>182 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>183 <span style=''></span><span style='background: #AEF1AE'>      if (files.isEmpty) {
-</span>184 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>CloseableIterator(list.iterator.asScala, tail.close())</span><span style='background: #AEF1AE'>
-</span>185 <span style=''></span><span style='background: #AEF1AE'>      } else {
-</span>186 <span style=''></span><span style='background: #AEF1AE'>        new MergeSortingIterator(files.toIndexedSeq, serializer, list.iterator.asScala, tail, ordering)
-</span>187 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>188 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>189 <span style=''>  }
-</span>190 <span style=''>
-</span>191 <span style=''>  /**
-</span>192 <span style=''>   * Does a merge sort on a group of locally sorted files and a left-over in-memory iterator
-</span>193 <span style=''>   *
-</span>194 <span style=''>   * @param files files to merge
-</span>195 <span style=''>   * @param serializer serializer
-</span>196 <span style=''>   * @param mem left-over in-memory features, already sorted
-</span>197 <span style=''>   * @param closeable link to the original (now-empty) feature iterator, for cleaning up on close
-</span>198 <span style=''>   * @param ordering feature ordering
-</span>199 <span style=''>   */
-</span>200 <span style=''>  private class MergeSortingIterator(
-</span>201 <span style=''>      files: IndexedSeq[File],
-</span>202 <span style=''>      serializer: SimpleFeatureSerializer,
-</span>203 <span style=''>      mem: Iterator[SimpleFeature],
-</span>204 <span style=''>      closeable: CloseableIterator[_],
-</span>205 <span style=''>      ordering: Ordering[SimpleFeature]
-</span>206 <span style=''>    ) extends CloseableIterator[SimpleFeature] {
-</span>207 <span style=''>
-</span>208 <span style=''>    // list of feature iterators to merge
-</span>209 <span style=''>    private val merging = </span><span style='background: #AEF1AE'>IndexedSeq(CloseableIterator(mem)) ++ files.map(new FileIterator(_, serializer))</span><span style=''>
-</span>210 <span style=''>
-</span>211 <span style=''>    // priority queue containing the next feature from each file
-</span>212 <span style=''>    private val heads = {
-</span>213 <span style=''>      val o = </span><span style='background: #AEF1AE'>Ordering.by[(SimpleFeature, Int), SimpleFeature](_._1)(ordering)</span><span style=''>
-</span>214 <span style=''>      val q = </span><span style='background: #AEF1AE'>new java.util.PriorityQueue[(SimpleFeature, Int)](files.size + 1, o)</span><span style=''>
-</span>215 <span style=''>      var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
-</span>216 <span style=''>      while (</span><span style='background: #AEF1AE'>i &lt; merging.length</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>217 <span style=''></span><span style='background: #AEF1AE'>        val m = merging(i)
-</span>218 <span style=''></span><span style='background: #AEF1AE'>        if (m.hasNext) {
-</span>219 <span style=''></span><span style='background: #AEF1AE'>          q.add(m.next -&gt; i)
-</span>220 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>221 <span style=''></span><span style='background: #AEF1AE'>        i += 1
-</span>222 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>223 <span style=''>      q
-</span>224 <span style=''>    }
-</span>225 <span style=''>
-</span>226 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>!heads.isEmpty</span><span style=''>
-</span>227 <span style=''>
-</span>228 <span style=''>    override def next(): SimpleFeature = {
-</span>229 <span style=''>      val (f, i) = heads.poll()
-</span>230 <span style=''>      val m = </span><span style='background: #AEF1AE'>merging(i)</span><span style=''>
-</span>231 <span style=''>      if (</span><span style='background: #AEF1AE'>m.hasNext</span><span style=''>) {
-</span>232 <span style=''>        </span><span style='background: #AEF1AE'>heads.add(m.next -&gt; i)</span><span style=''>
-</span>233 <span style=''>      }
-</span>234 <span style=''>      f
-</span>235 <span style=''>    }
-</span>236 <span style=''>
-</span>237 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>CloseQuietly.raise(merging :+ closeable)</span><span style=''>
-</span>238 <span style=''>  }
-</span>239 <span style=''>
-</span>240 <span style=''>  /**
-</span>241 <span style=''>   * Reads a tmp file of serialized simple features
-</span>242 <span style=''>   *
-</span>243 <span style=''>   * @param file file
-</span>244 <span style=''>   * @param serializer serializer
-</span>245 <span style=''>   */
-</span>246 <span style=''>  private class FileIterator(file: File, serializer: SimpleFeatureSerializer)
-</span>247 <span style=''>      extends CloseableIterator[SimpleFeature] with LazyLogging {
-</span>248 <span style=''>
-</span>249 <span style=''>    private val is = </span><span style='background: #AEF1AE'>new FileInputStream(file)</span><span style=''>
-</span>250 <span style=''>    private var buf = </span><span style='background: #AEF1AE'>Array.ofDim[Byte](4)</span><span style=''>
-</span>251 <span style=''>
-</span>252 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>is.available() &gt; 0</span><span style=''>
-</span>253 <span style=''>
-</span>254 <span style=''>    override def next(): SimpleFeature = {
-</span>255 <span style=''>      </span><span style='background: #AEF1AE'>is.read(buf, 0, 4)</span><span style=''>
-</span>256 <span style=''>      val size = </span><span style='background: #AEF1AE'>ByteArrays.readInt(buf)</span><span style=''>
-</span>257 <span style=''>      if (</span><span style='background: #AEF1AE'>buf.length &lt; size</span><span style=''>) {
-</span>258 <span style=''>        </span><span style='background: #AEF1AE'>buf = Array.ofDim((size * 1.2).toInt)</span><span style=''>
-</span>259 <span style=''>      }
-</span>260 <span style=''>      </span><span style='background: #AEF1AE'>is.read(buf, 0, size)</span><span style=''>
-</span>261 <span style=''>      </span><span style='background: #AEF1AE'>serializer.deserialize(buf, 0, size)</span><span style=''>
-</span>262 <span style=''>    }
-</span>263 <span style=''>
-</span>264 <span style=''>    override def close(): Unit = {
-</span>265 <span style=''>      try { </span><span style='background: #AEF1AE'>is.close()</span><span style=''> } finally {
-</span>266 <span style=''>        </span><span style='background: #AEF1AE'>if (!file.delete()) </span><span style='background: #F0ADAD'>{
-</span>267 <span style=''></span><span style='background: #F0ADAD'>          logger.warn(s&quot;Unable to delete tmp file '${file.getAbsolutePath}''&quot;)
-</span>268 <span style=''></span><span style='background: #F0ADAD'>          file.deleteOnExit()
-</span>269 <span style=''></span><span style='background: #F0ADAD'>        }</span><span style=''>
-</span>270 <span style=''>      }
-</span>271 <span style=''>    }
-</span>272 <span style=''>  }
-</span>273 <span style=''>
-</span>274 <span style=''>  /**
-</span>275 <span style=''>   * Evidence that a feature is sizable
-</span>276 <span style=''>   *
-</span>277 <span style=''>   * @tparam T type binding
-</span>278 <span style=''>   */
-</span>279 <span style=''>  private trait FeatureIsSizable[T &lt;: SimpleFeature] {
-</span>280 <span style=''>    def sizeOf(feature: T): Long
-</span>281 <span style=''>  }
-</span>282 <span style=''>
-</span>283 <span style=''>  /**
-</span>284 <span style=''>   * Evidence that Sizable features are sizable
-</span>285 <span style=''>   */
-</span>286 <span style=''>  private object SizableFeatureIsSizable extends FeatureIsSizable[SimpleFeature with Sizable] {
-</span>287 <span style=''>    override def sizeOf(feature: SimpleFeature with Sizable): Long = </span><span style='background: #AEF1AE'>feature.calculateSizeOf()</span><span style=''>
-</span>288 <span style=''>  }
-</span>289 <span style=''>
-</span>290 <span style=''>  /**
-</span>291 <span style=''>   * Use a rough estimate based on attributes and user data
-</span>292 <span style=''>   */
-</span>293 <span style=''>  private object UnSizableFeatureIsSizable extends FeatureIsSizable[SimpleFeature] {
-</span>294 <span style=''>    override def sizeOf(feature: SimpleFeature): Long =
-</span>295 <span style=''>      </span><span style='background: #F0ADAD'>Sizable.sizeOf(feature) + Sizable.deepSizeOf(feature.getAttributes, feature.getUserData)</span><span style=''>
-</span>296 <span style=''>  }
-</span>297 <span style=''>}
+</span>27 <span style=''>import scala.util.{Random, Try}
+</span>28 <span style=''>
+</span>29 <span style=''>/**
+</span>30 <span style=''>  * In memory sorting of simple features, with optional spill to disk
+</span>31 <span style=''>  *
+</span>32 <span style=''>  * @param features unsorted feature iterator
+</span>33 <span style=''>  * @param sortBy attributes to sort by, in the form: (name, reverse).
+</span>34 <span style=''>  *               for sort by feature id (e.g. natural sort), use an empty string for name
+</span>35 <span style=''>  */
+</span>36 <span style=''>class SortingSimpleFeatureIterator(features: CloseableIterator[SimpleFeature], sortBy: Seq[(String, Boolean)])
+</span>37 <span style=''>    extends CloseableIterator[SimpleFeature] {
+</span>38 <span style=''>
+</span>39 <span style=''>  import SortingSimpleFeatureIterator.{sortInMemory, sortWithSpillover}
+</span>40 <span style=''>
+</span>41 <span style=''>  private val closed = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
+</span>42 <span style=''>
+</span>43 <span style=''>  private lazy val sorted: CloseableIterator[SimpleFeature] = {
+</span>44 <span style=''>    try {
+</span>45 <span style=''>      if (closed.get || !features.hasNext) { CloseableIterator.empty } else {
+</span>46 <span style=''>        val head = features.next()
+</span>47 <span style=''>        if (!features.hasNext) { CloseableIterator.single(head) } else {
+</span>48 <span style=''>          val ordering = SimpleFeatureOrdering(head.getFeatureType, sortBy)
+</span>49 <span style=''>          QueryProperties.SortMemoryThreshold.toBytes match {
+</span>50 <span style=''>            case None =&gt; sortInMemory(head, features, ordering, closed)
+</span>51 <span style=''>            case Some(threshold) =&gt; sortWithSpillover(head, features, ordering, closed, threshold)
+</span>52 <span style=''>          }
+</span>53 <span style=''>        }
+</span>54 <span style=''>      }
+</span>55 <span style=''>    } finally {
+</span>56 <span style=''>      features.close()
+</span>57 <span style=''>    }
+</span>58 <span style=''>  }
+</span>59 <span style=''>
+</span>60 <span style=''>  override def hasNext: Boolean = </span><span style='background: #AEF1AE'>sorted.hasNext</span><span style=''>
+</span>61 <span style=''>
+</span>62 <span style=''>  override def next(): SimpleFeature = </span><span style='background: #AEF1AE'>sorted.next()</span><span style=''>
+</span>63 <span style=''>
+</span>64 <span style=''>  override def close(): Unit = {
+</span>65 <span style=''>    if (</span><span style='background: #AEF1AE'>closed.compareAndSet(false, true)</span><span style=''>) {
+</span>66 <span style=''>      </span><span style='background: #AEF1AE'>sorted.close()</span><span style=''> // also closes original features iterator
+</span>67 <span style=''>    }
+</span>68 <span style=''>  }
+</span>69 <span style=''>}
+</span>70 <span style=''>
+</span>71 <span style=''>object SortingSimpleFeatureIterator extends LazyLogging {
+</span>72 <span style=''>
+</span>73 <span style=''>  /**
+</span>74 <span style=''>   * Sorts the iterator in memory
+</span>75 <span style=''>   *
+</span>76 <span style=''>   * @param head head of iterator
+</span>77 <span style=''>   * @param tail tail of iterator
+</span>78 <span style=''>   * @param ordering ordering
+</span>79 <span style=''>   * @param closed checked to determine if we should stop sorting and return early
+</span>80 <span style=''>   * @return
+</span>81 <span style=''>   */
+</span>82 <span style=''>  private def sortInMemory(
+</span>83 <span style=''>      head: SimpleFeature,
+</span>84 <span style=''>      tail: CloseableIterator[SimpleFeature],
+</span>85 <span style=''>      ordering: Ordering[SimpleFeature],
+</span>86 <span style=''>      closed: AtomicBoolean): CloseableIterator[SimpleFeature] = {
+</span>87 <span style=''>    // use ArrayList for sort-in-place of the underlying array
+</span>88 <span style=''>    val list = </span><span style='background: #AEF1AE'>new java.util.ArrayList[SimpleFeature](1000)</span><span style=''>
+</span>89 <span style=''>    </span><span style='background: #AEF1AE'>list.add(head)</span><span style=''>
+</span>90 <span style=''>
+</span>91 <span style=''>    while (</span><span style='background: #AEF1AE'>tail.hasNext &amp;&amp; !closed.get</span><span style=''>) {
+</span>92 <span style=''>      </span><span style='background: #AEF1AE'>list.add(tail.next())</span><span style=''>
+</span>93 <span style=''>    }
+</span>94 <span style=''>
+</span>95 <span style=''>    if (</span><span style='background: #AEF1AE'>closed.get</span><span style=''>) {
+</span>96 <span style=''>      // don't bother sorting, just return an empty iterator
+</span>97 <span style=''>      </span><span style='background: #F0ADAD'>CloseableIterator.empty</span><span style=''>
+</span>98 <span style=''>    } else </span><span style='background: #AEF1AE'>{
+</span>99 <span style=''></span><span style='background: #AEF1AE'>      sort(list, ordering)
+</span>100 <span style=''></span><span style='background: #AEF1AE'>      CloseableIterator(list.iterator)
+</span>101 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>102 <span style=''>  }
+</span>103 <span style=''>
+</span>104 <span style=''>  /**
+</span>105 <span style=''>   * Sorts the iterator in memory, but spills over to disk if the size in memory exceeds the specified threshold
+</span>106 <span style=''>   *
+</span>107 <span style=''>   * @param head head of iterator
+</span>108 <span style=''>   * @param tail tail of iterator
+</span>109 <span style=''>   * @param ordering ordering
+</span>110 <span style=''>   * @param closed checked to determine if we should stop sorting and return early
+</span>111 <span style=''>   * @param threshold max memory to use before spilling to disk
+</span>112 <span style=''>   * @return
+</span>113 <span style=''>   */
+</span>114 <span style=''>  private def sortWithSpillover(
+</span>115 <span style=''>      head: SimpleFeature,
+</span>116 <span style=''>      tail: CloseableIterator[SimpleFeature],
+</span>117 <span style=''>      ordering: Ordering[SimpleFeature],
+</span>118 <span style=''>      closed: AtomicBoolean,
+</span>119 <span style=''>      threshold: Long): CloseableIterator[SimpleFeature] = {
+</span>120 <span style=''>    var sorter = </span><span style='background: #AEF1AE'>new SpillToDiskSorter(head, ordering, threshold)</span><span style=''>
+</span>121 <span style=''>    try {
+</span>122 <span style=''>      </span><span style='background: #AEF1AE'>while (tail.hasNext &amp;&amp; !closed.get()) {
+</span>123 <span style=''></span><span style='background: #AEF1AE'>        sorter = sorter + tail.next()
+</span>124 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>125 <span style=''></span><span style='background: #AEF1AE'>      sorter.result(closed.get)</span><span style=''>
+</span>126 <span style=''>    } catch {
+</span>127 <span style=''>      case NonFatal(e) </span><span style='background: #F0ADAD'>=&gt;
+</span>128 <span style=''></span><span style='background: #F0ADAD'>        sorter.cleanup()
+</span>129 <span style=''></span><span style='background: #F0ADAD'>        throw e</span><span style=''>
+</span>130 <span style=''>    }
+</span>131 <span style=''>  }
+</span>132 <span style=''>
+</span>133 <span style=''>  /**
+</span>134 <span style=''>   * Sort a list in-place
+</span>135 <span style=''>   *
+</span>136 <span style=''>   * @param list list
+</span>137 <span style=''>   * @param ordering ordering
+</span>138 <span style=''>   */
+</span>139 <span style=''>  private def sort(list: java.util.ArrayList[SimpleFeature], ordering: Ordering[SimpleFeature]): Unit = {
+</span>140 <span style=''>    val start = </span><span style='background: #AEF1AE'>System.nanoTime()</span><span style=''>
+</span>141 <span style=''>    </span><span style='background: #AEF1AE'>list.sort(ordering)</span><span style=''>
+</span>142 <span style=''>    logger.debug(s&quot;Sorted ${list.size()} features in ${(System.nanoTime() - start)/1000000}ms&quot;)
+</span>143 <span style=''>  }
+</span>144 <span style=''>
+</span>145 <span style=''>  /**
+</span>146 <span style=''>   * Delete a file
+</span>147 <span style=''>   *
+</span>148 <span style=''>   * @param file file to delete
+</span>149 <span style=''>   */
+</span>150 <span style=''>  private def delete(file: File): Unit = {
+</span>151 <span style=''>    try {
+</span>152 <span style=''>      </span><span style='background: #AEF1AE'>if (!file.delete()) {
+</span>153 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>logger.warn(s&quot;Unable to delete tmp file '${file.getAbsolutePath}''&quot;)</span><span style='background: #AEF1AE'>
+</span>154 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>155 <span style=''>    } catch {
+</span>156 <span style=''>      case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>logger.warn(s&quot;Unable to delete tmp file '${file.getAbsolutePath}''&quot;, e)</span><span style=''>
+</span>157 <span style=''>    }
+</span>158 <span style=''>  }
+</span>159 <span style=''>
+</span>160 <span style=''>  /**
+</span>161 <span style=''>   * Gets a sizeable implementation based on the feature class
+</span>162 <span style=''>   *
+</span>163 <span style=''>   * @param sf simple feature
+</span>164 <span style=''>   * @return
+</span>165 <span style=''>   */
+</span>166 <span style=''>  private def toSizeable(sf: SimpleFeature): FeatureIsSizable[SimpleFeature] = {
+</span>167 <span style=''>    sf match {
+</span>168 <span style=''>      case _: SimpleFeature with Sizable =&gt; </span><span style='background: #AEF1AE'>SizableFeatureIsSizable.asInstanceOf[FeatureIsSizable[SimpleFeature]]</span><span style=''>
+</span>169 <span style=''>      case _ </span><span style='background: #F0ADAD'>=&gt;
+</span>170 <span style=''></span><span style='background: #F0ADAD'>        // currently, all of our uses of this class pass in Sizable features... this means we missed one
+</span>171 <span style=''></span><span style='background: #F0ADAD'>        logger.warn(
+</span>172 <span style=''></span><span style='background: #F0ADAD'>          s&quot;Feature class '${sf.getClass.getName}' doesn't implement Sizable - &quot; +
+</span>173 <span style=''></span><span style='background: #F0ADAD'>            &quot;using estimated size for memory threshold calculations&quot;)
+</span>174 <span style=''></span><span style='background: #F0ADAD'>        UnSizableFeatureIsSizable</span><span style=''>
+</span>175 <span style=''>    }
+</span>176 <span style=''>  }
+</span>177 <span style=''>
+</span>178 <span style=''>  /**
+</span>179 <span style=''>   * Class for sorting with spill-to-disk
+</span>180 <span style=''>   *
+</span>181 <span style=''>   * @param spill write/read to disk
+</span>182 <span style=''>   * @param sizer sizer for the features being sorted
+</span>183 <span style=''>   * @param ordering sort ordering
+</span>184 <span style=''>   * @param threshold memory threshold for dumping to disk, in bytes
+</span>185 <span style=''>   * @param files list of files that have been dumped to disk
+</span>186 <span style=''>   * @param pending a file that is asynchronously being dumped to disk, if any
+</span>187 <span style=''>   */
+</span>188 <span style=''>  private class SpillToDiskSorter(
+</span>189 <span style=''>      spill: SpillToDisk,
+</span>190 <span style=''>      sizer: FeatureIsSizable[SimpleFeature],
+</span>191 <span style=''>      ordering: Ordering[SimpleFeature],
+</span>192 <span style=''>      threshold: Long,
+</span>193 <span style=''>      files: Seq[File] = Seq.empty,
+</span>194 <span style=''>      pending: Option[Future[File]] = None) extends Callable[File] {
+</span>195 <span style=''>
+</span>196 <span style=''>    private val start = </span><span style='background: #AEF1AE'>System.nanoTime()</span><span style=''>
+</span>197 <span style=''>    private val mem = </span><span style='background: #AEF1AE'>new java.util.ArrayList[SimpleFeature](1000)</span><span style=''>
+</span>198 <span style=''>    private var size: Long = </span><span style='background: #AEF1AE'>0</span><span style=''>
+</span>199 <span style=''>
+</span>200 <span style=''>    /**
+</span>201 <span style=''>     * Create a new sorter
+</span>202 <span style=''>     *
+</span>203 <span style=''>     * @param sf simple feature, representative of the features being chunked
+</span>204 <span style=''>     * @param ordering ordering
+</span>205 <span style=''>     * @param threshold threshold for triggering a spill-to-disk, in bytes
+</span>206 <span style=''>     * @return
+</span>207 <span style=''>     */
+</span>208 <span style=''>    def this(sf: SimpleFeature, ordering: Ordering[SimpleFeature], threshold: Long) = {
+</span>209 <span style=''>      </span><span style='background: #AEF1AE'>this(new SpillToDisk(sf.getFeatureType), toSizeable(sf), ordering, threshold)</span><span style=''>
+</span>210 <span style=''>      </span><span style='background: #AEF1AE'>mem.add(sf)</span><span style=''>
+</span>211 <span style=''>      </span><span style='background: #AEF1AE'>size += sizer.sizeOf(sf)</span><span style=''>
+</span>212 <span style=''>    }
+</span>213 <span style=''>
+</span>214 <span style=''>    /**
+</span>215 <span style=''>     * Add the simple feature to the chunk, returning either this chunk or a new chunk
+</span>216 <span style=''>     *
+</span>217 <span style=''>     * @param sf feature
+</span>218 <span style=''>     * @return next chunk
+</span>219 <span style=''>     */
+</span>220 <span style=''>    def +(sf: SimpleFeature): SpillToDiskSorter = {
+</span>221 <span style=''>      if (</span><span style='background: #AEF1AE'>size &gt;= threshold</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>222 <span style=''></span><span style='background: #AEF1AE'>        logger.debug(s&quot;Read ${mem.size()} features from the underlying store in ${(System.nanoTime() - start)/1000000}ms&quot;)
+</span>223 <span style=''></span><span style='background: #AEF1AE'>        // only allow one sort at a time so we don't blow up memory with all the array lists
+</span>224 <span style=''></span><span style='background: #AEF1AE'>        val last = pending.map { f =&gt;
+</span>225 <span style=''></span><span style='background: #AEF1AE'>          if (f.isDone) { </span><span style='background: #F0ADAD'>f.get()</span><span style='background: #AEF1AE'> } else {
+</span>226 <span style=''></span><span style='background: #AEF1AE'>            val start = System.nanoTime()
+</span>227 <span style=''></span><span style='background: #AEF1AE'>            val file = f.get()
+</span>228 <span style=''></span><span style='background: #AEF1AE'>            logger.debug(s&quot;Waited ${(System.nanoTime() - start)/1000000}ms for last batch to be flushed to disk&quot;)
+</span>229 <span style=''></span><span style='background: #AEF1AE'>            file
+</span>230 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>231 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>232 <span style=''></span><span style='background: #AEF1AE'>        val future = CachedThreadPool.call(this)
+</span>233 <span style=''></span><span style='background: #AEF1AE'>        new SpillToDiskSorter(spill, sizer, ordering, threshold, files ++ last, Some(future)) + sf
+</span>234 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''> else </span><span style='background: #AEF1AE'>{
+</span>235 <span style=''></span><span style='background: #AEF1AE'>        mem.add(sf)
+</span>236 <span style=''></span><span style='background: #AEF1AE'>        size += sizer.sizeOf(sf)
+</span>237 <span style=''></span><span style='background: #AEF1AE'>        this
+</span>238 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>239 <span style=''>    }
+</span>240 <span style=''>
+</span>241 <span style=''>    override def call(): File = {
+</span>242 <span style=''>      </span><span style='background: #AEF1AE'>sort(mem, ordering)</span><span style=''>
+</span>243 <span style=''>      </span><span style='background: #AEF1AE'>spill.write(mem)</span><span style=''>
+</span>244 <span style=''>    }
+</span>245 <span style=''>
+</span>246 <span style=''>    /**
+</span>247 <span style=''>     * Get all the features added so far, in sorted order
+</span>248 <span style=''>     *
+</span>249 <span style=''>     * @return
+</span>250 <span style=''>     */
+</span>251 <span style=''>    def result(closed: Boolean): CloseableIterator[SimpleFeature] = {
+</span>252 <span style=''>      logger.debug(s&quot;Read ${mem.size()} features from the underlying store in ${(System.nanoTime() - start)/1000000}ms&quot;)
+</span>253 <span style=''>      if (closed) </span><span style='background: #F0ADAD'>{
+</span>254 <span style=''></span><span style='background: #F0ADAD'>        // don't bother sorting, just clean up and return an empty iterator
+</span>255 <span style=''></span><span style='background: #F0ADAD'>        cleanup()
+</span>256 <span style=''></span><span style='background: #F0ADAD'>        CloseableIterator.empty
+</span>257 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style=''> else </span><span style='background: #AEF1AE'>{
+</span>258 <span style=''></span><span style='background: #AEF1AE'>        sort(mem, ordering)
+</span>259 <span style=''></span><span style='background: #AEF1AE'>        val memIter = CloseableIterator(mem.iterator)
+</span>260 <span style=''></span><span style='background: #AEF1AE'>        if (files.isEmpty &amp;&amp; </span><span style='background: #F0ADAD'>pending.isEmpty</span><span style='background: #AEF1AE'>) {
+</span>261 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>memIter</span><span style='background: #AEF1AE'>
+</span>262 <span style=''></span><span style='background: #AEF1AE'>        } else {
+</span>263 <span style=''></span><span style='background: #AEF1AE'>          val filesIter = (files ++ pending.map(_.get())).map(spill.read)
+</span>264 <span style=''></span><span style='background: #AEF1AE'>          new MergeSortingIterator(IndexedSeq(memIter) ++ filesIter, ordering)
+</span>265 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>266 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>267 <span style=''>    }
+</span>268 <span style=''>
+</span>269 <span style=''>    /**
+</span>270 <span style=''>     * Delete any underlying resources. Should only be called if not calling `result` due to an error/interruption
+</span>271 <span style=''>     */
+</span>272 <span style=''>    def cleanup(): Unit = {
+</span>273 <span style=''>      </span><span style='background: #F0ADAD'>pending.foreach(_.cancel(true))</span><span style=''>
+</span>274 <span style=''>      </span><span style='background: #F0ADAD'>files.foreach(delete)</span><span style=''>
+</span>275 <span style=''>      </span><span style='background: #F0ADAD'>Try(pending.map(_.get())).toOption.flatten.foreach(delete)</span><span style=''>
+</span>276 <span style=''>    }
+</span>277 <span style=''>  }
+</span>278 <span style=''>
+</span>279 <span style=''>  /**
+</span>280 <span style=''>   * Class for writing and reading back from disk
+</span>281 <span style=''>   *
+</span>282 <span style=''>   * @param sft feature type
+</span>283 <span style=''>   */
+</span>284 <span style=''>  private class SpillToDisk(sft: SimpleFeatureType) {
+</span>285 <span style=''>
+</span>286 <span style=''>    // grouping ID for tmp files, doesn't have to be unique
+</span>287 <span style=''>    private val id =f&quot;${sft.getTypeName.replaceAll(&quot;[^A-Za-z0-9_-]&quot;, &quot;&quot;).take(20)}-${Random.nextInt(10000)}%04d&quot;
+</span>288 <span style=''>
+</span>289 <span style=''>    private val serializer = </span><span style='background: #AEF1AE'>KryoFeatureSerializer(sft, SerializationOption.WithUserData)</span><span style=''>
+</span>290 <span style=''>
+</span>291 <span style=''>    def write(features: java.util.ArrayList[SimpleFeature]): File = {
+</span>292 <span style=''>      val start = </span><span style='background: #AEF1AE'>System.nanoTime()</span><span style=''>
+</span>293 <span style=''>      val file = </span><span style='background: #AEF1AE'>Files.createTempFile(s&quot;gm-sort-$id-&quot;, &quot;.kryo&quot;).toFile</span><span style=''>
+</span>294 <span style=''>      logger.trace(s&quot;Created temp sort file '${file.getAbsolutePath}'&quot;)
+</span>295 <span style=''>      </span><span style='background: #AEF1AE'>file.deleteOnExit()</span><span style=''>
+</span>296 <span style=''>      </span><span style='background: #AEF1AE'>WithClose(new FileOutputStream(file)) { os =&gt;
+</span>297 <span style=''></span><span style='background: #AEF1AE'>        features.forEach { sf =&gt;
+</span>298 <span style=''></span><span style='background: #AEF1AE'>          val bytes = serializer.serialize(sf)
+</span>299 <span style=''></span><span style='background: #AEF1AE'>          os.write(ByteArrays.toBytes(bytes.length))
+</span>300 <span style=''></span><span style='background: #AEF1AE'>          os.write(bytes)
+</span>301 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>302 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>303 <span style=''>      logger.debug(s&quot;Wrote ${features.size()} features to disk in ${(System.nanoTime() - start)/1000000}ms&quot;)
+</span>304 <span style=''>      file
+</span>305 <span style=''>    }
+</span>306 <span style=''>
+</span>307 <span style=''>    def read(file: File): CloseableIterator[SimpleFeature] = </span><span style='background: #AEF1AE'>new FileIterator(file, serializer)</span><span style=''>
+</span>308 <span style=''>  }
+</span>309 <span style=''>
+</span>310 <span style=''>  /**
+</span>311 <span style=''>   * Does a merge sort on a group of locally sorted files and a left-over in-memory iterator
+</span>312 <span style=''>   *
+</span>313 <span style=''>   * @param merging list of feature iterators to merge, already sorted
+</span>314 <span style=''>   * @param ordering feature ordering
+</span>315 <span style=''>   */
+</span>316 <span style=''>  private class MergeSortingIterator(merging: IndexedSeq[CloseableIterator[SimpleFeature]], ordering: Ordering[SimpleFeature])
+</span>317 <span style=''>      extends CloseableIterator[SimpleFeature] {
+</span>318 <span style=''>
+</span>319 <span style=''>    // priority queue containing the next feature from each file
+</span>320 <span style=''>    private val heads = {
+</span>321 <span style=''>      val o = </span><span style='background: #AEF1AE'>Ordering.by[(SimpleFeature, Int), SimpleFeature](_._1)(ordering)</span><span style=''>
+</span>322 <span style=''>      val q = </span><span style='background: #AEF1AE'>new java.util.PriorityQueue[(SimpleFeature, Int)](merging.size, o)</span><span style=''>
+</span>323 <span style=''>      var i = </span><span style='background: #AEF1AE'>0</span><span style=''>
+</span>324 <span style=''>      while (</span><span style='background: #AEF1AE'>i &lt; merging.length</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>325 <span style=''></span><span style='background: #AEF1AE'>        val m = merging(i)
+</span>326 <span style=''></span><span style='background: #AEF1AE'>        if (m.hasNext) {
+</span>327 <span style=''></span><span style='background: #AEF1AE'>          q.add(m.next -&gt; i)
+</span>328 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>329 <span style=''></span><span style='background: #AEF1AE'>        i += 1
+</span>330 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>331 <span style=''>      q
+</span>332 <span style=''>    }
+</span>333 <span style=''>
+</span>334 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>!heads.isEmpty</span><span style=''>
+</span>335 <span style=''>
+</span>336 <span style=''>    override def next(): SimpleFeature = {
+</span>337 <span style=''>      val (f, i) = heads.poll()
+</span>338 <span style=''>      val m = </span><span style='background: #AEF1AE'>merging(i)</span><span style=''>
+</span>339 <span style=''>      if (</span><span style='background: #AEF1AE'>m.hasNext</span><span style=''>) {
+</span>340 <span style=''>        </span><span style='background: #AEF1AE'>heads.add(m.next -&gt; i)</span><span style=''>
+</span>341 <span style=''>      }
+</span>342 <span style=''>      f
+</span>343 <span style=''>    }
+</span>344 <span style=''>
+</span>345 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>CloseQuietly.raise(merging)</span><span style=''>
+</span>346 <span style=''>  }
+</span>347 <span style=''>
+</span>348 <span style=''>  /**
+</span>349 <span style=''>   * Reads a tmp file of serialized simple features
+</span>350 <span style=''>   *
+</span>351 <span style=''>   * @param file file
+</span>352 <span style=''>   * @param serializer serializer
+</span>353 <span style=''>   */
+</span>354 <span style=''>  private class FileIterator(file: File, serializer: SimpleFeatureSerializer)
+</span>355 <span style=''>      extends CloseableIterator[SimpleFeature] with LazyLogging {
+</span>356 <span style=''>
+</span>357 <span style=''>    private val is = </span><span style='background: #AEF1AE'>new FileInputStream(file)</span><span style=''>
+</span>358 <span style=''>    private var buf = </span><span style='background: #AEF1AE'>Array.ofDim[Byte](4)</span><span style=''>
+</span>359 <span style=''>
+</span>360 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>is.available() &gt; 0</span><span style=''>
+</span>361 <span style=''>
+</span>362 <span style=''>    override def next(): SimpleFeature = {
+</span>363 <span style=''>      </span><span style='background: #AEF1AE'>is.read(buf, 0, 4)</span><span style=''>
+</span>364 <span style=''>      val size = </span><span style='background: #AEF1AE'>ByteArrays.readInt(buf)</span><span style=''>
+</span>365 <span style=''>      if (</span><span style='background: #AEF1AE'>buf.length &lt; size</span><span style=''>) {
+</span>366 <span style=''>        </span><span style='background: #AEF1AE'>buf = Array.ofDim((size * 1.2).toInt)</span><span style=''>
+</span>367 <span style=''>      }
+</span>368 <span style=''>      </span><span style='background: #AEF1AE'>is.read(buf, 0, size)</span><span style=''>
+</span>369 <span style=''>      </span><span style='background: #AEF1AE'>serializer.deserialize(buf, 0, size)</span><span style=''>
+</span>370 <span style=''>    }
+</span>371 <span style=''>
+</span>372 <span style=''>    override def close(): Unit = {
+</span>373 <span style=''>      try { </span><span style='background: #AEF1AE'>is.close()</span><span style=''> } finally {
+</span>374 <span style=''>        </span><span style='background: #AEF1AE'>delete(file)</span><span style=''>
+</span>375 <span style=''>      }
+</span>376 <span style=''>    }
+</span>377 <span style=''>  }
+</span>378 <span style=''>
+</span>379 <span style=''>  /**
+</span>380 <span style=''>   * Evidence that a feature is sizable
+</span>381 <span style=''>   *
+</span>382 <span style=''>   * @tparam T type binding
+</span>383 <span style=''>   */
+</span>384 <span style=''>  private trait FeatureIsSizable[T &lt;: SimpleFeature] {
+</span>385 <span style=''>    def sizeOf(feature: T): Long
+</span>386 <span style=''>  }
+</span>387 <span style=''>
+</span>388 <span style=''>  /**
+</span>389 <span style=''>   * Evidence that Sizable features are sizable
+</span>390 <span style=''>   */
+</span>391 <span style=''>  private object SizableFeatureIsSizable extends FeatureIsSizable[SimpleFeature with Sizable] {
+</span>392 <span style=''>    override def sizeOf(feature: SimpleFeature with Sizable): Long = </span><span style='background: #AEF1AE'>feature.calculateSizeOf()</span><span style=''>
+</span>393 <span style=''>  }
+</span>394 <span style=''>
+</span>395 <span style=''>  /**
+</span>396 <span style=''>   * Use a rough estimate based on attributes and user data
+</span>397 <span style=''>   */
+</span>398 <span style=''>  private object UnSizableFeatureIsSizable extends FeatureIsSizable[SimpleFeature] {
+</span>399 <span style=''>    override def sizeOf(feature: SimpleFeature): Long =
+</span>400 <span style=''>      </span><span style='background: #F0ADAD'>Sizable.sizeOf(feature) + Sizable.deepSizeOf(feature.getAttributes, feature.getUserData)</span><span style=''>
+</span>401 <span style=''>  }
+</span>402 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -333,15 +438,15 @@
         <th>Code</th>
       </tr><tr>
         <td>
-          40
+          41
         </td>
         <td>
           18443
         </td>
         <td>
-          1879
+          1976
           -
-          1903
+          2000
         </td>
         <td>
           Apply
@@ -357,15 +462,15 @@
         </td>
       </tr><tr>
         <td>
-          55
+          60
         </td>
         <td>
           18444
         </td>
         <td>
-          2530
+          2685
           -
-          2544
+          2699
         </td>
         <td>
           Select
@@ -381,15 +486,15 @@
         </td>
       </tr><tr>
         <td>
-          57
+          62
         </td>
         <td>
           18445
         </td>
         <td>
-          2585
+          2740
           -
-          2598
+          2753
         </td>
         <td>
           Apply
@@ -405,15 +510,15 @@
         </td>
       </tr><tr>
         <td>
-          60
+          65
         </td>
         <td>
           18446
         </td>
         <td>
-          2641
+          2796
           -
-          2674
+          2829
         </td>
         <td>
           Apply
@@ -429,15 +534,15 @@
         </td>
       </tr><tr>
         <td>
-          60
+          65
         </td>
         <td>
           18449
         </td>
         <td>
-          2637
+          2792
           -
-          2637
+          2792
         </td>
         <td>
           Literal
@@ -453,15 +558,15 @@
         </td>
       </tr><tr>
         <td>
-          60
+          65
         </td>
         <td>
           18450
         </td>
         <td>
-          2637
+          2792
           -
-          2637
+          2792
         </td>
         <td>
           Block
@@ -477,15 +582,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          66
         </td>
         <td>
           18447
         </td>
         <td>
-          2684
+          2839
           -
-          2698
+          2853
         </td>
         <td>
           Apply
@@ -501,15 +606,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          66
         </td>
         <td>
           18448
         </td>
         <td>
-          2684
+          2839
           -
-          2698
+          2853
         </td>
         <td>
           Block
@@ -525,15 +630,15 @@
         </td>
       </tr><tr>
         <td>
-          85
+          88
         </td>
         <td>
           18451
         </td>
         <td>
-          3389
+          3500
           -
-          3432
+          3544
         </td>
         <td>
           Apply
@@ -545,19 +650,19 @@
           
         </td>
         <td style="background: #AEF1AE">
-          new java.util.ArrayList[org.geotools.api.feature.simple.SimpleFeature](100)
+          new java.util.ArrayList[org.geotools.api.feature.simple.SimpleFeature](1000)
         </td>
       </tr><tr>
         <td>
-          86
+          89
         </td>
         <td>
           18452
         </td>
         <td>
-          3437
+          3549
           -
-          3451
+          3563
         </td>
         <td>
           Apply
@@ -573,15 +678,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          91
         </td>
         <td>
           18453
         </td>
         <td>
-          3480
+          3592
           -
-          3491
+          3603
         </td>
         <td>
           Select
@@ -597,15 +702,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          91
         </td>
         <td>
           18454
         </td>
         <td>
-          3464
+          3576
           -
-          3491
+          3603
         </td>
         <td>
           Apply
@@ -621,15 +726,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          91
         </td>
         <td>
           18458
         </td>
         <td>
-          3501
+          3613
           -
-          3522
+          3634
         </td>
         <td>
           Block
@@ -648,15 +753,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          91
         </td>
         <td>
           18459
         </td>
         <td>
-          3457
+          3569
           -
-          3457
+          3569
         </td>
         <td>
           Literal
@@ -672,15 +777,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          91
         </td>
         <td>
           18460
         </td>
         <td>
-          3457
+          3569
           -
-          3457
+          3569
         </td>
         <td>
           Block
@@ -696,15 +801,15 @@
         </td>
       </tr><tr>
         <td>
-          89
+          92
         </td>
         <td>
           18455
         </td>
         <td>
-          3510
+          3622
           -
-          3521
+          3633
         </td>
         <td>
           Apply
@@ -720,15 +825,15 @@
         </td>
       </tr><tr>
         <td>
-          89
+          92
         </td>
         <td>
           18456
         </td>
         <td>
-          3501
+          3613
           -
-          3522
+          3634
         </td>
         <td>
           Apply
@@ -744,15 +849,15 @@
         </td>
       </tr><tr>
         <td>
-          89
+          92
         </td>
         <td>
           18457
         </td>
         <td>
-          3509
+          3621
           -
-          3509
+          3621
         </td>
         <td>
           Apply
@@ -768,15 +873,15 @@
         </td>
       </tr><tr>
         <td>
-          92
+          95
         </td>
         <td>
           18461
         </td>
         <td>
-          3538
+          3650
           -
-          3548
+          3660
         </td>
         <td>
           Apply
@@ -792,111 +897,63 @@
         </td>
       </tr><tr>
         <td>
-          94
+          97
         </td>
         <td>
           18462
         </td>
         <td>
-          3637
+          3731
           -
-          3651
+          3754
         </td>
         <td>
-          Select
+          TypeApply
         </td>
         <td>
-          scala.collection.Iterator.empty
+          org.locationtech.geomesa.utils.collection.CloseableIterator.empty
         </td>
         <td>
           
         </td>
         <td style="background: #F0ADAD">
-          scala.`package`.Iterator.empty
+          org.locationtech.geomesa.utils.collection.CloseableIterator.empty[Nothing]
         </td>
       </tr><tr>
         <td>
-          94
+          97
         </td>
         <td>
           18463
         </td>
         <td>
-          3653
+          3731
           -
-          3665
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.io.Closeable.close
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          tail.close()
-        </td>
-      </tr><tr>
-        <td>
-          94
-        </td>
-        <td>
-          18464
-        </td>
-        <td>
-          3619
-          -
-          3666
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply[Nothing](scala.`package`.Iterator.empty, tail.close())
-        </td>
-      </tr><tr>
-        <td>
-          94
-        </td>
-        <td>
-          18465
-        </td>
-        <td>
-          3619
-          -
-          3666
+          3754
         </td>
         <td>
           Block
         </td>
         <td>
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply
+          org.locationtech.geomesa.utils.collection.CloseableIterator.empty
         </td>
         <td>
           
         </td>
         <td style="background: #F0ADAD">
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply[Nothing](scala.`package`.Iterator.empty, tail.close())
+          org.locationtech.geomesa.utils.collection.CloseableIterator.empty[Nothing]
         </td>
       </tr><tr>
         <td>
-          95
+          98
         </td>
         <td>
-          18471
+          18467
         </td>
         <td>
-          3678
+          3766
           -
-          3772
+          3839
         </td>
         <td>
           Block
@@ -909,45 +966,45 @@
         </td>
         <td style="background: #AEF1AE">
           {
-  list.sort(ordering);
-  org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala, tail.close())
+  SortingSimpleFeatureIterator.this.sort(list, ordering);
+  org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](list.iterator())
 }
         </td>
       </tr><tr>
         <td>
-          96
+          99
         </td>
         <td>
-          18466
+          18464
         </td>
         <td>
-          3686
+          3774
           -
-          3705
+          3794
         </td>
         <td>
           Apply
         </td>
         <td>
-          java.util.ArrayList.sort
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.sort
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          list.sort(ordering)
+          SortingSimpleFeatureIterator.this.sort(list, ordering)
         </td>
       </tr><tr>
         <td>
-          97
+          100
         </td>
         <td>
-          18467
+          18465
         </td>
         <td>
-          3730
+          3819
           -
-          3743
+          3832
         </td>
         <td>
           Apply
@@ -963,63 +1020,15 @@
         </td>
       </tr><tr>
         <td>
-          97
+          100
         </td>
         <td>
-          18468
+          18466
         </td>
         <td>
-          3730
+          3801
           -
-          3751
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.collection.convert.Decorators.AsScala.asScala
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala
-        </td>
-      </tr><tr>
-        <td>
-          97
-        </td>
-        <td>
-          18469
-        </td>
-        <td>
-          3753
-          -
-          3765
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.io.Closeable.close
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          tail.close()
-        </td>
-      </tr><tr>
-        <td>
-          97
-        </td>
-        <td>
-          18470
-        </td>
-        <td>
-          3712
-          -
-          3766
+          3833
         </td>
         <td>
           Apply
@@ -1031,67 +1040,43 @@
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala, tail.close())
+          org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](list.iterator())
         </td>
       </tr><tr>
         <td>
-          126
+          120
         </td>
         <td>
-          18472
+          18468
         </td>
         <td>
-          4742
+          4487
           -
-          4811
+          4535
         </td>
         <td>
-          TypeApply
+          Apply
         </td>
         <td>
-          scala.Any.asInstanceOf
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.&lt;init&gt;
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          SortingSimpleFeatureIterator.this.SizableFeatureIsSizable.asInstanceOf[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FeatureIsSizable[org.geotools.api.feature.simple.SimpleFeature]]
+          new SortingSimpleFeatureIterator.this.SpillToDiskSorter(head, ordering, threshold)
         </td>
       </tr><tr>
         <td>
-          126
+          121
         </td>
         <td>
-          18473
+          18479
         </td>
         <td>
-          4742
+          4552
           -
-          4811
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          scala.Any.asInstanceOf
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          SortingSimpleFeatureIterator.this.SizableFeatureIsSizable.asInstanceOf[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FeatureIsSizable[org.geotools.api.feature.simple.SimpleFeature]]
-        </td>
-      </tr><tr>
-        <td>
-          127
-        </td>
-        <td>
-          18475
-        </td>
-        <td>
-          4825
-          -
-          5144
+          4669
         </td>
         <td>
           Block
@@ -1102,146 +1087,31 @@
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
+        <td style="background: #AEF1AE">
           {
-  (if (SortingSimpleFeatureIterator.this.logger.underlying.isWarnEnabled())
-    SortingSimpleFeatureIterator.this.logger.underlying.warn(scala.StringContext.apply(&quot;Feature class \'&quot;, &quot;\' doesn\'t implement Sizable - &quot;).s(head.getClass().getName()).+(&quot;using estimated size for memory threshold calculations&quot;))
-  else
-    (): Unit);
-  SortingSimpleFeatureIterator.this.UnSizableFeatureIsSizable
+  while$2(){
+    if (tail.hasNext.&amp;&amp;(closed.get().unary_!))
+      {
+        sorter = sorter.+(tail.next());
+        while$2()
+      }
+    else
+      ()
+  };
+  sorter.result(closed.get())
 }
         </td>
       </tr><tr>
         <td>
-          132
+          122
         </td>
         <td>
-          18474
+          18469
         </td>
         <td>
-          5119
+          4575
           -
-          5144
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.UnSizableFeatureIsSizable
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          SortingSimpleFeatureIterator.this.UnSizableFeatureIsSizable
-        </td>
-      </tr><tr>
-        <td>
-          135
-        </td>
-        <td>
-          18476
-        </td>
-        <td>
-          5168
-          -
-          5191
-        </td>
-        <td>
-          TypeApply
-        </td>
-        <td>
-          scala.collection.generic.GenericCompanion.empty
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          scala.collection.mutable.ArrayBuffer.empty[java.io.File]
-        </td>
-      </tr><tr>
-        <td>
-          138
-        </td>
-        <td>
-          18477
-        </td>
-        <td>
-          5431
-          -
-          5475
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.ArrayList.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new java.util.ArrayList[org.geotools.api.feature.simple.SimpleFeature](1000)
-        </td>
-      </tr><tr>
-        <td>
-          139
-        </td>
-        <td>
-          18478
-        </td>
-        <td>
-          5480
-          -
-          5494
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.ArrayList.add
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          list.add(head)
-        </td>
-      </tr><tr>
-        <td>
-          140
-        </td>
-        <td>
-          18479
-        </td>
-        <td>
-          5510
-          -
-          5530
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FeatureIsSizable.sizeOf
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          sizable.sizeOf(head)
-        </td>
-      </tr><tr>
-        <td>
-          142
-        </td>
-        <td>
-          18480
-        </td>
-        <td>
-          5559
-          -
-          5570
+          4588
         </td>
         <td>
           Select
@@ -1257,15 +1127,15 @@
         </td>
       </tr><tr>
         <td>
-          142
+          122
         </td>
         <td>
-          18481
+          18470
         </td>
         <td>
-          5543
+          4559
           -
-          5570
+          4588
         </td>
         <td>
           Apply
@@ -1281,39 +1151,15 @@
         </td>
       </tr><tr>
         <td>
-          142
+          122
         </td>
         <td>
-          18512
+          18474
         </td>
         <td>
-          5572
+          4600
           -
-          5572
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.while$3
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          while$3()
-        </td>
-      </tr><tr>
-        <td>
-          142
-        </td>
-        <td>
-          18513
-        </td>
-        <td>
-          5572
-          -
-          6275
+          4629
         </td>
         <td>
           Block
@@ -1326,515 +1172,21 @@
         </td>
         <td style="background: #AEF1AE">
           {
-  {
-    if (size.&gt;=(threshold))
-      {
-        list.sort(ordering);
-        val file: java.io.File = java.nio.file.Files.createTempFile(scala.StringContext.apply(&quot;gm-sort-&quot;, &quot;-&quot;).s(id), &quot;.kryo&quot;).toFile();
-        files.+=(file);
-        (if (SortingSimpleFeatureIterator.this.logger.underlying.isTraceEnabled())
-          SortingSimpleFeatureIterator.this.logger.underlying.trace(&quot;Created temp sort file \'{}\'&quot;, (file.getAbsolutePath(): AnyRef))
-        else
-          (): Unit);
-        org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.io.FileOutputStream, Unit](new java.io.FileOutputStream(file))(((os: java.io.FileOutputStream) =&gt; {
-          var i: Int = 0;
-          while$2(){
-            if (i.&lt;(list.size()))
-              {
-                {
-                  val bytes: Array[Byte] = serializer.serialize(list.get(i));
-                  os.write(org.locationtech.geomesa.utils.index.ByteArrays.toBytes(bytes.length));
-                  os.write(bytes);
-                  i = i.+(1)
-                };
-                while$2()
-              }
-            else
-              ()
-          }
-        }))(io.this.IsCloseable.closeableIsCloseable);
-        list.clear();
-        size = 0L
-      }
-    else
-      ();
-    val next: org.geotools.api.feature.simple.SimpleFeature = tail.next();
-    list.add(next);
-    size = size.+(sizable.sizeOf(next))
-  };
-  while$3()
-}
-        </td>
-      </tr><tr>
-        <td>
-          142
-        </td>
-        <td>
-          18514
-        </td>
-        <td>
-          5536
-          -
-          5536
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          142
-        </td>
-        <td>
-          18515
-        </td>
-        <td>
-          5536
-          -
-          5536
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          143
-        </td>
-        <td>
-          18482
-        </td>
-        <td>
-          5584
-          -
-          5601
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Long.&gt;=
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          size.&gt;=(threshold)
-        </td>
-      </tr><tr>
-        <td>
-          143
-        </td>
-        <td>
-          18505
-        </td>
-        <td>
-          5603
-          -
-          6184
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          {
-  list.sort(ordering);
-  val file: java.io.File = java.nio.file.Files.createTempFile(scala.StringContext.apply(&quot;gm-sort-&quot;, &quot;-&quot;).s(id), &quot;.kryo&quot;).toFile();
-  files.+=(file);
-  (if (SortingSimpleFeatureIterator.this.logger.underlying.isTraceEnabled())
-    SortingSimpleFeatureIterator.this.logger.underlying.trace(&quot;Created temp sort file \'{}\'&quot;, (file.getAbsolutePath(): AnyRef))
-  else
-    (): Unit);
-  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.io.FileOutputStream, Unit](new java.io.FileOutputStream(file))(((os: java.io.FileOutputStream) =&gt; {
-    var i: Int = 0;
-    while$2(){
-      if (i.&lt;(list.size()))
-        {
-          {
-            val bytes: Array[Byte] = serializer.serialize(list.get(i));
-            os.write(org.locationtech.geomesa.utils.index.ByteArrays.toBytes(bytes.length));
-            os.write(bytes);
-            i = i.+(1)
-          };
-          while$2()
-        }
-      else
-        ()
-    }
-  }))(io.this.IsCloseable.closeableIsCloseable);
-  list.clear();
-  size = 0L
-}
-        </td>
-      </tr><tr>
-        <td>
-          143
-        </td>
-        <td>
-          18506
-        </td>
-        <td>
-          5580
-          -
-          5580
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          143
-        </td>
-        <td>
-          18507
-        </td>
-        <td>
-          5580
-          -
-          5580
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          145
-        </td>
-        <td>
-          18483
-        </td>
-        <td>
-          5658
-          -
-          5677
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.ArrayList.sort
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          list.sort(ordering)
-        </td>
-      </tr><tr>
-        <td>
-          146
-        </td>
-        <td>
-          18484
-        </td>
-        <td>
-          5697
-          -
-          5750
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.nio.file.Path.toFile
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          java.nio.file.Files.createTempFile(scala.StringContext.apply(&quot;gm-sort-&quot;, &quot;-&quot;).s(id), &quot;.kryo&quot;).toFile()
-        </td>
-      </tr><tr>
-        <td>
-          147
-        </td>
-        <td>
-          18485
-        </td>
-        <td>
-          5759
-          -
-          5772
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.collection.mutable.ArrayBuffer.+=
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          files.+=(file)
-        </td>
-      </tr><tr>
-        <td>
-          149
-        </td>
-        <td>
-          18486
-        </td>
-        <td>
-          5865
-          -
-          5891
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.io.FileOutputStream.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new java.io.FileOutputStream(file)
-        </td>
-      </tr><tr>
-        <td>
-          149
-        </td>
-        <td>
-          18501
-        </td>
-        <td>
-          5893
-          -
-          5893
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          io.this.IsCloseable.closeableIsCloseable
-        </td>
-      </tr><tr>
-        <td>
-          149
-        </td>
-        <td>
-          18502
-        </td>
-        <td>
-          5855
-          -
-          6138
-        </td>
-        <td>
-          ApplyToImplicitArgs
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.io.WithClose.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.io.FileOutputStream, Unit](new java.io.FileOutputStream(file))(((os: java.io.FileOutputStream) =&gt; {
-  var i: Int = 0;
-  while$2(){
-    if (i.&lt;(list.size()))
-      {
-        {
-          val bytes: Array[Byte] = serializer.serialize(list.get(i));
-          os.write(org.locationtech.geomesa.utils.index.ByteArrays.toBytes(bytes.length));
-          os.write(bytes);
-          i = i.+(1)
-        };
-        while$2()
-      }
-    else
-      ()
-  }
-}))(io.this.IsCloseable.closeableIsCloseable)
-        </td>
-      </tr><tr>
-        <td>
-          150
-        </td>
-        <td>
-          18487
-        </td>
-        <td>
-          5919
-          -
-          5920
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          0
-        </td>
-      </tr><tr>
-        <td>
-          151
-        </td>
-        <td>
-          18488
-        </td>
-        <td>
-          5942
-          -
-          5953
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.ArrayList.size
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          list.size()
-        </td>
-      </tr><tr>
-        <td>
-          151
-        </td>
-        <td>
-          18489
-        </td>
-        <td>
-          5938
-          -
-          5953
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Int.&lt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          i.&lt;(list.size())
-        </td>
-      </tr><tr>
-        <td>
-          151
-        </td>
-        <td>
-          18497
-        </td>
-        <td>
-          5955
-          -
-          5955
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.while$2
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          while$2()
-        </td>
-      </tr><tr>
-        <td>
-          151
-        </td>
-        <td>
-          18498
-        </td>
-        <td>
-          5955
-          -
-          6128
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          {
-  {
-    val bytes: Array[Byte] = serializer.serialize(list.get(i));
-    os.write(org.locationtech.geomesa.utils.index.ByteArrays.toBytes(bytes.length));
-    os.write(bytes);
-    i = i.+(1)
-  };
+  sorter = sorter.+(tail.next());
   while$2()
 }
         </td>
       </tr><tr>
         <td>
-          151
+          122
         </td>
         <td>
-          18499
+          18475
         </td>
         <td>
-          5931
+          4552
           -
-          5931
+          4552
         </td>
         <td>
           Literal
@@ -1850,15 +1202,15 @@
         </td>
       </tr><tr>
         <td>
-          151
+          122
         </td>
         <td>
-          18500
+          18476
         </td>
         <td>
-          5931
+          4552
           -
-          5931
+          4552
         </td>
         <td>
           Block
@@ -1874,231 +1226,15 @@
         </td>
       </tr><tr>
         <td>
-          152
+          123
         </td>
         <td>
-          18490
+          18471
         </td>
         <td>
-          6002
+          4618
           -
-          6013
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.ArrayList.get
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          list.get(i)
-        </td>
-      </tr><tr>
-        <td>
-          152
-        </td>
-        <td>
-          18491
-        </td>
-        <td>
-          5981
-          -
-          6014
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.features.kryo.impl.KryoFeatureSerialization.serialize
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          serializer.serialize(list.get(i))
-        </td>
-      </tr><tr>
-        <td>
-          153
-        </td>
-        <td>
-          18492
-        </td>
-        <td>
-          6055
-          -
-          6067
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.Array.length
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          bytes.length
-        </td>
-      </tr><tr>
-        <td>
-          153
-        </td>
-        <td>
-          18493
-        </td>
-        <td>
-          6036
-          -
-          6068
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.index.ByteArrays.toBytes
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.index.ByteArrays.toBytes(bytes.length)
-        </td>
-      </tr><tr>
-        <td>
-          153
-        </td>
-        <td>
-          18494
-        </td>
-        <td>
-          6027
-          -
-          6069
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.io.FileOutputStream.write
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          os.write(org.locationtech.geomesa.utils.index.ByteArrays.toBytes(bytes.length))
-        </td>
-      </tr><tr>
-        <td>
-          154
-        </td>
-        <td>
-          18495
-        </td>
-        <td>
-          6082
-          -
-          6097
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.io.FileOutputStream.write
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          os.write(bytes)
-        </td>
-      </tr><tr>
-        <td>
-          155
-        </td>
-        <td>
-          18496
-        </td>
-        <td>
-          6110
-          -
-          6116
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Int.+
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          i.+(1)
-        </td>
-      </tr><tr>
-        <td>
-          158
-        </td>
-        <td>
-          18503
-        </td>
-        <td>
-          6147
-          -
-          6159
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.ArrayList.clear
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          list.clear()
-        </td>
-      </tr><tr>
-        <td>
-          159
-        </td>
-        <td>
-          18504
-        </td>
-        <td>
-          6175
-          -
-          6176
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          0L
-        </td>
-      </tr><tr>
-        <td>
-          161
-        </td>
-        <td>
-          18508
-        </td>
-        <td>
-          6202
-          -
-          6213
+          4629
         </td>
         <td>
           Apply
@@ -2114,87 +1250,63 @@
         </td>
       </tr><tr>
         <td>
-          162
+          123
         </td>
         <td>
-          18509
+          18472
         </td>
         <td>
-          6220
+          4609
           -
-          6234
+          4629
         </td>
         <td>
           Apply
         </td>
         <td>
-          java.util.ArrayList.add
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.+
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          list.add(next)
+          sorter.+(tail.next())
         </td>
       </tr><tr>
         <td>
-          163
+          123
         </td>
         <td>
-          18510
+          18473
         </td>
         <td>
-          6249
+          4607
           -
-          6269
+          4607
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FeatureIsSizable.sizeOf
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.while$2
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          sizable.sizeOf(next)
+          while$2()
         </td>
       </tr><tr>
         <td>
-          163
+          125
         </td>
         <td>
-          18511
+          18477
         </td>
         <td>
-          6241
+          4658
           -
-          6269
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.Long.+
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          size.+(sizable.sizeOf(next))
-        </td>
-      </tr><tr>
-        <td>
-          166
-        </td>
-        <td>
-          18516
-        </td>
-        <td>
-          6285
-          -
-          6295
+          4668
         </td>
         <td>
           Apply
@@ -2210,15 +1322,39 @@
         </td>
       </tr><tr>
         <td>
-          166
+          125
         </td>
         <td>
-          18528
+          18478
         </td>
         <td>
-          6297
+          4644
           -
-          6758
+          4669
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.result
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sorter.result(closed.get())
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          18482
+        </td>
+        <td>
+          4707
+          -
+          4750
         </td>
         <td>
           Block
@@ -2231,77 +1367,117 @@
         </td>
         <td style="background: #F0ADAD">
           {
-  files.foreach[Unit](((file: java.io.File) =&gt; try {
-    if (file.delete().unary_!)
-      {
-        (if (SortingSimpleFeatureIterator.this.logger.underlying.isWarnEnabled())
-          SortingSimpleFeatureIterator.this.logger.underlying.warn(&quot;Unable to delete tmp file \'{}\'\'&quot;, (file.getAbsolutePath(): AnyRef))
-        else
-          (): Unit);
-        file.deleteOnExit()
-      }
-    else
-      ()
-  } catch {
-    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (SortingSimpleFeatureIterator.this.logger.underlying.isWarnEnabled())
-      SortingSimpleFeatureIterator.this.logger.underlying.warn(scala.StringContext.apply(&quot;Unable to delete tmp file \'&quot;, &quot;\'\'&quot;).s(file.getAbsolutePath()), e)
-    else
-      (): Unit)
-  }));
-  org.locationtech.geomesa.utils.collection.CloseableIterator.apply[Nothing](scala.`package`.Iterator.empty, tail.close())
+  sorter.cleanup();
+  throw e
 }
         </td>
       </tr><tr>
         <td>
-          167
+          128
         </td>
         <td>
-          18524
+          18480
         </td>
         <td>
-          6305
+          4718
           -
-          6637
+          4734
         </td>
         <td>
           Apply
         </td>
         <td>
-          scala.collection.mutable.ResizableArray.foreach
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.cleanup
         </td>
         <td>
           
         </td>
         <td style="background: #F0ADAD">
-          files.foreach[Unit](((file: java.io.File) =&gt; try {
-  if (file.delete().unary_!)
-    {
-      (if (SortingSimpleFeatureIterator.this.logger.underlying.isWarnEnabled())
-        SortingSimpleFeatureIterator.this.logger.underlying.warn(&quot;Unable to delete tmp file \'{}\'\'&quot;, (file.getAbsolutePath(): AnyRef))
-      else
-        (): Unit);
-      file.deleteOnExit()
-    }
-  else
-    ()
-} catch {
-  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; (if (SortingSimpleFeatureIterator.this.logger.underlying.isWarnEnabled())
-    SortingSimpleFeatureIterator.this.logger.underlying.warn(scala.StringContext.apply(&quot;Unable to delete tmp file \'&quot;, &quot;\'\'&quot;).s(file.getAbsolutePath()), e)
-  else
-    (): Unit)
-}))
+          sorter.cleanup()
         </td>
       </tr><tr>
         <td>
-          169
+          129
         </td>
         <td>
-          18517
+          18481
         </td>
         <td>
-          6357
+          4743
           -
-          6371
+          4750
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw e
+        </td>
+      </tr><tr>
+        <td>
+          140
+        </td>
+        <td>
+          18483
+        </td>
+        <td>
+          4979
+          -
+          4996
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.System.nanoTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime()
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          18484
+        </td>
+        <td>
+          5001
+          -
+          5020
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.ArrayList.sort
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          list.sort(ordering)
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          18485
+        </td>
+        <td>
+          5253
+          -
+          5267
         </td>
         <td>
           Select
@@ -2312,50 +1488,20 @@
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
+        <td style="background: #AEF1AE">
           file.delete().unary_!
         </td>
       </tr><tr>
         <td>
-          169
+          152
         </td>
         <td>
-          18519
+          18487
         </td>
         <td>
-          6373
+          5249
           -
-          6499
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          {
-  (if (SortingSimpleFeatureIterator.this.logger.underlying.isWarnEnabled())
-    SortingSimpleFeatureIterator.this.logger.underlying.warn(&quot;Unable to delete tmp file \'{}\'\'&quot;, (file.getAbsolutePath(): AnyRef))
-  else
-    (): Unit);
-  file.deleteOnExit()
-}
-        </td>
-      </tr><tr>
-        <td>
-          169
-        </td>
-        <td>
-          18520
-        </td>
-        <td>
-          6353
-          -
-          6353
+          5249
         </td>
         <td>
           Literal
@@ -2366,20 +1512,20 @@
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
+        <td style="background: #AEF1AE">
           ()
         </td>
       </tr><tr>
         <td>
-          169
+          152
         </td>
         <td>
-          18521
+          18488
         </td>
         <td>
-          6353
+          5249
           -
-          6353
+          5249
         </td>
         <td>
           Block
@@ -2390,20 +1536,20 @@
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
+        <td style="background: #AEF1AE">
           ()
         </td>
       </tr><tr>
         <td>
-          169
+          152
         </td>
         <td>
-          18522
+          18489
         </td>
         <td>
-          6353
+          5249
           -
-          6499
+          5355
         </td>
         <td>
           If
@@ -2414,53 +1560,53 @@
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
+        <td style="background: #AEF1AE">
           if (file.delete().unary_!)
-  {
-    (if (SortingSimpleFeatureIterator.this.logger.underlying.isWarnEnabled())
-      SortingSimpleFeatureIterator.this.logger.underlying.warn(&quot;Unable to delete tmp file \'{}\'\'&quot;, (file.getAbsolutePath(): AnyRef))
-    else
-      (): Unit);
-    file.deleteOnExit()
-  }
+  (if (SortingSimpleFeatureIterator.this.logger.underlying.isWarnEnabled())
+    SortingSimpleFeatureIterator.this.logger.underlying.warn(&quot;Unable to delete tmp file \'{}\'\'&quot;, (file.getAbsolutePath(): AnyRef))
+  else
+    (): Unit)
 else
   ()
         </td>
       </tr><tr>
         <td>
-          171
+          153
         </td>
         <td>
-          18518
+          18486
         </td>
         <td>
-          6468
+          5279
           -
-          6487
+          5347
         </td>
         <td>
-          Apply
+          Typed
         </td>
         <td>
-          java.io.File.deleteOnExit
+          &lt;nosymbol&gt;
         </td>
         <td>
           
         </td>
         <td style="background: #F0ADAD">
-          file.deleteOnExit()
+          (if (SortingSimpleFeatureIterator.this.logger.underlying.isWarnEnabled())
+  SortingSimpleFeatureIterator.this.logger.underlying.warn(&quot;Unable to delete tmp file \'{}\'\'&quot;, (file.getAbsolutePath(): AnyRef))
+else
+  (): Unit)
         </td>
       </tr><tr>
         <td>
-          174
+          156
         </td>
         <td>
-          18523
+          18490
         </td>
         <td>
-          6548
+          5396
           -
-          6619
+          5467
         </td>
         <td>
           Typed
@@ -2479,87 +1625,453 @@ else
         </td>
       </tr><tr>
         <td>
-          178
+          168
         </td>
         <td>
-          18525
+          18491
         </td>
         <td>
-          6723
+          5742
           -
-          6737
+          5811
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Any.asInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SortingSimpleFeatureIterator.this.SizableFeatureIsSizable.asInstanceOf[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FeatureIsSizable[org.geotools.api.feature.simple.SimpleFeature]]
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          18492
+        </td>
+        <td>
+          5742
+          -
+          5811
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Any.asInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SortingSimpleFeatureIterator.this.SizableFeatureIsSizable.asInstanceOf[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FeatureIsSizable[org.geotools.api.feature.simple.SimpleFeature]]
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          18494
+        </td>
+        <td>
+          5825
+          -
+          6140
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (SortingSimpleFeatureIterator.this.logger.underlying.isWarnEnabled())
+    SortingSimpleFeatureIterator.this.logger.underlying.warn(scala.StringContext.apply(&quot;Feature class \'&quot;, &quot;\' doesn\'t implement Sizable - &quot;).s(sf.getClass().getName()).+(&quot;using estimated size for memory threshold calculations&quot;))
+  else
+    (): Unit);
+  SortingSimpleFeatureIterator.this.UnSizableFeatureIsSizable
+}
+        </td>
+      </tr><tr>
+        <td>
+          174
+        </td>
+        <td>
+          18493
+        </td>
+        <td>
+          6115
+          -
+          6140
         </td>
         <td>
           Select
         </td>
         <td>
-          scala.collection.Iterator.empty
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.UnSizableFeatureIsSizable
         </td>
         <td>
           
         </td>
         <td style="background: #F0ADAD">
-          scala.`package`.Iterator.empty
+          SortingSimpleFeatureIterator.this.UnSizableFeatureIsSizable
         </td>
       </tr><tr>
         <td>
-          178
+          196
         </td>
         <td>
-          18526
+          18495
         </td>
         <td>
-          6739
+          6848
           -
-          6751
+          6865
         </td>
         <td>
           Apply
         </td>
         <td>
-          java.io.Closeable.close
+          java.lang.System.nanoTime
         </td>
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
-          tail.close()
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime()
         </td>
       </tr><tr>
         <td>
-          178
+          197
         </td>
         <td>
-          18527
+          18496
         </td>
         <td>
-          6705
+          6888
           -
-          6752
+          6932
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply
+          java.util.ArrayList.&lt;init&gt;
         </td>
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply[Nothing](scala.`package`.Iterator.empty, tail.close())
+        <td style="background: #AEF1AE">
+          new java.util.ArrayList[org.geotools.api.feature.simple.SimpleFeature](1000)
         </td>
       </tr><tr>
         <td>
-          179
+          198
         </td>
         <td>
-          18545
+          18497
         </td>
         <td>
-          6764
+          6962
           -
-          7051
+          6963
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0L
+        </td>
+      </tr><tr>
+        <td>
+          208
+        </td>
+        <td>
+          18506
+        </td>
+        <td>
+          7301
+          -
+          7301
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          209
+        </td>
+        <td>
+          18498
+        </td>
+        <td>
+          7330
+          -
+          7347
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeature.getFeatureType
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sf.getFeatureType()
+        </td>
+      </tr><tr>
+        <td>
+          209
+        </td>
+        <td>
+          18499
+        </td>
+        <td>
+          7314
+          -
+          7348
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDisk.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new SortingSimpleFeatureIterator.this.SpillToDisk(sf.getFeatureType())
+        </td>
+      </tr><tr>
+        <td>
+          209
+        </td>
+        <td>
+          18500
+        </td>
+        <td>
+          7350
+          -
+          7364
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.toSizeable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SortingSimpleFeatureIterator.this.toSizeable(sf)
+        </td>
+      </tr><tr>
+        <td>
+          209
+        </td>
+        <td>
+          18501
+        </td>
+        <td>
+          7309
+          -
+          7386
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.&lt;init&gt;(new SortingSimpleFeatureIterator.this.SpillToDisk(sf.getFeatureType()), SortingSimpleFeatureIterator.this.toSizeable(sf), ordering, threshold, SortingSimpleFeatureIterator.this.SpillToDiskSorter.&lt;init&gt;$default$5, SortingSimpleFeatureIterator.this.SpillToDiskSorter.&lt;init&gt;$default$6)
+        </td>
+      </tr><tr>
+        <td>
+          210
+        </td>
+        <td>
+          18502
+        </td>
+        <td>
+          7393
+          -
+          7404
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.ArrayList.add
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.mem.add(sf)
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          18503
+        </td>
+        <td>
+          7419
+          -
+          7435
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FeatureIsSizable.sizeOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.sizer.sizeOf(sf)
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          18504
+        </td>
+        <td>
+          7411
+          -
+          7435
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.size.+(SpillToDiskSorter.this.sizer.sizeOf(sf))
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          18505
+        </td>
+        <td>
+          7411
+          -
+          7435
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.size_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.size_=(SpillToDiskSorter.this.size.+(SpillToDiskSorter.this.sizer.sizeOf(sf)))
+        </td>
+      </tr><tr>
+        <td>
+          221
+        </td>
+        <td>
+          18507
+        </td>
+        <td>
+          7674
+          -
+          7683
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.threshold
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.threshold
+        </td>
+      </tr><tr>
+        <td>
+          221
+        </td>
+        <td>
+          18508
+        </td>
+        <td>
+          7666
+          -
+          7683
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&gt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.size.&gt;=(SpillToDiskSorter.this.threshold)
+        </td>
+      </tr><tr>
+        <td>
+          221
+        </td>
+        <td>
+          18518
+        </td>
+        <td>
+          7685
+          -
+          8365
         </td>
         <td>
           Block
@@ -2572,75 +2084,144 @@ else
         </td>
         <td style="background: #AEF1AE">
           {
-  if (list.isEmpty().unary_!)
-    list.sort(ordering)
+  (if (SortingSimpleFeatureIterator.this.logger.underlying.isDebugEnabled())
+    SortingSimpleFeatureIterator.this.logger.underlying.debug(&quot;Read {} features from the underlying store in {}ms&quot;, (scala.Array.apply[AnyRef](SpillToDiskSorter.this.mem.size().asInstanceOf[AnyRef], java.lang.System.nanoTime().-(SpillToDiskSorter.this.start)./(1000000).asInstanceOf[AnyRef])((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
   else
-    ();
-  if (files.isEmpty)
-    org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala, tail.close())
+    (): Unit);
+  val last: Option[java.io.File] = SpillToDiskSorter.this.pending.map[java.io.File](((f: java.util.concurrent.Future[java.io.File]) =&gt; if (f.isDone())
+    f.get()
   else
-    new SortingSimpleFeatureIterator.this.MergeSortingIterator(files.toIndexedSeq, serializer, scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala, tail, ordering)
+    {
+      val start: Long = java.lang.System.nanoTime();
+      val file: java.io.File = f.get();
+      (if (SortingSimpleFeatureIterator.this.logger.underlying.isDebugEnabled())
+        SortingSimpleFeatureIterator.this.logger.underlying.debug(&quot;Waited {}ms for last batch to be flushed to disk&quot;, java.lang.System.nanoTime().-(start)./(1000000).asInstanceOf[AnyRef])
+      else
+        (): Unit);
+      file
+    }));
+  val future: java.util.concurrent.Future[java.io.File] = org.locationtech.geomesa.utils.concurrent.CachedThreadPool.call[java.io.File](this);
+  new SortingSimpleFeatureIterator.this.SpillToDiskSorter(SpillToDiskSorter.this.spill, SpillToDiskSorter.this.sizer, SpillToDiskSorter.this.ordering, SpillToDiskSorter.this.threshold, SpillToDiskSorter.this.files.++[java.io.File, Seq[java.io.File]](scala.this.Option.option2Iterable[java.io.File](last))(collection.this.Seq.canBuildFrom[java.io.File]), scala.Some.apply[java.util.concurrent.Future[java.io.File]](future)).+(sf)
 }
         </td>
       </tr><tr>
         <td>
-          180
+          224
         </td>
         <td>
-          18529
+          18515
         </td>
         <td>
-          6776
+          7922
           -
-          6789
+          8209
         </td>
         <td>
-          Select
+          Apply
         </td>
         <td>
-          scala.Boolean.unary_!
+          scala.Option.map
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          list.isEmpty().unary_!
+          SpillToDiskSorter.this.pending.map[java.io.File](((f: java.util.concurrent.Future[java.io.File]) =&gt; if (f.isDone())
+  f.get()
+else
+  {
+    val start: Long = java.lang.System.nanoTime();
+    val file: java.io.File = f.get();
+    (if (SortingSimpleFeatureIterator.this.logger.underlying.isDebugEnabled())
+      SortingSimpleFeatureIterator.this.logger.underlying.debug(&quot;Waited {}ms for last batch to be flushed to disk&quot;, java.lang.System.nanoTime().-(start)./(1000000).asInstanceOf[AnyRef])
+    else
+      (): Unit);
+    file
+  }))
         </td>
       </tr><tr>
         <td>
-          180
+          225
         </td>
         <td>
-          18532
+          18509
         </td>
         <td>
-          6772
+          7955
           -
-          6772
+          7963
         </td>
         <td>
-          Literal
+          Apply
         </td>
         <td>
-          &lt;nosymbol&gt;
+          java.util.concurrent.Future.isDone
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          f.isDone()
+        </td>
+      </tr><tr>
+        <td>
+          225
+        </td>
+        <td>
+          18510
+        </td>
+        <td>
+          7967
+          -
+          7974
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.get
         </td>
         <td>
           
         </td>
         <td style="background: #F0ADAD">
-          ()
+          f.get()
         </td>
       </tr><tr>
         <td>
-          180
+          225
         </td>
         <td>
-          18533
+          18511
         </td>
         <td>
-          6772
+          7967
           -
-          6772
+          7974
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.util.concurrent.Future.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          f.get()
+        </td>
+      </tr><tr>
+        <td>
+          225
+        </td>
+        <td>
+          18514
+        </td>
+        <td>
+          7982
+          -
+          8199
         </td>
         <td>
           Block
@@ -2651,452 +2232,844 @@ else
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
-          ()
+        <td style="background: #AEF1AE">
+          {
+  val start: Long = java.lang.System.nanoTime();
+  val file: java.io.File = f.get();
+  (if (SortingSimpleFeatureIterator.this.logger.underlying.isDebugEnabled())
+    SortingSimpleFeatureIterator.this.logger.underlying.debug(&quot;Waited {}ms for last batch to be flushed to disk&quot;, java.lang.System.nanoTime().-(start)./(1000000).asInstanceOf[AnyRef])
+  else
+    (): Unit);
+  file
+}
         </td>
       </tr><tr>
         <td>
-          181
+          226
         </td>
         <td>
-          18530
+          18512
         </td>
         <td>
-          6801
+          8008
           -
-          6820
+          8025
         </td>
         <td>
           Apply
         </td>
         <td>
-          java.util.ArrayList.sort
+          java.lang.System.nanoTime
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          list.sort(ordering)
+          java.lang.System.nanoTime()
         </td>
       </tr><tr>
         <td>
-          181
+          227
+        </td>
+        <td>
+          18513
+        </td>
+        <td>
+          8049
+          -
+          8056
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          f.get()
+        </td>
+      </tr><tr>
+        <td>
+          232
+        </td>
+        <td>
+          18516
+        </td>
+        <td>
+          8231
+          -
+          8258
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.call
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.concurrent.CachedThreadPool.call[java.io.File](this)
+        </td>
+      </tr><tr>
+        <td>
+          233
+        </td>
+        <td>
+          18517
+        </td>
+        <td>
+          8267
+          -
+          8357
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new SortingSimpleFeatureIterator.this.SpillToDiskSorter(SpillToDiskSorter.this.spill, SpillToDiskSorter.this.sizer, SpillToDiskSorter.this.ordering, SpillToDiskSorter.this.threshold, SpillToDiskSorter.this.files.++[java.io.File, Seq[java.io.File]](scala.this.Option.option2Iterable[java.io.File](last))(collection.this.Seq.canBuildFrom[java.io.File]), scala.Some.apply[java.util.concurrent.Future[java.io.File]](future)).+(sf)
+        </td>
+      </tr><tr>
+        <td>
+          234
+        </td>
+        <td>
+          18523
+        </td>
+        <td>
+          8371
+          -
+          8446
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  SpillToDiskSorter.this.mem.add(sf);
+  SpillToDiskSorter.this.size_=(SpillToDiskSorter.this.size.+(SpillToDiskSorter.this.sizer.sizeOf(sf)));
+  this
+}
+        </td>
+      </tr><tr>
+        <td>
+          235
+        </td>
+        <td>
+          18519
+        </td>
+        <td>
+          8381
+          -
+          8392
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.ArrayList.add
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.mem.add(sf)
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          18520
+        </td>
+        <td>
+          8409
+          -
+          8425
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FeatureIsSizable.sizeOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.sizer.sizeOf(sf)
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          18521
+        </td>
+        <td>
+          8401
+          -
+          8425
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.size.+(SpillToDiskSorter.this.sizer.sizeOf(sf))
+        </td>
+      </tr><tr>
+        <td>
+          236
+        </td>
+        <td>
+          18522
+        </td>
+        <td>
+          8401
+          -
+          8425
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.size_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.size_=(SpillToDiskSorter.this.size.+(SpillToDiskSorter.this.sizer.sizeOf(sf)))
+        </td>
+      </tr><tr>
+        <td>
+          242
+        </td>
+        <td>
+          18524
+        </td>
+        <td>
+          8499
+          -
+          8502
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.mem
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.mem
+        </td>
+      </tr><tr>
+        <td>
+          242
+        </td>
+        <td>
+          18525
+        </td>
+        <td>
+          8504
+          -
+          8512
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.ordering
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.ordering
+        </td>
+      </tr><tr>
+        <td>
+          242
+        </td>
+        <td>
+          18526
+        </td>
+        <td>
+          8494
+          -
+          8513
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.sort
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SortingSimpleFeatureIterator.this.sort(SpillToDiskSorter.this.mem, SpillToDiskSorter.this.ordering)
+        </td>
+      </tr><tr>
+        <td>
+          243
+        </td>
+        <td>
+          18527
+        </td>
+        <td>
+          8532
+          -
+          8535
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.mem
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.mem
+        </td>
+      </tr><tr>
+        <td>
+          243
+        </td>
+        <td>
+          18528
+        </td>
+        <td>
+          8520
+          -
+          8536
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDisk.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.spill.write(SpillToDiskSorter.this.mem)
+        </td>
+      </tr><tr>
+        <td>
+          253
         </td>
         <td>
           18531
         </td>
         <td>
-          6801
+          8849
           -
-          6820
+          8984
         </td>
         <td>
           Block
         </td>
         <td>
-          java.util.ArrayList.sort
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          list.sort(ordering)
-        </td>
-      </tr><tr>
-        <td>
-          183
-        </td>
-        <td>
-          18534
-        </td>
-        <td>
-          6839
-          -
-          6852
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.collection.IndexedSeqOptimized.isEmpty
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          files.isEmpty
-        </td>
-      </tr><tr>
-        <td>
-          184
-        </td>
-        <td>
-          18535
-        </td>
-        <td>
-          6882
-          -
-          6895
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.ArrayList.iterator
+          &lt;nosymbol&gt;
         </td>
         <td>
           
         </td>
         <td style="background: #F0ADAD">
-          list.iterator()
+          {
+  SpillToDiskSorter.this.cleanup();
+  org.locationtech.geomesa.utils.collection.CloseableIterator.empty[Nothing]
+}
         </td>
       </tr><tr>
         <td>
-          184
+          255
         </td>
         <td>
-          18536
+          18529
         </td>
         <td>
-          6882
+          8935
           -
-          6903
+          8944
         </td>
         <td>
-          Select
+          Apply
         </td>
         <td>
-          scala.collection.convert.Decorators.AsScala.asScala
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.cleanup
         </td>
         <td>
           
         </td>
         <td style="background: #F0ADAD">
-          scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala
+          SpillToDiskSorter.this.cleanup()
         </td>
       </tr><tr>
         <td>
-          184
+          256
         </td>
         <td>
-          18537
+          18530
         </td>
         <td>
-          6905
+          8953
           -
-          6917
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.io.Closeable.close
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          tail.close()
-        </td>
-      </tr><tr>
-        <td>
-          184
-        </td>
-        <td>
-          18538
-        </td>
-        <td>
-          6864
-          -
-          6918
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala, tail.close())
-        </td>
-      </tr><tr>
-        <td>
-          184
-        </td>
-        <td>
-          18539
-        </td>
-        <td>
-          6864
-          -
-          6918
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala, tail.close())
-        </td>
-      </tr><tr>
-        <td>
-          186
-        </td>
-        <td>
-          18540
-        </td>
-        <td>
-          6967
-          -
-          6985
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.collection.TraversableOnce.toIndexedSeq
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          files.toIndexedSeq
-        </td>
-      </tr><tr>
-        <td>
-          186
-        </td>
-        <td>
-          18541
-        </td>
-        <td>
-          6999
-          -
-          7012
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          java.util.ArrayList.iterator
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          list.iterator()
-        </td>
-      </tr><tr>
-        <td>
-          186
-        </td>
-        <td>
-          18542
-        </td>
-        <td>
-          6999
-          -
-          7020
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.collection.convert.Decorators.AsScala.asScala
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala
-        </td>
-      </tr><tr>
-        <td>
-          186
-        </td>
-        <td>
-          18543
-        </td>
-        <td>
-          6942
-          -
-          7037
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.MergeSortingIterator.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new SortingSimpleFeatureIterator.this.MergeSortingIterator(files.toIndexedSeq, serializer, scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala, tail, ordering)
-        </td>
-      </tr><tr>
-        <td>
-          186
-        </td>
-        <td>
-          18544
-        </td>
-        <td>
-          6942
-          -
-          7037
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.MergeSortingIterator.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new SortingSimpleFeatureIterator.this.MergeSortingIterator(files.toIndexedSeq, serializer, scala.collection.JavaConverters.asScalaIteratorConverter[org.geotools.api.feature.simple.SimpleFeature](list.iterator()).asScala, tail, ordering)
-        </td>
-      </tr><tr>
-        <td>
-          209
-        </td>
-        <td>
-          18546
-        </td>
-        <td>
-          7805
-          -
-          7808
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.MergeSortingIterator.mem
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          MergeSortingIterator.this.mem
-        </td>
-      </tr><tr>
-        <td>
-          209
-        </td>
-        <td>
-          18547
-        </td>
-        <td>
-          7787
-          -
-          7809
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](MergeSortingIterator.this.mem)
-        </td>
-      </tr><tr>
-        <td>
-          209
-        </td>
-        <td>
-          18548
-        </td>
-        <td>
-          7844
-          -
-          7854
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.MergeSortingIterator.serializer
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          MergeSortingIterator.this.serializer
-        </td>
-      </tr><tr>
-        <td>
-          209
-        </td>
-        <td>
-          18549
-        </td>
-        <td>
-          7824
-          -
-          7855
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FileIterator.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new SortingSimpleFeatureIterator.this.FileIterator(x$1, MergeSortingIterator.this.serializer)
-        </td>
-      </tr><tr>
-        <td>
-          209
-        </td>
-        <td>
-          18550
-        </td>
-        <td>
-          7823
-          -
-          7823
+          8976
         </td>
         <td>
           TypeApply
         </td>
         <td>
-          scala.collection.IndexedSeq.canBuildFrom
+          org.locationtech.geomesa.utils.collection.CloseableIterator.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.utils.collection.CloseableIterator.empty[Nothing]
+        </td>
+      </tr><tr>
+        <td>
+          257
+        </td>
+        <td>
+          18552
+        </td>
+        <td>
+          8990
+          -
+          9327
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FileIterator]
+          {
+  SortingSimpleFeatureIterator.this.sort(SpillToDiskSorter.this.mem, SpillToDiskSorter.this.ordering);
+  val memIter: org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature] = org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](SpillToDiskSorter.this.mem.iterator());
+  if (SpillToDiskSorter.this.files.isEmpty.&amp;&amp;(SpillToDiskSorter.this.pending.isEmpty))
+    memIter
+  else
+    {
+      val filesIter: Seq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]] = SpillToDiskSorter.this.files.++[java.io.File, Seq[java.io.File]](scala.this.Option.option2Iterable[java.io.File](SpillToDiskSorter.this.pending.map[java.io.File](((x$1: java.util.concurrent.Future[java.io.File]) =&gt; x$1.get()))))(collection.this.Seq.canBuildFrom[java.io.File]).map[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature], Seq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]]({
+        ((file: java.io.File) =&gt; SpillToDiskSorter.this.spill.read(file))
+      })(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]);
+      new SortingSimpleFeatureIterator.this.MergeSortingIterator(scala.`package`.IndexedSeq.apply[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]](memIter).++[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature], IndexedSeq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]](filesIter)(collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]), SpillToDiskSorter.this.ordering)
+    }
+}
         </td>
       </tr><tr>
         <td>
-          209
+          258
+        </td>
+        <td>
+          18532
+        </td>
+        <td>
+          9005
+          -
+          9008
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.mem
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.mem
+        </td>
+      </tr><tr>
+        <td>
+          258
+        </td>
+        <td>
+          18533
+        </td>
+        <td>
+          9010
+          -
+          9018
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.ordering
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.ordering
+        </td>
+      </tr><tr>
+        <td>
+          258
+        </td>
+        <td>
+          18534
+        </td>
+        <td>
+          9000
+          -
+          9019
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.sort
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SortingSimpleFeatureIterator.this.sort(SpillToDiskSorter.this.mem, SpillToDiskSorter.this.ordering)
+        </td>
+      </tr><tr>
+        <td>
+          259
+        </td>
+        <td>
+          18535
+        </td>
+        <td>
+          9060
+          -
+          9072
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.ArrayList.iterator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.mem.iterator()
+        </td>
+      </tr><tr>
+        <td>
+          259
+        </td>
+        <td>
+          18536
+        </td>
+        <td>
+          9042
+          -
+          9073
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.collection.CloseableIterator.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](SpillToDiskSorter.this.mem.iterator())
+        </td>
+      </tr><tr>
+        <td>
+          260
+        </td>
+        <td>
+          18537
+        </td>
+        <td>
+          9103
+          -
+          9118
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Option.isEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SpillToDiskSorter.this.pending.isEmpty
+        </td>
+      </tr><tr>
+        <td>
+          260
+        </td>
+        <td>
+          18538
+        </td>
+        <td>
+          9086
+          -
+          9118
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.files.isEmpty.&amp;&amp;(SpillToDiskSorter.this.pending.isEmpty)
+        </td>
+      </tr><tr>
+        <td>
+          261
+        </td>
+        <td>
+          18539
+        </td>
+        <td>
+          9132
+          -
+          9139
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.memIter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          memIter
+        </td>
+      </tr><tr>
+        <td>
+          262
         </td>
         <td>
           18551
         </td>
         <td>
-          7814
+          9155
           -
-          7856
+          9319
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val filesIter: Seq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]] = SpillToDiskSorter.this.files.++[java.io.File, Seq[java.io.File]](scala.this.Option.option2Iterable[java.io.File](SpillToDiskSorter.this.pending.map[java.io.File](((x$1: java.util.concurrent.Future[java.io.File]) =&gt; x$1.get()))))(collection.this.Seq.canBuildFrom[java.io.File]).map[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature], Seq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]]({
+    ((file: java.io.File) =&gt; SpillToDiskSorter.this.spill.read(file))
+  })(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]);
+  new SortingSimpleFeatureIterator.this.MergeSortingIterator(scala.`package`.IndexedSeq.apply[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]](memIter).++[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature], IndexedSeq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]](filesIter)(collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]), SpillToDiskSorter.this.ordering)
+}
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          18540
+        </td>
+        <td>
+          9205
+          -
+          9212
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1.get()
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          18541
+        </td>
+        <td>
+          9193
+          -
+          9213
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.pending.map[java.io.File](((x$1: java.util.concurrent.Future[java.io.File]) =&gt; x$1.get()))
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          18542
+        </td>
+        <td>
+          9193
+          -
+          9213
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Option.option2Iterable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Option.option2Iterable[java.io.File](SpillToDiskSorter.this.pending.map[java.io.File](((x$1: java.util.concurrent.Future[java.io.File]) =&gt; x$1.get())))
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          18543
+        </td>
+        <td>
+          9190
+          -
+          9190
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[java.io.File]
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          18544
+        </td>
+        <td>
+          9219
+          -
+          9229
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDisk.read
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.spill.read(file)
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          18545
+        </td>
+        <td>
+          9218
+          -
+          9218
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]
+        </td>
+      </tr><tr>
+        <td>
+          263
+        </td>
+        <td>
+          18546
+        </td>
+        <td>
+          9183
+          -
+          9230
         </td>
         <td>
           ApplyToImplicitArgs
@@ -3108,19 +3081,21 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          MergeSortingIterator.this.files.map[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FileIterator, IndexedSeq[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FileIterator]](((x$1: java.io.File) =&gt; new SortingSimpleFeatureIterator.this.FileIterator(x$1, MergeSortingIterator.this.serializer)))(collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FileIterator])
+          SpillToDiskSorter.this.files.++[java.io.File, Seq[java.io.File]](scala.this.Option.option2Iterable[java.io.File](SpillToDiskSorter.this.pending.map[java.io.File](((x$1: java.util.concurrent.Future[java.io.File]) =&gt; x$1.get()))))(collection.this.Seq.canBuildFrom[java.io.File]).map[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature], Seq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]]({
+  ((file: java.io.File) =&gt; SpillToDiskSorter.this.spill.read(file))
+})(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]])
         </td>
       </tr><tr>
         <td>
-          209
+          264
         </td>
         <td>
-          18552
+          18547
         </td>
         <td>
-          7811
+          9286
           -
-          7811
+          9286
         </td>
         <td>
           TypeApply
@@ -3136,15 +3111,15 @@ else
         </td>
       </tr><tr>
         <td>
-          209
+          264
         </td>
         <td>
-          18553
+          18548
         </td>
         <td>
-          7776
+          9266
           -
-          7856
+          9298
         </td>
         <td>
           ApplyToImplicitArgs
@@ -3156,19 +3131,727 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          scala.`package`.IndexedSeq.apply[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]](org.locationtech.geomesa.utils.collection.CloseableIterator.apply[org.geotools.api.feature.simple.SimpleFeature](MergeSortingIterator.this.mem)).++[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature], IndexedSeq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]](MergeSortingIterator.this.files.map[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FileIterator, IndexedSeq[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FileIterator]](((x$1: java.io.File) =&gt; new SortingSimpleFeatureIterator.this.FileIterator(x$1, MergeSortingIterator.this.serializer)))(collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FileIterator]))(collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]])
+          scala.`package`.IndexedSeq.apply[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]](memIter).++[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature], IndexedSeq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]](filesIter)(collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]])
         </td>
       </tr><tr>
         <td>
-          213
+          264
+        </td>
+        <td>
+          18549
+        </td>
+        <td>
+          9300
+          -
+          9308
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDiskSorter.ordering
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDiskSorter.this.ordering
+        </td>
+      </tr><tr>
+        <td>
+          264
+        </td>
+        <td>
+          18550
+        </td>
+        <td>
+          9241
+          -
+          9309
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.MergeSortingIterator.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new SortingSimpleFeatureIterator.this.MergeSortingIterator(scala.`package`.IndexedSeq.apply[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]](memIter).++[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature], IndexedSeq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]](filesIter)(collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]), SpillToDiskSorter.this.ordering)
+        </td>
+      </tr><tr>
+        <td>
+          273
+        </td>
+        <td>
+          18553
+        </td>
+        <td>
+          9516
+          -
+          9530
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.cancel
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$2.cancel(true)
+        </td>
+      </tr><tr>
+        <td>
+          273
         </td>
         <td>
           18554
         </td>
         <td>
-          8012
+          9500
           -
-          8016
+          9531
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SpillToDiskSorter.this.pending.foreach[Boolean](((x$2: java.util.concurrent.Future[java.io.File]) =&gt; x$2.cancel(true)))
+        </td>
+      </tr><tr>
+        <td>
+          274
+        </td>
+        <td>
+          18555
+        </td>
+        <td>
+          9552
+          -
+          9558
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SortingSimpleFeatureIterator.this.delete(file)
+        </td>
+      </tr><tr>
+        <td>
+          274
+        </td>
+        <td>
+          18556
+        </td>
+        <td>
+          9538
+          -
+          9559
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SpillToDiskSorter.this.files.foreach[Unit]({
+  ((file: java.io.File) =&gt; SortingSimpleFeatureIterator.this.delete(file))
+})
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          18557
+        </td>
+        <td>
+          9582
+          -
+          9589
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.Future.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$3.get()
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          18558
+        </td>
+        <td>
+          9570
+          -
+          9590
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SpillToDiskSorter.this.pending.map[java.io.File](((x$3: java.util.concurrent.Future[java.io.File]) =&gt; x$3.get()))
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          18559
+        </td>
+        <td>
+          9601
+          -
+          9601
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Predef.$conforms
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.$conforms[Option[java.io.File]]
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          18560
+        </td>
+        <td>
+          9617
+          -
+          9623
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SortingSimpleFeatureIterator.this.delete(file)
+        </td>
+      </tr><tr>
+        <td>
+          275
+        </td>
+        <td>
+          18561
+        </td>
+        <td>
+          9566
+          -
+          9624
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.util.Try.apply[Option[java.io.File]](SpillToDiskSorter.this.pending.map[java.io.File](((x$3: java.util.concurrent.Future[java.io.File]) =&gt; x$3.get()))).toOption.flatten[java.io.File](scala.Predef.$conforms[Option[java.io.File]]).foreach[Unit]({
+  ((file: java.io.File) =&gt; SortingSimpleFeatureIterator.this.delete(file))
+})
+        </td>
+      </tr><tr>
+        <td>
+          289
+        </td>
+        <td>
+          18562
+        </td>
+        <td>
+          10012
+          -
+          10015
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDisk.sft
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDisk.this.sft
+        </td>
+      </tr><tr>
+        <td>
+          289
+        </td>
+        <td>
+          18563
+        </td>
+        <td>
+          10017
+          -
+          10049
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.features.SerializationOption.WithUserData
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.features.SerializationOption.WithUserData
+        </td>
+      </tr><tr>
+        <td>
+          289
+        </td>
+        <td>
+          18564
+        </td>
+        <td>
+          10017
+          -
+          10049
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          org.locationtech.geomesa.features.SerializationOption.optionToSet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          features.this.SerializationOption.optionToSet(org.locationtech.geomesa.features.SerializationOption.WithUserData)
+        </td>
+      </tr><tr>
+        <td>
+          289
+        </td>
+        <td>
+          18565
+        </td>
+        <td>
+          9990
+          -
+          10050
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.kryo.KryoFeatureSerializer.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.features.kryo.KryoFeatureSerializer.apply(SpillToDisk.this.sft, features.this.SerializationOption.optionToSet(org.locationtech.geomesa.features.SerializationOption.WithUserData))
+        </td>
+      </tr><tr>
+        <td>
+          292
+        </td>
+        <td>
+          18566
+        </td>
+        <td>
+          10140
+          -
+          10157
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.System.nanoTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.lang.System.nanoTime()
+        </td>
+      </tr><tr>
+        <td>
+          293
+        </td>
+        <td>
+          18567
+        </td>
+        <td>
+          10175
+          -
+          10228
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.nio.file.Path.toFile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.nio.file.Files.createTempFile(scala.StringContext.apply(&quot;gm-sort-&quot;, &quot;-&quot;).s(SpillToDisk.this.id), &quot;.kryo&quot;).toFile()
+        </td>
+      </tr><tr>
+        <td>
+          295
+        </td>
+        <td>
+          18568
+        </td>
+        <td>
+          10307
+          -
+          10326
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.File.deleteOnExit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          file.deleteOnExit()
+        </td>
+      </tr><tr>
+        <td>
+          296
+        </td>
+        <td>
+          18569
+        </td>
+        <td>
+          10343
+          -
+          10369
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.FileOutputStream.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new java.io.FileOutputStream(file)
+        </td>
+      </tr><tr>
+        <td>
+          296
+        </td>
+        <td>
+          18576
+        </td>
+        <td>
+          10371
+          -
+          10371
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          296
+        </td>
+        <td>
+          18577
+        </td>
+        <td>
+          10333
+          -
+          10555
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.io.FileOutputStream, Unit](new java.io.FileOutputStream(file))(((os: java.io.FileOutputStream) =&gt; features.forEach(((sf: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
+  val bytes: Array[Byte] = SpillToDisk.this.serializer.serialize(sf);
+  os.write(org.locationtech.geomesa.utils.index.ByteArrays.toBytes(bytes.length));
+  os.write(bytes)
+}))))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          297
+        </td>
+        <td>
+          18575
+        </td>
+        <td>
+          10387
+          -
+          10547
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.ArrayList.forEach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          features.forEach(((sf: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
+  val bytes: Array[Byte] = SpillToDisk.this.serializer.serialize(sf);
+  os.write(org.locationtech.geomesa.utils.index.ByteArrays.toBytes(bytes.length));
+  os.write(bytes)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          298
+        </td>
+        <td>
+          18570
+        </td>
+        <td>
+          10434
+          -
+          10458
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.features.kryo.impl.KryoFeatureSerialization.serialize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDisk.this.serializer.serialize(sf)
+        </td>
+      </tr><tr>
+        <td>
+          299
+        </td>
+        <td>
+          18571
+        </td>
+        <td>
+          10497
+          -
+          10509
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Array.length
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          bytes.length
+        </td>
+      </tr><tr>
+        <td>
+          299
+        </td>
+        <td>
+          18572
+        </td>
+        <td>
+          10478
+          -
+          10510
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.index.ByteArrays.toBytes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.index.ByteArrays.toBytes(bytes.length)
+        </td>
+      </tr><tr>
+        <td>
+          299
+        </td>
+        <td>
+          18573
+        </td>
+        <td>
+          10469
+          -
+          10511
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.FileOutputStream.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          os.write(org.locationtech.geomesa.utils.index.ByteArrays.toBytes(bytes.length))
+        </td>
+      </tr><tr>
+        <td>
+          300
+        </td>
+        <td>
+          18574
+        </td>
+        <td>
+          10522
+          -
+          10537
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.FileOutputStream.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          os.write(bytes)
+        </td>
+      </tr><tr>
+        <td>
+          307
+        </td>
+        <td>
+          18578
+        </td>
+        <td>
+          10767
+          -
+          10777
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.SpillToDisk.serializer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SpillToDisk.this.serializer
+        </td>
+      </tr><tr>
+        <td>
+          307
+        </td>
+        <td>
+          18579
+        </td>
+        <td>
+          10744
+          -
+          10778
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FileIterator.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new SortingSimpleFeatureIterator.this.FileIterator(file, SpillToDisk.this.serializer)
+        </td>
+      </tr><tr>
+        <td>
+          321
+        </td>
+        <td>
+          18580
+        </td>
+        <td>
+          11334
+          -
+          11338
         </td>
         <td>
           Select
@@ -3180,19 +3863,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          x$2._1
+          x$4._1
         </td>
       </tr><tr>
         <td>
-          213
+          321
         </td>
         <td>
-          18555
+          18581
         </td>
         <td>
-          8018
+          11340
           -
-          8026
+          11348
         </td>
         <td>
           Select
@@ -3208,15 +3891,15 @@ else
         </td>
       </tr><tr>
         <td>
-          213
+          321
         </td>
         <td>
-          18556
+          18582
         </td>
         <td>
-          7963
+          11285
           -
-          8027
+          11349
         </td>
         <td>
           Apply
@@ -3228,43 +3911,43 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          scala.`package`.Ordering.by[(org.geotools.api.feature.simple.SimpleFeature, Int), org.geotools.api.feature.simple.SimpleFeature](((x$2: (org.geotools.api.feature.simple.SimpleFeature, Int)) =&gt; x$2._1))(MergeSortingIterator.this.ordering)
+          scala.`package`.Ordering.by[(org.geotools.api.feature.simple.SimpleFeature, Int), org.geotools.api.feature.simple.SimpleFeature](((x$4: (org.geotools.api.feature.simple.SimpleFeature, Int)) =&gt; x$4._1))(MergeSortingIterator.this.ordering)
         </td>
       </tr><tr>
         <td>
-          214
+          322
         </td>
         <td>
-          18557
+          18583
         </td>
         <td>
-          8092
+          11414
           -
-          8106
+          11426
         </td>
         <td>
-          Apply
+          Select
         </td>
         <td>
-          scala.Int.+
+          scala.collection.SeqLike.size
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          MergeSortingIterator.this.files.size.+(1)
+          MergeSortingIterator.this.merging.size
         </td>
       </tr><tr>
         <td>
-          214
+          322
         </td>
         <td>
-          18558
+          18584
         </td>
         <td>
-          8042
+          11364
           -
-          8110
+          11430
         </td>
         <td>
           Apply
@@ -3276,19 +3959,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          new java.util.PriorityQueue[(org.geotools.api.feature.simple.SimpleFeature, Int)](MergeSortingIterator.this.files.size.+(1), o)
+          new java.util.PriorityQueue[(org.geotools.api.feature.simple.SimpleFeature, Int)](MergeSortingIterator.this.merging.size, o)
         </td>
       </tr><tr>
         <td>
-          215
+          323
         </td>
         <td>
-          18559
+          18585
         </td>
         <td>
-          8125
+          11445
           -
-          8126
+          11446
         </td>
         <td>
           Literal
@@ -3304,15 +3987,15 @@ else
         </td>
       </tr><tr>
         <td>
-          216
+          324
         </td>
         <td>
-          18560
+          18586
         </td>
         <td>
-          8144
+          11464
           -
-          8158
+          11478
         </td>
         <td>
           Select
@@ -3328,15 +4011,15 @@ else
         </td>
       </tr><tr>
         <td>
-          216
+          324
         </td>
         <td>
-          18561
+          18587
         </td>
         <td>
-          8140
+          11460
           -
-          8158
+          11478
         </td>
         <td>
           Apply
@@ -3352,39 +4035,39 @@ else
         </td>
       </tr><tr>
         <td>
-          216
+          324
         </td>
         <td>
-          18570
+          18596
         </td>
         <td>
-          8160
+          11480
           -
-          8160
+          11480
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.MergeSortingIterator.while$4
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.MergeSortingIterator.while$3
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          while$4()
+          while$3()
         </td>
       </tr><tr>
         <td>
-          216
+          324
         </td>
         <td>
-          18571
+          18597
         </td>
         <td>
-          8160
+          11480
           -
-          8275
+          11595
         </td>
         <td>
           Block
@@ -3405,20 +4088,20 @@ else
       ();
     i = i.+(1)
   };
-  while$4()
+  while$3()
 }
         </td>
       </tr><tr>
         <td>
-          216
+          324
         </td>
         <td>
-          18572
+          18598
         </td>
         <td>
-          8133
+          11453
           -
-          8133
+          11453
         </td>
         <td>
           Literal
@@ -3434,15 +4117,15 @@ else
         </td>
       </tr><tr>
         <td>
-          216
+          324
         </td>
         <td>
-          18573
+          18599
         </td>
         <td>
-          8133
+          11453
           -
-          8133
+          11453
         </td>
         <td>
           Block
@@ -3458,15 +4141,15 @@ else
         </td>
       </tr><tr>
         <td>
-          217
+          325
         </td>
         <td>
-          18562
+          18588
         </td>
         <td>
-          8178
+          11498
           -
-          8188
+          11508
         </td>
         <td>
           Apply
@@ -3482,15 +4165,15 @@ else
         </td>
       </tr><tr>
         <td>
-          218
+          326
         </td>
         <td>
-          18563
+          18589
         </td>
         <td>
-          8201
+          11521
           -
-          8210
+          11530
         </td>
         <td>
           Select
@@ -3506,15 +4189,15 @@ else
         </td>
       </tr><tr>
         <td>
-          218
+          326
         </td>
         <td>
-          18567
+          18593
         </td>
         <td>
-          8197
+          11517
           -
-          8197
+          11517
         </td>
         <td>
           Literal
@@ -3530,15 +4213,15 @@ else
         </td>
       </tr><tr>
         <td>
-          218
+          326
         </td>
         <td>
-          18568
+          18594
         </td>
         <td>
-          8197
+          11517
           -
-          8197
+          11517
         </td>
         <td>
           Block
@@ -3554,15 +4237,15 @@ else
         </td>
       </tr><tr>
         <td>
-          219
+          327
         </td>
         <td>
-          18564
+          18590
         </td>
         <td>
-          8230
+          11550
           -
-          8241
+          11561
         </td>
         <td>
           Apply
@@ -3578,15 +4261,15 @@ else
         </td>
       </tr><tr>
         <td>
-          219
+          327
         </td>
         <td>
-          18565
+          18591
         </td>
         <td>
-          8224
+          11544
           -
-          8242
+          11562
         </td>
         <td>
           Apply
@@ -3602,15 +4285,15 @@ else
         </td>
       </tr><tr>
         <td>
-          219
+          327
         </td>
         <td>
-          18566
+          18592
         </td>
         <td>
-          8224
+          11544
           -
-          8242
+          11562
         </td>
         <td>
           Block
@@ -3626,15 +4309,15 @@ else
         </td>
       </tr><tr>
         <td>
-          221
+          329
         </td>
         <td>
-          18569
+          18595
         </td>
         <td>
-          8261
+          11581
           -
-          8267
+          11587
         </td>
         <td>
           Apply
@@ -3650,15 +4333,15 @@ else
         </td>
       </tr><tr>
         <td>
-          226
+          334
         </td>
         <td>
-          18574
+          18600
         </td>
         <td>
-          8327
+          11647
           -
-          8341
+          11661
         </td>
         <td>
           Select
@@ -3674,15 +4357,15 @@ else
         </td>
       </tr><tr>
         <td>
-          229
+          337
         </td>
         <td>
-          18575
+          18601
         </td>
         <td>
-          8397
+          11717
           -
-          8397
+          11717
         </td>
         <td>
           Select
@@ -3694,19 +4377,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          x$3._1
+          x$5._1
         </td>
       </tr><tr>
         <td>
-          229
+          337
         </td>
         <td>
-          18576
+          18602
         </td>
         <td>
-          8400
+          11720
           -
-          8400
+          11720
         </td>
         <td>
           Select
@@ -3718,19 +4401,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          x$3._2
+          x$5._2
         </td>
       </tr><tr>
         <td>
-          230
+          338
         </td>
         <td>
-          18577
+          18603
         </td>
         <td>
-          8432
+          11752
           -
-          8442
+          11762
         </td>
         <td>
           Apply
@@ -3746,15 +4429,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          339
         </td>
         <td>
-          18578
+          18604
         </td>
         <td>
-          8453
+          11773
           -
-          8462
+          11782
         </td>
         <td>
           Select
@@ -3770,15 +4453,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          339
         </td>
         <td>
-          18582
+          18608
         </td>
         <td>
-          8449
+          11769
           -
-          8449
+          11769
         </td>
         <td>
           Literal
@@ -3794,15 +4477,15 @@ else
         </td>
       </tr><tr>
         <td>
-          231
+          339
         </td>
         <td>
-          18583
+          18609
         </td>
         <td>
-          8449
+          11769
           -
-          8449
+          11769
         </td>
         <td>
           Block
@@ -3818,15 +4501,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          340
         </td>
         <td>
-          18579
+          18605
         </td>
         <td>
-          8484
+          11804
           -
-          8495
+          11815
         </td>
         <td>
           Apply
@@ -3842,15 +4525,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          340
         </td>
         <td>
-          18580
+          18606
         </td>
         <td>
-          8474
+          11794
           -
-          8496
+          11816
         </td>
         <td>
           Apply
@@ -3866,15 +4549,15 @@ else
         </td>
       </tr><tr>
         <td>
-          232
+          340
         </td>
         <td>
-          18581
+          18607
         </td>
         <td>
-          8474
+          11794
           -
-          8496
+          11816
         </td>
         <td>
           Block
@@ -3890,87 +4573,39 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          345
         </td>
         <td>
-          18584
+          18610
         </td>
         <td>
-          8583
+          11892
           -
-          8592
+          11899
         </td>
         <td>
           Select
         </td>
         <td>
-          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.MergeSortingIterator.closeable
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.MergeSortingIterator.merging
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          MergeSortingIterator.this.closeable
+          MergeSortingIterator.this.merging
         </td>
       </tr><tr>
         <td>
-          237
+          345
         </td>
         <td>
-          18585
+          18611
         </td>
         <td>
-          8580
+          11891
           -
-          8580
-        </td>
-        <td>
-          TypeApply
-        </td>
-        <td>
-          scala.collection.IndexedSeq.canBuildFrom
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[Any]]
-        </td>
-      </tr><tr>
-        <td>
-          237
-        </td>
-        <td>
-          18586
-        </td>
-        <td>
-          8572
-          -
-          8592
-        </td>
-        <td>
-          ApplyToImplicitArgs
-        </td>
-        <td>
-          scala.collection.SeqLike.:+
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          MergeSortingIterator.this.merging.:+[org.locationtech.geomesa.utils.collection.CloseableIterator[Any], IndexedSeq[org.locationtech.geomesa.utils.collection.CloseableIterator[Any]]](MergeSortingIterator.this.closeable)(collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[Any]])
-        </td>
-      </tr><tr>
-        <td>
-          237
-        </td>
-        <td>
-          18587
-        </td>
-        <td>
-          8571
-          -
-          8571
+          11891
         </td>
         <td>
           Select
@@ -3986,15 +4621,15 @@ else
         </td>
       </tr><tr>
         <td>
-          237
+          345
         </td>
         <td>
-          18588
+          18612
         </td>
         <td>
-          8553
+          11873
           -
-          8593
+          11900
         </td>
         <td>
           ApplyToImplicitArgs
@@ -4006,19 +4641,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.io.`package`.CloseQuietly.raise[IndexedSeq[org.locationtech.geomesa.utils.collection.CloseableIterator[Any]]](MergeSortingIterator.this.merging.:+[org.locationtech.geomesa.utils.collection.CloseableIterator[Any], IndexedSeq[org.locationtech.geomesa.utils.collection.CloseableIterator[Any]]](MergeSortingIterator.this.closeable)(collection.this.IndexedSeq.canBuildFrom[org.locationtech.geomesa.utils.collection.CloseableIterator[Any]]))(io.this.IsCloseable.iterableIsCloseable)
+          org.locationtech.geomesa.utils.io.`package`.CloseQuietly.raise[IndexedSeq[org.locationtech.geomesa.utils.collection.CloseableIterator[org.geotools.api.feature.simple.SimpleFeature]]](MergeSortingIterator.this.merging)(io.this.IsCloseable.iterableIsCloseable)
         </td>
       </tr><tr>
         <td>
-          249
+          357
         </td>
         <td>
-          18589
+          18613
         </td>
         <td>
-          8910
+          12217
           -
-          8914
+          12221
         </td>
         <td>
           Select
@@ -4034,15 +4669,15 @@ else
         </td>
       </tr><tr>
         <td>
-          249
+          357
         </td>
         <td>
-          18590
+          18614
         </td>
         <td>
-          8890
+          12197
           -
-          8915
+          12222
         </td>
         <td>
           Apply
@@ -4058,15 +4693,15 @@ else
         </td>
       </tr><tr>
         <td>
-          250
+          358
         </td>
         <td>
-          18591
+          18615
         </td>
         <td>
-          8956
+          12263
           -
-          8957
+          12264
         </td>
         <td>
           Literal
@@ -4082,15 +4717,15 @@ else
         </td>
       </tr><tr>
         <td>
-          250
+          358
         </td>
         <td>
-          18592
+          18616
         </td>
         <td>
-          8938
+          12245
           -
-          8958
+          12265
         </td>
         <td>
           ApplyToImplicitArgs
@@ -4106,15 +4741,15 @@ else
         </td>
       </tr><tr>
         <td>
-          252
+          360
         </td>
         <td>
-          18593
+          18617
         </td>
         <td>
-          8996
+          12303
           -
-          9014
+          12321
         </td>
         <td>
           Apply
@@ -4130,15 +4765,15 @@ else
         </td>
       </tr><tr>
         <td>
-          255
+          363
         </td>
         <td>
-          18594
+          18618
         </td>
         <td>
-          9073
+          12380
           -
-          9076
+          12383
         </td>
         <td>
           Select
@@ -4154,15 +4789,15 @@ else
         </td>
       </tr><tr>
         <td>
-          255
+          363
         </td>
         <td>
-          18595
+          18619
         </td>
         <td>
-          9078
+          12385
           -
-          9079
+          12386
         </td>
         <td>
           Literal
@@ -4178,15 +4813,15 @@ else
         </td>
       </tr><tr>
         <td>
-          255
+          363
         </td>
         <td>
-          18596
+          18620
         </td>
         <td>
-          9081
+          12388
           -
-          9082
+          12389
         </td>
         <td>
           Literal
@@ -4202,15 +4837,15 @@ else
         </td>
       </tr><tr>
         <td>
-          255
+          363
         </td>
         <td>
-          18597
+          18621
         </td>
         <td>
-          9065
+          12372
           -
-          9083
+          12390
         </td>
         <td>
           Apply
@@ -4226,15 +4861,15 @@ else
         </td>
       </tr><tr>
         <td>
-          256
+          364
         </td>
         <td>
-          18598
+          18622
         </td>
         <td>
-          9120
+          12427
           -
-          9123
+          12430
         </td>
         <td>
           Select
@@ -4250,15 +4885,15 @@ else
         </td>
       </tr><tr>
         <td>
-          256
+          364
         </td>
         <td>
-          18599
+          18623
         </td>
         <td>
-          9101
+          12408
           -
-          9124
+          12431
         </td>
         <td>
           Apply
@@ -4274,15 +4909,15 @@ else
         </td>
       </tr><tr>
         <td>
-          257
+          365
         </td>
         <td>
-          18600
+          18624
         </td>
         <td>
-          9135
+          12442
           -
-          9152
+          12459
         </td>
         <td>
           Apply
@@ -4298,15 +4933,15 @@ else
         </td>
       </tr><tr>
         <td>
-          257
+          365
         </td>
         <td>
-          18606
+          18630
         </td>
         <td>
-          9131
+          12438
           -
-          9131
+          12438
         </td>
         <td>
           Literal
@@ -4322,15 +4957,15 @@ else
         </td>
       </tr><tr>
         <td>
-          257
+          365
         </td>
         <td>
-          18607
+          18631
         </td>
         <td>
-          9131
+          12438
           -
-          9131
+          12438
         </td>
         <td>
           Block
@@ -4346,15 +4981,15 @@ else
         </td>
       </tr><tr>
         <td>
-          258
+          366
         </td>
         <td>
-          18601
+          18625
         </td>
         <td>
-          9190
+          12497
           -
-          9193
+          12500
         </td>
         <td>
           Literal
@@ -4370,15 +5005,15 @@ else
         </td>
       </tr><tr>
         <td>
-          258
+          366
         </td>
         <td>
-          18602
+          18626
         </td>
         <td>
-          9182
+          12489
           -
-          9200
+          12507
         </td>
         <td>
           Select
@@ -4394,15 +5029,15 @@ else
         </td>
       </tr><tr>
         <td>
-          258
+          366
         </td>
         <td>
-          18603
+          18627
         </td>
         <td>
-          9170
+          12477
           -
-          9201
+          12508
         </td>
         <td>
           ApplyToImplicitArgs
@@ -4418,15 +5053,15 @@ else
         </td>
       </tr><tr>
         <td>
-          258
+          366
         </td>
         <td>
-          18604
+          18628
         </td>
         <td>
-          9164
+          12471
           -
-          9201
+          12508
         </td>
         <td>
           Apply
@@ -4442,15 +5077,15 @@ else
         </td>
       </tr><tr>
         <td>
-          258
+          366
         </td>
         <td>
-          18605
+          18629
         </td>
         <td>
-          9164
+          12471
           -
-          9201
+          12508
         </td>
         <td>
           Block
@@ -4466,15 +5101,15 @@ else
         </td>
       </tr><tr>
         <td>
-          260
+          368
         </td>
         <td>
-          18608
+          18632
         </td>
         <td>
-          9224
+          12531
           -
-          9227
+          12534
         </td>
         <td>
           Select
@@ -4490,15 +5125,15 @@ else
         </td>
       </tr><tr>
         <td>
-          260
+          368
         </td>
         <td>
-          18609
+          18633
         </td>
         <td>
-          9229
+          12536
           -
-          9230
+          12537
         </td>
         <td>
           Literal
@@ -4514,15 +5149,15 @@ else
         </td>
       </tr><tr>
         <td>
-          260
+          368
         </td>
         <td>
-          18610
+          18634
         </td>
         <td>
-          9216
+          12523
           -
-          9237
+          12544
         </td>
         <td>
           Apply
@@ -4538,15 +5173,15 @@ else
         </td>
       </tr><tr>
         <td>
-          261
+          369
         </td>
         <td>
-          18611
+          18635
         </td>
         <td>
-          9267
+          12574
           -
-          9270
+          12577
         </td>
         <td>
           Select
@@ -4562,15 +5197,15 @@ else
         </td>
       </tr><tr>
         <td>
-          261
+          369
         </td>
         <td>
-          18612
+          18636
         </td>
         <td>
-          9272
+          12579
           -
-          9273
+          12580
         </td>
         <td>
           Literal
@@ -4586,15 +5221,15 @@ else
         </td>
       </tr><tr>
         <td>
-          261
+          369
         </td>
         <td>
-          18613
+          18637
         </td>
         <td>
-          9244
+          12551
           -
-          9280
+          12587
         </td>
         <td>
           Apply
@@ -4610,15 +5245,15 @@ else
         </td>
       </tr><tr>
         <td>
-          265
+          373
         </td>
         <td>
-          18614
+          18638
         </td>
         <td>
-          9335
+          12642
           -
-          9345
+          12652
         </td>
         <td>
           Apply
@@ -4634,15 +5269,15 @@ else
         </td>
       </tr><tr>
         <td>
-          265
+          373
         </td>
         <td>
-          18615
+          18639
         </td>
         <td>
-          9335
+          12642
           -
-          9345
+          12652
         </td>
         <td>
           Block
@@ -4658,174 +5293,87 @@ else
         </td>
       </tr><tr>
         <td>
-          266
+          374
         </td>
         <td>
-          18616
+          18640
         </td>
         <td>
-          9370
+          12680
           -
-          9384
+          12684
         </td>
         <td>
           Select
         </td>
         <td>
-          scala.Boolean.unary_!
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.FileIterator.file
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          FileIterator.this.file.delete().unary_!
+          FileIterator.this.file
         </td>
       </tr><tr>
         <td>
-          266
+          374
         </td>
         <td>
-          18618
+          18641
         </td>
         <td>
-          9386
+          12673
           -
-          9506
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          {
-  (if (FileIterator.this.logger.underlying.isWarnEnabled())
-    FileIterator.this.logger.underlying.warn(&quot;Unable to delete tmp file \'{}\'\'&quot;, (FileIterator.this.file.getAbsolutePath(): AnyRef))
-  else
-    (): Unit);
-  FileIterator.this.file.deleteOnExit()
-}
-        </td>
-      </tr><tr>
-        <td>
-          266
-        </td>
-        <td>
-          18619
-        </td>
-        <td>
-          9366
-          -
-          9366
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          266
-        </td>
-        <td>
-          18620
-        </td>
-        <td>
-          9366
-          -
-          9366
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          266
-        </td>
-        <td>
-          18621
-        </td>
-        <td>
-          9366
-          -
-          9506
-        </td>
-        <td>
-          If
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          if (FileIterator.this.file.delete().unary_!)
-  {
-    (if (FileIterator.this.logger.underlying.isWarnEnabled())
-      FileIterator.this.logger.underlying.warn(&quot;Unable to delete tmp file \'{}\'\'&quot;, (FileIterator.this.file.getAbsolutePath(): AnyRef))
-    else
-      (): Unit);
-    FileIterator.this.file.deleteOnExit()
-  }
-else
-  ()
-        </td>
-      </tr><tr>
-        <td>
-          268
-        </td>
-        <td>
-          18617
-        </td>
-        <td>
-          9477
-          -
-          9496
+          12685
         </td>
         <td>
           Apply
         </td>
         <td>
-          java.io.File.deleteOnExit
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.delete
         </td>
         <td>
           
         </td>
-        <td style="background: #F0ADAD">
-          FileIterator.this.file.deleteOnExit()
+        <td style="background: #AEF1AE">
+          SortingSimpleFeatureIterator.this.delete(FileIterator.this.file)
         </td>
       </tr><tr>
         <td>
-          287
+          374
         </td>
         <td>
-          18622
+          18642
         </td>
         <td>
-          9929
+          12673
           -
-          9954
+          12685
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.utils.SortingSimpleFeatureIterator.delete
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SortingSimpleFeatureIterator.this.delete(FileIterator.this.file)
+        </td>
+      </tr><tr>
+        <td>
+          392
+        </td>
+        <td>
+          18643
+        </td>
+        <td>
+          13108
+          -
+          13133
         </td>
         <td>
           Apply
@@ -4841,15 +5389,15 @@ else
         </td>
       </tr><tr>
         <td>
-          295
+          400
         </td>
         <td>
-          18623
+          18644
         </td>
         <td>
-          10224
+          13403
           -
-          10245
+          13424
         </td>
         <td>
           Apply
@@ -4865,15 +5413,15 @@ else
         </td>
       </tr><tr>
         <td>
-          295
+          400
         </td>
         <td>
-          18624
+          18645
         </td>
         <td>
-          10247
+          13426
           -
-          10266
+          13445
         </td>
         <td>
           Apply
@@ -4889,15 +5437,15 @@ else
         </td>
       </tr><tr>
         <td>
-          295
+          400
         </td>
         <td>
-          18625
+          18646
         </td>
         <td>
-          10205
+          13384
           -
-          10267
+          13446
         </td>
         <td>
           Apply
@@ -4913,15 +5461,15 @@ else
         </td>
       </tr><tr>
         <td>
-          295
+          400
         </td>
         <td>
-          18626
+          18647
         </td>
         <td>
-          10179
+          13358
           -
-          10267
+          13446
         </td>
         <td>
           Apply
