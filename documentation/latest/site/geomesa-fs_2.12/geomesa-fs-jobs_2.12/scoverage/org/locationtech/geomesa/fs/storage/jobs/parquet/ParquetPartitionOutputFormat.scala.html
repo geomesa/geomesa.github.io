@@ -1,0 +1,3766 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/fs/storage/jobs/parquet/ParquetPartitionOutputFormat.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.fs.storage.jobs.parquet
+</span>10 <span style=''>
+</span>11 <span style=''>import com.typesafe.scalalogging.LazyLogging
+</span>12 <span style=''>import org.apache.hadoop.fs.Path
+</span>13 <span style=''>import org.apache.hadoop.mapred.InvalidJobConfException
+</span>14 <span style=''>import org.apache.hadoop.mapreduce._
+</span>15 <span style=''>import org.apache.hadoop.mapreduce.lib.output.{FileOutputCommitter, FileOutputFormat}
+</span>16 <span style=''>import org.apache.hadoop.mapreduce.security.TokenCache
+</span>17 <span style=''>import org.geotools.api.feature.simple.SimpleFeature
+</span>18 <span style=''>import org.locationtech.geomesa.fs.storage.core.{FileSystemContext, FileSystemStorage, Partition, PartitionKey, StorageCatalog}
+</span>19 <span style=''>import org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration
+</span>20 <span style=''>import org.locationtech.geomesa.utils.io.{CloseWithLogging, FileSizeEstimator}
+</span>21 <span style=''>
+</span>22 <span style=''>import java.net.URI
+</span>23 <span style=''>import java.util.concurrent.CopyOnWriteArrayList
+</span>24 <span style=''>
+</span>25 <span style=''>/**
+</span>26 <span style=''>  * Output format that writes to multiple partition files
+</span>27 <span style=''>  */
+</span>28 <span style=''>class ParquetPartitionOutputFormat extends OutputFormat[Void, SimpleFeature] {
+</span>29 <span style=''>
+</span>30 <span style=''>  private val delegate = </span><span style='background: #AEF1AE'>new ParquetSimpleFeatureOutputFormat()</span><span style=''>
+</span>31 <span style=''>
+</span>32 <span style=''>  override def getRecordWriter(context: TaskAttemptContext): RecordWriter[Void, SimpleFeature] =
+</span>33 <span style=''>    </span><span style='background: #AEF1AE'>new PartitionSchemeRecordWriter(context)</span><span style=''>
+</span>34 <span style=''>
+</span>35 <span style=''>  override def getOutputCommitter(context: TaskAttemptContext): OutputCommitter =
+</span>36 <span style=''>    </span><span style='background: #AEF1AE'>delegate.getOutputCommitter(context)</span><span style=''>
+</span>37 <span style=''>
+</span>38 <span style=''>  // same as FileOutputFormat, but doesn't require that output directory doesn't exist
+</span>39 <span style=''>  override def checkOutputSpecs(job: JobContext): Unit = {
+</span>40 <span style=''>    // Ensure that the output directory is set
+</span>41 <span style=''>    val outDir = </span><span style='background: #AEF1AE'>FileOutputFormat.getOutputPath(job)</span><span style=''>
+</span>42 <span style=''>    if (</span><span style='background: #AEF1AE'>outDir == null</span><span style=''>) {
+</span>43 <span style=''>      </span><span style='background: #F0ADAD'>throw new InvalidJobConfException(&quot;Output directory not set&quot;)</span><span style=''>
+</span>44 <span style=''>    }
+</span>45 <span style=''>    // get delegation token for outDir's file system
+</span>46 <span style=''>    </span><span style='background: #AEF1AE'>TokenCache.obtainTokensForNamenodes(job.getCredentials, Array[Path](outDir), job.getConfiguration)</span><span style=''>
+</span>47 <span style=''>  }
+</span>48 <span style=''>
+</span>49 <span style=''>  private class PartitionSchemeRecordWriter(context: TaskAttemptContext)
+</span>50 <span style=''>      extends RecordWriter[Void, SimpleFeature] with LazyLogging {
+</span>51 <span style=''>
+</span>52 <span style=''>    import StorageConfiguration.Counters.{Features, Group}
+</span>53 <span style=''>
+</span>54 <span style=''>    private val fsc = {
+</span>55 <span style=''>      val hadoopConf = </span><span style='background: #AEF1AE'>context.getConfiguration</span><span style=''>
+</span>56 <span style=''>      val conf = {
+</span>57 <span style=''>        val builder = </span><span style='background: #AEF1AE'>Map.newBuilder[String, String]</span><span style=''>
+</span>58 <span style=''>        </span><span style='background: #AEF1AE'>hadoopConf.forEach(e =&gt; builder += e.getKey -&gt; hadoopConf.get(e.getKey))</span><span style=''> // use .get to resolve envs
+</span>59 <span style=''>        </span><span style='background: #AEF1AE'>builder.result()</span><span style=''>
+</span>60 <span style=''>      }
+</span>61 <span style=''>      val root = </span><span style='background: #AEF1AE'>StorageConfiguration.getRootPath(hadoopConf)</span><span style=''>
+</span>62 <span style=''>      </span><span style='background: #AEF1AE'>FileSystemContext.create(root, conf)</span><span style=''>
+</span>63 <span style=''>    }
+</span>64 <span style=''>
+</span>65 <span style=''>    private val catalog = </span><span style='background: #AEF1AE'>StorageCatalog(fsc)</span><span style=''>
+</span>66 <span style=''>    private val storage = </span><span style='background: #AEF1AE'>catalog.load(StorageConfiguration.getSftName(context.getConfiguration))</span><span style=''>
+</span>67 <span style=''>
+</span>68 <span style=''>    private val fileSize = </span><span style='background: #AEF1AE'>StorageConfiguration.getTargetFileSize(context.getConfiguration)</span><span style=''>
+</span>69 <span style=''>
+</span>70 <span style=''>    private val counter = </span><span style='background: #AEF1AE'>context.getCounter(Group, Features)</span><span style=''>
+</span>71 <span style=''>    private val cache = </span><span style='background: #AEF1AE'>scala.collection.mutable.Map.empty[Seq[PartitionKey], PartitionState]</span><span style=''>
+</span>72 <span style=''>
+</span>73 <span style=''>    private val workPath = </span><span style='background: #AEF1AE'>delegate.getOutputCommitter(context).asInstanceOf[FileOutputCommitter].getWorkPath</span><span style=''>
+</span>74 <span style=''>
+</span>75 <span style=''>    private def newState(partitions: Seq[PartitionKey]): PartitionState = {
+</span>76 <span style=''>      val estimator = </span><span style='background: #F0ADAD'>fileSize.map(storage.sizer.estimator)</span><span style=''>
+</span>77 <span style=''>      estimator match {
+</span>78 <span style=''>        case None =&gt; </span><span style='background: #F0ADAD'>new SinglePartitionState(Partition(partitions))</span><span style=''>
+</span>79 <span style=''>        case Some(e) =&gt; </span><span style='background: #F0ADAD'>new ChunkedPartitionState(Partition(partitions), e, context)</span><span style=''>
+</span>80 <span style=''>      }
+</span>81 <span style=''>    }
+</span>82 <span style=''>
+</span>83 <span style=''>    override def write(key: Void, value: SimpleFeature): Unit = {
+</span>84 <span style=''>      val partition = </span><span style='background: #F0ADAD'>storage.schemes.map(_.getPartition(value))</span><span style=''>
+</span>85 <span style=''>      val state = </span><span style='background: #F0ADAD'>cache.getOrElseUpdate(partition, newState(partition))</span><span style=''>
+</span>86 <span style=''>      </span><span style='background: #F0ADAD'>state.write(key, value)</span><span style=''>
+</span>87 <span style=''>      </span><span style='background: #F0ADAD'>counter.increment(1)</span><span style=''>
+</span>88 <span style=''>    }
+</span>89 <span style=''>
+</span>90 <span style=''>    override def close(context: TaskAttemptContext): Unit = {
+</span>91 <span style=''>      </span><span style='background: #AEF1AE'>cache.foreach { case (partition, state) </span><span style='background: #F0ADAD'>=&gt;
+</span>92 <span style=''></span><span style='background: #F0ADAD'>        logger.debug(s&quot;Closing writer for $partition&quot;)
+</span>93 <span style=''></span><span style='background: #F0ADAD'>        state.close(context)
+</span>94 <span style=''></span><span style='background: #F0ADAD'>        storage.metadata.register(Map(Partition(partition) -&gt; state.getFiles()))</span><span style='background: #AEF1AE'>
+</span>95 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>96 <span style=''>      </span><span style='background: #AEF1AE'>CloseWithLogging(Seq(storage, catalog))</span><span style=''>
+</span>97 <span style=''>    }
+</span>98 <span style=''>
+</span>99 <span style=''>    private sealed abstract class PartitionState(partition: Partition) {
+</span>100 <span style=''>
+</span>101 <span style=''>      import scala.collection.JavaConverters._
+</span>102 <span style=''>
+</span>103 <span style=''>      private val files = </span><span style='background: #F0ADAD'>new CopyOnWriteArrayList[URI]()</span><span style=''>
+</span>104 <span style=''>      private val counter = </span><span style='background: #F0ADAD'>context.getCounter(Group, StorageConfiguration.Counters.partition(partition.toString))</span><span style=''>
+</span>105 <span style=''>
+</span>106 <span style=''>      private var currentFile: Path = _
+</span>107 <span style=''>      private var featureCount: Long = </span><span style='background: #F0ADAD'>0</span><span style=''>
+</span>108 <span style=''>
+</span>109 <span style=''>      // noinspection AccessorLikeMethodIsEmptyParen
+</span>110 <span style=''>      def getFiles(): Seq[URI] = </span><span style='background: #F0ADAD'>files.asScala.toSeq</span><span style=''>
+</span>111 <span style=''>
+</span>112 <span style=''>      def write(key: Void, value: SimpleFeature): Unit = </span><span style='background: #F0ADAD'>featureCount += 1</span><span style=''>
+</span>113 <span style=''>
+</span>114 <span style=''>      def close(context: TaskAttemptContext): Unit = </span><span style='background: #F0ADAD'>closeCurrentFile()</span><span style=''>
+</span>115 <span style=''>
+</span>116 <span style=''>      protected def newWriter(): (Path, RecordWriter[Void, SimpleFeature]) = {
+</span>117 <span style=''>        </span><span style='background: #F0ADAD'>closeCurrentFile()</span><span style=''>
+</span>118 <span style=''>        // TODO is this in the right fs?
+</span>119 <span style=''>        </span><span style='background: #F0ADAD'>currentFile = new Path(workPath, FileSystemStorage.newFilePath(storage.sft.getTypeName))</span><span style=''>
+</span>120 <span style=''>        </span><span style='background: #F0ADAD'>featureCount = 0</span><span style=''>
+</span>121 <span style=''>        logger.debug(s&quot;Creating record writer at path $currentFile&quot;)
+</span>122 <span style=''>        // noinspection LanguageFeature
+</span>123 <span style=''>        </span><span style='background: #F0ADAD'>(currentFile, delegate.getRecordWriter(context, currentFile))</span><span style=''>
+</span>124 <span style=''>      }
+</span>125 <span style=''>
+</span>126 <span style=''>      private def closeCurrentFile(): Unit = {
+</span>127 <span style=''>        if (</span><span style='background: #F0ADAD'>currentFile != null</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>128 <span style=''></span><span style='background: #F0ADAD'>          files.add(currentFile.toUri)
+</span>129 <span style=''></span><span style='background: #F0ADAD'>          counter.increment(featureCount)
+</span>130 <span style=''></span><span style='background: #F0ADAD'>          currentFile = null
+</span>131 <span style=''></span><span style='background: #F0ADAD'>          featureCount = 0
+</span>132 <span style=''></span><span style='background: #F0ADAD'>        }</span><span style=''>
+</span>133 <span style=''>      }
+</span>134 <span style=''>    }
+</span>135 <span style=''>
+</span>136 <span style=''>    private class SinglePartitionState(partition: Partition) extends PartitionState(partition) {
+</span>137 <span style=''>
+</span>138 <span style=''>      private val writer = </span><span style='background: #F0ADAD'>newWriter()._2</span><span style=''>
+</span>139 <span style=''>
+</span>140 <span style=''>      override def write(key: Void, value: SimpleFeature): Unit = {
+</span>141 <span style=''>        </span><span style='background: #F0ADAD'>writer.write(key, value)</span><span style=''>
+</span>142 <span style=''>        </span><span style='background: #F0ADAD'>super.write(key, value)</span><span style=''>
+</span>143 <span style=''>      }
+</span>144 <span style=''>
+</span>145 <span style=''>      override def close(context: TaskAttemptContext): Unit = {
+</span>146 <span style=''>        </span><span style='background: #F0ADAD'>writer.close(context)</span><span style=''>
+</span>147 <span style=''>        </span><span style='background: #F0ADAD'>super.close(context)</span><span style=''>
+</span>148 <span style=''>      }
+</span>149 <span style=''>    }
+</span>150 <span style=''>
+</span>151 <span style=''>    private class ChunkedPartitionState(partition: Partition, estimator: FileSizeEstimator, context: TaskAttemptContext)
+</span>152 <span style=''>        extends PartitionState(partition) {
+</span>153 <span style=''>
+</span>154 <span style=''>      private var count = </span><span style='background: #F0ADAD'>0L</span><span style=''> // number of features written
+</span>155 <span style=''>      private var total = </span><span style='background: #F0ADAD'>0L</span><span style=''> // sum size of all finished chunks
+</span>156 <span style=''>      private var remaining = </span><span style='background: #F0ADAD'>estimator.estimate(0L)</span><span style=''>
+</span>157 <span style=''>
+</span>158 <span style=''>      logger.debug(s&quot;Initial estimate: $remaining&quot;)
+</span>159 <span style=''>
+</span>160 <span style=''>      private var path: Path = _
+</span>161 <span style=''>      private var writer: RecordWriter[Void, SimpleFeature] = _
+</span>162 <span style=''>
+</span>163 <span style=''>      override def write(key: Void, value: SimpleFeature): Unit = {
+</span>164 <span style=''>        if (</span><span style='background: #F0ADAD'>writer == null</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>165 <span style=''></span><span style='background: #F0ADAD'>          val (p, w) = newWriter()
+</span>166 <span style=''></span><span style='background: #F0ADAD'>          path = p
+</span>167 <span style=''></span><span style='background: #F0ADAD'>          writer = w
+</span>168 <span style=''></span><span style='background: #F0ADAD'>        }</span><span style=''>
+</span>169 <span style=''>        </span><span style='background: #F0ADAD'>writer.write(key, value)</span><span style=''>
+</span>170 <span style=''>        </span><span style='background: #F0ADAD'>count += 1</span><span style=''>
+</span>171 <span style=''>        </span><span style='background: #F0ADAD'>remaining -= 1</span><span style=''>
+</span>172 <span style=''>        if (</span><span style='background: #F0ADAD'>remaining == 0</span><span style=''>) </span><span style='background: #F0ADAD'>{
+</span>173 <span style=''></span><span style='background: #F0ADAD'>          // TODO if we can access the underlying parquet writer we can check the size without closing the file
+</span>174 <span style=''></span><span style='background: #F0ADAD'>          writer.close(context)
+</span>175 <span style=''></span><span style='background: #F0ADAD'>          val length = storage.table.io().newInputFile(path.toString).getLength
+</span>176 <span style=''></span><span style='background: #F0ADAD'>          logger.debug(s&quot;File length: $length $path&quot;)
+</span>177 <span style=''></span><span style='background: #F0ADAD'>          writer = null
+</span>178 <span style=''></span><span style='background: #F0ADAD'>          // adjust our estimate to account for the actual bytes written
+</span>179 <span style=''></span><span style='background: #F0ADAD'>          total += length
+</span>180 <span style=''></span><span style='background: #F0ADAD'>          estimator.update(total, count)
+</span>181 <span style=''></span><span style='background: #F0ADAD'>          remaining = estimator.estimate(0L)
+</span>182 <span style=''></span><span style='background: #F0ADAD'>          logger.debug(s&quot;New estimate: $remaining&quot;)
+</span>183 <span style=''></span><span style='background: #F0ADAD'>        }</span><span style=''>
+</span>184 <span style=''>        </span><span style='background: #F0ADAD'>super.write(key, value)</span><span style=''>
+</span>185 <span style=''>      }
+</span>186 <span style=''>
+</span>187 <span style=''>      override def close(context: TaskAttemptContext): Unit = {
+</span>188 <span style=''>        if (</span><span style='background: #F0ADAD'>writer != null</span><span style=''>) {
+</span>189 <span style=''>          </span><span style='background: #F0ADAD'>writer.close(context)</span><span style=''>
+</span>190 <span style=''>        }
+</span>191 <span style=''>        </span><span style='background: #F0ADAD'>super.close(context)</span><span style=''>
+</span>192 <span style=''>      }
+</span>193 <span style=''>    }
+</span>194 <span style=''>  }
+</span>195 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          30
+        </td>
+        <td>
+          239
+        </td>
+        <td>
+          1410
+          -
+          1448
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetSimpleFeatureOutputFormat.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new ParquetSimpleFeatureOutputFormat()
+        </td>
+      </tr><tr>
+        <td>
+          33
+        </td>
+        <td>
+          240
+        </td>
+        <td>
+          1551
+          -
+          1591
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new ParquetPartitionOutputFormat.this.PartitionSchemeRecordWriter(context)
+        </td>
+      </tr><tr>
+        <td>
+          36
+        </td>
+        <td>
+          241
+        </td>
+        <td>
+          1679
+          -
+          1715
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetSimpleFeatureOutputFormat.getOutputCommitter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ParquetPartitionOutputFormat.this.delegate.getOutputCommitter(context)
+        </td>
+      </tr><tr>
+        <td>
+          41
+        </td>
+        <td>
+          242
+        </td>
+        <td>
+          1927
+          -
+          1962
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.lib.output.FileOutputFormat.getOutputPath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.apache.hadoop.mapreduce.lib.output.FileOutputFormat.getOutputPath(job)
+        </td>
+      </tr><tr>
+        <td>
+          42
+        </td>
+        <td>
+          243
+        </td>
+        <td>
+          1971
+          -
+          1985
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          outDir.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          42
+        </td>
+        <td>
+          246
+        </td>
+        <td>
+          1967
+          -
+          1967
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          42
+        </td>
+        <td>
+          247
+        </td>
+        <td>
+          1967
+          -
+          1967
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          244
+        </td>
+        <td>
+          1995
+          -
+          2056
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new org.apache.hadoop.mapred.InvalidJobConfException(&quot;Output directory not set&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          245
+        </td>
+        <td>
+          1995
+          -
+          2056
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new org.apache.hadoop.mapred.InvalidJobConfException(&quot;Output directory not set&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          248
+        </td>
+        <td>
+          2156
+          -
+          2174
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.JobContext.getCredentials
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          job.getCredentials()
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          249
+        </td>
+        <td>
+          2176
+          -
+          2195
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Array.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Array.apply[org.apache.hadoop.fs.Path](outDir)((ClassTag.apply[org.apache.hadoop.fs.Path](classOf[org.apache.hadoop.fs.Path]): scala.reflect.ClassTag[org.apache.hadoop.fs.Path]))
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          250
+        </td>
+        <td>
+          2197
+          -
+          2217
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.JobContext.getConfiguration
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          job.getConfiguration()
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          251
+        </td>
+        <td>
+          2120
+          -
+          2218
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.security.TokenCache.obtainTokensForNamenodes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.apache.hadoop.mapreduce.security.TokenCache.obtainTokensForNamenodes(job.getCredentials(), scala.Array.apply[org.apache.hadoop.fs.Path](outDir)((ClassTag.apply[org.apache.hadoop.fs.Path](classOf[org.apache.hadoop.fs.Path]): scala.reflect.ClassTag[org.apache.hadoop.fs.Path])), job.getConfiguration())
+        </td>
+      </tr><tr>
+        <td>
+          55
+        </td>
+        <td>
+          252
+        </td>
+        <td>
+          2472
+          -
+          2496
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.JobContext.getConfiguration
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionSchemeRecordWriter.this.context.getConfiguration()
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          253
+        </td>
+        <td>
+          2538
+          -
+          2568
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.immutable.Map.newBuilder
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.Map.newBuilder[String, String]
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          254
+        </td>
+        <td>
+          2612
+          -
+          2620
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.Entry.getKey
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          e.getKey()
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          255
+        </td>
+        <td>
+          2639
+          -
+          2647
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.Entry.getKey
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          e.getKey()
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          256
+        </td>
+        <td>
+          2624
+          -
+          2648
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.conf.Configuration.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          hadoopConf.get(e.getKey())
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          257
+        </td>
+        <td>
+          2612
+          -
+          2648
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.ArrowAssoc[String](e.getKey()).-&gt;[String](hadoopConf.get(e.getKey()))
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          258
+        </td>
+        <td>
+          2601
+          -
+          2648
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.Builder.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          builder.+=(scala.Predef.ArrowAssoc[String](e.getKey()).-&gt;[String](hadoopConf.get(e.getKey())))
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          259
+        </td>
+        <td>
+          2609
+          -
+          2609
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          260
+        </td>
+        <td>
+          2577
+          -
+          2649
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Iterable.forEach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          hadoopConf.forEach(((e: java.util.Map.Entry[String,String]) =&gt; {
+  builder.+=(scala.Predef.ArrowAssoc[String](e.getKey()).-&gt;[String](hadoopConf.get(e.getKey())));
+  ()
+}))
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          261
+        </td>
+        <td>
+          2686
+          -
+          2702
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.Builder.result
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          builder.result()
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          262
+        </td>
+        <td>
+          2728
+          -
+          2772
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.getRootPath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.getRootPath(hadoopConf)
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          263
+        </td>
+        <td>
+          2779
+          -
+          2815
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemContext.create
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.core.`package`.FileSystemContext.create(root, conf)
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          264
+        </td>
+        <td>
+          2864
+          -
+          2867
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.fsc
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionSchemeRecordWriter.this.fsc
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          265
+        </td>
+        <td>
+          2849
+          -
+          2868
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.StorageCatalog.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.core.StorageCatalog.apply(PartitionSchemeRecordWriter.this.fsc)
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          266
+        </td>
+        <td>
+          2940
+          -
+          2964
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.JobContext.getConfiguration
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionSchemeRecordWriter.this.context.getConfiguration()
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          267
+        </td>
+        <td>
+          2908
+          -
+          2965
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.getSftName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.getSftName(PartitionSchemeRecordWriter.this.context.getConfiguration())
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          268
+        </td>
+        <td>
+          2895
+          -
+          2966
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.StorageCatalog.load
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionSchemeRecordWriter.this.catalog.load(org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.getSftName(PartitionSchemeRecordWriter.this.context.getConfiguration()))
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          269
+        </td>
+        <td>
+          3034
+          -
+          3058
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.JobContext.getConfiguration
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionSchemeRecordWriter.this.context.getConfiguration()
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          270
+        </td>
+        <td>
+          2995
+          -
+          3059
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.getTargetFileSize
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.getTargetFileSize(PartitionSchemeRecordWriter.this.context.getConfiguration())
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          271
+        </td>
+        <td>
+          3106
+          -
+          3111
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.Group
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.Group
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          272
+        </td>
+        <td>
+          3113
+          -
+          3121
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.Features
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.Features
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          273
+        </td>
+        <td>
+          3087
+          -
+          3122
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.TaskAttemptContext.getCounter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionSchemeRecordWriter.this.context.getCounter(org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.Group, org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.Features)
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          274
+        </td>
+        <td>
+          3147
+          -
+          3216
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.mutable.Map.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.Map.empty[Seq[org.locationtech.geomesa.fs.storage.core.PartitionKey], PartitionSchemeRecordWriter.this.PartitionState]
+        </td>
+      </tr><tr>
+        <td>
+          73
+        </td>
+        <td>
+          275
+        </td>
+        <td>
+          3245
+          -
+          3327
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.lib.output.FileOutputCommitter.getWorkPath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ParquetPartitionOutputFormat.this.delegate.getOutputCommitter(PartitionSchemeRecordWriter.this.context).asInstanceOf[org.apache.hadoop.mapreduce.lib.output.FileOutputCommitter].getWorkPath()
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          276
+        </td>
+        <td>
+          3440
+          -
+          3463
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.utils.FileSize.estimator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.storage.sizer.estimator(size)
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          277
+        </td>
+        <td>
+          3427
+          -
+          3464
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.fileSize.map[org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator]({
+  ((size: Long) =&gt; PartitionSchemeRecordWriter.this.storage.sizer.estimator(size))
+})
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          278
+        </td>
+        <td>
+          3535
+          -
+          3556
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.Partition.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partitions)
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          279
+        </td>
+        <td>
+          3510
+          -
+          3557
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.SinglePartitionState.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new PartitionSchemeRecordWriter.this.SinglePartitionState(org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partitions))
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          280
+        </td>
+        <td>
+          3510
+          -
+          3557
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.SinglePartitionState.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new PartitionSchemeRecordWriter.this.SinglePartitionState(org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partitions))
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          281
+        </td>
+        <td>
+          3608
+          -
+          3629
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.Partition.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partitions)
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          282
+        </td>
+        <td>
+          3634
+          -
+          3641
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.context
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.context
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          283
+        </td>
+        <td>
+          3582
+          -
+          3642
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new PartitionSchemeRecordWriter.this.ChunkedPartitionState(org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partitions), e, PartitionSchemeRecordWriter.this.context)
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          284
+        </td>
+        <td>
+          3582
+          -
+          3642
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new PartitionSchemeRecordWriter.this.ChunkedPartitionState(org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partitions), e, PartitionSchemeRecordWriter.this.context)
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          285
+        </td>
+        <td>
+          3766
+          -
+          3787
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.schemes.PartitionScheme.getPartition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$1.getPartition(value)
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          286
+        </td>
+        <td>
+          3765
+          -
+          3765
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.PartitionKey]
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          287
+        </td>
+        <td>
+          3746
+          -
+          3788
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.storage.schemes.map[org.locationtech.geomesa.fs.storage.core.PartitionKey, Seq[org.locationtech.geomesa.fs.storage.core.PartitionKey]](((x$1: org.locationtech.geomesa.fs.storage.core.schemes.PartitionScheme) =&gt; x$1.getPartition(value)))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.PartitionKey])
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          288
+        </td>
+        <td>
+          3840
+          -
+          3859
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.newState
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.newState(partition)
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          289
+        </td>
+        <td>
+          3807
+          -
+          3860
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.MapLike.getOrElseUpdate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.cache.getOrElseUpdate(partition, PartitionSchemeRecordWriter.this.newState(partition))
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          290
+        </td>
+        <td>
+          3867
+          -
+          3890
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          state.write(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          291
+        </td>
+        <td>
+          3897
+          -
+          3917
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.Counter.increment
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.counter.increment(1L)
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          298
+        </td>
+        <td>
+          4033
+          -
+          4200
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  (if (PartitionSchemeRecordWriter.this.logger.underlying.isDebugEnabled())
+    PartitionSchemeRecordWriter.this.logger.underlying.debug(&quot;Closing writer for {}&quot;, (partition: AnyRef))
+  else
+    (): Unit);
+  state.close(context);
+  PartitionSchemeRecordWriter.this.storage.metadata.register(scala.Predef.Map.apply[org.locationtech.geomesa.fs.storage.core.Partition, Seq[java.net.URI]](scala.Predef.ArrowAssoc[org.locationtech.geomesa.fs.storage.core.Partition](org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partition)).-&gt;[Seq[java.net.URI]](state.getFiles())))
+}
+        </td>
+      </tr><tr>
+        <td>
+          91
+        </td>
+        <td>
+          299
+        </td>
+        <td>
+          3993
+          -
+          4208
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionSchemeRecordWriter.this.cache.foreach[Seq[org.apache.iceberg.DataFile]](((x0$1: (Seq[org.locationtech.geomesa.fs.storage.core.PartitionKey], PartitionSchemeRecordWriter.this.PartitionState)) =&gt; x0$1 match {
+  case (_1: Seq[org.locationtech.geomesa.fs.storage.core.PartitionKey], _2: PartitionSchemeRecordWriter.this.PartitionState)(Seq[org.locationtech.geomesa.fs.storage.core.PartitionKey], PartitionSchemeRecordWriter.this.PartitionState)((partition @ _), (state @ _)) =&gt; {
+    (if (PartitionSchemeRecordWriter.this.logger.underlying.isDebugEnabled())
+      PartitionSchemeRecordWriter.this.logger.underlying.debug(&quot;Closing writer for {}&quot;, (partition: AnyRef))
+    else
+      (): Unit);
+    state.close(context);
+    PartitionSchemeRecordWriter.this.storage.metadata.register(scala.Predef.Map.apply[org.locationtech.geomesa.fs.storage.core.Partition, Seq[java.net.URI]](scala.Predef.ArrowAssoc[org.locationtech.geomesa.fs.storage.core.Partition](org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partition)).-&gt;[Seq[java.net.URI]](state.getFiles())))
+  }
+}))
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          292
+        </td>
+        <td>
+          4099
+          -
+          4119
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          state.close(context)
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          293
+        </td>
+        <td>
+          4158
+          -
+          4178
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.Partition.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partition)
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          294
+        </td>
+        <td>
+          4182
+          -
+          4198
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.getFiles
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          state.getFiles()
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          295
+        </td>
+        <td>
+          4158
+          -
+          4198
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.ArrowAssoc[org.locationtech.geomesa.fs.storage.core.Partition](org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partition)).-&gt;[Seq[java.net.URI]](state.getFiles())
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          296
+        </td>
+        <td>
+          4154
+          -
+          4199
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenMapFactory.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Predef.Map.apply[org.locationtech.geomesa.fs.storage.core.Partition, Seq[java.net.URI]](scala.Predef.ArrowAssoc[org.locationtech.geomesa.fs.storage.core.Partition](org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partition)).-&gt;[Seq[java.net.URI]](state.getFiles()))
+        </td>
+      </tr><tr>
+        <td>
+          94
+        </td>
+        <td>
+          297
+        </td>
+        <td>
+          4128
+          -
+          4200
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.DataFiles.register
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.storage.metadata.register(scala.Predef.Map.apply[org.locationtech.geomesa.fs.storage.core.Partition, Seq[java.net.URI]](scala.Predef.ArrowAssoc[org.locationtech.geomesa.fs.storage.core.Partition](org.locationtech.geomesa.fs.storage.core.`package`.Partition.apply(partition)).-&gt;[Seq[java.net.URI]](state.getFiles())))
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          300
+        </td>
+        <td>
+          4236
+          -
+          4243
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.storage
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionSchemeRecordWriter.this.storage
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          301
+        </td>
+        <td>
+          4245
+          -
+          4252
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.catalog
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PartitionSchemeRecordWriter.this.catalog
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          302
+        </td>
+        <td>
+          4232
+          -
+          4253
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.Seq.apply[java.io.Closeable](PartitionSchemeRecordWriter.this.storage, PartitionSchemeRecordWriter.this.catalog)
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          303
+        </td>
+        <td>
+          4231
+          -
+          4231
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.iterableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.iterableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          304
+        </td>
+        <td>
+          4215
+          -
+          4254
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[Seq[java.io.Closeable]](scala.collection.Seq.apply[java.io.Closeable](PartitionSchemeRecordWriter.this.storage, PartitionSchemeRecordWriter.this.catalog))(io.this.IsCloseable.iterableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          305
+        </td>
+        <td>
+          4231
+          -
+          4231
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          103
+        </td>
+        <td>
+          306
+        </td>
+        <td>
+          4410
+          -
+          4441
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.CopyOnWriteArrayList.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new java.util.concurrent.CopyOnWriteArrayList[java.net.URI]()
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          307
+        </td>
+        <td>
+          4489
+          -
+          4494
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.Group
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.Group
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          308
+        </td>
+        <td>
+          4496
+          -
+          4555
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.partition(PartitionState.this.partition.toString)
+        </td>
+      </tr><tr>
+        <td>
+          104
+        </td>
+        <td>
+          309
+        </td>
+        <td>
+          4470
+          -
+          4556
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.TaskAttemptContext.getCounter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.context.getCounter(org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.Group, org.locationtech.geomesa.fs.storage.jobs.StorageConfiguration.Counters.partition(PartitionState.this.partition.toString))
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          310
+        </td>
+        <td>
+          4637
+          -
+          4638
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          0L
+        </td>
+      </tr><tr>
+        <td>
+          110
+        </td>
+        <td>
+          311
+        </td>
+        <td>
+          4726
+          -
+          4731
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.files
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.files
+        </td>
+      </tr><tr>
+        <td>
+          110
+        </td>
+        <td>
+          312
+        </td>
+        <td>
+          4726
+          -
+          4745
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SeqLike.toSeq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.collection.JavaConverters.asScalaBufferConverter[java.net.URI](PartitionState.this.files).asScala.toSeq
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          313
+        </td>
+        <td>
+          4804
+          -
+          4821
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.featureCount.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          314
+        </td>
+        <td>
+          4804
+          -
+          4821
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.featureCount_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.featureCount_=(PartitionState.this.featureCount.+(1))
+        </td>
+      </tr><tr>
+        <td>
+          114
+        </td>
+        <td>
+          315
+        </td>
+        <td>
+          4876
+          -
+          4894
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.closeCurrentFile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.closeCurrentFile()
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          316
+        </td>
+        <td>
+          4983
+          -
+          5001
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.closeCurrentFile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.closeCurrentFile()
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          317
+        </td>
+        <td>
+          5074
+          -
+          5082
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.workPath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.workPath
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          318
+        </td>
+        <td>
+          5114
+          -
+          5137
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.storage.sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          319
+        </td>
+        <td>
+          5084
+          -
+          5138
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.newFilePath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.newFilePath(PartitionSchemeRecordWriter.this.storage.sft.getTypeName(), org.locationtech.geomesa.fs.storage.core.FileSystemStorage.newFilePath$default$2)
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          320
+        </td>
+        <td>
+          5065
+          -
+          5139
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new org.apache.hadoop.fs.Path(PartitionSchemeRecordWriter.this.workPath, org.locationtech.geomesa.fs.storage.core.FileSystemStorage.newFilePath(PartitionSchemeRecordWriter.this.storage.sft.getTypeName(), org.locationtech.geomesa.fs.storage.core.FileSystemStorage.newFilePath$default$2))
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          321
+        </td>
+        <td>
+          5051
+          -
+          5139
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.currentFile_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.currentFile_=(new org.apache.hadoop.fs.Path(PartitionSchemeRecordWriter.this.workPath, org.locationtech.geomesa.fs.storage.core.FileSystemStorage.newFilePath(PartitionSchemeRecordWriter.this.storage.sft.getTypeName(), org.locationtech.geomesa.fs.storage.core.FileSystemStorage.newFilePath$default$2)))
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          322
+        </td>
+        <td>
+          5148
+          -
+          5164
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.featureCount_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.featureCount_=(0L)
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          323
+        </td>
+        <td>
+          5283
+          -
+          5294
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.currentFile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.currentFile
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          324
+        </td>
+        <td>
+          5321
+          -
+          5328
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.context
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.context
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          325
+        </td>
+        <td>
+          5330
+          -
+          5341
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.currentFile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.currentFile
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          326
+        </td>
+        <td>
+          5296
+          -
+          5342
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.parquet.hadoop.ParquetOutputFormat.getRecordWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ParquetPartitionOutputFormat.this.delegate.getRecordWriter(PartitionSchemeRecordWriter.this.context, PartitionState.this.currentFile)
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          327
+        </td>
+        <td>
+          5282
+          -
+          5343
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Tuple2.apply[org.apache.hadoop.fs.Path, org.apache.hadoop.mapreduce.RecordWriter[Void,org.geotools.api.feature.simple.SimpleFeature]](PartitionState.this.currentFile, ParquetPartitionOutputFormat.this.delegate.getRecordWriter(PartitionSchemeRecordWriter.this.context, PartitionState.this.currentFile))
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          328
+        </td>
+        <td>
+          5412
+          -
+          5431
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.currentFile.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          335
+        </td>
+        <td>
+          5433
+          -
+          5581
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  PartitionState.this.files.add(PartitionState.this.currentFile.toUri());
+  PartitionState.this.counter.increment(PartitionState.this.featureCount);
+  PartitionState.this.currentFile_=(null);
+  PartitionState.this.featureCount_=(0L)
+}
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          336
+        </td>
+        <td>
+          5408
+          -
+          5408
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          337
+        </td>
+        <td>
+          5408
+          -
+          5408
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          329
+        </td>
+        <td>
+          5455
+          -
+          5472
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.fs.Path.toUri
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.currentFile.toUri()
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          330
+        </td>
+        <td>
+          5445
+          -
+          5473
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.CopyOnWriteArrayList.add
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.files.add(PartitionState.this.currentFile.toUri())
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          331
+        </td>
+        <td>
+          5502
+          -
+          5514
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.featureCount
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.featureCount
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          332
+        </td>
+        <td>
+          5484
+          -
+          5515
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.Counter.increment
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.counter.increment(PartitionState.this.featureCount)
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          333
+        </td>
+        <td>
+          5526
+          -
+          5544
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.currentFile_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.currentFile_=(null)
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          334
+        </td>
+        <td>
+          5555
+          -
+          5571
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.featureCount_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionState.this.featureCount_=(0L)
+        </td>
+      </tr><tr>
+        <td>
+          138
+        </td>
+        <td>
+          338
+        </td>
+        <td>
+          5722
+          -
+          5736
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple2._2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SinglePartitionState.this.newWriter()._2
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          339
+        </td>
+        <td>
+          5814
+          -
+          5838
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.RecordWriter.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SinglePartitionState.this.writer.write(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          340
+        </td>
+        <td>
+          5847
+          -
+          5870
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SinglePartitionState.super.write(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          146
+        </td>
+        <td>
+          341
+        </td>
+        <td>
+          5952
+          -
+          5973
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.RecordWriter.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SinglePartitionState.this.writer.close(context)
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          342
+        </td>
+        <td>
+          5982
+          -
+          6002
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          SinglePartitionState.super.close(context)
+        </td>
+      </tr><tr>
+        <td>
+          154
+        </td>
+        <td>
+          343
+        </td>
+        <td>
+          6210
+          -
+          6212
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          0L
+        </td>
+      </tr><tr>
+        <td>
+          155
+        </td>
+        <td>
+          344
+        </td>
+        <td>
+          6269
+          -
+          6271
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          0L
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          345
+        </td>
+        <td>
+          6337
+          -
+          6359
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.FileSizeEstimator.estimate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.estimator.estimate(0L)
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          346
+        </td>
+        <td>
+          6592
+          -
+          6606
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.writer.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          354
+        </td>
+        <td>
+          6608
+          -
+          6694
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  &lt;synthetic&gt; &lt;artifact&gt; private[this] val x$2: (org.apache.hadoop.fs.Path, org.apache.hadoop.mapreduce.RecordWriter[Void,org.geotools.api.feature.simple.SimpleFeature]) = (ChunkedPartitionState.this.newWriter(): (org.apache.hadoop.fs.Path, org.apache.hadoop.mapreduce.RecordWriter[Void,org.geotools.api.feature.simple.SimpleFeature]) @unchecked) match {
+    case (_1: org.apache.hadoop.fs.Path, _2: org.apache.hadoop.mapreduce.RecordWriter[Void,org.geotools.api.feature.simple.SimpleFeature])(org.apache.hadoop.fs.Path, org.apache.hadoop.mapreduce.RecordWriter[Void,org.geotools.api.feature.simple.SimpleFeature])((p @ _), (w @ _)) =&gt; scala.Tuple2.apply[org.apache.hadoop.fs.Path, org.apache.hadoop.mapreduce.RecordWriter[Void,org.geotools.api.feature.simple.SimpleFeature]](p, w)
+  };
+  val p: org.apache.hadoop.fs.Path = x$2._1;
+  val w: org.apache.hadoop.mapreduce.RecordWriter[Void,org.geotools.api.feature.simple.SimpleFeature] = x$2._2;
+  ChunkedPartitionState.this.path_=(p);
+  ChunkedPartitionState.this.writer_=(w)
+}
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          355
+        </td>
+        <td>
+          6588
+          -
+          6588
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          356
+        </td>
+        <td>
+          6588
+          -
+          6588
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          347
+        </td>
+        <td>
+          6633
+          -
+          6644
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.newWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.newWriter()
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          348
+        </td>
+        <td>
+          6624
+          -
+          6630
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Tuple2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Tuple2.apply[org.apache.hadoop.fs.Path, org.apache.hadoop.mapreduce.RecordWriter[Void,org.geotools.api.feature.simple.SimpleFeature]](p, w)
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          349
+        </td>
+        <td>
+          6624
+          -
+          6630
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Tuple2.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          scala.Tuple2.apply[org.apache.hadoop.fs.Path, org.apache.hadoop.mapreduce.RecordWriter[Void,org.geotools.api.feature.simple.SimpleFeature]](p, w)
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          350
+        </td>
+        <td>
+          6625
+          -
+          6625
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple2._1
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$2._1
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          351
+        </td>
+        <td>
+          6628
+          -
+          6628
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Tuple2._2
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          x$2._2
+        </td>
+      </tr><tr>
+        <td>
+          166
+        </td>
+        <td>
+          352
+        </td>
+        <td>
+          6655
+          -
+          6663
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.path_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.path_=(p)
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          353
+        </td>
+        <td>
+          6674
+          -
+          6684
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.writer_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.writer_=(w)
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          357
+        </td>
+        <td>
+          6703
+          -
+          6727
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.RecordWriter.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.writer.write(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          358
+        </td>
+        <td>
+          6736
+          -
+          6746
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.count.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          359
+        </td>
+        <td>
+          6736
+          -
+          6746
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.count_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.count_=(ChunkedPartitionState.this.count.+(1))
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          360
+        </td>
+        <td>
+          6755
+          -
+          6769
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.remaining.-(1)
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          361
+        </td>
+        <td>
+          6755
+          -
+          6769
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.remaining_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.remaining_=(ChunkedPartitionState.this.remaining.-(1))
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          362
+        </td>
+        <td>
+          6782
+          -
+          6796
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.remaining.==(0)
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          374
+        </td>
+        <td>
+          6798
+          -
+          7348
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          {
+  ChunkedPartitionState.this.writer.close(ChunkedPartitionState.this.context);
+  val length: Long = PartitionSchemeRecordWriter.this.storage.table.io().newInputFile(ChunkedPartitionState.this.path.toString()).getLength();
+  (if (PartitionSchemeRecordWriter.this.logger.underlying.isDebugEnabled())
+    PartitionSchemeRecordWriter.this.logger.underlying.debug(&quot;File length: {} {}&quot;, (scala.Array.apply[AnyRef](length.asInstanceOf[AnyRef], (ChunkedPartitionState.this.path: AnyRef))((ClassTag.AnyRef: scala.reflect.ClassTag[AnyRef])): _*))
+  else
+    (): Unit);
+  ChunkedPartitionState.this.writer_=(null);
+  ChunkedPartitionState.this.total_=(ChunkedPartitionState.this.total.+(length));
+  ChunkedPartitionState.this.estimator.update(ChunkedPartitionState.this.total, ChunkedPartitionState.this.count);
+  ChunkedPartitionState.this.remaining_=(ChunkedPartitionState.this.estimator.estimate(0L));
+  (if (PartitionSchemeRecordWriter.this.logger.underlying.isDebugEnabled())
+    PartitionSchemeRecordWriter.this.logger.underlying.debug(&quot;New estimate: {}&quot;, ChunkedPartitionState.this.remaining.asInstanceOf[AnyRef])
+  else
+    (): Unit)
+}
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          375
+        </td>
+        <td>
+          6778
+          -
+          6778
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          376
+        </td>
+        <td>
+          6778
+          -
+          6778
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          174
+        </td>
+        <td>
+          363
+        </td>
+        <td>
+          6935
+          -
+          6942
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.context
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.context
+        </td>
+      </tr><tr>
+        <td>
+          174
+        </td>
+        <td>
+          364
+        </td>
+        <td>
+          6922
+          -
+          6943
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.RecordWriter.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.writer.close(ChunkedPartitionState.this.context)
+        </td>
+      </tr><tr>
+        <td>
+          175
+        </td>
+        <td>
+          365
+        </td>
+        <td>
+          6967
+          -
+          7023
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.io.InputFile.getLength
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          PartitionSchemeRecordWriter.this.storage.table.io().newInputFile(ChunkedPartitionState.this.path.toString()).getLength()
+        </td>
+      </tr><tr>
+        <td>
+          177
+        </td>
+        <td>
+          366
+        </td>
+        <td>
+          7088
+          -
+          7101
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.writer_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.writer_=(null)
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          367
+        </td>
+        <td>
+          7185
+          -
+          7200
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.total.+(length)
+        </td>
+      </tr><tr>
+        <td>
+          179
+        </td>
+        <td>
+          368
+        </td>
+        <td>
+          7185
+          -
+          7200
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.total_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.total_=(ChunkedPartitionState.this.total.+(length))
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          369
+        </td>
+        <td>
+          7228
+          -
+          7233
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.total
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.total
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          370
+        </td>
+        <td>
+          7235
+          -
+          7240
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.count
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.count
+        </td>
+      </tr><tr>
+        <td>
+          180
+        </td>
+        <td>
+          371
+        </td>
+        <td>
+          7211
+          -
+          7241
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.FileSizeEstimator.update
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.estimator.update(ChunkedPartitionState.this.total, ChunkedPartitionState.this.count)
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          372
+        </td>
+        <td>
+          7264
+          -
+          7286
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.FileSizeEstimator.estimate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.estimator.estimate(0L)
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          373
+        </td>
+        <td>
+          7252
+          -
+          7286
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.ChunkedPartitionState.remaining_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.remaining_=(ChunkedPartitionState.this.estimator.estimate(0L))
+        </td>
+      </tr><tr>
+        <td>
+          184
+        </td>
+        <td>
+          377
+        </td>
+        <td>
+          7357
+          -
+          7380
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.super.write(key, value)
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          378
+        </td>
+        <td>
+          7466
+          -
+          7480
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.writer.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          381
+        </td>
+        <td>
+          7462
+          -
+          7462
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          382
+        </td>
+        <td>
+          7462
+          -
+          7462
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          379
+        </td>
+        <td>
+          7494
+          -
+          7515
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.RecordWriter.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.writer.close(context)
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          380
+        </td>
+        <td>
+          7494
+          -
+          7515
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.hadoop.mapreduce.RecordWriter.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.this.writer.close(context)
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          383
+        </td>
+        <td>
+          7534
+          -
+          7554
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.jobs.parquet.ParquetPartitionOutputFormat.PartitionSchemeRecordWriter.PartitionState.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ChunkedPartitionState.super.close(context)
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>
