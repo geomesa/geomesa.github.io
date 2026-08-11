@@ -1,1 +1,1 @@
-packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html"},{"l":"org.locationtech.geomesa.index.conf"},{"l":"org.locationtech.geomesa.index.geotools"},{"l":"org.locationtech.geomesa.index.view"}];updateSearchResults();
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html","k":"18"},{"l":"org.locationtech.geomesa.index.conf"},{"l":"org.locationtech.geomesa.index.geotools"},{"l":"org.locationtech.geomesa.index.view"}];updateSearchResults();
