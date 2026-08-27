@@ -32,11 +32,11 @@
 </span>8 <span style=''>
 </span>9 <span style=''>package org.locationtech.geomesa.fs.storage.core.iceberg
 </span>10 <span style=''>
-</span>11 <span style=''>import org.apache.iceberg.data.parquet.GenericParquetWriter
-</span>12 <span style=''>import org.apache.iceberg.deletes.PositionDelete
-</span>13 <span style=''>import org.apache.iceberg.parquet.Parquet
-</span>14 <span style=''>import org.apache.iceberg.{DeleteFile, Schema}
-</span>15 <span style=''>import org.apache.parquet.schema.MessageType
+</span>11 <span style=''>import org.apache.iceberg.data.{BaseDeleteLoader, DeleteLoader}
+</span>12 <span style=''>import org.apache.iceberg.deletes.{BaseDVFileWriter, DVFileWriter, PositionDeleteIndex}
+</span>13 <span style=''>import org.apache.iceberg.io.OutputFile
+</span>14 <span style=''>import org.apache.iceberg.util.{CharSequenceMap, DeleteFileSet}
+</span>15 <span style=''>import org.apache.iceberg.{DeleteFile, ManifestFiles, PartitionSpec, StructLike}
 </span>16 <span style=''>import org.geotools.api.data.Query
 </span>17 <span style=''>import org.geotools.api.feature.simple.SimpleFeature
 </span>18 <span style=''>import org.geotools.api.filter.Filter
@@ -49,162 +49,207 @@
 </span>25 <span style=''>import org.locationtech.geomesa.index.geotools.GeoMesaFeatureWriter
 </span>26 <span style=''>import org.locationtech.geomesa.security.SecurityUtils
 </span>27 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
-</span>28 <span style=''>import org.locationtech.geomesa.utils.io.{CloseWithLogging, FlushQuietly}
+</span>28 <span style=''>import org.locationtech.geomesa.utils.io.{CloseQuietly, CloseWithLogging, FlushQuietly, WithClose}
 </span>29 <span style=''>
 </span>30 <span style=''>import java.io.{Closeable, Flushable}
 </span>31 <span style=''>import java.util.Collections
 </span>32 <span style=''>import java.util.concurrent.ConcurrentHashMap
 </span>33 <span style=''>import java.util.concurrent.atomic.AtomicBoolean
-</span>34 <span style=''>
-</span>35 <span style=''>/**
-</span>36 <span style=''> * Update writer implementation
-</span>37 <span style=''> *
-</span>38 <span style=''> * @param storage file system storage instance
-</span>39 <span style=''> * @param reader features to update
-</span>40 <span style=''> * @param writer writer for updated features
-</span>41 <span style=''> * @param deleter deleter for removed/modified features
-</span>42 <span style=''> */
-</span>43 <span style=''>class IcebergUpdateWriter(
-</span>44 <span style=''>    storage: FileSystemStorage,
-</span>45 <span style=''>    reader: CloseableIterator[SimpleFeature],
-</span>46 <span style=''>    writer: MultiPartitionWriter,
-</span>47 <span style=''>    deleter: MultiPartitionDeleter,
-</span>48 <span style=''>  ) extends FileSystemUpdateWriter {
-</span>49 <span style=''>
-</span>50 <span style=''>  // feature returned from reader
-</span>51 <span style=''>  private var original: SimpleFeature = _
-</span>52 <span style=''>
-</span>53 <span style=''>  // feature that caller will modify
-</span>54 <span style=''>  private var live: FastSettableFeature = _
-</span>55 <span style=''>
-</span>56 <span style=''>  override def hasNext: Boolean = </span><span style='background: #AEF1AE'>reader.hasNext</span><span style=''>
-</span>57 <span style=''>
-</span>58 <span style=''>  override def next(): FastSettableFeature = {
-</span>59 <span style=''>    </span><span style='background: #AEF1AE'>original = reader.next()</span><span style=''>
-</span>60 <span style=''>    </span><span style='background: #AEF1AE'>live = ScalaSimpleFeature.copy(storage.sft, original)</span><span style=''> // this copies user data as well
-</span>61 <span style=''>    // set the use provided FID hint - allows user to update fid if desired,
-</span>62 <span style=''>    // but if not we'll use the existing one
-</span>63 <span style=''>    </span><span style='background: #AEF1AE'>live.getUserData.put(Hints.USE_PROVIDED_FID, java.lang.Boolean.TRUE)</span><span style=''>
-</span>64 <span style=''>    </span><span style='background: #AEF1AE'>live</span><span style=''>
-</span>65 <span style=''>  }
-</span>66 <span style=''>
-</span>67 <span style=''>  override def write(): Unit = {
-</span>68 <span style=''>    if (</span><span style='background: #AEF1AE'>original == null</span><span style=''>) {
-</span>69 <span style=''>      </span><span style='background: #F0ADAD'>throw new IllegalStateException(&quot;next() must be called before write()&quot;)</span><span style=''>
-</span>70 <span style=''>    }
-</span>71 <span style=''>    // update the feature id based on hints before we compare for changes
-</span>72 <span style=''>    </span><span style='background: #AEF1AE'>live = GeoMesaFeatureWriter.featureWithFid(live)</span><span style=''>
-</span>73 <span style=''>    // only write if feature has actually changed...
-</span>74 <span style=''>    // comparison of feature ID and attributes - doesn't consider concrete class used
-</span>75 <span style=''>    if (</span><span style='background: #AEF1AE'>!ScalaSimpleFeature.equalIdAndAttributes(live, original) ||
-</span>76 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>SecurityUtils.getVisibility(live) != SecurityUtils.getVisibility(original)</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>77 <span style=''></span><span style='background: #AEF1AE'>      deleter(original)
-</span>78 <span style=''></span><span style='background: #AEF1AE'>      writer(live)
-</span>79 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>80 <span style=''>    </span><span style='background: #AEF1AE'>original = null</span><span style=''>
-</span>81 <span style=''>    </span><span style='background: #AEF1AE'>live = null</span><span style=''>
-</span>82 <span style=''>  }
-</span>83 <span style=''>
-</span>84 <span style=''>  override def remove(): Unit = {
-</span>85 <span style=''>    if (</span><span style='background: #AEF1AE'>original == null</span><span style=''>) {
-</span>86 <span style=''>      </span><span style='background: #F0ADAD'>throw new IllegalStateException(&quot;next() must be called before remove()&quot;)</span><span style=''>
-</span>87 <span style=''>    }
-</span>88 <span style=''>    </span><span style='background: #AEF1AE'>deleter(original)</span><span style=''>
-</span>89 <span style=''>    </span><span style='background: #AEF1AE'>original = null</span><span style=''>
-</span>90 <span style=''>    </span><span style='background: #AEF1AE'>live = null</span><span style=''>
-</span>91 <span style=''>  }
-</span>92 <span style=''>
-</span>93 <span style=''>  override def flush(): Unit = </span><span style='background: #F0ADAD'>FlushQuietly.raise(writer, deleter)</span><span style=''>
-</span>94 <span style=''>
-</span>95 <span style=''>  override def close(): Unit = {
-</span>96 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging.raise(Seq(reader, writer, deleter))</span><span style=''>
-</span>97 <span style=''>    if (</span><span style='background: #AEF1AE'>!deleter.files.isEmpty</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>98 <span style=''></span><span style='background: #AEF1AE'>      val delta = storage.table.newRowDelta()
-</span>99 <span style=''></span><span style='background: #AEF1AE'>      deleter.files.forEach(f =&gt; delta.addDeletes(f))
-</span>100 <span style=''></span><span style='background: #AEF1AE'>      delta.commit()
-</span>101 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>102 <span style=''>  }
-</span>103 <span style=''>}
-</span>104 <span style=''>
-</span>105 <span style=''>object IcebergUpdateWriter {
-</span>106 <span style=''>
-</span>107 <span style=''>  /**
-</span>108 <span style=''>   * Create a new update writer
-</span>109 <span style=''>   *
-</span>110 <span style=''>   * @param storage storage
-</span>111 <span style=''>   * @param filter filter for features to update
-</span>112 <span style=''>   * @param readThreads number of threads using to read features to update
-</span>113 <span style=''>   * @param maxOpenPartitions max open writer partitions
-</span>114 <span style=''>   * @return
-</span>115 <span style=''>   */
-</span>116 <span style=''>  def apply(storage: FileSystemStorage, filter: Filter, readThreads: Int, maxOpenPartitions: Int): IcebergUpdateWriter = {
-</span>117 <span style=''>    // note: writer and deleter are Closeable, but they don't need to be closed unless they initialize at least one partition,
-</span>118 <span style=''>    // so it's safe to not clean them up if there's an exception in this method
-</span>119 <span style=''>    val writer = </span><span style='background: #AEF1AE'>new MultiPartitionWriter(storage, maxOpenPartitions)</span><span style=''>
-</span>120 <span style=''>    val deleter = </span><span style='background: #AEF1AE'>new MultiPartitionDeleter(storage, maxOpenPartitions)</span><span style=''>
-</span>121 <span style=''>    // note: this class expects the reader to return RecordSimpleFeatures, but this isn't enforced through the call signature
-</span>122 <span style=''>    val reader = </span><span style='background: #AEF1AE'>storage.getReader(new Query(storage.sft.getTypeName, filter), readThreads, forUpdate = true)</span><span style=''>
-</span>123 <span style=''>    </span><span style='background: #AEF1AE'>new IcebergUpdateWriter(storage, reader, writer, deleter)</span><span style=''>
-</span>124 <span style=''>  }
-</span>125 <span style=''>
-</span>126 <span style=''>  /**
-</span>127 <span style=''>   * Multi-partition deleter
-</span>128 <span style=''>   *
-</span>129 <span style=''>   * @param storage file system storage instance
-</span>130 <span style=''>   * @param maxOpenPartitions max open partition writers
-</span>131 <span style=''>   */
-</span>132 <span style=''>  private class MultiPartitionDeleter(storage: FileSystemStorage, maxOpenPartitions: Int)
-</span>133 <span style=''>      extends MultiPartitionAction[DeleteWriter](storage, maxOpenPartitions) {
-</span>134 <span style=''>
-</span>135 <span style=''>    val files: java.util.Set[DeleteFile] = </span><span style='background: #AEF1AE'>Collections.newSetFromMap(new ConcurrentHashMap[DeleteFile, java.lang.Boolean]())</span><span style=''>
-</span>136 <span style=''>
-</span>137 <span style=''>    override protected def createAction(partition: Partition): DeleteWriter = </span><span style='background: #AEF1AE'>new DeleteWriter(storage, partition, files)</span><span style=''>
-</span>138 <span style=''>    override protected def apply(action: DeleteWriter, feature: SimpleFeature): Unit =
-</span>139 <span style=''>      </span><span style='background: #AEF1AE'>action.apply(feature.asInstanceOf[StructSimpleFeature])</span><span style=''>
-</span>140 <span style=''>  }
-</span>141 <span style=''>
-</span>142 <span style=''>  /**
-</span>143 <span style=''>   * Single partition deleter
-</span>144 <span style=''>   *
-</span>145 <span style=''>   * @param storage file system storage instance
-</span>146 <span style=''>   * @param partition partition to delete records out of
-</span>147 <span style=''>   * @param files set for returning any delete files created by this deleter
-</span>148 <span style=''>   */
-</span>149 <span style=''>  private class DeleteWriter(storage: FileSystemStorage, partition: Partition, files: java.util.Set[DeleteFile])
-</span>150 <span style=''>      extends (StructSimpleFeature =&gt; Unit) with Closeable with Flushable {
+</span>34 <span style=''>import java.util.function.{Function, Supplier}
+</span>35 <span style=''>
+</span>36 <span style=''>/**
+</span>37 <span style=''> * Update writer implementation
+</span>38 <span style=''> *
+</span>39 <span style=''> * @param storage file system storage instance
+</span>40 <span style=''> * @param reader features to update
+</span>41 <span style=''> * @param writer writer for updated features
+</span>42 <span style=''> * @param deleter deleter for removed/modified features
+</span>43 <span style=''> */
+</span>44 <span style=''>class IcebergUpdateWriter(
+</span>45 <span style=''>    storage: FileSystemStorage,
+</span>46 <span style=''>    reader: CloseableIterator[SimpleFeature],
+</span>47 <span style=''>    writer: MultiPartitionWriter,
+</span>48 <span style=''>    deleter: MultiPartitionDeleter,
+</span>49 <span style=''>  ) extends FileSystemUpdateWriter {
+</span>50 <span style=''>
+</span>51 <span style=''>  // feature returned from reader
+</span>52 <span style=''>  private var original: SimpleFeature = _
+</span>53 <span style=''>
+</span>54 <span style=''>  // feature that caller will modify
+</span>55 <span style=''>  private var live: FastSettableFeature = _
+</span>56 <span style=''>
+</span>57 <span style=''>  override def hasNext: Boolean = </span><span style='background: #AEF1AE'>reader.hasNext</span><span style=''>
+</span>58 <span style=''>
+</span>59 <span style=''>  override def next(): FastSettableFeature = {
+</span>60 <span style=''>    </span><span style='background: #AEF1AE'>original = reader.next()</span><span style=''>
+</span>61 <span style=''>    </span><span style='background: #AEF1AE'>live = ScalaSimpleFeature.copy(storage.sft, original)</span><span style=''> // this copies user data as well
+</span>62 <span style=''>    // set the use provided FID hint - allows user to update fid if desired,
+</span>63 <span style=''>    // but if not we'll use the existing one
+</span>64 <span style=''>    </span><span style='background: #AEF1AE'>live.getUserData.put(Hints.USE_PROVIDED_FID, java.lang.Boolean.TRUE)</span><span style=''>
+</span>65 <span style=''>    </span><span style='background: #AEF1AE'>live</span><span style=''>
+</span>66 <span style=''>  }
+</span>67 <span style=''>
+</span>68 <span style=''>  override def write(): Unit = {
+</span>69 <span style=''>    if (</span><span style='background: #AEF1AE'>original == null</span><span style=''>) {
+</span>70 <span style=''>      </span><span style='background: #F0ADAD'>throw new IllegalStateException(&quot;next() must be called before write()&quot;)</span><span style=''>
+</span>71 <span style=''>    }
+</span>72 <span style=''>    // update the feature id based on hints before we compare for changes
+</span>73 <span style=''>    </span><span style='background: #AEF1AE'>live = GeoMesaFeatureWriter.featureWithFid(live)</span><span style=''>
+</span>74 <span style=''>    // only write if feature has actually changed...
+</span>75 <span style=''>    // comparison of feature ID and attributes - doesn't consider concrete class used
+</span>76 <span style=''>    if (</span><span style='background: #AEF1AE'>!ScalaSimpleFeature.equalIdAndAttributes(live, original) ||
+</span>77 <span style=''></span><span style='background: #AEF1AE'>        </span><span style='background: #F0ADAD'>SecurityUtils.getVisibility(live) != SecurityUtils.getVisibility(original)</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>78 <span style=''></span><span style='background: #AEF1AE'>      deleter(original)
+</span>79 <span style=''></span><span style='background: #AEF1AE'>      writer(live)
+</span>80 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>81 <span style=''>    </span><span style='background: #AEF1AE'>original = null</span><span style=''>
+</span>82 <span style=''>    </span><span style='background: #AEF1AE'>live = null</span><span style=''>
+</span>83 <span style=''>  }
+</span>84 <span style=''>
+</span>85 <span style=''>  override def remove(): Unit = {
+</span>86 <span style=''>    if (</span><span style='background: #AEF1AE'>original == null</span><span style=''>) {
+</span>87 <span style=''>      </span><span style='background: #F0ADAD'>throw new IllegalStateException(&quot;next() must be called before remove()&quot;)</span><span style=''>
+</span>88 <span style=''>    }
+</span>89 <span style=''>    </span><span style='background: #AEF1AE'>deleter(original)</span><span style=''>
+</span>90 <span style=''>    </span><span style='background: #AEF1AE'>original = null</span><span style=''>
+</span>91 <span style=''>    </span><span style='background: #AEF1AE'>live = null</span><span style=''>
+</span>92 <span style=''>  }
+</span>93 <span style=''>
+</span>94 <span style=''>  override def flush(): Unit = </span><span style='background: #F0ADAD'>FlushQuietly.raise(writer, deleter)</span><span style=''>
+</span>95 <span style=''>
+</span>96 <span style=''>  override def close(): Unit = {
+</span>97 <span style=''>    </span><span style='background: #AEF1AE'>CloseWithLogging.raise(Seq(reader, writer, deleter))</span><span style=''>
+</span>98 <span style=''>    if (</span><span style='background: #AEF1AE'>!deleter.files.isEmpty</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>99 <span style=''></span><span style='background: #AEF1AE'>      val delta = storage.table.newRowDelta()
+</span>100 <span style=''></span><span style='background: #AEF1AE'>      // guard against concurrent commits that touch the same delete files
+</span>101 <span style=''></span><span style='background: #AEF1AE'>      Option(storage.table.currentSnapshot()).foreach(s =&gt; delta.validateFromSnapshot(s.snapshotId()))
+</span>102 <span style=''></span><span style='background: #AEF1AE'>      deleter.files.forEach(f =&gt; delta.addDeletes(f))
+</span>103 <span style=''></span><span style='background: #AEF1AE'>      // remove any previous DVs whose deletes we merged into the newly written DVs, otherwise
+</span>104 <span style=''></span><span style='background: #AEF1AE'>      // the commit will fail validation with multiple live DVs referencing the same data file
+</span>105 <span style=''></span><span style='background: #AEF1AE'>      deleter.rewritten.forEach(f =&gt; delta.removeDeletes(f))
+</span>106 <span style=''></span><span style='background: #AEF1AE'>      delta.commit()
+</span>107 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>108 <span style=''>  }
+</span>109 <span style=''>}
+</span>110 <span style=''>
+</span>111 <span style=''>object IcebergUpdateWriter {
+</span>112 <span style=''>
+</span>113 <span style=''>  /**
+</span>114 <span style=''>   * Create a new update writer
+</span>115 <span style=''>   *
+</span>116 <span style=''>   * @param storage storage
+</span>117 <span style=''>   * @param filter filter for features to update
+</span>118 <span style=''>   * @param readThreads number of threads using to read features to update
+</span>119 <span style=''>   * @param maxOpenPartitions max open writer partitions
+</span>120 <span style=''>   * @return
+</span>121 <span style=''>   */
+</span>122 <span style=''>  def apply(storage: FileSystemStorage, filter: Filter, readThreads: Int, maxOpenPartitions: Int): IcebergUpdateWriter = {
+</span>123 <span style=''>    // note: writer and deleter are Closeable, but they don't need to be closed unless they initialize at least one partition,
+</span>124 <span style=''>    // so it's safe to not clean them up if there's an exception in this method
+</span>125 <span style=''>    val writer = </span><span style='background: #AEF1AE'>new MultiPartitionWriter(storage, maxOpenPartitions)</span><span style=''>
+</span>126 <span style=''>    val deleter = </span><span style='background: #AEF1AE'>new MultiPartitionDeleter(storage, maxOpenPartitions)</span><span style=''>
+</span>127 <span style=''>    // note: this class expects the reader to return RecordSimpleFeatures, but this isn't enforced through the call signature
+</span>128 <span style=''>    val reader = </span><span style='background: #AEF1AE'>storage.getReader(new Query(storage.sft.getTypeName, filter), readThreads, forUpdate = true)</span><span style=''>
+</span>129 <span style=''>    </span><span style='background: #AEF1AE'>new IcebergUpdateWriter(storage, reader, writer, deleter)</span><span style=''>
+</span>130 <span style=''>  }
+</span>131 <span style=''>
+</span>132 <span style=''>  /**
+</span>133 <span style=''>   * Multi-partition deleter
+</span>134 <span style=''>   *
+</span>135 <span style=''>   * @param storage file system storage instance
+</span>136 <span style=''>   * @param maxOpenPartitions max open partition writers
+</span>137 <span style=''>   */
+</span>138 <span style=''>  private class MultiPartitionDeleter(storage: FileSystemStorage, maxOpenPartitions: Int)
+</span>139 <span style=''>      extends MultiPartitionAction[DeleteWriter](storage, maxOpenPartitions) {
+</span>140 <span style=''>
+</span>141 <span style=''>    // newly written delete files (DVs) to add on commit
+</span>142 <span style=''>    val files: java.util.Set[DeleteFile] = </span><span style='background: #AEF1AE'>Collections.newSetFromMap(new ConcurrentHashMap[DeleteFile, java.lang.Boolean]())</span><span style=''>
+</span>143 <span style=''>    // previous DVs whose deletes we merged into the new DVs - these must be removed on commit
+</span>144 <span style=''>    val rewritten: java.util.Set[DeleteFile] = </span><span style='background: #AEF1AE'>Collections.newSetFromMap(new ConcurrentHashMap[DeleteFile, java.lang.Boolean]())</span><span style=''>
+</span>145 <span style=''>
+</span>146 <span style=''>    private val closed = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
+</span>147 <span style=''>    private val fileSupplier: Supplier[OutputFile] = () =&gt; </span><span style='background: #AEF1AE'>storage.table.io().newOutputFile(storage.newFilePath(&quot;puffin&quot;))</span><span style=''>
+</span>148 <span style=''>    // loads existing deletes for a data file so they can be merged into the new DV - a data file
+</span>149 <span style=''>    // can only be referenced by a single DV, so we have to rewrite any existing one
+</span>150 <span style=''>    private val writer = </span><span style='background: #AEF1AE'>new BaseDVFileWriter(fileSupplier, new PreviousDeleteLoader(storage))</span><span style=''>
 </span>151 <span style=''>
-</span>152 <span style=''>    private val closed = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
-</span>153 <span style=''>    private val deletes = </span><span style='background: #AEF1AE'>Seq.newBuilder[(String, Long)]</span><span style=''>
-</span>154 <span style=''>    private val path = </span><span style='background: #AEF1AE'>storage.newFilePath(&quot;x-&quot;)</span><span style=''>
-</span>155 <span style=''>    private val file = </span><span style='background: #AEF1AE'>storage.table.io().newOutputFile(path)</span><span style=''>
+</span>152 <span style=''>    override protected def createAction(partition: Partition): DeleteWriter =
+</span>153 <span style=''>      </span><span style='background: #AEF1AE'>new DeleteWriter(writer, storage.table.spec(), storage.metadata.partition(partition))</span><span style=''>
+</span>154 <span style=''>    override protected def apply(action: DeleteWriter, feature: SimpleFeature): Unit =
+</span>155 <span style=''>      </span><span style='background: #AEF1AE'>action.apply(feature.asInstanceOf[StructSimpleFeature])</span><span style=''>
 </span>156 <span style=''>
-</span>157 <span style=''>    private val writer =
-</span>158 <span style=''>      </span><span style='background: #AEF1AE'>Parquet.writeDeletes(file)
-</span>159 <span style=''></span><span style='background: #AEF1AE'>        .withSpec(storage.table.spec())
-</span>160 <span style=''></span><span style='background: #AEF1AE'>        .withPartition(storage.metadata.partition(partition))
-</span>161 <span style=''></span><span style='background: #AEF1AE'>        .createWriterFunc((schema: Schema, `type`: MessageType) =&gt; GenericParquetWriter.create(schema, `type`))
-</span>162 <span style=''></span><span style='background: #AEF1AE'>        .buildPositionWriter[Unit]()</span><span style=''>
-</span>163 <span style=''>
-</span>164 <span style=''>    override def apply(feature: StructSimpleFeature): Unit = </span><span style='background: #AEF1AE'>deletes += (feature.getFilePath -&gt; feature.getRowPosition)</span><span style=''>
-</span>165 <span style=''>
-</span>166 <span style=''>    override def flush(): Unit = </span><span style='background: #F0ADAD'>{}</span><span style=''>
-</span>167 <span style=''>
-</span>168 <span style=''>    override def close(): Unit = {
-</span>169 <span style=''>      if (</span><span style='background: #AEF1AE'>closed.compareAndSet(false, true)</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>170 <span style=''></span><span style='background: #AEF1AE'>        try {
-</span>171 <span style=''></span><span style='background: #AEF1AE'>          val struct = PositionDelete.create[Unit]()
-</span>172 <span style=''></span><span style='background: #AEF1AE'>          // note: deletes need to be sorted by file+row
-</span>173 <span style=''></span><span style='background: #AEF1AE'>          deletes.result().sorted.foreach { case (path, pos) =&gt;
-</span>174 <span style=''></span><span style='background: #AEF1AE'>            writer.write(struct.set(path, pos))
-</span>175 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>176 <span style=''></span><span style='background: #AEF1AE'>        } finally{
-</span>177 <span style=''></span><span style='background: #AEF1AE'>          CloseWithLogging(writer)
-</span>178 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>179 <span style=''></span><span style='background: #AEF1AE'>        files.add(writer.toDeleteFile)
-</span>180 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
-</span>181 <span style=''>    }
-</span>182 <span style=''>  }
-</span>183 <span style=''>}
+</span>157 <span style=''>    override def close(): Unit = {
+</span>158 <span style=''>      if (</span><span style='background: #AEF1AE'>closed.compareAndSet(false, true)</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>159 <span style=''></span><span style='background: #AEF1AE'>        try { super.close() } finally  {
+</span>160 <span style=''></span><span style='background: #AEF1AE'>          CloseQuietly.raise(writer)
+</span>161 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>162 <span style=''></span><span style='background: #AEF1AE'>        val result = writer.result()
+</span>163 <span style=''></span><span style='background: #AEF1AE'>        files.addAll(result.deleteFiles())
+</span>164 <span style=''></span><span style='background: #AEF1AE'>        rewritten.addAll(result.rewrittenDeleteFiles())
+</span>165 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>166 <span style=''>    }
+</span>167 <span style=''>  }
+</span>168 <span style=''>
+</span>169 <span style=''>  /**
+</span>170 <span style=''>   * Loads existing deletes (deletion vectors) for a given data file path, so they can be merged into a
+</span>171 <span style=''>   * newly written DV. Returns null if there are no existing deletes for the given path.
+</span>172 <span style=''>   *
+</span>173 <span style=''>   * @param storage file system storage instance
+</span>174 <span style=''>   */
+</span>175 <span style=''>  private class PreviousDeleteLoader(storage: FileSystemStorage) extends Function[String, PositionDeleteIndex] {
+</span>176 <span style=''>
+</span>177 <span style=''>    import scala.collection.JavaConverters._
+</span>178 <span style=''>
+</span>179 <span style=''>    // map of data-file-path -&gt; set of delete files that reference it, from the current table state
+</span>180 <span style=''>    private lazy val deletesByPath: CharSequenceMap[DeleteFileSet] = {
+</span>181 <span style=''>      val map = CharSequenceMap.create[DeleteFileSet]()
+</span>182 <span style=''>      val snapshot = storage.table.currentSnapshot()
+</span>183 <span style=''>      if (snapshot != null) {
+</span>184 <span style=''>        val io = storage.table.io()
+</span>185 <span style=''>        val specs = storage.table.specs()
+</span>186 <span style=''>        snapshot.deleteManifests(io).asScala.foreach { manifest =&gt;
+</span>187 <span style=''>          WithClose(ManifestFiles.readDeleteManifest(manifest, io, specs)) { reader =&gt;
+</span>188 <span style=''>            reader.iterator().asScala.foreach { deleteFile =&gt;
+</span>189 <span style=''>              val ref = deleteFile.referencedDataFile()
+</span>190 <span style=''>              if (ref != null) {
+</span>191 <span style=''>                // copy() to detach from the manifest reader, which reuses containers
+</span>192 <span style=''>                map.computeIfAbsent(ref, () =&gt; DeleteFileSet.create()).add(deleteFile.copy())
+</span>193 <span style=''>              }
+</span>194 <span style=''>            }
+</span>195 <span style=''>          }
+</span>196 <span style=''>        }
+</span>197 <span style=''>      }
+</span>198 <span style=''>      map
+</span>199 <span style=''>    }
+</span>200 <span style=''>
+</span>201 <span style=''>    private lazy val loader: DeleteLoader =
+</span>202 <span style=''>      new BaseDeleteLoader(deleteFile =&gt; storage.table.io().newInputFile(deleteFile))
+</span>203 <span style=''>
+</span>204 <span style=''>    override def apply(path: String): PositionDeleteIndex = {
+</span>205 <span style=''>      val set = </span><span style='background: #AEF1AE'>deletesByPath.get(path)</span><span style=''>
+</span>206 <span style=''>      if (</span><span style='background: #AEF1AE'>set == null</span><span style=''>) { </span><span style='background: #AEF1AE'>null</span><span style=''> } else {
+</span>207 <span style=''>        </span><span style='background: #AEF1AE'>loader.loadPositionDeletes(set, path)</span><span style=''>
+</span>208 <span style=''>      }
+</span>209 <span style=''>    }
+</span>210 <span style=''>  }
+</span>211 <span style=''>
+</span>212 <span style=''>  /**
+</span>213 <span style=''>   * Single partition deleter
+</span>214 <span style=''>   *
+</span>215 <span style=''>   * @param writer delete writer
+</span>216 <span style=''>   * @param spec table partition spec
+</span>217 <span style=''>   * @param partition partition to delete records out of
+</span>218 <span style=''>   */
+</span>219 <span style=''>  private class DeleteWriter(writer: DVFileWriter, spec: PartitionSpec, partition: StructLike)
+</span>220 <span style=''>      extends (StructSimpleFeature =&gt; Unit) with Closeable with Flushable {
+</span>221 <span style=''>
+</span>222 <span style=''>    override def apply(feature: StructSimpleFeature): Unit =
+</span>223 <span style=''>      </span><span style='background: #AEF1AE'>writer.delete(feature.getFilePath, feature.getRowPosition, spec, partition)</span><span style=''>
+</span>224 <span style=''>
+</span>225 <span style=''>    override def flush(): Unit = </span><span style='background: #F0ADAD'>{}</span><span style=''>
+</span>226 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>{}</span><span style=''>
+</span>227 <span style=''>  }
+</span>228 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -219,15 +264,15 @@
         <th>Code</th>
       </tr><tr>
         <td>
-          56
+          57
         </td>
         <td>
-          1689
+          1682
         </td>
         <td>
-          2443
+          2609
           -
-          2457
+          2623
         </td>
         <td>
           Select
@@ -243,15 +288,15 @@
         </td>
       </tr><tr>
         <td>
-          59
+          60
         </td>
         <td>
-          1690
+          1683
         </td>
         <td>
-          2521
+          2687
           -
-          2534
+          2700
         </td>
         <td>
           Apply
@@ -267,15 +312,15 @@
         </td>
       </tr><tr>
         <td>
-          59
+          60
         </td>
         <td>
-          1691
+          1684
         </td>
         <td>
-          2510
+          2676
           -
-          2534
+          2700
         </td>
         <td>
           Apply
@@ -291,15 +336,15 @@
         </td>
       </tr><tr>
         <td>
-          60
+          61
         </td>
         <td>
-          1692
+          1685
         </td>
         <td>
-          2570
+          2736
           -
-          2581
+          2747
         </td>
         <td>
           Select
@@ -315,15 +360,15 @@
         </td>
       </tr><tr>
         <td>
-          60
+          61
         </td>
         <td>
-          1693
+          1686
         </td>
         <td>
-          2583
+          2749
           -
-          2591
+          2757
         </td>
         <td>
           Select
@@ -339,15 +384,15 @@
         </td>
       </tr><tr>
         <td>
-          60
+          61
         </td>
         <td>
-          1694
+          1687
         </td>
         <td>
-          2546
+          2712
           -
-          2592
+          2758
         </td>
         <td>
           Apply
@@ -363,15 +408,15 @@
         </td>
       </tr><tr>
         <td>
-          60
+          61
         </td>
         <td>
-          1695
+          1688
         </td>
         <td>
-          2539
+          2705
           -
-          2592
+          2758
         </td>
         <td>
           Apply
@@ -387,15 +432,15 @@
         </td>
       </tr><tr>
         <td>
-          63
+          64
         </td>
         <td>
-          1696
+          1689
         </td>
         <td>
-          2773
+          2939
           -
-          2795
+          2961
         </td>
         <td>
           Select
@@ -411,15 +456,15 @@
         </td>
       </tr><tr>
         <td>
-          63
+          64
         </td>
         <td>
-          1697
+          1690
         </td>
         <td>
-          2797
+          2963
           -
-          2819
+          2985
         </td>
         <td>
           Select
@@ -435,15 +480,15 @@
         </td>
       </tr><tr>
         <td>
-          63
+          64
         </td>
         <td>
-          1698
+          1691
         </td>
         <td>
-          2752
+          2918
           -
-          2820
+          2986
         </td>
         <td>
           Apply
@@ -459,15 +504,15 @@
         </td>
       </tr><tr>
         <td>
-          64
+          65
         </td>
         <td>
-          1699
+          1692
         </td>
         <td>
-          2825
+          2991
           -
-          2829
+          2995
         </td>
         <td>
           Select
@@ -483,15 +528,15 @@
         </td>
       </tr><tr>
         <td>
-          68
+          69
         </td>
         <td>
-          1700
+          1693
         </td>
         <td>
-          2876
+          3042
           -
-          2892
+          3058
         </td>
         <td>
           Apply
@@ -507,15 +552,15 @@
         </td>
       </tr><tr>
         <td>
-          68
+          69
         </td>
         <td>
-          1703
+          1696
         </td>
         <td>
-          2872
+          3038
           -
-          2872
+          3038
         </td>
         <td>
           Literal
@@ -531,15 +576,15 @@
         </td>
       </tr><tr>
         <td>
-          68
+          69
         </td>
         <td>
-          1704
+          1697
         </td>
         <td>
-          2872
+          3038
           -
-          2872
+          3038
         </td>
         <td>
           Block
@@ -555,15 +600,15 @@
         </td>
       </tr><tr>
         <td>
-          69
+          70
         </td>
         <td>
-          1701
+          1694
         </td>
         <td>
-          2902
+          3068
           -
-          2973
+          3139
         </td>
         <td>
           Throw
@@ -579,15 +624,15 @@
         </td>
       </tr><tr>
         <td>
-          69
+          70
         </td>
         <td>
-          1702
+          1695
         </td>
         <td>
-          2902
+          3068
           -
-          2973
+          3139
         </td>
         <td>
           Block
@@ -603,15 +648,15 @@
         </td>
       </tr><tr>
         <td>
-          72
+          73
         </td>
         <td>
-          1705
+          1698
         </td>
         <td>
-          3101
+          3267
           -
-          3105
+          3271
         </td>
         <td>
           Select
@@ -627,15 +672,15 @@
         </td>
       </tr><tr>
         <td>
-          72
+          73
         </td>
         <td>
-          1706
+          1699
         </td>
         <td>
-          3065
+          3231
           -
-          3106
+          3272
         </td>
         <td>
           Apply
@@ -651,15 +696,15 @@
         </td>
       </tr><tr>
         <td>
-          72
+          73
         </td>
         <td>
-          1707
+          1700
         </td>
         <td>
-          3058
+          3224
           -
-          3106
+          3272
         </td>
         <td>
           Apply
@@ -675,15 +720,15 @@
         </td>
       </tr><tr>
         <td>
-          75
+          76
         </td>
         <td>
-          1708
+          1701
         </td>
         <td>
-          3295
+          3461
           -
-          3299
+          3465
         </td>
         <td>
           Select
@@ -699,15 +744,15 @@
         </td>
       </tr><tr>
         <td>
-          75
+          76
         </td>
         <td>
-          1709
+          1702
         </td>
         <td>
-          3301
+          3467
           -
-          3309
+          3475
         </td>
         <td>
           Select
@@ -723,15 +768,15 @@
         </td>
       </tr><tr>
         <td>
-          75
+          76
         </td>
         <td>
-          1714
+          1707
         </td>
         <td>
-          3254
+          3420
           -
-          3396
+          3562
         </td>
         <td>
           Apply
@@ -747,15 +792,15 @@
         </td>
       </tr><tr>
         <td>
-          75
+          76
         </td>
         <td>
-          1720
+          1713
         </td>
         <td>
-          3250
+          3416
           -
-          3250
+          3416
         </td>
         <td>
           Literal
@@ -771,15 +816,15 @@
         </td>
       </tr><tr>
         <td>
-          75
+          76
         </td>
         <td>
-          1721
+          1714
         </td>
         <td>
-          3250
+          3416
           -
-          3250
+          3416
         </td>
         <td>
           Block
@@ -795,15 +840,15 @@
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
-          1710
+          1703
         </td>
         <td>
-          3350
+          3516
           -
-          3354
+          3520
         </td>
         <td>
           Select
@@ -819,15 +864,15 @@
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
-          1711
+          1704
         </td>
         <td>
-          3387
+          3553
           -
-          3395
+          3561
         </td>
         <td>
           Select
@@ -843,15 +888,15 @@
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
-          1712
+          1705
         </td>
         <td>
-          3359
+          3525
           -
-          3396
+          3562
         </td>
         <td>
           Apply
@@ -867,15 +912,15 @@
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
-          1713
+          1706
         </td>
         <td>
-          3322
+          3488
           -
-          3396
+          3562
         </td>
         <td>
           Apply
@@ -891,15 +936,15 @@
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
-          1719
+          1712
         </td>
         <td>
-          3398
+          3564
           -
-          3448
+          3614
         </td>
         <td>
           Block
@@ -918,15 +963,15 @@
         </td>
       </tr><tr>
         <td>
-          77
+          78
         </td>
         <td>
-          1715
+          1708
         </td>
         <td>
-          3414
+          3580
           -
-          3422
+          3588
         </td>
         <td>
           Select
@@ -942,15 +987,15 @@
         </td>
       </tr><tr>
         <td>
-          77
+          78
         </td>
         <td>
-          1716
+          1709
         </td>
         <td>
-          3406
+          3572
           -
-          3423
+          3589
         </td>
         <td>
           Apply
@@ -966,15 +1011,15 @@
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
-          1717
+          1710
         </td>
         <td>
-          3437
+          3603
           -
-          3441
+          3607
         </td>
         <td>
           Select
@@ -990,15 +1035,15 @@
         </td>
       </tr><tr>
         <td>
-          78
+          79
         </td>
         <td>
-          1718
+          1711
         </td>
         <td>
-          3430
+          3596
           -
-          3442
+          3608
         </td>
         <td>
           Apply
@@ -1014,15 +1059,15 @@
         </td>
       </tr><tr>
         <td>
-          80
+          81
         </td>
         <td>
-          1722
+          1715
         </td>
         <td>
-          3453
+          3619
           -
-          3468
+          3634
         </td>
         <td>
           Apply
@@ -1038,15 +1083,15 @@
         </td>
       </tr><tr>
         <td>
-          81
+          82
         </td>
         <td>
-          1723
+          1716
         </td>
         <td>
-          3473
+          3639
           -
-          3484
+          3650
         </td>
         <td>
           Apply
@@ -1062,15 +1107,15 @@
         </td>
       </tr><tr>
         <td>
-          85
+          86
         </td>
         <td>
-          1724
+          1717
         </td>
         <td>
-          3532
+          3698
           -
-          3548
+          3714
         </td>
         <td>
           Apply
@@ -1086,15 +1131,15 @@
         </td>
       </tr><tr>
         <td>
-          85
+          86
         </td>
         <td>
-          1727
+          1720
         </td>
         <td>
-          3528
+          3694
           -
-          3528
+          3694
         </td>
         <td>
           Literal
@@ -1110,15 +1155,15 @@
         </td>
       </tr><tr>
         <td>
-          85
+          86
         </td>
         <td>
-          1728
+          1721
         </td>
         <td>
-          3528
+          3694
           -
-          3528
+          3694
         </td>
         <td>
           Block
@@ -1134,15 +1179,15 @@
         </td>
       </tr><tr>
         <td>
-          86
+          87
         </td>
         <td>
-          1725
+          1718
         </td>
         <td>
-          3558
+          3724
           -
-          3630
+          3796
         </td>
         <td>
           Throw
@@ -1158,15 +1203,15 @@
         </td>
       </tr><tr>
         <td>
-          86
+          87
         </td>
         <td>
-          1726
+          1719
         </td>
         <td>
-          3558
+          3724
           -
-          3630
+          3796
         </td>
         <td>
           Block
@@ -1182,15 +1227,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          89
         </td>
         <td>
-          1729
+          1722
         </td>
         <td>
-          3649
+          3815
           -
-          3657
+          3823
         </td>
         <td>
           Select
@@ -1206,15 +1251,15 @@
         </td>
       </tr><tr>
         <td>
-          88
+          89
         </td>
         <td>
-          1730
+          1723
         </td>
         <td>
-          3641
+          3807
           -
-          3658
+          3824
         </td>
         <td>
           Apply
@@ -1230,15 +1275,15 @@
         </td>
       </tr><tr>
         <td>
-          89
+          90
         </td>
         <td>
-          1731
+          1724
         </td>
         <td>
-          3663
+          3829
           -
-          3678
+          3844
         </td>
         <td>
           Apply
@@ -1254,15 +1299,15 @@
         </td>
       </tr><tr>
         <td>
-          90
+          91
         </td>
         <td>
-          1732
+          1725
         </td>
         <td>
-          3683
+          3849
           -
-          3694
+          3860
         </td>
         <td>
           Apply
@@ -1278,15 +1323,15 @@
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
-          1733
+          1726
         </td>
         <td>
-          3750
+          3916
           -
-          3756
+          3922
         </td>
         <td>
           Select
@@ -1302,15 +1347,15 @@
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
-          1734
+          1727
         </td>
         <td>
-          3758
+          3924
           -
-          3765
+          3931
         </td>
         <td>
           Select
@@ -1326,15 +1371,15 @@
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
-          1735
+          1728
         </td>
         <td>
-          3749
+          3915
           -
-          3749
+          3915
         </td>
         <td>
           Select
@@ -1350,15 +1395,15 @@
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
-          1736
+          1729
         </td>
         <td>
-          3749
+          3915
           -
-          3749
+          3915
         </td>
         <td>
           Select
@@ -1374,15 +1419,15 @@
         </td>
       </tr><tr>
         <td>
-          93
+          94
         </td>
         <td>
-          1737
+          1730
         </td>
         <td>
-          3731
+          3897
           -
-          3766
+          3932
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1398,15 +1443,15 @@
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          1738
+          1731
         </td>
         <td>
-          3832
+          3998
           -
-          3838
+          4004
         </td>
         <td>
           Select
@@ -1422,15 +1467,15 @@
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          1739
+          1732
         </td>
         <td>
-          3840
+          4006
           -
-          3846
+          4012
         </td>
         <td>
           Select
@@ -1446,15 +1491,15 @@
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          1740
+          1733
         </td>
         <td>
-          3848
+          4014
           -
-          3855
+          4021
         </td>
         <td>
           Select
@@ -1470,15 +1515,15 @@
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          1741
+          1734
         </td>
         <td>
-          3828
+          3994
           -
-          3856
+          4022
         </td>
         <td>
           Apply
@@ -1494,15 +1539,15 @@
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          1742
+          1735
         </td>
         <td>
-          3827
+          3993
           -
-          3827
+          3993
         </td>
         <td>
           Select
@@ -1518,15 +1563,15 @@
         </td>
       </tr><tr>
         <td>
-          96
+          97
         </td>
         <td>
-          1743
+          1736
         </td>
         <td>
-          3805
+          3971
           -
-          3857
+          4023
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1542,15 +1587,15 @@
         </td>
       </tr><tr>
         <td>
-          97
+          98
         </td>
         <td>
-          1744
+          1737
         </td>
         <td>
-          3866
+          4032
           -
-          3888
+          4054
         </td>
         <td>
           Select
@@ -1566,15 +1611,15 @@
         </td>
       </tr><tr>
         <td>
-          97
+          98
         </td>
         <td>
           1750
         </td>
         <td>
-          3890
+          4056
           -
-          4018
+          4613
         </td>
         <td>
           Block
@@ -1588,8 +1633,13 @@
         <td style="background: #AEF1AE">
           {
   val delta: org.apache.iceberg.RowDelta = IcebergUpdateWriter.this.storage.table.newRowDelta();
+  scala.Option.apply[org.apache.iceberg.Snapshot](IcebergUpdateWriter.this.storage.table.currentSnapshot()).foreach[org.apache.iceberg.RowDelta](((s: org.apache.iceberg.Snapshot) =&gt; delta.validateFromSnapshot(s.snapshotId())));
   IcebergUpdateWriter.this.deleter.files.forEach(((f: org.apache.iceberg.DeleteFile) =&gt; {
     delta.addDeletes(f);
+    ()
+  }));
+  IcebergUpdateWriter.this.deleter.rewritten.forEach(((f: org.apache.iceberg.DeleteFile) =&gt; {
+    delta.removeDeletes(f);
     ()
   }));
   delta.commit()
@@ -1597,42 +1647,18 @@
         </td>
       </tr><tr>
         <td>
-          97
+          98
         </td>
         <td>
           1751
         </td>
         <td>
-          3862
+          4028
           -
-          3862
+          4028
         </td>
         <td>
           Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          97
-        </td>
-        <td>
-          1752
-        </td>
-        <td>
-          3862
-          -
-          3862
-        </td>
-        <td>
-          Block
         </td>
         <td>
           &lt;nosymbol&gt;
@@ -1648,12 +1674,36 @@
           98
         </td>
         <td>
-          1745
+          1752
         </td>
         <td>
-          3910
+          4028
           -
-          3937
+          4028
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          1738
+        </td>
+        <td>
+          4076
+          -
+          4103
         </td>
         <td>
           Apply
@@ -1669,15 +1719,111 @@
         </td>
       </tr><tr>
         <td>
-          99
+          101
         </td>
         <td>
-          1746
+          1739
         </td>
         <td>
-          3971
+          4192
           -
-          3990
+          4223
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Table.currentSnapshot
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          IcebergUpdateWriter.this.storage.table.currentSnapshot()
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          1740
+        </td>
+        <td>
+          4265
+          -
+          4279
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Snapshot.snapshotId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          s.snapshotId()
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          1741
+        </td>
+        <td>
+          4238
+          -
+          4280
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.RowDelta.validateFromSnapshot
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          delta.validateFromSnapshot(s.snapshotId())
+        </td>
+      </tr><tr>
+        <td>
+          101
+        </td>
+        <td>
+          1742
+        </td>
+        <td>
+          4185
+          -
+          4281
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Option.apply[org.apache.iceberg.Snapshot](IcebergUpdateWriter.this.storage.table.currentSnapshot()).foreach[org.apache.iceberg.RowDelta](((s: org.apache.iceberg.Snapshot) =&gt; delta.validateFromSnapshot(s.snapshotId())))
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          1743
+        </td>
+        <td>
+          4315
+          -
+          4334
         </td>
         <td>
           Apply
@@ -1693,15 +1839,15 @@
         </td>
       </tr><tr>
         <td>
-          99
+          102
         </td>
         <td>
-          1747
+          1744
         </td>
         <td>
-          3987
+          4331
           -
-          3987
+          4331
         </td>
         <td>
           Literal
@@ -1717,15 +1863,15 @@
         </td>
       </tr><tr>
         <td>
-          99
+          102
         </td>
         <td>
-          1748
+          1745
         </td>
         <td>
-          3944
+          4288
           -
-          3991
+          4335
         </td>
         <td>
           Apply
@@ -1744,15 +1890,90 @@
         </td>
       </tr><tr>
         <td>
-          100
+          105
+        </td>
+        <td>
+          1746
+        </td>
+        <td>
+          4563
+          -
+          4585
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.RowDelta.removeDeletes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          delta.removeDeletes(f)
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          1747
+        </td>
+        <td>
+          4582
+          -
+          4582
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          105
+        </td>
+        <td>
+          1748
+        </td>
+        <td>
+          4532
+          -
+          4586
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Iterable.forEach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          IcebergUpdateWriter.this.deleter.rewritten.forEach(((f: org.apache.iceberg.DeleteFile) =&gt; {
+  delta.removeDeletes(f);
+  ()
+}))
+        </td>
+      </tr><tr>
+        <td>
+          106
         </td>
         <td>
           1749
         </td>
         <td>
-          3998
+          4593
           -
-          4012
+          4607
         </td>
         <td>
           Apply
@@ -1768,15 +1989,15 @@
         </td>
       </tr><tr>
         <td>
-          119
+          125
         </td>
         <td>
           1753
         </td>
         <td>
-          4674
+          5269
           -
-          4726
+          5321
         </td>
         <td>
           Apply
@@ -1792,15 +2013,15 @@
         </td>
       </tr><tr>
         <td>
-          120
+          126
         </td>
         <td>
           1754
         </td>
         <td>
-          4745
+          5340
           -
-          4798
+          5393
         </td>
         <td>
           Apply
@@ -1816,15 +2037,15 @@
         </td>
       </tr><tr>
         <td>
-          122
+          128
         </td>
         <td>
           1755
         </td>
         <td>
-          4970
+          5565
           -
-          4993
+          5588
         </td>
         <td>
           Apply
@@ -1840,15 +2061,15 @@
         </td>
       </tr><tr>
         <td>
-          122
+          128
         </td>
         <td>
           1756
         </td>
         <td>
-          4960
+          5555
           -
-          5002
+          5597
         </td>
         <td>
           Apply
@@ -1864,15 +2085,15 @@
         </td>
       </tr><tr>
         <td>
-          122
+          128
         </td>
         <td>
           1757
         </td>
         <td>
-          5029
+          5624
           -
-          5033
+          5628
         </td>
         <td>
           Literal
@@ -1888,15 +2109,15 @@
         </td>
       </tr><tr>
         <td>
-          122
+          128
         </td>
         <td>
           1758
         </td>
         <td>
-          4942
+          5537
           -
-          5034
+          5629
         </td>
         <td>
           Apply
@@ -1912,15 +2133,15 @@
         </td>
       </tr><tr>
         <td>
-          123
+          129
         </td>
         <td>
           1759
         </td>
         <td>
-          5039
+          5634
           -
-          5096
+          5691
         </td>
         <td>
           Apply
@@ -1936,15 +2157,15 @@
         </td>
       </tr><tr>
         <td>
-          135
+          142
         </td>
         <td>
           1760
         </td>
         <td>
-          5493
+          6145
           -
-          5547
+          6199
         </td>
         <td>
           Apply
@@ -1960,15 +2181,15 @@
         </td>
       </tr><tr>
         <td>
-          135
+          142
         </td>
         <td>
           1761
         </td>
         <td>
-          5467
+          6119
           -
-          5548
+          6200
         </td>
         <td>
           Apply
@@ -1984,135 +2205,63 @@
         </td>
       </tr><tr>
         <td>
-          137
+          144
         </td>
         <td>
           1762
         </td>
         <td>
-          5645
+          6369
           -
-          5652
+          6423
         </td>
         <td>
-          Select
+          Apply
         </td>
         <td>
-          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.MultiPartitionDeleter.storage
+          java.util.concurrent.ConcurrentHashMap.&lt;init&gt;
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          MultiPartitionDeleter.this.storage
+          new java.util.concurrent.ConcurrentHashMap[org.apache.iceberg.DeleteFile,Boolean]()
         </td>
       </tr><tr>
         <td>
-          137
+          144
         </td>
         <td>
           1763
         </td>
         <td>
-          5665
+          6343
           -
-          5670
+          6424
         </td>
         <td>
-          Select
+          Apply
         </td>
         <td>
-          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.MultiPartitionDeleter.files
+          java.util.Collections.newSetFromMap
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          MultiPartitionDeleter.this.files
+          java.util.Collections.newSetFromMap[org.apache.iceberg.DeleteFile](new java.util.concurrent.ConcurrentHashMap[org.apache.iceberg.DeleteFile,Boolean]())
         </td>
       </tr><tr>
         <td>
-          137
+          146
         </td>
         <td>
           1764
         </td>
         <td>
-          5628
+          6451
           -
-          5671
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.DeleteWriter.&lt;init&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          new IcebergUpdateWriter.this.DeleteWriter(MultiPartitionDeleter.this.storage, partition, MultiPartitionDeleter.this.files)
-        </td>
-      </tr><tr>
-        <td>
-          139
-        </td>
-        <td>
-          1765
-        </td>
-        <td>
-          5778
-          -
-          5819
-        </td>
-        <td>
-          TypeApply
-        </td>
-        <td>
-          scala.Any.asInstanceOf
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          feature.asInstanceOf[org.locationtech.geomesa.fs.storage.core.iceberg.StructSimpleFeature]
-        </td>
-      </tr><tr>
-        <td>
-          139
-        </td>
-        <td>
-          1766
-        </td>
-        <td>
-          5765
-          -
-          5820
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.DeleteWriter.apply
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          action.apply(feature.asInstanceOf[org.locationtech.geomesa.fs.storage.core.iceberg.StructSimpleFeature])
-        </td>
-      </tr><tr>
-        <td>
-          152
-        </td>
-        <td>
-          1767
-        </td>
-        <td>
-          6271
-          -
-          6295
+          6475
         </td>
         <td>
           Apply
@@ -2128,39 +2277,15 @@
         </td>
       </tr><tr>
         <td>
-          153
+          147
         </td>
         <td>
-          1768
+          1765
         </td>
         <td>
-          6322
+          6568
           -
-          6352
-        </td>
-        <td>
-          TypeApply
-        </td>
-        <td>
-          scala.collection.Seq.newBuilder
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          scala.collection.Seq.newBuilder[(String, Long)]
-        </td>
-      </tr><tr>
-        <td>
-          154
-        </td>
-        <td>
-          1769
-        </td>
-        <td>
-          6376
-          -
-          6401
+          6597
         </td>
         <td>
           Apply
@@ -2172,43 +2297,19 @@
           
         </td>
         <td style="background: #AEF1AE">
-          DeleteWriter.this.storage.newFilePath(&quot;x-&quot;)
+          MultiPartitionDeleter.this.storage.newFilePath(&quot;puffin&quot;)
         </td>
       </tr><tr>
         <td>
-          155
+          147
         </td>
         <td>
-          1770
+          1766
         </td>
         <td>
-          6458
+          6535
           -
-          6462
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.DeleteWriter.path
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          DeleteWriter.this.path
-        </td>
-      </tr><tr>
-        <td>
-          155
-        </td>
-        <td>
-          1771
-        </td>
-        <td>
-          6425
-          -
-          6463
+          6598
         </td>
         <td>
           Apply
@@ -2220,187 +2321,259 @@
           
         </td>
         <td style="background: #AEF1AE">
-          DeleteWriter.this.storage.table.io().newOutputFile(DeleteWriter.this.path)
+          MultiPartitionDeleter.this.storage.table.io().newOutputFile(MultiPartitionDeleter.this.storage.newFilePath(&quot;puffin&quot;))
         </td>
       </tr><tr>
         <td>
-          162
+          150
+        </td>
+        <td>
+          1767
+        </td>
+        <td>
+          6828
+          -
+          6840
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.MultiPartitionDeleter.fileSupplier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MultiPartitionDeleter.this.fileSupplier
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          1768
+        </td>
+        <td>
+          6867
+          -
+          6874
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.MultiPartitionDeleter.storage
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MultiPartitionDeleter.this.storage
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          1769
+        </td>
+        <td>
+          6842
+          -
+          6875
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.PreviousDeleteLoader.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new IcebergUpdateWriter.this.PreviousDeleteLoader(MultiPartitionDeleter.this.storage)
+        </td>
+      </tr><tr>
+        <td>
+          150
+        </td>
+        <td>
+          1770
+        </td>
+        <td>
+          6807
+          -
+          6876
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.deletes.BaseDVFileWriter.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.iceberg.deletes.BaseDVFileWriter(MultiPartitionDeleter.this.fileSupplier, new IcebergUpdateWriter.this.PreviousDeleteLoader(MultiPartitionDeleter.this.storage))
+        </td>
+      </tr><tr>
+        <td>
+          153
+        </td>
+        <td>
+          1771
+        </td>
+        <td>
+          6979
+          -
+          6985
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.MultiPartitionDeleter.writer
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MultiPartitionDeleter.this.writer
+        </td>
+      </tr><tr>
+        <td>
+          153
         </td>
         <td>
           1772
         </td>
         <td>
-          6496
+          6987
           -
-          6773
+          7007
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.apache.iceberg.parquet.Parquet.DeleteWriteBuilder.buildPositionWriter
+          org.apache.iceberg.Table.spec
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          org.apache.iceberg.parquet.Parquet.writeDeletes(DeleteWriter.this.file).withSpec(DeleteWriter.this.storage.table.spec()).withPartition(DeleteWriter.this.storage.metadata.partition(DeleteWriter.this.partition)).createWriterFunc(((schema: org.apache.iceberg.Schema, `type`: org.apache.parquet.schema.MessageType) =&gt; org.apache.iceberg.data.parquet.GenericParquetWriter.create(schema, ``type``))).buildPositionWriter[Unit]()
+          MultiPartitionDeleter.this.storage.table.spec()
         </td>
       </tr><tr>
         <td>
-          164
+          153
         </td>
         <td>
           1773
         </td>
         <td>
-          6848
+          7009
           -
-          6867
+          7046
         </td>
         <td>
-          Select
+          Apply
         </td>
         <td>
-          org.locationtech.geomesa.fs.storage.core.iceberg.StructSimpleFeature.getFilePath
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.DataFiles.partition
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          feature.getFilePath
+          MultiPartitionDeleter.this.storage.metadata.partition(partition)
         </td>
       </tr><tr>
         <td>
-          164
+          153
         </td>
         <td>
           1774
         </td>
         <td>
-          6871
+          6962
           -
-          6893
+          7047
         </td>
         <td>
-          Select
+          Apply
         </td>
         <td>
-          org.locationtech.geomesa.fs.storage.core.iceberg.StructSimpleFeature.getRowPosition
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.DeleteWriter.&lt;init&gt;
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          feature.getRowPosition
+          new IcebergUpdateWriter.this.DeleteWriter(MultiPartitionDeleter.this.writer, MultiPartitionDeleter.this.storage.table.spec(), MultiPartitionDeleter.this.storage.metadata.partition(partition))
         </td>
       </tr><tr>
         <td>
-          164
+          155
         </td>
         <td>
           1775
         </td>
         <td>
-          6848
+          7154
           -
-          6893
+          7195
         </td>
         <td>
-          Apply
+          TypeApply
         </td>
         <td>
-          scala.Predef.ArrowAssoc.-&gt;
+          scala.Any.asInstanceOf
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          scala.Predef.ArrowAssoc[String](feature.getFilePath).-&gt;[Long](feature.getRowPosition)
+          feature.asInstanceOf[org.locationtech.geomesa.fs.storage.core.iceberg.StructSimpleFeature]
         </td>
       </tr><tr>
         <td>
-          164
+          155
         </td>
         <td>
           1776
         </td>
         <td>
-          6836
+          7141
           -
-          6894
+          7196
         </td>
         <td>
           Apply
         </td>
         <td>
-          scala.collection.mutable.Builder.+=
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.DeleteWriter.apply
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          DeleteWriter.this.deletes.+=(scala.Predef.ArrowAssoc[String](feature.getFilePath).-&gt;[Long](feature.getRowPosition))
+          action.apply(feature.asInstanceOf[org.locationtech.geomesa.fs.storage.core.iceberg.StructSimpleFeature])
         </td>
       </tr><tr>
         <td>
-          164
+          158
         </td>
         <td>
           1777
         </td>
         <td>
-          6844
+          7243
           -
-          6844
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          166
-        </td>
-        <td>
-          1778
-        </td>
-        <td>
-          6929
-          -
-          6931
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #F0ADAD">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          169
-        </td>
-        <td>
-          1779
-        </td>
-        <td>
-          6978
-          -
-          7011
+          7276
         </td>
         <td>
           Apply
@@ -2412,19 +2585,19 @@
           
         </td>
         <td style="background: #AEF1AE">
-          DeleteWriter.this.closed.compareAndSet(false, true)
+          MultiPartitionDeleter.this.closed.compareAndSet(false, true)
         </td>
       </tr><tr>
         <td>
-          169
+          158
         </td>
         <td>
-          1797
+          1790
         </td>
         <td>
-          7013
+          7278
           -
-          7373
+          7511
         </td>
         <td>
           Block
@@ -2438,31 +2611,27 @@
         <td style="background: #AEF1AE">
           {
   try {
-    val struct: org.apache.iceberg.deletes.PositionDelete[Unit] = org.apache.iceberg.deletes.PositionDelete.create[Unit]();
-    DeleteWriter.this.deletes.result().sorted[(String, Long)](math.this.Ordering.Tuple2[String, Long](math.this.Ordering.String, math.this.Ordering.Long)).foreach[Unit](((x0$1: (String, Long)) =&gt; x0$1 match {
-      case (_1: String, _2: Long)(String, Long)((path @ _), (pos @ _)) =&gt; DeleteWriter.this.writer.write(struct.set(path, pos))
-    }))
-  } finally {
-    org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[org.apache.iceberg.deletes.PositionDeleteWriter[Unit]](DeleteWriter.this.writer)(io.this.IsCloseable.closeableIsCloseable);
-    ()
-  };
+    MultiPartitionDeleter.super.close()
+  } finally org.locationtech.geomesa.utils.io.`package`.CloseQuietly.raise[org.apache.iceberg.deletes.BaseDVFileWriter](MultiPartitionDeleter.this.writer)(io.this.IsCloseable.closeableIsCloseable);
+  val result: org.apache.iceberg.io.DeleteWriteResult = MultiPartitionDeleter.this.writer.result();
+  MultiPartitionDeleter.this.files.addAll(result.deleteFiles());
   {
-    DeleteWriter.this.files.add(DeleteWriter.this.writer.toDeleteFile());
+    MultiPartitionDeleter.this.rewritten.addAll(result.rewrittenDeleteFiles());
     ()
   }
 }
         </td>
       </tr><tr>
         <td>
-          169
+          158
         </td>
         <td>
-          1798
+          1791
         </td>
         <td>
-          6974
+          7239
           -
-          6974
+          7239
         </td>
         <td>
           Literal
@@ -2478,15 +2647,15 @@
         </td>
       </tr><tr>
         <td>
-          169
+          158
         </td>
         <td>
-          1799
+          1792
         </td>
         <td>
-          6974
+          7239
           -
-          6974
+          7239
         </td>
         <td>
           Block
@@ -2502,262 +2671,87 @@
         </td>
       </tr><tr>
         <td>
-          170
+          159
         </td>
         <td>
-          1788
+          1778
         </td>
         <td>
-          7039
+          7294
           -
-          7262
+          7307
         </td>
         <td>
-          Block
+          Apply
         </td>
         <td>
-          &lt;nosymbol&gt;
+          org.locationtech.geomesa.fs.storage.core.utils.MultiPartitionAction.close
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          {
-  val struct: org.apache.iceberg.deletes.PositionDelete[Unit] = org.apache.iceberg.deletes.PositionDelete.create[Unit]();
-  DeleteWriter.this.deletes.result().sorted[(String, Long)](math.this.Ordering.Tuple2[String, Long](math.this.Ordering.String, math.this.Ordering.Long)).foreach[Unit](((x0$1: (String, Long)) =&gt; x0$1 match {
-    case (_1: String, _2: Long)(String, Long)((path @ _), (pos @ _)) =&gt; DeleteWriter.this.writer.write(struct.set(path, pos))
-  }))
-}
+          MultiPartitionDeleter.super.close()
         </td>
       </tr><tr>
         <td>
-          171
+          159
+        </td>
+        <td>
+          1779
+        </td>
+        <td>
+          7294
+          -
+          7307
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.utils.MultiPartitionAction.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MultiPartitionDeleter.super.close()
+        </td>
+      </tr><tr>
+        <td>
+          160
         </td>
         <td>
           1780
         </td>
         <td>
-          7052
+          7350
           -
-          7081
+          7356
         </td>
         <td>
-          Apply
+          Select
         </td>
         <td>
-          org.apache.iceberg.deletes.PositionDelete.create
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.MultiPartitionDeleter.writer
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          org.apache.iceberg.deletes.PositionDelete.create[Unit]()
+          MultiPartitionDeleter.this.writer
         </td>
       </tr><tr>
         <td>
-          173
+          160
         </td>
         <td>
           1781
         </td>
         <td>
-          7166
+          7349
           -
-          7166
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.math.Ordering.String
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          math.this.Ordering.String
-        </td>
-      </tr><tr>
-        <td>
-          173
-        </td>
-        <td>
-          1782
-        </td>
-        <td>
-          7166
-          -
-          7166
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          scala.math.Ordering.Long
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          math.this.Ordering.Long
-        </td>
-      </tr><tr>
-        <td>
-          173
-        </td>
-        <td>
-          1783
-        </td>
-        <td>
-          7166
-          -
-          7166
-        </td>
-        <td>
-          ApplyToImplicitArgs
-        </td>
-        <td>
-          scala.math.Ordering.Tuple2
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          math.this.Ordering.Tuple2[String, Long](math.this.Ordering.String, math.this.Ordering.Long)
-        </td>
-      </tr><tr>
-        <td>
-          173
-        </td>
-        <td>
-          1787
-        </td>
-        <td>
-          7149
-          -
-          7262
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          scala.collection.IterableLike.foreach
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          DeleteWriter.this.deletes.result().sorted[(String, Long)](math.this.Ordering.Tuple2[String, Long](math.this.Ordering.String, math.this.Ordering.Long)).foreach[Unit](((x0$1: (String, Long)) =&gt; x0$1 match {
-  case (_1: String, _2: Long)(String, Long)((path @ _), (pos @ _)) =&gt; DeleteWriter.this.writer.write(struct.set(path, pos))
-}))
-        </td>
-      </tr><tr>
-        <td>
-          174
-        </td>
-        <td>
-          1784
-        </td>
-        <td>
-          7228
-          -
-          7249
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.iceberg.deletes.PositionDelete.set
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          struct.set(path, pos)
-        </td>
-      </tr><tr>
-        <td>
-          174
-        </td>
-        <td>
-          1785
-        </td>
-        <td>
-          7215
-          -
-          7250
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.iceberg.deletes.PositionDeleteWriter.write
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          DeleteWriter.this.writer.write(struct.set(path, pos))
-        </td>
-      </tr><tr>
-        <td>
-          174
-        </td>
-        <td>
-          1786
-        </td>
-        <td>
-          7215
-          -
-          7250
-        </td>
-        <td>
-          Block
-        </td>
-        <td>
-          org.apache.iceberg.deletes.PositionDeleteWriter.write
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          DeleteWriter.this.writer.write(struct.set(path, pos))
-        </td>
-      </tr><tr>
-        <td>
-          177
-        </td>
-        <td>
-          1789
-        </td>
-        <td>
-          7309
-          -
-          7315
-        </td>
-        <td>
-          Select
-        </td>
-        <td>
-          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.DeleteWriter.writer
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          DeleteWriter.this.writer
-        </td>
-      </tr><tr>
-        <td>
-          177
-        </td>
-        <td>
-          1790
-        </td>
-        <td>
-          7308
-          -
-          7308
+          7349
         </td>
         <td>
           Select
@@ -2773,39 +2767,183 @@
         </td>
       </tr><tr>
         <td>
-          177
+          160
         </td>
         <td>
-          1791
+          1782
         </td>
         <td>
-          7292
+          7331
           -
-          7316
+          7357
         </td>
         <td>
           ApplyToImplicitArgs
         </td>
         <td>
-          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
+          org.locationtech.geomesa.utils.io.SafeClose.raise
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[org.apache.iceberg.deletes.PositionDeleteWriter[Unit]](DeleteWriter.this.writer)(io.this.IsCloseable.closeableIsCloseable)
+          org.locationtech.geomesa.utils.io.`package`.CloseQuietly.raise[org.apache.iceberg.deletes.BaseDVFileWriter](MultiPartitionDeleter.this.writer)(io.this.IsCloseable.closeableIsCloseable)
         </td>
       </tr><tr>
         <td>
-          177
+          160
         </td>
         <td>
-          1792
+          1783
         </td>
         <td>
-          7308
+          7331
           -
-          7308
+          7357
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.SafeClose.raise
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.CloseQuietly.raise[org.apache.iceberg.deletes.BaseDVFileWriter](MultiPartitionDeleter.this.writer)(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          162
+        </td>
+        <td>
+          1784
+        </td>
+        <td>
+          7389
+          -
+          7404
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.deletes.BaseDVFileWriter.result
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MultiPartitionDeleter.this.writer.result()
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          1785
+        </td>
+        <td>
+          7426
+          -
+          7446
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.io.DeleteWriteResult.deleteFiles
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          result.deleteFiles()
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          1786
+        </td>
+        <td>
+          7413
+          -
+          7447
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Set.addAll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MultiPartitionDeleter.this.files.addAll(result.deleteFiles())
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          1787
+        </td>
+        <td>
+          7473
+          -
+          7502
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.io.DeleteWriteResult.rewrittenDeleteFiles
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          result.rewrittenDeleteFiles()
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          1788
+        </td>
+        <td>
+          7456
+          -
+          7503
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Set.addAll
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          MultiPartitionDeleter.this.rewritten.addAll(result.rewrittenDeleteFiles())
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          1789
+        </td>
+        <td>
+          7472
+          -
+          7472
         </td>
         <td>
           Literal
@@ -2821,15 +2959,87 @@
         </td>
       </tr><tr>
         <td>
-          177
+          205
         </td>
         <td>
           1793
         </td>
         <td>
-          7292
+          9101
           -
-          7316
+          9124
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.util.CharSequenceMap.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PreviousDeleteLoader.this.deletesByPath.get(path)
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          1794
+        </td>
+        <td>
+          9135
+          -
+          9146
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          set.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          1795
+        </td>
+        <td>
+          9150
+          -
+          9154
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          206
+        </td>
+        <td>
+          1796
+        </td>
+        <td>
+          9150
+          -
+          9154
         </td>
         <td>
           Block
@@ -2841,70 +3051,211 @@
           
         </td>
         <td style="background: #AEF1AE">
-          {
-  org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[org.apache.iceberg.deletes.PositionDeleteWriter[Unit]](DeleteWriter.this.writer)(io.this.IsCloseable.closeableIsCloseable);
-  ()
-}
+          null
         </td>
       </tr><tr>
         <td>
-          179
+          207
         </td>
         <td>
-          1794
+          1797
         </td>
         <td>
-          7345
+          9172
           -
-          7364
+          9209
         </td>
         <td>
           Apply
         </td>
         <td>
-          org.apache.iceberg.deletes.PositionDeleteWriter.toDeleteFile
+          org.apache.iceberg.data.DeleteLoader.loadPositionDeletes
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          DeleteWriter.this.writer.toDeleteFile()
+          PreviousDeleteLoader.this.loader.loadPositionDeletes(set, path)
         </td>
       </tr><tr>
         <td>
-          179
+          207
         </td>
         <td>
-          1795
+          1798
         </td>
         <td>
-          7335
+          9172
           -
-          7365
+          9209
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.iceberg.data.DeleteLoader.loadPositionDeletes
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          PreviousDeleteLoader.this.loader.loadPositionDeletes(set, path)
+        </td>
+      </tr><tr>
+        <td>
+          223
+        </td>
+        <td>
+          1799
+        </td>
+        <td>
+          9657
+          -
+          9676
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.StructSimpleFeature.getFilePath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getFilePath
+        </td>
+      </tr><tr>
+        <td>
+          223
+        </td>
+        <td>
+          1800
+        </td>
+        <td>
+          9678
+          -
+          9700
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.StructSimpleFeature.getRowPosition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          feature.getRowPosition
+        </td>
+      </tr><tr>
+        <td>
+          223
+        </td>
+        <td>
+          1801
+        </td>
+        <td>
+          9702
+          -
+          9706
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.DeleteWriter.spec
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          DeleteWriter.this.spec
+        </td>
+      </tr><tr>
+        <td>
+          223
+        </td>
+        <td>
+          1802
+        </td>
+        <td>
+          9708
+          -
+          9717
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergUpdateWriter.DeleteWriter.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          DeleteWriter.this.partition
+        </td>
+      </tr><tr>
+        <td>
+          223
+        </td>
+        <td>
+          1803
+        </td>
+        <td>
+          9643
+          -
+          9718
         </td>
         <td>
           Apply
         </td>
         <td>
-          java.util.Set.add
+          org.apache.iceberg.deletes.DVFileWriter.delete
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          DeleteWriter.this.files.add(DeleteWriter.this.writer.toDeleteFile())
+          DeleteWriter.this.writer.delete(feature.getFilePath, feature.getRowPosition, DeleteWriter.this.spec, DeleteWriter.this.partition)
         </td>
       </tr><tr>
         <td>
-          179
+          225
         </td>
         <td>
-          1796
+          1804
         </td>
         <td>
-          7344
+          9753
           -
-          7344
+          9755
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          226
+        </td>
+        <td>
+          1805
+        </td>
+        <td>
+          9789
+          -
+          9791
         </td>
         <td>
           Literal
