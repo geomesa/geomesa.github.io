@@ -1,0 +1,5029 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/fs/storage/core/FileSystemCompaction.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2025 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.fs.storage.core
+</span>10 <span style=''>
+</span>11 <span style=''>import org.apache.iceberg.DataFile
+</span>12 <span style=''>import org.apache.iceberg.expressions.Expressions
+</span>13 <span style=''>import org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan
+</span>14 <span style=''>import org.locationtech.geomesa.fs.storage.core.observer.FileSystemObserverFactory.NoOpObserver
+</span>15 <span style=''>import org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter
+</span>16 <span style=''>import org.locationtech.geomesa.fs.storage.core.schema.SimpleFeatureSchema
+</span>17 <span style=''>import org.locationtech.geomesa.utils.io.{CloseQuietly, WithClose}
+</span>18 <span style=''>
+</span>19 <span style=''>import scala.collection.mutable.ArrayBuffer
+</span>20 <span style=''>import scala.util.control.NonFatal
+</span>21 <span style=''>
+</span>22 <span style=''>/** Stages complete replacement files before publishing a single validated Iceberg rewrite. */
+</span>23 <span style=''>class FileSystemCompaction(storage: FileSystemStorage, partitions: Seq[Partition], target: Option[Long]) {
+</span>24 <span style=''>
+</span>25 <span style=''>  import FileSystemCompaction.{Output, Plan}
+</span>26 <span style=''>
+</span>27 <span style=''>  import scala.collection.JavaConverters._
+</span>28 <span style=''>
+</span>29 <span style=''>  def compact(): Unit = {
+</span>30 <span style=''>    val plans = </span><span style='background: #AEF1AE'>plan()</span><span style=''>
+</span>31 <span style=''>    val outputs = </span><span style='background: #AEF1AE'>plans.map(prepare)</span><span style=''>
+</span>32 <span style=''>    </span><span style='background: #AEF1AE'>commit(plans, outputs)</span><span style=''>
+</span>33 <span style=''>  }
+</span>34 <span style=''>
+</span>35 <span style=''>  private[core] def plan(): Seq[Plan] = {
+</span>36 <span style=''>    </span><span style='background: #AEF1AE'>storage.table.refresh()</span><span style=''>
+</span>37 <span style=''>    </span><span style='background: #AEF1AE'>require(storage.schema.schema.sameSchema(storage.table.schema()), </span><span style='background: #F0ADAD'>&quot;Reload storage after a table schema change&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>38 <span style=''>    </span><span style='background: #AEF1AE'>require(storage.partitionSpecId == storage.table.spec().specId(), &quot;Reload storage after a partition spec change&quot;)</span><span style=''>
+</span>39 <span style=''>    </span><span style='background: #AEF1AE'>Option(storage.table.currentSnapshot()).toSeq.flatMap { snapshot =&gt;
+</span>40 <span style=''></span><span style='background: #AEF1AE'>      val selected = partitions.toSet
+</span>41 <span style=''></span><span style='background: #AEF1AE'>      val files = WithClose(storage.table.newScan().useSnapshot(snapshot.snapshotId()).planFiles()) { tasks =&gt;
+</span>42 <span style=''></span><span style='background: #AEF1AE'>        tasks.asScala.map(_.file().copy()).filter { file =&gt;
+</span>43 <span style=''></span><span style='background: #AEF1AE'>          require(storage.table.spec().compatibleWith(storage.table.specs().get(file.specId())),
+</span>44 <span style=''></span><span style='background: #AEF1AE'>            &quot;Compaction requires input files with a compatible partition spec&quot;)
+</span>45 <span style=''></span><span style='background: #AEF1AE'>          selected.contains(storage.metadata.partition(file)) &amp;&amp; !target.exists(storage.sizer.fileIsSized(file, _))
+</span>46 <span style=''></span><span style='background: #AEF1AE'>        }.toList
+</span>47 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>48 <span style=''></span><span style='background: #AEF1AE'>      files.groupBy(storage.metadata.partition).toSeq.map { case (partition, inputs) =&gt;
+</span>49 <span style=''></span><span style='background: #AEF1AE'>        Plan(snapshot.snapshotId(), storage.table.schema().schemaId(), storage.table.spec().specId(), partition, inputs)
+</span>50 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>51 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>52 <span style=''>  }
+</span>53 <span style=''>
+</span>54 <span style=''>  /** Writes all live rows without applying the caller's authorizations. No files are registered here. */
+</span>55 <span style=''>  private[core] def prepare(plan: Plan): Output = {
+</span>56 <span style=''>    </span><span style='background: #AEF1AE'>validateSchema(plan.schemaId, plan.specId)</span><span style=''>
+</span>57 <span style=''>    val paths = </span><span style='background: #AEF1AE'>ArrayBuffer.empty[String]</span><span style=''>
+</span>58 <span style=''>    val inputs = </span><span style='background: #AEF1AE'>plan.files.map(_.location()).toSet</span><span style=''>
+</span>59 <span style=''>    val readSchema = </span><span style='background: #AEF1AE'>storage.schema.read(None, None, Set.empty).schema</span><span style=''>
+</span>60 <span style=''>    val writeConf = </span><span style='background: #AEF1AE'>storage.conf ++ ParquetFileSystemWriter.icebergBloomFilterConf(storage.table.properties()) ++
+</span>61 <span style=''></span><span style='background: #AEF1AE'>      Map(SimpleFeatureSchema.PartitionKey -&gt; plan.partition.toString)</span><span style=''>
+</span>62 <span style=''>    val estimator = </span><span style='background: #AEF1AE'>target.map(storage.sizer.estimator)</span><span style=''>
+</span>63 <span style=''>    var writer: ParquetFileSystemWriter = </span><span style='background: #AEF1AE'>null</span><span style=''>
+</span>64 <span style=''>    var rows = </span><span style='background: #AEF1AE'>0L</span><span style=''>
+</span>65 <span style=''>    var totalBytes = </span><span style='background: #AEF1AE'>0L</span><span style=''>
+</span>66 <span style=''>    var remaining = </span><span style='background: #AEF1AE'>estimator.fold(Long.MaxValue)(_.estimate(0L))</span><span style=''>
+</span>67 <span style=''>
+</span>68 <span style=''>    def closeWriter(): Unit = if (</span><span style='background: #AEF1AE'>writer != null</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>69 <span style=''></span><span style='background: #AEF1AE'>      writer.close()
+</span>70 <span style=''></span><span style='background: #AEF1AE'>      totalBytes += writer.size
+</span>71 <span style=''></span><span style='background: #AEF1AE'>      writer = null
+</span>72 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>73 <span style=''>
+</span>74 <span style=''>    try {
+</span>75 <span style=''>      </span><span style='background: #AEF1AE'>WithClose(new IcebergParquetScan(storage.table, readSchema, Expressions.alwaysTrue(), 1,
+</span>76 <span style=''></span><span style='background: #AEF1AE'>          Some(inputs.contains), Some(plan.snapshotId))) { reader =&gt;
+</span>77 <span style=''></span><span style='background: #AEF1AE'>        reader.foreach { feature =&gt;
+</span>78 <span style=''></span><span style='background: #AEF1AE'>          if (writer == null) {
+</span>79 <span style=''></span><span style='background: #AEF1AE'>            val path = storage.newFilePath()
+</span>80 <span style=''></span><span style='background: #AEF1AE'>            paths += path
+</span>81 <span style=''></span><span style='background: #AEF1AE'>            writer = ParquetFileSystemWriter(storage.schema, writeConf, storage.table.io(), path, NoOpObserver)
+</span>82 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>83 <span style=''></span><span style='background: #AEF1AE'>          writer.write(feature)
+</span>84 <span style=''></span><span style='background: #AEF1AE'>          rows += 1
+</span>85 <span style=''></span><span style='background: #AEF1AE'>          remaining -= 1
+</span>86 <span style=''></span><span style='background: #AEF1AE'>          if (remaining &lt;= 0) {
+</span>87 <span style=''></span><span style='background: #AEF1AE'>            closeWriter()
+</span>88 <span style=''></span><span style='background: #AEF1AE'>            estimator.foreach(_.update(totalBytes, rows))
+</span>89 <span style=''></span><span style='background: #AEF1AE'>            remaining = estimator.fold(</span><span style='background: #F0ADAD'>Long.MaxValue</span><span style='background: #AEF1AE'>)(_.estimate(0L))
+</span>90 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>91 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>92 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>93 <span style=''></span><span style='background: #AEF1AE'>      closeWriter()
+</span>94 <span style=''></span><span style='background: #AEF1AE'>      // Do not update table properties while files are merely staged.
+</span>95 <span style=''></span><span style='background: #AEF1AE'>      Output(plan.partition, paths.toList, rows)</span><span style=''>
+</span>96 <span style=''>    } catch {
+</span>97 <span style=''>      case NonFatal(e) </span><span style='background: #AEF1AE'>=&gt;
+</span>98 <span style=''></span><span style='background: #AEF1AE'>        CloseQuietly(Option(writer)).foreach(</span><span style='background: #F0ADAD'>e.addSuppressed</span><span style='background: #AEF1AE'>)
+</span>99 <span style=''></span><span style='background: #AEF1AE'>        paths.foreach { path =&gt;
+</span>100 <span style=''></span><span style='background: #AEF1AE'>          try { </span><span style='background: #F0ADAD'>storage.table.io().deleteFile(path)</span><span style='background: #AEF1AE'> } catch { case NonFatal(cleanup) =&gt; </span><span style='background: #F0ADAD'>e.addSuppressed(cleanup)</span><span style='background: #AEF1AE'> }
+</span>101 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>102 <span style=''></span><span style='background: #AEF1AE'>        throw e</span><span style=''>
+</span>103 <span style=''>    }
+</span>104 <span style=''>  }
+</span>105 <span style=''>
+</span>106 <span style=''>  /**
+</span>107 <span style=''>   * The compaction reader applies positional deletes, including deletion vectors,
+</span>108 <span style=''>   * so replacement files contain only surviving rows.
+</span>109 <span style=''>   * Iceberg removes deletion-vector entries for rewritten inputs during commit.
+</span>110 <span style=''>   * Legacy positional-delete entries may remain until sequence-number cleanup removes them.
+</span>111 <span style=''>   * Physical files remain available to retained snapshots until snapshot expiration
+</span>112 <span style=''>   * can safely remove them.
+</span>113 <span style=''>   */
+</span>114 <span style=''>  private[core] def commit(plans: Seq[Plan], outputs: Seq[Output]): Unit = {
+</span>115 <span style=''>    if (</span><span style='background: #AEF1AE'>plans.isEmpty</span><span style=''>) </span><span style='background: #AEF1AE'>return</span><span style=''>
+</span>116 <span style=''>    </span><span style='background: #AEF1AE'>require(plans.map(_.snapshotId).distinct.size == 1, </span><span style='background: #F0ADAD'>&quot;Compaction plans must share one snapshot&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>117 <span style=''>    </span><span style='background: #AEF1AE'>require(outputs.map(_.partition).toSet == plans.map(_.partition).toSet &amp;&amp; outputs.size == plans.size,
+</span>118 <span style=''></span><span style='background: #AEF1AE'>      &quot;Compaction results must cover every planned partition exactly once&quot;)</span><span style=''>
+</span>119 <span style=''>    </span><span style='background: #AEF1AE'>require(plans.map(_.schemaId).distinct.size == 1 &amp;&amp; plans.map(_.specId).distinct.size == 1,
+</span>120 <span style=''></span><span style='background: #AEF1AE'>      </span><span style='background: #F0ADAD'>&quot;Compaction plans must share one schema and partition spec&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>121 <span style=''>    </span><span style='background: #AEF1AE'>validateSchema(plans.head.schemaId, plans.head.specId)</span><span style=''>
+</span>122 <span style=''>    </span><span style='background: #AEF1AE'>require(outputs.flatMap(_.paths).distinct.size == outputs.map(_.paths.size).sum,
+</span>123 <span style=''></span><span style='background: #AEF1AE'>      </span><span style='background: #F0ADAD'>&quot;Compaction results contain duplicate output paths&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>124 <span style=''>    val spec = </span><span style='background: #AEF1AE'>storage.table.specs().get(plans.head.specId)</span><span style=''>
+</span>125 <span style=''>    val replacements = </span><span style='background: #AEF1AE'>outputs.flatMap { output =&gt;
+</span>126 <span style=''></span><span style='background: #AEF1AE'>      val files = output.paths.map(storage.toDataFile(_, output.partition, spec))
+</span>127 <span style=''></span><span style='background: #AEF1AE'>      require(output.rows &gt;= 0 &amp;&amp; files.map(_.recordCount()).sum == output.rows,
+</span>128 <span style=''></span><span style='background: #AEF1AE'>        &quot;Compaction result row counts do not match replacement files&quot;)
+</span>129 <span style=''></span><span style='background: #AEF1AE'>      files
+</span>130 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>131 <span style=''>    </span><span style='background: #AEF1AE'>validateSchema(plans.head.schemaId, plans.head.specId)</span><span style=''>
+</span>132 <span style=''>    val rewrite = </span><span style='background: #AEF1AE'>storage.table.newRewrite().validateFromSnapshot(plans.head.snapshotId)</span><span style=''>
+</span>133 <span style=''>    </span><span style='background: #AEF1AE'>plans.flatMap(_.files).foreach(rewrite.deleteFile)</span><span style=''>
+</span>134 <span style=''>    </span><span style='background: #AEF1AE'>replacements.foreach(rewrite.addFile)</span><span style=''>
+</span>135 <span style=''>    // Iceberg validates both missing source files and concurrent row-level deletes during commit.
+</span>136 <span style=''>    // Leave staged files for orphan cleanup if commit fails: its final status can be unknown.
+</span>137 <span style=''>    </span><span style='background: #AEF1AE'>rewrite.commit()</span><span style=''>
+</span>138 <span style=''>  }
+</span>139 <span style=''>
+</span>140 <span style=''>  private def validateSchema(schemaId: Int, specId: Int): Unit = {
+</span>141 <span style=''>    </span><span style='background: #AEF1AE'>storage.table.refresh()</span><span style=''>
+</span>142 <span style=''>    </span><span style='background: #AEF1AE'>require(storage.table.schema().schemaId() == schemaId &amp;&amp; storage.table.spec().specId() == specId,
+</span>143 <span style=''></span><span style='background: #AEF1AE'>      &quot;Table schema or partition spec changed during compaction&quot;)</span><span style=''>
+</span>144 <span style=''>  }
+</span>145 <span style=''>}
+</span>146 <span style=''>
+</span>147 <span style=''>private[core] object FileSystemCompaction {
+</span>148 <span style=''>  case class Plan(snapshotId: Long, schemaId: Int, specId: Int, partition: Partition, files: Seq[DataFile])
+</span>149 <span style=''>  case class Output(partition: Partition, paths: Seq[String], rows: Long)
+</span>150 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          30
+        </td>
+        <td>
+          78
+        </td>
+        <td>
+          1415
+          -
+          1421
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.plan
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.plan()
+        </td>
+      </tr><tr>
+        <td>
+          31
+        </td>
+        <td>
+          79
+        </td>
+        <td>
+          1450
+          -
+          1457
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.prepare
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.prepare(plan)
+        </td>
+      </tr><tr>
+        <td>
+          31
+        </td>
+        <td>
+          80
+        </td>
+        <td>
+          1449
+          -
+          1449
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output]
+        </td>
+      </tr><tr>
+        <td>
+          31
+        </td>
+        <td>
+          81
+        </td>
+        <td>
+          1440
+          -
+          1458
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.map[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output, Seq[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output]]({
+  ((plan: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; FileSystemCompaction.this.prepare(plan))
+})(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output])
+        </td>
+      </tr><tr>
+        <td>
+          32
+        </td>
+        <td>
+          82
+        </td>
+        <td>
+          1463
+          -
+          1485
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.commit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.commit(plans, outputs)
+        </td>
+      </tr><tr>
+        <td>
+          36
+        </td>
+        <td>
+          83
+        </td>
+        <td>
+          1537
+          -
+          1560
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Table.refresh
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.refresh()
+        </td>
+      </tr><tr>
+        <td>
+          37
+        </td>
+        <td>
+          84
+        </td>
+        <td>
+          1606
+          -
+          1628
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Table.schema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.schema()
+        </td>
+      </tr><tr>
+        <td>
+          37
+        </td>
+        <td>
+          85
+        </td>
+        <td>
+          1573
+          -
+          1629
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Schema.sameSchema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.schema.schema.sameSchema(FileSystemCompaction.this.storage.table.schema())
+        </td>
+      </tr><tr>
+        <td>
+          37
+        </td>
+        <td>
+          86
+        </td>
+        <td>
+          1631
+          -
+          1675
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;Reload storage after a table schema change&quot;
+        </td>
+      </tr><tr>
+        <td>
+          37
+        </td>
+        <td>
+          87
+        </td>
+        <td>
+          1565
+          -
+          1676
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(FileSystemCompaction.this.storage.schema.schema.sameSchema(FileSystemCompaction.this.storage.table.schema()), &quot;Reload storage after a table schema change&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          38
+        </td>
+        <td>
+          88
+        </td>
+        <td>
+          1716
+          -
+          1745
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.PartitionSpec.specId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.spec().specId()
+        </td>
+      </tr><tr>
+        <td>
+          38
+        </td>
+        <td>
+          89
+        </td>
+        <td>
+          1689
+          -
+          1745
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.partitionSpecId.==(FileSystemCompaction.this.storage.table.spec().specId())
+        </td>
+      </tr><tr>
+        <td>
+          38
+        </td>
+        <td>
+          90
+        </td>
+        <td>
+          1747
+          -
+          1793
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;Reload storage after a partition spec change&quot;
+        </td>
+      </tr><tr>
+        <td>
+          38
+        </td>
+        <td>
+          91
+        </td>
+        <td>
+          1681
+          -
+          1794
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(FileSystemCompaction.this.storage.partitionSpecId.==(FileSystemCompaction.this.storage.table.spec().specId()), &quot;Reload storage after a partition spec change&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          92
+        </td>
+        <td>
+          1806
+          -
+          1837
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Table.currentSnapshot
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.currentSnapshot()
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          93
+        </td>
+        <td>
+          1799
+          -
+          1838
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Option.apply[org.apache.iceberg.Snapshot](FileSystemCompaction.this.storage.table.currentSnapshot())
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          118
+        </td>
+        <td>
+          1853
+          -
+          1853
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan]
+        </td>
+      </tr><tr>
+        <td>
+          39
+        </td>
+        <td>
+          119
+        </td>
+        <td>
+          1799
+          -
+          2616
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Option.option2Iterable[org.apache.iceberg.Snapshot](scala.Option.apply[org.apache.iceberg.Snapshot](FileSystemCompaction.this.storage.table.currentSnapshot())).toSeq.flatMap[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan, Seq[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan]](((snapshot: org.apache.iceberg.Snapshot) =&gt; {
+  val selected: scala.collection.immutable.Set[org.locationtech.geomesa.fs.storage.core.Partition] = FileSystemCompaction.this.partitions.toSet[org.locationtech.geomesa.fs.storage.core.Partition];
+  val files: List[org.apache.iceberg.DataFile] = org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.apache.iceberg.io.CloseableIterable[org.apache.iceberg.FileScanTask], List[org.apache.iceberg.DataFile]](FileSystemCompaction.this.storage.table.newScan().useSnapshot(snapshot.snapshotId()).planFiles())(((tasks: org.apache.iceberg.io.CloseableIterable[org.apache.iceberg.FileScanTask]) =&gt; scala.collection.JavaConverters.iterableAsScalaIterableConverter[org.apache.iceberg.FileScanTask](tasks).asScala.map[org.apache.iceberg.DataFile, Iterable[org.apache.iceberg.DataFile]](((x$1: org.apache.iceberg.FileScanTask) =&gt; x$1.file().copy()))(collection.this.Iterable.canBuildFrom[org.apache.iceberg.DataFile]).filter(((file: org.apache.iceberg.DataFile) =&gt; {
+  scala.Predef.require(FileSystemCompaction.this.storage.table.spec().compatibleWith(FileSystemCompaction.this.storage.table.specs().get(file.specId())), &quot;Compaction requires input files with a compatible partition spec&quot;);
+  selected.contains(FileSystemCompaction.this.storage.metadata.partition(file)).&amp;&amp;(FileSystemCompaction.this.target.exists(((x$2: Long) =&gt; FileSystemCompaction.this.storage.sizer.fileIsSized(file, x$2))).unary_!)
+})).toList))(io.this.IsCloseable.closeableIsCloseable);
+  files.groupBy[org.locationtech.geomesa.fs.storage.core.Partition]({
+  ((file: org.apache.iceberg.DataFile) =&gt; FileSystemCompaction.this.storage.metadata.partition(file))
+}).toSeq.map[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan, Seq[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan]](((x0$1: (org.locationtech.geomesa.fs.storage.core.Partition, List[org.apache.iceberg.DataFile])) =&gt; x0$1 match {
+    case (_1: org.locationtech.geomesa.fs.storage.core.Partition, _2: List[org.apache.iceberg.DataFile])(org.locationtech.geomesa.fs.storage.core.Partition, List[org.apache.iceberg.DataFile])((partition @ _), (inputs @ _)) =&gt; FileSystemCompaction.Plan.apply(snapshot.snapshotId(), FileSystemCompaction.this.storage.table.schema().schemaId(), FileSystemCompaction.this.storage.table.spec().specId(), partition, inputs)
+  }))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan])
+}))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan])
+        </td>
+      </tr><tr>
+        <td>
+          40
+        </td>
+        <td>
+          94
+        </td>
+        <td>
+          1888
+          -
+          1904
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toSet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.partitions.toSet[org.locationtech.geomesa.fs.storage.core.Partition]
+        </td>
+      </tr><tr>
+        <td>
+          41
+        </td>
+        <td>
+          95
+        </td>
+        <td>
+          1933
+          -
+          2003
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Scan.planFiles
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.newScan().useSnapshot(snapshot.snapshotId()).planFiles()
+        </td>
+      </tr><tr>
+        <td>
+          41
+        </td>
+        <td>
+          108
+        </td>
+        <td>
+          2005
+          -
+          2005
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          41
+        </td>
+        <td>
+          109
+        </td>
+        <td>
+          1923
+          -
+          2393
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.apache.iceberg.io.CloseableIterable[org.apache.iceberg.FileScanTask], List[org.apache.iceberg.DataFile]](FileSystemCompaction.this.storage.table.newScan().useSnapshot(snapshot.snapshotId()).planFiles())(((tasks: org.apache.iceberg.io.CloseableIterable[org.apache.iceberg.FileScanTask]) =&gt; scala.collection.JavaConverters.iterableAsScalaIterableConverter[org.apache.iceberg.FileScanTask](tasks).asScala.map[org.apache.iceberg.DataFile, Iterable[org.apache.iceberg.DataFile]](((x$1: org.apache.iceberg.FileScanTask) =&gt; x$1.file().copy()))(collection.this.Iterable.canBuildFrom[org.apache.iceberg.DataFile]).filter(((file: org.apache.iceberg.DataFile) =&gt; {
+  scala.Predef.require(FileSystemCompaction.this.storage.table.spec().compatibleWith(FileSystemCompaction.this.storage.table.specs().get(file.specId())), &quot;Compaction requires input files with a compatible partition spec&quot;);
+  selected.contains(FileSystemCompaction.this.storage.metadata.partition(file)).&amp;&amp;(FileSystemCompaction.this.target.exists(((x$2: Long) =&gt; FileSystemCompaction.this.storage.sizer.fileIsSized(file, x$2))).unary_!)
+})).toList))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          42
+        </td>
+        <td>
+          96
+        </td>
+        <td>
+          2042
+          -
+          2057
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.ContentFile.copy
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1.file().copy()
+        </td>
+      </tr><tr>
+        <td>
+          42
+        </td>
+        <td>
+          97
+        </td>
+        <td>
+          2041
+          -
+          2041
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Iterable.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Iterable.canBuildFrom[org.apache.iceberg.DataFile]
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          98
+        </td>
+        <td>
+          2156
+          -
+          2169
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.ContentFile.specId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          file.specId()
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          99
+        </td>
+        <td>
+          2130
+          -
+          2170
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.specs().get(file.specId())
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          100
+        </td>
+        <td>
+          2094
+          -
+          2171
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.PartitionSpec.compatibleWith
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.spec().compatibleWith(FileSystemCompaction.this.storage.table.specs().get(file.specId()))
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          102
+        </td>
+        <td>
+          2086
+          -
+          2252
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(FileSystemCompaction.this.storage.table.spec().compatibleWith(FileSystemCompaction.this.storage.table.specs().get(file.specId())), &quot;Compaction requires input files with a compatible partition spec&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          101
+        </td>
+        <td>
+          2185
+          -
+          2251
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;Compaction requires input files with a compatible partition spec&quot;
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          103
+        </td>
+        <td>
+          2281
+          -
+          2313
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.DataFiles.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.metadata.partition(file)
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          104
+        </td>
+        <td>
+          2333
+          -
+          2367
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.utils.FileSize.fileIsSized
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.sizer.fileIsSized(file, x$2)
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          105
+        </td>
+        <td>
+          2318
+          -
+          2368
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.target.exists(((x$2: Long) =&gt; FileSystemCompaction.this.storage.sizer.fileIsSized(file, x$2))).unary_!
+        </td>
+      </tr><tr>
+        <td>
+          45
+        </td>
+        <td>
+          106
+        </td>
+        <td>
+          2263
+          -
+          2368
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          selected.contains(FileSystemCompaction.this.storage.metadata.partition(file)).&amp;&amp;(FileSystemCompaction.this.target.exists(((x$2: Long) =&gt; FileSystemCompaction.this.storage.sizer.fileIsSized(file, x$2))).unary_!)
+        </td>
+      </tr><tr>
+        <td>
+          46
+        </td>
+        <td>
+          107
+        </td>
+        <td>
+          2024
+          -
+          2385
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toList
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.iterableAsScalaIterableConverter[org.apache.iceberg.FileScanTask](tasks).asScala.map[org.apache.iceberg.DataFile, Iterable[org.apache.iceberg.DataFile]](((x$1: org.apache.iceberg.FileScanTask) =&gt; x$1.file().copy()))(collection.this.Iterable.canBuildFrom[org.apache.iceberg.DataFile]).filter(((file: org.apache.iceberg.DataFile) =&gt; {
+  scala.Predef.require(FileSystemCompaction.this.storage.table.spec().compatibleWith(FileSystemCompaction.this.storage.table.specs().get(file.specId())), &quot;Compaction requires input files with a compatible partition spec&quot;);
+  selected.contains(FileSystemCompaction.this.storage.metadata.partition(file)).&amp;&amp;(FileSystemCompaction.this.target.exists(((x$2: Long) =&gt; FileSystemCompaction.this.storage.sizer.fileIsSized(file, x$2))).unary_!)
+})).toList
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          110
+        </td>
+        <td>
+          2414
+          -
+          2440
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.DataFiles.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.metadata.partition(file)
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          116
+        </td>
+        <td>
+          2452
+          -
+          2452
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan]
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          117
+        </td>
+        <td>
+          2400
+          -
+          2610
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          files.groupBy[org.locationtech.geomesa.fs.storage.core.Partition]({
+  ((file: org.apache.iceberg.DataFile) =&gt; FileSystemCompaction.this.storage.metadata.partition(file))
+}).toSeq.map[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan, Seq[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan]](((x0$1: (org.locationtech.geomesa.fs.storage.core.Partition, List[org.apache.iceberg.DataFile])) =&gt; x0$1 match {
+  case (_1: org.locationtech.geomesa.fs.storage.core.Partition, _2: List[org.apache.iceberg.DataFile])(org.locationtech.geomesa.fs.storage.core.Partition, List[org.apache.iceberg.DataFile])((partition @ _), (inputs @ _)) =&gt; FileSystemCompaction.Plan.apply(snapshot.snapshotId(), FileSystemCompaction.this.storage.table.schema().schemaId(), FileSystemCompaction.this.storage.table.spec().specId(), partition, inputs)
+}))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan])
+        </td>
+      </tr><tr>
+        <td>
+          49
+        </td>
+        <td>
+          111
+        </td>
+        <td>
+          2495
+          -
+          2516
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Snapshot.snapshotId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          snapshot.snapshotId()
+        </td>
+      </tr><tr>
+        <td>
+          49
+        </td>
+        <td>
+          112
+        </td>
+        <td>
+          2518
+          -
+          2551
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Schema.schemaId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.schema().schemaId()
+        </td>
+      </tr><tr>
+        <td>
+          49
+        </td>
+        <td>
+          113
+        </td>
+        <td>
+          2553
+          -
+          2582
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.PartitionSpec.specId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.spec().specId()
+        </td>
+      </tr><tr>
+        <td>
+          49
+        </td>
+        <td>
+          114
+        </td>
+        <td>
+          2490
+          -
+          2602
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.Plan.apply(snapshot.snapshotId(), FileSystemCompaction.this.storage.table.schema().schemaId(), FileSystemCompaction.this.storage.table.spec().specId(), partition, inputs)
+        </td>
+      </tr><tr>
+        <td>
+          49
+        </td>
+        <td>
+          115
+        </td>
+        <td>
+          2490
+          -
+          2602
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.Plan.apply(snapshot.snapshotId(), FileSystemCompaction.this.storage.table.schema().schemaId(), FileSystemCompaction.this.storage.table.spec().specId(), partition, inputs)
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          120
+        </td>
+        <td>
+          2799
+          -
+          2812
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.schemaId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.schemaId
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          121
+        </td>
+        <td>
+          2814
+          -
+          2825
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.specId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.specId
+        </td>
+      </tr><tr>
+        <td>
+          56
+        </td>
+        <td>
+          122
+        </td>
+        <td>
+          2784
+          -
+          2826
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.validateSchema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.validateSchema(plan.schemaId, plan.specId)
+        </td>
+      </tr><tr>
+        <td>
+          57
+        </td>
+        <td>
+          123
+        </td>
+        <td>
+          2843
+          -
+          2868
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.ArrayBuffer.empty[String]
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          124
+        </td>
+        <td>
+          2901
+          -
+          2913
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.ContentFile.location
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$3.location()
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          125
+        </td>
+        <td>
+          2900
+          -
+          2900
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[String]
+        </td>
+      </tr><tr>
+        <td>
+          58
+        </td>
+        <td>
+          126
+        </td>
+        <td>
+          2886
+          -
+          2920
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toSet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.files.map[String, Seq[String]](((x$3: org.apache.iceberg.DataFile) =&gt; x$3.location()))(collection.this.Seq.canBuildFrom[String]).toSet[String]
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          127
+        </td>
+        <td>
+          2962
+          -
+          2966
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          128
+        </td>
+        <td>
+          2968
+          -
+          2972
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          129
+        </td>
+        <td>
+          2974
+          -
+          2983
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.ImmutableSetFactory.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.Set.empty[String]
+        </td>
+      </tr><tr>
+        <td>
+          59
+        </td>
+        <td>
+          130
+        </td>
+        <td>
+          2942
+          -
+          2991
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.SimpleFeatureIcebergSchema.ReadSchema.schema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.schema.read(scala.None, scala.None, scala.Predef.Set.empty[String], FileSystemCompaction.this.storage.schema.read$default$4, FileSystemCompaction.this.storage.schema.read$default$5).schema
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          131
+        </td>
+        <td>
+          3075
+          -
+          3101
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Table.properties
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.properties()
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          132
+        </td>
+        <td>
+          3028
+          -
+          3102
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.icebergBloomFilterConf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.icebergBloomFilterConf(FileSystemCompaction.this.storage.table.properties())
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          136
+        </td>
+        <td>
+          3012
+          -
+          3176
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.immutable.MapLike.++
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.conf.++[String](org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.icebergBloomFilterConf(FileSystemCompaction.this.storage.table.properties())).++[String](scala.Predef.Map.apply[String, String](scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.fs.storage.core.schema.SimpleFeatureSchema.PartitionKey).-&gt;[String](plan.partition.toString)))
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          133
+        </td>
+        <td>
+          3116
+          -
+          3148
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.schema.SimpleFeatureSchema.PartitionKey
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.core.schema.SimpleFeatureSchema.PartitionKey
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          134
+        </td>
+        <td>
+          3116
+          -
+          3175
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.ArrowAssoc.-&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.fs.storage.core.schema.SimpleFeatureSchema.PartitionKey).-&gt;[String](plan.partition.toString)
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          135
+        </td>
+        <td>
+          3112
+          -
+          3176
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.generic.GenMapFactory.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.Map.apply[String, String](scala.Predef.ArrowAssoc[String](org.locationtech.geomesa.fs.storage.core.schema.SimpleFeatureSchema.PartitionKey).-&gt;[String](plan.partition.toString))
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          137
+        </td>
+        <td>
+          3208
+          -
+          3231
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.utils.FileSize.estimator
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.sizer.estimator(size)
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          138
+        </td>
+        <td>
+          3197
+          -
+          3232
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.target.map[org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator]({
+  ((size: Long) =&gt; FileSystemCompaction.this.storage.sizer.estimator(size))
+})
+        </td>
+      </tr><tr>
+        <td>
+          63
+        </td>
+        <td>
+          139
+        </td>
+        <td>
+          3275
+          -
+          3279
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          140
+        </td>
+        <td>
+          3295
+          -
+          3297
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0L
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          141
+        </td>
+        <td>
+          3319
+          -
+          3321
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0L
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          142
+        </td>
+        <td>
+          3357
+          -
+          3370
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          9223372036854775807L
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          143
+        </td>
+        <td>
+          3372
+          -
+          3386
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.FileSizeEstimator.estimate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$4.estimate(0L)
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          144
+        </td>
+        <td>
+          3342
+          -
+          3387
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.fold
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          estimator.fold[Long](9223372036854775807L)(((x$4: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$4.estimate(0L)))
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          145
+        </td>
+        <td>
+          3423
+          -
+          3437
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          150
+        </td>
+        <td>
+          3439
+          -
+          3519
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  writer.close();
+  totalBytes = totalBytes.+(writer.size);
+  writer = null
+}
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          151
+        </td>
+        <td>
+          3419
+          -
+          3419
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          152
+        </td>
+        <td>
+          3419
+          -
+          3419
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          69
+        </td>
+        <td>
+          146
+        </td>
+        <td>
+          3447
+          -
+          3461
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.close
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.close()
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          147
+        </td>
+        <td>
+          3482
+          -
+          3493
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.size
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          148
+        </td>
+        <td>
+          3468
+          -
+          3493
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          totalBytes.+(writer.size)
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          149
+        </td>
+        <td>
+          3509
+          -
+          3513
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          191
+        </td>
+        <td>
+          3537
+          -
+          4390
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan, Unit](new org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan(FileSystemCompaction.this.storage.table, readSchema, org.apache.iceberg.expressions.Expressions.alwaysTrue(), 1, scala.Some.apply[String =&gt; Boolean]({
+    ((elem: String) =&gt; inputs.contains(elem))
+  }), scala.Some.apply[Long](plan.snapshotId)))(((reader: org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan) =&gt; reader.foreach[Unit](((feature: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
+    if (writer.==(null))
+      {
+        val path: String = FileSystemCompaction.this.storage.newFilePath(FileSystemCompaction.this.storage.newFilePath$default$1);
+        paths.+=(path);
+        writer = org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.apply(FileSystemCompaction.this.storage.schema, writeConf, FileSystemCompaction.this.storage.table.io(), path, org.locationtech.geomesa.fs.storage.core.observer.FileSystemObserverFactory.NoOpObserver)
+      }
+    else
+      ();
+    writer.write(feature);
+    rows = rows.+(1);
+    remaining = remaining.-(1);
+    if (remaining.&lt;=(0))
+      {
+        closeWriter();
+        estimator.foreach[Unit](((x$5: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$5.update(totalBytes, rows)));
+        remaining = estimator.fold[Long](9223372036854775807L)(((x$6: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$6.estimate(0L)))
+      }
+    else
+      ()
+  }))))(io.this.IsCloseable.closeableIsCloseable);
+  closeWriter();
+  FileSystemCompaction.Output.apply(plan.partition, paths.toList, rows)
+}
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          153
+        </td>
+        <td>
+          3570
+          -
+          3583
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.table
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          154
+        </td>
+        <td>
+          3597
+          -
+          3621
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.expressions.Expressions.alwaysTrue
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.apache.iceberg.expressions.Expressions.alwaysTrue()
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          155
+        </td>
+        <td>
+          3623
+          -
+          3624
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          160
+        </td>
+        <td>
+          3547
+          -
+          3681
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan(FileSystemCompaction.this.storage.table, readSchema, org.apache.iceberg.expressions.Expressions.alwaysTrue(), 1, scala.Some.apply[String =&gt; Boolean]({
+  ((elem: String) =&gt; inputs.contains(elem))
+}), scala.Some.apply[Long](plan.snapshotId))
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          156
+        </td>
+        <td>
+          3641
+          -
+          3656
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.SetLike.contains
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          inputs.contains(elem)
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          157
+        </td>
+        <td>
+          3636
+          -
+          3657
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[String =&gt; Boolean]({
+  ((elem: String) =&gt; inputs.contains(elem))
+})
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          158
+        </td>
+        <td>
+          3664
+          -
+          3679
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.snapshotId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.snapshotId
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          159
+        </td>
+        <td>
+          3659
+          -
+          3680
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[Long](plan.snapshotId)
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          185
+        </td>
+        <td>
+          3683
+          -
+          3683
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          186
+        </td>
+        <td>
+          3537
+          -
+          4250
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan, Unit](new org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan(FileSystemCompaction.this.storage.table, readSchema, org.apache.iceberg.expressions.Expressions.alwaysTrue(), 1, scala.Some.apply[String =&gt; Boolean]({
+  ((elem: String) =&gt; inputs.contains(elem))
+}), scala.Some.apply[Long](plan.snapshotId)))(((reader: org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan) =&gt; reader.foreach[Unit](((feature: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
+  if (writer.==(null))
+    {
+      val path: String = FileSystemCompaction.this.storage.newFilePath(FileSystemCompaction.this.storage.newFilePath$default$1);
+      paths.+=(path);
+      writer = org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.apply(FileSystemCompaction.this.storage.schema, writeConf, FileSystemCompaction.this.storage.table.io(), path, org.locationtech.geomesa.fs.storage.core.observer.FileSystemObserverFactory.NoOpObserver)
+    }
+  else
+    ();
+  writer.write(feature);
+  rows = rows.+(1);
+  remaining = remaining.-(1);
+  if (remaining.&lt;=(0))
+    {
+      closeWriter();
+      estimator.foreach[Unit](((x$5: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$5.update(totalBytes, rows)));
+      remaining = estimator.fold[Long](9223372036854775807L)(((x$6: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$6.estimate(0L)))
+    }
+  else
+    ()
+}))))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          184
+        </td>
+        <td>
+          3703
+          -
+          4242
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.collection.CloseableIterator.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          reader.foreach[Unit](((feature: org.geotools.api.feature.simple.SimpleFeature) =&gt; {
+  if (writer.==(null))
+    {
+      val path: String = FileSystemCompaction.this.storage.newFilePath(FileSystemCompaction.this.storage.newFilePath$default$1);
+      paths.+=(path);
+      writer = org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.apply(FileSystemCompaction.this.storage.schema, writeConf, FileSystemCompaction.this.storage.table.io(), path, org.locationtech.geomesa.fs.storage.core.observer.FileSystemObserverFactory.NoOpObserver)
+    }
+  else
+    ();
+  writer.write(feature);
+  rows = rows.+(1);
+  remaining = remaining.-(1);
+  if (remaining.&lt;=(0))
+    {
+      closeWriter();
+      estimator.foreach[Unit](((x$5: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$5.update(totalBytes, rows)));
+      remaining = estimator.fold[Long](9223372036854775807L)(((x$6: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$6.estimate(0L)))
+    }
+  else
+    ()
+}))
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          161
+        </td>
+        <td>
+          3745
+          -
+          3759
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          168
+        </td>
+        <td>
+          3761
+          -
+          3957
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val path: String = FileSystemCompaction.this.storage.newFilePath(FileSystemCompaction.this.storage.newFilePath$default$1);
+  paths.+=(path);
+  writer = org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.apply(FileSystemCompaction.this.storage.schema, writeConf, FileSystemCompaction.this.storage.table.io(), path, org.locationtech.geomesa.fs.storage.core.observer.FileSystemObserverFactory.NoOpObserver)
+}
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          169
+        </td>
+        <td>
+          3741
+          -
+          3741
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          170
+        </td>
+        <td>
+          3741
+          -
+          3741
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          79
+        </td>
+        <td>
+          162
+        </td>
+        <td>
+          3786
+          -
+          3807
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.newFilePath
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.newFilePath(FileSystemCompaction.this.storage.newFilePath$default$1)
+        </td>
+      </tr><tr>
+        <td>
+          80
+        </td>
+        <td>
+          163
+        </td>
+        <td>
+          3820
+          -
+          3833
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          paths.+=(path)
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          164
+        </td>
+        <td>
+          3879
+          -
+          3893
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.schema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.schema
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          165
+        </td>
+        <td>
+          3906
+          -
+          3924
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Table.io
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.io()
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          166
+        </td>
+        <td>
+          3932
+          -
+          3944
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.observer.FileSystemObserverFactory.NoOpObserver
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.core.observer.FileSystemObserverFactory.NoOpObserver
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          167
+        </td>
+        <td>
+          3855
+          -
+          3945
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.apply(FileSystemCompaction.this.storage.schema, writeConf, FileSystemCompaction.this.storage.table.io(), path, org.locationtech.geomesa.fs.storage.core.observer.FileSystemObserverFactory.NoOpObserver)
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          171
+        </td>
+        <td>
+          3968
+          -
+          3989
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter.write
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          writer.write(feature)
+        </td>
+      </tr><tr>
+        <td>
+          84
+        </td>
+        <td>
+          172
+        </td>
+        <td>
+          4000
+          -
+          4009
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rows.+(1)
+        </td>
+      </tr><tr>
+        <td>
+          85
+        </td>
+        <td>
+          173
+        </td>
+        <td>
+          4020
+          -
+          4034
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.-
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          remaining.-(1)
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          174
+        </td>
+        <td>
+          4049
+          -
+          4063
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          remaining.&lt;=(0)
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          181
+        </td>
+        <td>
+          4065
+          -
+          4232
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  closeWriter();
+  estimator.foreach[Unit](((x$5: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$5.update(totalBytes, rows)));
+  remaining = estimator.fold[Long](9223372036854775807L)(((x$6: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$6.estimate(0L)))
+}
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          182
+        </td>
+        <td>
+          4045
+          -
+          4045
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          86
+        </td>
+        <td>
+          183
+        </td>
+        <td>
+          4045
+          -
+          4045
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          175
+        </td>
+        <td>
+          4079
+          -
+          4092
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.closeWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          closeWriter()
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          176
+        </td>
+        <td>
+          4123
+          -
+          4149
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.FileSizeEstimator.update
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$5.update(totalBytes, rows)
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          177
+        </td>
+        <td>
+          4105
+          -
+          4150
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          estimator.foreach[Unit](((x$5: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$5.update(totalBytes, rows)))
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          178
+        </td>
+        <td>
+          4190
+          -
+          4203
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          9223372036854775807L
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          179
+        </td>
+        <td>
+          4205
+          -
+          4219
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.FileSizeEstimator.estimate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$6.estimate(0L)
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          180
+        </td>
+        <td>
+          4175
+          -
+          4220
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.fold
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          estimator.fold[Long](9223372036854775807L)(((x$6: org.locationtech.geomesa.fs.storage.core.utils.FileSize.UpdatingFileSizeEstimator) =&gt; x$6.estimate(0L)))
+        </td>
+      </tr><tr>
+        <td>
+          93
+        </td>
+        <td>
+          187
+        </td>
+        <td>
+          4257
+          -
+          4270
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.closeWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          closeWriter()
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          188
+        </td>
+        <td>
+          4355
+          -
+          4369
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plan.partition
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          189
+        </td>
+        <td>
+          4371
+          -
+          4383
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.IndexedSeqOptimized.toList
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          paths.toList
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          190
+        </td>
+        <td>
+          4348
+          -
+          4390
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.Output.apply(plan.partition, paths.toList, rows)
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          202
+        </td>
+        <td>
+          4428
+          -
+          4665
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[Option[org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter]](scala.Option.apply[org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter](writer))(io.this.IsCloseable.optionIsCloseable).foreach[Unit]({
+    ((x$1: Throwable) =&gt; e.addSuppressed(x$1))
+  });
+  paths.foreach[Unit](((path: String) =&gt; try {
+    FileSystemCompaction.this.storage.table.io().deleteFile(path)
+  } catch {
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((cleanup @ _)) =&gt; e.addSuppressed(cleanup)
+  }));
+  throw e
+}
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          192
+        </td>
+        <td>
+          4452
+          -
+          4466
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Option.apply[org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter](writer)
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          193
+        </td>
+        <td>
+          4451
+          -
+          4451
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.optionIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.optionIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          194
+        </td>
+        <td>
+          4476
+          -
+          4491
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Throwable.addSuppressed
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          e.addSuppressed(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          195
+        </td>
+        <td>
+          4439
+          -
+          4492
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.CloseQuietly.apply[Option[org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter]](scala.Option.apply[org.locationtech.geomesa.fs.storage.core.parquet.io.ParquetFileSystemWriter](writer))(io.this.IsCloseable.optionIsCloseable).foreach[Unit]({
+  ((x$1: Throwable) =&gt; e.addSuppressed(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          200
+        </td>
+        <td>
+          4501
+          -
+          4649
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ResizableArray.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          paths.foreach[Unit](((path: String) =&gt; try {
+  FileSystemCompaction.this.storage.table.io().deleteFile(path)
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((cleanup @ _)) =&gt; e.addSuppressed(cleanup)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          196
+        </td>
+        <td>
+          4541
+          -
+          4576
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.io.FileIO.deleteFile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          FileSystemCompaction.this.storage.table.io().deleteFile(path)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          197
+        </td>
+        <td>
+          4541
+          -
+          4576
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.iceberg.io.FileIO.deleteFile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          FileSystemCompaction.this.storage.table.io().deleteFile(path)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          198
+        </td>
+        <td>
+          4613
+          -
+          4637
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Throwable.addSuppressed
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          e.addSuppressed(cleanup)
+        </td>
+      </tr><tr>
+        <td>
+          100
+        </td>
+        <td>
+          199
+        </td>
+        <td>
+          4613
+          -
+          4637
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.lang.Throwable.addSuppressed
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          e.addSuppressed(cleanup)
+        </td>
+      </tr><tr>
+        <td>
+          102
+        </td>
+        <td>
+          201
+        </td>
+        <td>
+          4658
+          -
+          4665
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw e
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          203
+        </td>
+        <td>
+          5200
+          -
+          5213
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SeqLike.isEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.isEmpty
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          204
+        </td>
+        <td>
+          5215
+          -
+          5221
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          205
+        </td>
+        <td>
+          5215
+          -
+          5221
+        </td>
+        <td>
+          Return
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.commit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          return ()
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          206
+        </td>
+        <td>
+          5196
+          -
+          5196
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          115
+        </td>
+        <td>
+          207
+        </td>
+        <td>
+          5196
+          -
+          5196
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          208
+        </td>
+        <td>
+          5234
+          -
+          5276
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.map[Long, Seq[Long]](((x$7: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$7.snapshotId))(collection.this.Seq.canBuildFrom[Long]).distinct.size.==(1)
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          209
+        </td>
+        <td>
+          5278
+          -
+          5320
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;Compaction plans must share one snapshot&quot;
+        </td>
+      </tr><tr>
+        <td>
+          116
+        </td>
+        <td>
+          210
+        </td>
+        <td>
+          5226
+          -
+          5321
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(plans.map[Long, Seq[Long]](((x$7: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$7.snapshotId))(collection.this.Seq.canBuildFrom[Long]).distinct.size.==(1), &quot;Compaction plans must share one snapshot&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          211
+        </td>
+        <td>
+          5346
+          -
+          5357
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$8.partition
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          212
+        </td>
+        <td>
+          5345
+          -
+          5345
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.Partition]
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          213
+        </td>
+        <td>
+          5378
+          -
+          5389
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$9.partition
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          214
+        </td>
+        <td>
+          5377
+          -
+          5377
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.Partition]
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          215
+        </td>
+        <td>
+          5368
+          -
+          5396
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toSet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.map[org.locationtech.geomesa.fs.storage.core.Partition, Seq[org.locationtech.geomesa.fs.storage.core.Partition]](((x$9: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$9.partition))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.Partition]).toSet[org.locationtech.geomesa.fs.storage.core.Partition]
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          216
+        </td>
+        <td>
+          5416
+          -
+          5426
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SeqLike.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.size
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          217
+        </td>
+        <td>
+          5400
+          -
+          5426
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          outputs.size.==(plans.size)
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          218
+        </td>
+        <td>
+          5334
+          -
+          5426
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          outputs.map[org.locationtech.geomesa.fs.storage.core.Partition, Seq[org.locationtech.geomesa.fs.storage.core.Partition]](((x$8: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output) =&gt; x$8.partition))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.Partition]).toSet[org.locationtech.geomesa.fs.storage.core.Partition].==(plans.map[org.locationtech.geomesa.fs.storage.core.Partition, Seq[org.locationtech.geomesa.fs.storage.core.Partition]](((x$9: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$9.partition))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.Partition]).toSet[org.locationtech.geomesa.fs.storage.core.Partition]).&amp;&amp;(outputs.size.==(plans.size))
+        </td>
+      </tr><tr>
+        <td>
+          117
+        </td>
+        <td>
+          220
+        </td>
+        <td>
+          5326
+          -
+          5503
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(outputs.map[org.locationtech.geomesa.fs.storage.core.Partition, Seq[org.locationtech.geomesa.fs.storage.core.Partition]](((x$8: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output) =&gt; x$8.partition))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.Partition]).toSet[org.locationtech.geomesa.fs.storage.core.Partition].==(plans.map[org.locationtech.geomesa.fs.storage.core.Partition, Seq[org.locationtech.geomesa.fs.storage.core.Partition]](((x$9: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$9.partition))(collection.this.Seq.canBuildFrom[org.locationtech.geomesa.fs.storage.core.Partition]).toSet[org.locationtech.geomesa.fs.storage.core.Partition]).&amp;&amp;(outputs.size.==(plans.size)), &quot;Compaction results must cover every planned partition exactly once&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          118
+        </td>
+        <td>
+          219
+        </td>
+        <td>
+          5434
+          -
+          5502
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;Compaction results must cover every planned partition exactly once&quot;
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          221
+        </td>
+        <td>
+          5526
+          -
+          5536
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.schemaId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$10.schemaId
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          222
+        </td>
+        <td>
+          5525
+          -
+          5525
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[Int]
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          223
+        </td>
+        <td>
+          5555
+          -
+          5556
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          224
+        </td>
+        <td>
+          5560
+          -
+          5598
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.map[Int, Seq[Int]](((x$11: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$11.specId))(collection.this.Seq.canBuildFrom[Int]).distinct.size.==(1)
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          225
+        </td>
+        <td>
+          5516
+          -
+          5598
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.map[Int, Seq[Int]](((x$10: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$10.schemaId))(collection.this.Seq.canBuildFrom[Int]).distinct.size.==(1).&amp;&amp;(plans.map[Int, Seq[Int]](((x$11: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$11.specId))(collection.this.Seq.canBuildFrom[Int]).distinct.size.==(1))
+        </td>
+      </tr><tr>
+        <td>
+          119
+        </td>
+        <td>
+          227
+        </td>
+        <td>
+          5508
+          -
+          5666
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(plans.map[Int, Seq[Int]](((x$10: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$10.schemaId))(collection.this.Seq.canBuildFrom[Int]).distinct.size.==(1).&amp;&amp;(plans.map[Int, Seq[Int]](((x$11: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$11.specId))(collection.this.Seq.canBuildFrom[Int]).distinct.size.==(1)), &quot;Compaction plans must share one schema and partition spec&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          120
+        </td>
+        <td>
+          226
+        </td>
+        <td>
+          5606
+          -
+          5665
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;Compaction plans must share one schema and partition spec&quot;
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          228
+        </td>
+        <td>
+          5686
+          -
+          5705
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.schemaId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.head.schemaId
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          229
+        </td>
+        <td>
+          5707
+          -
+          5724
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.specId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.head.specId
+        </td>
+      </tr><tr>
+        <td>
+          121
+        </td>
+        <td>
+          230
+        </td>
+        <td>
+          5671
+          -
+          5725
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.validateSchema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.validateSchema(plans.head.schemaId, plans.head.specId)
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          231
+        </td>
+        <td>
+          5754
+          -
+          5761
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output.paths
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$12.paths
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          232
+        </td>
+        <td>
+          5753
+          -
+          5753
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[String]
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          233
+        </td>
+        <td>
+          5792
+          -
+          5804
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SeqLike.size
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$13.paths.size
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          234
+        </td>
+        <td>
+          5791
+          -
+          5791
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[Int]
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          235
+        </td>
+        <td>
+          5806
+          -
+          5806
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.math.Numeric.IntIsIntegral
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          math.this.Numeric.IntIsIntegral
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          236
+        </td>
+        <td>
+          5780
+          -
+          5809
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableOnce.sum
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          outputs.map[Int, Seq[Int]](((x$13: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output) =&gt; x$13.paths.size))(collection.this.Seq.canBuildFrom[Int]).sum[Int](math.this.Numeric.IntIsIntegral)
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          237
+        </td>
+        <td>
+          5738
+          -
+          5809
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          outputs.flatMap[String, Seq[String]](((x$12: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output) =&gt; x$12.paths))(collection.this.Seq.canBuildFrom[String]).distinct.size.==(outputs.map[Int, Seq[Int]](((x$13: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output) =&gt; x$13.paths.size))(collection.this.Seq.canBuildFrom[Int]).sum[Int](math.this.Numeric.IntIsIntegral))
+        </td>
+      </tr><tr>
+        <td>
+          122
+        </td>
+        <td>
+          239
+        </td>
+        <td>
+          5730
+          -
+          5869
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(outputs.flatMap[String, Seq[String]](((x$12: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output) =&gt; x$12.paths))(collection.this.Seq.canBuildFrom[String]).distinct.size.==(outputs.map[Int, Seq[Int]](((x$13: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output) =&gt; x$13.paths.size))(collection.this.Seq.canBuildFrom[Int]).sum[Int](math.this.Numeric.IntIsIntegral)), &quot;Compaction results contain duplicate output paths&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          123
+        </td>
+        <td>
+          238
+        </td>
+        <td>
+          5817
+          -
+          5868
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;Compaction results contain duplicate output paths&quot;
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          240
+        </td>
+        <td>
+          5911
+          -
+          5928
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.specId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.head.specId
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          241
+        </td>
+        <td>
+          5885
+          -
+          5929
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Map.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.specs().get(plans.head.specId)
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          255
+        </td>
+        <td>
+          5969
+          -
+          5969
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.apache.iceberg.DataFile]
+        </td>
+      </tr><tr>
+        <td>
+          125
+        </td>
+        <td>
+          256
+        </td>
+        <td>
+          5953
+          -
+          6232
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          outputs.flatMap[org.apache.iceberg.DataFile, Seq[org.apache.iceberg.DataFile]](((output: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output) =&gt; {
+  val files: Seq[org.apache.iceberg.DataFile] = output.paths.map[org.apache.iceberg.DataFile, Seq[org.apache.iceberg.DataFile]](((x$14: String) =&gt; FileSystemCompaction.this.storage.toDataFile(x$14, output.partition, spec)))(collection.this.Seq.canBuildFrom[org.apache.iceberg.DataFile]);
+  scala.Predef.require(output.rows.&gt;=(0).&amp;&amp;(files.map[Long, Seq[Long]](((x$15: org.apache.iceberg.DataFile) =&gt; x$15.recordCount()))(collection.this.Seq.canBuildFrom[Long]).sum[Long](math.this.Numeric.LongIsIntegral).==(output.rows)), &quot;Compaction result row counts do not match replacement files&quot;);
+  files
+}))(collection.this.Seq.canBuildFrom[org.apache.iceberg.DataFile])
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          242
+        </td>
+        <td>
+          6038
+          -
+          6054
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output.partition
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          output.partition
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          243
+        </td>
+        <td>
+          6016
+          -
+          6061
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.toDataFile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.toDataFile(x$14, output.partition, spec)
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          244
+        </td>
+        <td>
+          6015
+          -
+          6015
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.apache.iceberg.DataFile]
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          245
+        </td>
+        <td>
+          5999
+          -
+          6062
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          output.paths.map[org.apache.iceberg.DataFile, Seq[org.apache.iceberg.DataFile]](((x$14: String) =&gt; FileSystemCompaction.this.storage.toDataFile(x$14, output.partition, spec)))(collection.this.Seq.canBuildFrom[org.apache.iceberg.DataFile])
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          246
+        </td>
+        <td>
+          6092
+          -
+          6093
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          247
+        </td>
+        <td>
+          6107
+          -
+          6122
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.ContentFile.recordCount
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$15.recordCount()
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          248
+        </td>
+        <td>
+          6106
+          -
+          6106
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[Long]
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          249
+        </td>
+        <td>
+          6124
+          -
+          6124
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.math.Numeric.LongIsIntegral
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          math.this.Numeric.LongIsIntegral
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          250
+        </td>
+        <td>
+          6131
+          -
+          6142
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Output.rows
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          output.rows
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          251
+        </td>
+        <td>
+          6097
+          -
+          6142
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Long.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          files.map[Long, Seq[Long]](((x$15: org.apache.iceberg.DataFile) =&gt; x$15.recordCount()))(collection.this.Seq.canBuildFrom[Long]).sum[Long](math.this.Numeric.LongIsIntegral).==(output.rows)
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          252
+        </td>
+        <td>
+          6077
+          -
+          6142
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          output.rows.&gt;=(0).&amp;&amp;(files.map[Long, Seq[Long]](((x$15: org.apache.iceberg.DataFile) =&gt; x$15.recordCount()))(collection.this.Seq.canBuildFrom[Long]).sum[Long](math.this.Numeric.LongIsIntegral).==(output.rows))
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          254
+        </td>
+        <td>
+          6069
+          -
+          6214
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(output.rows.&gt;=(0).&amp;&amp;(files.map[Long, Seq[Long]](((x$15: org.apache.iceberg.DataFile) =&gt; x$15.recordCount()))(collection.this.Seq.canBuildFrom[Long]).sum[Long](math.this.Numeric.LongIsIntegral).==(output.rows)), &quot;Compaction result row counts do not match replacement files&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          253
+        </td>
+        <td>
+          6152
+          -
+          6213
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;Compaction result row counts do not match replacement files&quot;
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          257
+        </td>
+        <td>
+          6252
+          -
+          6271
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.schemaId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.head.schemaId
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          258
+        </td>
+        <td>
+          6273
+          -
+          6290
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.specId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.head.specId
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          259
+        </td>
+        <td>
+          6237
+          -
+          6291
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.validateSchema
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.validateSchema(plans.head.schemaId, plans.head.specId)
+        </td>
+      </tr><tr>
+        <td>
+          132
+        </td>
+        <td>
+          260
+        </td>
+        <td>
+          6358
+          -
+          6379
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.snapshotId
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.head.snapshotId
+        </td>
+      </tr><tr>
+        <td>
+          132
+        </td>
+        <td>
+          261
+        </td>
+        <td>
+          6310
+          -
+          6380
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.RewriteFiles.validateFromSnapshot
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.newRewrite().validateFromSnapshot(plans.head.snapshotId)
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          262
+        </td>
+        <td>
+          6399
+          -
+          6406
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan.files
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$16.files
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          263
+        </td>
+        <td>
+          6398
+          -
+          6398
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.Seq.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          collection.this.Seq.canBuildFrom[org.apache.iceberg.DataFile]
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          264
+        </td>
+        <td>
+          6416
+          -
+          6434
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.RewriteFiles.deleteFile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rewrite.deleteFile(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          265
+        </td>
+        <td>
+          6385
+          -
+          6435
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          plans.flatMap[org.apache.iceberg.DataFile, Seq[org.apache.iceberg.DataFile]](((x$16: org.locationtech.geomesa.fs.storage.core.FileSystemCompaction.Plan) =&gt; x$16.files))(collection.this.Seq.canBuildFrom[org.apache.iceberg.DataFile]).foreach[org.apache.iceberg.RewriteFiles]({
+  ((x$1: org.apache.iceberg.DataFile) =&gt; rewrite.deleteFile(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          266
+        </td>
+        <td>
+          6461
+          -
+          6476
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.RewriteFiles.addFile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rewrite.addFile(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          267
+        </td>
+        <td>
+          6440
+          -
+          6477
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          replacements.foreach[org.apache.iceberg.RewriteFiles]({
+  ((x$1: org.apache.iceberg.DataFile) =&gt; rewrite.addFile(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          137
+        </td>
+        <td>
+          268
+        </td>
+        <td>
+          6676
+          -
+          6692
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.PendingUpdate.commit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          rewrite.commit()
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          269
+        </td>
+        <td>
+          6769
+          -
+          6792
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Table.refresh
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.refresh()
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          270
+        </td>
+        <td>
+          6854
+          -
+          6893
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.spec().specId().==(specId)
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          271
+        </td>
+        <td>
+          6805
+          -
+          6893
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemCompaction.this.storage.table.schema().schemaId().==(schemaId).&amp;&amp;(FileSystemCompaction.this.storage.table.spec().specId().==(specId))
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          273
+        </td>
+        <td>
+          6797
+          -
+          6960
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(FileSystemCompaction.this.storage.table.schema().schemaId().==(schemaId).&amp;&amp;(FileSystemCompaction.this.storage.table.spec().specId().==(specId)), &quot;Table schema or partition spec changed during compaction&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          143
+        </td>
+        <td>
+          272
+        </td>
+        <td>
+          6901
+          -
+          6959
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;Table schema or partition spec changed during compaction&quot;
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>
