@@ -39,191 +39,210 @@
 </span>15 <span style=''>import org.apache.iceberg.expressions.{Evaluator, Expression, Expressions}
 </span>16 <span style=''>import org.apache.iceberg.parquet.Parquet
 </span>17 <span style=''>import org.geotools.api.feature.simple.SimpleFeature
-</span>18 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
-</span>19 <span style=''>import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
-</span>20 <span style=''>import org.locationtech.geomesa.utils.io.IsCloseableImplicits.ExecutorServiceIsCloseable
-</span>21 <span style=''>import org.locationtech.geomesa.utils.io.{CloseWithLogging, IsCloseable, WithClose}
-</span>22 <span style=''>
-</span>23 <span style=''>import java.io.Closeable
-</span>24 <span style=''>import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
-</span>25 <span style=''>import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
-</span>26 <span style=''>import scala.util.control.NonFatal
-</span>27 <span style=''>
-</span>28 <span style=''>/**
-</span>29 <span style=''> * Reads parquet files based on an iceberg table scan
-</span>30 <span style=''> *
-</span>31 <span style=''> * @param table table to scan
-</span>32 <span style=''> * @param schema read schema
-</span>33 <span style=''> * @param filter filter
-</span>34 <span style=''> * @param threads number of threads used to execute
-</span>35 <span style=''> * @param fileFilter optional filter for restricting the files that are scanned
-</span>36 <span style=''> * @param snapshotId optional snapshot to pin the scan to
-</span>37 <span style=''> */
-</span>38 <span style=''>class IcebergParquetScan(
-</span>39 <span style=''>    table: Table,
-</span>40 <span style=''>    schema: SimpleFeatureIcebergSchema,
-</span>41 <span style=''>    filter: Expression,
-</span>42 <span style=''>    threads: Int,
-</span>43 <span style=''>    fileFilter: Option[String =&gt; Boolean] = None,
-</span>44 <span style=''>    snapshotId: Option[Long] = None
-</span>45 <span style=''>  ) extends CloseableIterator[SimpleFeature] with LazyLogging {
-</span>46 <span style=''>
-</span>47 <span style=''>  import scala.collection.JavaConverters._
-</span>48 <span style=''>
-</span>49 <span style=''>  private val queue = </span><span style='background: #AEF1AE'>new LinkedBlockingQueue[StructLike](10000)</span><span style=''>
-</span>50 <span style=''>  private val closed = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
-</span>51 <span style=''>  private val failure = </span><span style='background: #AEF1AE'>new AtomicReference[Throwable]()</span><span style=''>
-</span>52 <span style=''>
-</span>53 <span style=''>  private val row = </span><span style='background: #AEF1AE'>StructSimpleFeature(schema)</span><span style=''>
-</span>54 <span style=''>
-</span>55 <span style=''>  // WithClose here shuts down the executor service, but already submitted tasks will still be executed
-</span>56 <span style=''>  // note: we have to be explicit, as starting with Java 19 ExecutorService extends AutoCloseable which means two implicits match
-</span>57 <span style=''>  private implicit val exIsCloseable: ExecutorServiceIsCloseable = </span><span style='background: #AEF1AE'>IsCloseable.executorServiceIsCloseable</span><span style=''>
-</span>58 <span style=''>  private val ex =
-</span>59 <span style=''>    </span><span style='background: #AEF1AE'>WithClose(new CachedThreadPool(threads)) { pool =&gt;
-</span>60 <span style=''></span><span style='background: #AEF1AE'>      // note: exclude z2 cols even if there's no transform
-</span>61 <span style=''></span><span style='background: #AEF1AE'>      val scan = table.newScan().caseSensitive(false).project(schema.schema).filter(filter)
-</span>62 <span style=''></span><span style='background: #AEF1AE'>      snapshotId.foreach(scan.useSnapshot)
-</span>63 <span style=''></span><span style='background: #AEF1AE'>      try {
-</span>64 <span style=''></span><span style='background: #AEF1AE'>        WithClose(scan.planTasks()) { plan =&gt;
-</span>65 <span style=''></span><span style='background: #AEF1AE'>          WithClose(plan.iterator()) { tasks =&gt;
-</span>66 <span style=''></span><span style='background: #AEF1AE'>            var taskCount = 0
-</span>67 <span style=''></span><span style='background: #AEF1AE'>            var fileCount = 0
-</span>68 <span style=''></span><span style='background: #AEF1AE'>            logger.debug(&quot;Submitting tasks&quot;)
-</span>69 <span style=''></span><span style='background: #AEF1AE'>            tasks.forEachRemaining { task =&gt;
-</span>70 <span style=''></span><span style='background: #AEF1AE'>              val fileTasks = task.files().asScala.toSeq
-</span>71 <span style=''></span><span style='background: #AEF1AE'>              val filteredTasks = fileFilter match {
-</span>72 <span style=''></span><span style='background: #AEF1AE'>                case None =&gt; fileTasks
-</span>73 <span style=''></span><span style='background: #AEF1AE'>                case Some(filt) =&gt;
-</span>74 <span style=''></span><span style='background: #AEF1AE'>                  fileTasks.filter { fileTask =&gt;
-</span>75 <span style=''></span><span style='background: #AEF1AE'>                    val res = filt.apply(fileTask.file().location())
-</span>76 <span style=''></span><span style='background: #AEF1AE'>                    if (!res) {
-</span>77 <span style=''></span><span style='background: #AEF1AE'>                      logger.debug(
-</span>78 <span style=''></span><span style='background: #AEF1AE'>                        s&quot;Skipping file ${fileTask.file().location()} [${fileTask.start()}:${fileTask.length()}] due to file filter&quot;)
-</span>79 <span style=''></span><span style='background: #AEF1AE'>                    }
-</span>80 <span style=''></span><span style='background: #AEF1AE'>                    res
-</span>81 <span style=''></span><span style='background: #AEF1AE'>                  }
-</span>82 <span style=''></span><span style='background: #AEF1AE'>              }
-</span>83 <span style=''></span><span style='background: #AEF1AE'>              if (filteredTasks.nonEmpty) {
-</span>84 <span style=''></span><span style='background: #AEF1AE'>                logger.trace(s&quot;Submitting task with ${filteredTasks.size} file(s)&quot;)
-</span>85 <span style=''></span><span style='background: #AEF1AE'>                pool.submit(new TaskRunnable(filteredTasks))
-</span>86 <span style=''></span><span style='background: #AEF1AE'>                taskCount += 1
-</span>87 <span style=''></span><span style='background: #AEF1AE'>                fileCount += filteredTasks.size
-</span>88 <span style=''></span><span style='background: #AEF1AE'>              }
-</span>89 <span style=''></span><span style='background: #AEF1AE'>            }
-</span>90 <span style=''></span><span style='background: #AEF1AE'>            logger.debug(s&quot;Submitted $taskCount tasks (scanning $fileCount total files) using $threads threads&quot;)
-</span>91 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>92 <span style=''></span><span style='background: #AEF1AE'>        }
-</span>93 <span style=''></span><span style='background: #AEF1AE'>      } finally {
-</span>94 <span style=''></span><span style='background: #AEF1AE'>        CloseWithLogging(Option(scan).collect { case c: Closeable =&gt; </span><span style='background: #F0ADAD'>c</span><span style='background: #AEF1AE'> })
-</span>95 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>96 <span style=''></span><span style='background: #AEF1AE'>      pool
-</span>97 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>98 <span style=''>
-</span>99 <span style=''>  private var current: StructLike = _
-</span>100 <span style=''>
-</span>101 <span style=''>  override def hasNext: Boolean = {
-</span>102 <span style=''>    </span><span style='background: #AEF1AE'>Option(failure.get()).foreach(e =&gt; </span><span style='background: #F0ADAD'>throw new RuntimeException(&quot;Error reading Iceberg data&quot;, e)</span><span style='background: #AEF1AE'>)</span><span style=''>
-</span>103 <span style=''>    if (</span><span style='background: #AEF1AE'>current != null</span><span style=''>) {
-</span>104 <span style=''>      </span><span style='background: #AEF1AE'>return true</span><span style=''>
-</span>105 <span style=''>    }
-</span>106 <span style=''>    </span><span style='background: #AEF1AE'>current = queue.poll()</span><span style=''>
-</span>107 <span style=''>    if (</span><span style='background: #AEF1AE'>current != null</span><span style=''>) {
-</span>108 <span style=''>      </span><span style='background: #AEF1AE'>return true</span><span style=''>
-</span>109 <span style=''>    }
-</span>110 <span style=''>
-</span>111 <span style=''>    if (</span><span style='background: #AEF1AE'>closed.get()</span><span style=''>) {
-</span>112 <span style=''>      </span><span style='background: #F0ADAD'>false</span><span style=''>
-</span>113 <span style=''>    } else </span><span style='background: #AEF1AE'>if (ex.isTerminated) {
-</span>114 <span style=''></span><span style='background: #AEF1AE'>      Option(failure.get()).foreach(e =&gt; </span><span style='background: #F0ADAD'>throw new RuntimeException(&quot;Error reading Iceberg data&quot;, e)</span><span style='background: #AEF1AE'>)
-</span>115 <span style=''></span><span style='background: #AEF1AE'>      current = queue.poll()
-</span>116 <span style=''></span><span style='background: #AEF1AE'>      current != null
-</span>117 <span style=''></span><span style='background: #AEF1AE'>    } else {
-</span>118 <span style=''></span><span style='background: #AEF1AE'>      while (current == null &amp;&amp; !ex.isTerminated) {
-</span>119 <span style=''></span><span style='background: #AEF1AE'>        current = queue.poll(100, TimeUnit.MILLISECONDS)
-</span>120 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>121 <span style=''></span><span style='background: #AEF1AE'>      Option(failure.get()).foreach(e =&gt; throw new RuntimeException(&quot;Error reading Iceberg data&quot;, e))
-</span>122 <span style=''></span><span style='background: #AEF1AE'>      current != null
-</span>123 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>124 <span style=''>  }
-</span>125 <span style=''>
-</span>126 <span style=''>  override def next(): SimpleFeature = {
-</span>127 <span style=''>    if (</span><span style='background: #AEF1AE'>hasNext</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>128 <span style=''></span><span style='background: #AEF1AE'>      row.setRow(current)
-</span>129 <span style=''></span><span style='background: #AEF1AE'>      current = null
-</span>130 <span style=''></span><span style='background: #AEF1AE'>      row
-</span>131 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''> else {
-</span>132 <span style=''>      </span><span style='background: #F0ADAD'>Iterator.empty.next</span><span style=''>
-</span>133 <span style=''>    }
-</span>134 <span style=''>  }
-</span>135 <span style=''>
-</span>136 <span style=''>  override def close(): Unit = {
-</span>137 <span style=''>    if (</span><span style='background: #AEF1AE'>closed.compareAndSet(false, true)</span><span style=''>) </span><span style='background: #AEF1AE'>{
-</span>138 <span style=''></span><span style='background: #AEF1AE'>      ex.shutdownNow()
-</span>139 <span style=''></span><span style='background: #AEF1AE'>      ex.awaitTermination(1, TimeUnit.SECONDS)
-</span>140 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>141 <span style=''>  }
-</span>142 <span style=''>
-</span>143 <span style=''>  private def readFile(task: FileScanTask, projection: Schema): CloseableIterator[StructLike] = {
-</span>144 <span style=''>    logger.debug(s&quot;Reading file ${task.file().location()} [${task.start()}:${task.length()}] with filter: ${task.residual()}&quot;)
-</span>145 <span style=''>    val inputFile = </span><span style='background: #AEF1AE'>table.io().newInputFile(task.file())</span><span style=''>
-</span>146 <span style=''>    // we have to pass in the file path as a constant
-</span>147 <span style=''>    val idToConstant = </span><span style='background: #AEF1AE'>java.util.Map.of[Integer, Any](MetadataColumns.FILE_PATH_COLUMN_ID, inputFile.location())</span><span style=''>
-</span>148 <span style=''>    // note: can't reuse containers b/c we put everything onto the queue - reading row-by-row with reused containers is much slower
-</span>149 <span style=''>    val reader =
-</span>150 <span style=''>      </span><span style='background: #AEF1AE'>Parquet.read(inputFile)
-</span>151 <span style=''></span><span style='background: #AEF1AE'>        .project(projection)
-</span>152 <span style=''></span><span style='background: #AEF1AE'>        .split(task.start(), task.length())
-</span>153 <span style=''></span><span style='background: #AEF1AE'>        .caseSensitive(false)
-</span>154 <span style=''></span><span style='background: #AEF1AE'>        .filter(task.residual())
-</span>155 <span style=''></span><span style='background: #AEF1AE'>        .createReaderFunc(fileSchema =&gt; GenericParquetReaders.buildReader(projection, fileSchema, idToConstant))
-</span>156 <span style=''></span><span style='background: #AEF1AE'>        .build[Record]()</span><span style=''>
-</span>157 <span style=''>    val iter = </span><span style='background: #AEF1AE'>reader.iterator()</span><span style=''>
-</span>158 <span style=''>    </span><span style='background: #AEF1AE'>CloseableIterator(iter.asScala, CloseWithLogging(Seq(iter, reader)))</span><span style=''>
-</span>159 <span style=''>  }
-</span>160 <span style=''>
-</span>161 <span style=''>  private class TaskRunnable(tasks: Seq[FileScanTask]) extends Runnable {
-</span>162 <span style=''>    override def run(): Unit = {
-</span>163 <span style=''>      try {
-</span>164 <span style=''>        </span><span style='background: #AEF1AE'>tasks.foreach { task =&gt;
-</span>165 <span style=''></span><span style='background: #AEF1AE'>          if (!closed.get()) {
-</span>166 <span style=''></span><span style='background: #AEF1AE'>            val deleteFilter = if (task.deletes().isEmpty) { None } else {
-</span>167 <span style=''></span><span style='background: #AEF1AE'>              val filter = new GenericDeleteFilter(table.io(), task, table.schema(), schema.schema)
-</span>168 <span style=''></span><span style='background: #AEF1AE'>              require(!filter.hasEqDeletes,
-</span>169 <span style=''></span><span style='background: #AEF1AE'>                </span><span style='background: #F0ADAD'>s&quot;Only positional deletes are supported, but got equality deletes: ${task.deletes().asScala.map(_.location()).mkString(&quot;, &quot;)}&quot;</span><span style='background: #AEF1AE'>)
-</span>170 <span style=''></span><span style='background: #AEF1AE'>              Some(filter).filter(_.hasPosDeletes)
-</span>171 <span style=''></span><span style='background: #AEF1AE'>            }
-</span>172 <span style=''></span><span style='background: #AEF1AE'>            val projection = deleteFilter.fold(schema.schema)(_.requiredSchema())
-</span>173 <span style=''></span><span style='background: #AEF1AE'>            WithClose(readFile(task, projection)) { iter =&gt;
-</span>174 <span style=''></span><span style='background: #AEF1AE'>              val withDeletes = deleteFilter.fold(iter) { deletes =&gt;
-</span>175 <span style=''></span><span style='background: #AEF1AE'>                val index = deletes.deletedRowPositions()
-</span>176 <span style=''></span><span style='background: #AEF1AE'>                val position = projection.accessorForField(MetadataColumns.ROW_POSITION.fieldId())
-</span>177 <span style=''></span><span style='background: #AEF1AE'>                iter.filterNot(r =&gt; index.isDeleted(position.get(r).asInstanceOf[java.lang.Long]))
-</span>178 <span style=''></span><span style='background: #AEF1AE'>              }
-</span>179 <span style=''></span><span style='background: #AEF1AE'>              val residual = task.residual()
-</span>180 <span style=''></span><span style='background: #AEF1AE'>              val filtered = if (residual == null || residual == Expressions.alwaysTrue()) { withDeletes } else {
-</span>181 <span style=''></span><span style='background: #AEF1AE'>                val filter = new Evaluator(projection.asStruct(), residual, false)
-</span>182 <span style=''></span><span style='background: #AEF1AE'>                val wrapper = new InternalRecordWrapper(projection.asStruct())
-</span>183 <span style=''></span><span style='background: #AEF1AE'>                withDeletes.filter(r =&gt; filter.eval(wrapper.wrap(r)))
-</span>184 <span style=''></span><span style='background: #AEF1AE'>              }
-</span>185 <span style=''></span><span style='background: #AEF1AE'>              filtered.foreach(queue.put)
-</span>186 <span style=''></span><span style='background: #AEF1AE'>            }
-</span>187 <span style=''></span><span style='background: #AEF1AE'>          }
-</span>188 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
-</span>189 <span style=''>      } catch {
-</span>190 <span style=''>        case e: Throwable </span><span style='background: #AEF1AE'>=&gt;
-</span>191 <span style=''></span><span style='background: #AEF1AE'>          // submit captures all throwables in its Future. Publish even fatal failures to the reader so
-</span>192 <span style=''></span><span style='background: #AEF1AE'>          // a failed task cannot appear to be an empty input (and cause compaction to discard its rows).
-</span>193 <span style=''></span><span style='background: #AEF1AE'>          failure.compareAndSet(null, e)
-</span>194 <span style=''></span><span style='background: #AEF1AE'>          if (NonFatal(e)) {
-</span>195 <span style=''></span><span style='background: #AEF1AE'>            logger.error(&quot;Error running scan task:&quot;, e)
-</span>196 <span style=''></span><span style='background: #AEF1AE'>          } else {
-</span>197 <span style=''></span><span style='background: #AEF1AE'>            throw e
-</span>198 <span style=''></span><span style='background: #AEF1AE'>          }</span><span style=''>
-</span>199 <span style=''>      }
-</span>200 <span style=''>    }
-</span>201 <span style=''>  }
-</span>202 <span style=''>}
+</span>18 <span style=''>import org.locationtech.geomesa.fs.storage.core.iceberg.IcebergFilterConverter.ReferenceVisitor
+</span>19 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
+</span>20 <span style=''>import org.locationtech.geomesa.utils.concurrent.CachedThreadPool
+</span>21 <span style=''>import org.locationtech.geomesa.utils.io.IsCloseableImplicits.ExecutorServiceIsCloseable
+</span>22 <span style=''>import org.locationtech.geomesa.utils.io.{CloseWithLogging, IsCloseable, WithClose}
+</span>23 <span style=''>
+</span>24 <span style=''>import java.io.Closeable
+</span>25 <span style=''>import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+</span>26 <span style=''>import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
+</span>27 <span style=''>import scala.util.control.NonFatal
+</span>28 <span style=''>
+</span>29 <span style=''>/**
+</span>30 <span style=''> * Reads parquet files based on an iceberg table scan
+</span>31 <span style=''> *
+</span>32 <span style=''> * @param table table to scan
+</span>33 <span style=''> * @param schema read schema
+</span>34 <span style=''> * @param filter filter
+</span>35 <span style=''> * @param threads number of threads used to execute
+</span>36 <span style=''> * @param fileFilter optional filter for restricting the files that are scanned
+</span>37 <span style=''> * @param snapshotId optional snapshot to pin the scan to
+</span>38 <span style=''> */
+</span>39 <span style=''>class IcebergParquetScan(
+</span>40 <span style=''>    table: Table,
+</span>41 <span style=''>    schema: SimpleFeatureIcebergSchema,
+</span>42 <span style=''>    filter: Expression,
+</span>43 <span style=''>    threads: Int,
+</span>44 <span style=''>    fileFilter: Option[String =&gt; Boolean] = None,
+</span>45 <span style=''>    snapshotId: Option[Long] = None
+</span>46 <span style=''>  ) extends CloseableIterator[SimpleFeature] with LazyLogging {
+</span>47 <span style=''>
+</span>48 <span style=''>  import scala.collection.JavaConverters._
+</span>49 <span style=''>
+</span>50 <span style=''>  private val queue = </span><span style='background: #AEF1AE'>new LinkedBlockingQueue[StructLike](10000)</span><span style=''>
+</span>51 <span style=''>  private val closed = </span><span style='background: #AEF1AE'>new AtomicBoolean(false)</span><span style=''>
+</span>52 <span style=''>  private val failure = </span><span style='background: #AEF1AE'>new AtomicReference[Throwable]()</span><span style=''>
+</span>53 <span style=''>
+</span>54 <span style=''>  private val row = </span><span style='background: #AEF1AE'>StructSimpleFeature(schema)</span><span style=''>
+</span>55 <span style=''>
+</span>56 <span style=''>  // WithClose here shuts down the executor service, but already submitted tasks will still be executed
+</span>57 <span style=''>  // note: we have to be explicit, as starting with Java 19 ExecutorService extends AutoCloseable which means two implicits match
+</span>58 <span style=''>  private implicit val exIsCloseable: ExecutorServiceIsCloseable = </span><span style='background: #AEF1AE'>IsCloseable.executorServiceIsCloseable</span><span style=''>
+</span>59 <span style=''>  private val ex =
+</span>60 <span style=''>    </span><span style='background: #AEF1AE'>WithClose(new CachedThreadPool(threads)) { pool =&gt;
+</span>61 <span style=''></span><span style='background: #AEF1AE'>      // note: exclude z2 cols even if there's no transform
+</span>62 <span style=''></span><span style='background: #AEF1AE'>      val scan = table.newScan().caseSensitive(false).project(schema.schema).filter(filter)
+</span>63 <span style=''></span><span style='background: #AEF1AE'>      snapshotId.foreach(scan.useSnapshot)
+</span>64 <span style=''></span><span style='background: #AEF1AE'>      try {
+</span>65 <span style=''></span><span style='background: #AEF1AE'>        WithClose(scan.planTasks()) { plan =&gt;
+</span>66 <span style=''></span><span style='background: #AEF1AE'>          WithClose(plan.iterator()) { tasks =&gt;
+</span>67 <span style=''></span><span style='background: #AEF1AE'>            var taskCount = 0
+</span>68 <span style=''></span><span style='background: #AEF1AE'>            var fileCount = 0
+</span>69 <span style=''></span><span style='background: #AEF1AE'>            logger.debug(&quot;Submitting tasks&quot;)
+</span>70 <span style=''></span><span style='background: #AEF1AE'>            tasks.forEachRemaining { task =&gt;
+</span>71 <span style=''></span><span style='background: #AEF1AE'>              val fileTasks = task.files().asScala.toSeq
+</span>72 <span style=''></span><span style='background: #AEF1AE'>              val filteredTasks = fileFilter match {
+</span>73 <span style=''></span><span style='background: #AEF1AE'>                case None =&gt; fileTasks
+</span>74 <span style=''></span><span style='background: #AEF1AE'>                case Some(filt) =&gt;
+</span>75 <span style=''></span><span style='background: #AEF1AE'>                  fileTasks.filter { fileTask =&gt;
+</span>76 <span style=''></span><span style='background: #AEF1AE'>                    val res = filt.apply(fileTask.file().location())
+</span>77 <span style=''></span><span style='background: #AEF1AE'>                    if (!res) {
+</span>78 <span style=''></span><span style='background: #AEF1AE'>                      logger.debug(
+</span>79 <span style=''></span><span style='background: #AEF1AE'>                        s&quot;Skipping file ${fileTask.file().location()} [${fileTask.start()}:${fileTask.length()}] due to file filter&quot;)
+</span>80 <span style=''></span><span style='background: #AEF1AE'>                    }
+</span>81 <span style=''></span><span style='background: #AEF1AE'>                    res
+</span>82 <span style=''></span><span style='background: #AEF1AE'>                  }
+</span>83 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>84 <span style=''></span><span style='background: #AEF1AE'>              if (filteredTasks.nonEmpty) {
+</span>85 <span style=''></span><span style='background: #AEF1AE'>                logger.trace(s&quot;Submitting task with ${filteredTasks.size} file(s)&quot;)
+</span>86 <span style=''></span><span style='background: #AEF1AE'>                pool.submit(new TaskRunnable(filteredTasks))
+</span>87 <span style=''></span><span style='background: #AEF1AE'>                taskCount += 1
+</span>88 <span style=''></span><span style='background: #AEF1AE'>                fileCount += filteredTasks.size
+</span>89 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>90 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>91 <span style=''></span><span style='background: #AEF1AE'>            logger.debug(s&quot;Submitted $taskCount tasks (scanning $fileCount total files) using $threads threads&quot;)
+</span>92 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>93 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>94 <span style=''></span><span style='background: #AEF1AE'>      } finally {
+</span>95 <span style=''></span><span style='background: #AEF1AE'>        CloseWithLogging(Option(scan).collect { case c: Closeable =&gt; </span><span style='background: #F0ADAD'>c</span><span style='background: #AEF1AE'> })
+</span>96 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>97 <span style=''></span><span style='background: #AEF1AE'>      pool
+</span>98 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>99 <span style=''>
+</span>100 <span style=''>  private var current: StructLike = _
+</span>101 <span style=''>
+</span>102 <span style=''>  override def hasNext: Boolean = {
+</span>103 <span style=''>    </span><span style='background: #AEF1AE'>Option(failure.get()).foreach(e =&gt; </span><span style='background: #F0ADAD'>throw new RuntimeException(&quot;Error reading Iceberg data&quot;, e)</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>104 <span style=''>    if (</span><span style='background: #AEF1AE'>current != null</span><span style=''>) {
+</span>105 <span style=''>      </span><span style='background: #AEF1AE'>return true</span><span style=''>
+</span>106 <span style=''>    }
+</span>107 <span style=''>    </span><span style='background: #AEF1AE'>current = queue.poll()</span><span style=''>
+</span>108 <span style=''>    if (</span><span style='background: #AEF1AE'>current != null</span><span style=''>) {
+</span>109 <span style=''>      </span><span style='background: #AEF1AE'>return true</span><span style=''>
+</span>110 <span style=''>    }
+</span>111 <span style=''>
+</span>112 <span style=''>    if (</span><span style='background: #AEF1AE'>closed.get()</span><span style=''>) {
+</span>113 <span style=''>      </span><span style='background: #F0ADAD'>false</span><span style=''>
+</span>114 <span style=''>    } else </span><span style='background: #AEF1AE'>if (ex.isTerminated) {
+</span>115 <span style=''></span><span style='background: #AEF1AE'>      Option(failure.get()).foreach(e =&gt; </span><span style='background: #F0ADAD'>throw new RuntimeException(&quot;Error reading Iceberg data&quot;, e)</span><span style='background: #AEF1AE'>)
+</span>116 <span style=''></span><span style='background: #AEF1AE'>      current = queue.poll()
+</span>117 <span style=''></span><span style='background: #AEF1AE'>      current != null
+</span>118 <span style=''></span><span style='background: #AEF1AE'>    } else {
+</span>119 <span style=''></span><span style='background: #AEF1AE'>      while (current == null &amp;&amp; !ex.isTerminated) {
+</span>120 <span style=''></span><span style='background: #AEF1AE'>        current = queue.poll(100, TimeUnit.MILLISECONDS)
+</span>121 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>122 <span style=''></span><span style='background: #AEF1AE'>      Option(failure.get()).foreach(e =&gt; throw new RuntimeException(&quot;Error reading Iceberg data&quot;, e))
+</span>123 <span style=''></span><span style='background: #AEF1AE'>      current != null
+</span>124 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>125 <span style=''>  }
+</span>126 <span style=''>
+</span>127 <span style=''>  override def next(): SimpleFeature = {
+</span>128 <span style=''>    if (</span><span style='background: #AEF1AE'>hasNext</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>129 <span style=''></span><span style='background: #AEF1AE'>      row.setRow(current)
+</span>130 <span style=''></span><span style='background: #AEF1AE'>      current = null
+</span>131 <span style=''></span><span style='background: #AEF1AE'>      row
+</span>132 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''> else {
+</span>133 <span style=''>      </span><span style='background: #F0ADAD'>Iterator.empty.next</span><span style=''>
+</span>134 <span style=''>    }
+</span>135 <span style=''>  }
+</span>136 <span style=''>
+</span>137 <span style=''>  override def close(): Unit = {
+</span>138 <span style=''>    if (</span><span style='background: #AEF1AE'>closed.compareAndSet(false, true)</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>139 <span style=''></span><span style='background: #AEF1AE'>      ex.shutdownNow()
+</span>140 <span style=''></span><span style='background: #AEF1AE'>      ex.awaitTermination(1, TimeUnit.SECONDS)
+</span>141 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>142 <span style=''>  }
+</span>143 <span style=''>
+</span>144 <span style=''>  private def readFile(task: FileScanTask, projection: Schema): CloseableIterator[StructLike] = {
+</span>145 <span style=''>    logger.debug(s&quot;Reading file ${task.file().location()} [${task.start()}:${task.length()}] with filter: ${task.residual()}&quot;)
+</span>146 <span style=''>    val inputFile = </span><span style='background: #AEF1AE'>table.io().newInputFile(task.file())</span><span style=''>
+</span>147 <span style=''>    // we have to pass in the file path as a constant
+</span>148 <span style=''>    val idToConstant = </span><span style='background: #AEF1AE'>java.util.Map.of[Integer, Any](MetadataColumns.FILE_PATH_COLUMN_ID, inputFile.location())</span><span style=''>
+</span>149 <span style=''>    // note: can't reuse containers b/c we put everything onto the queue - reading row-by-row with reused containers is much slower
+</span>150 <span style=''>    val reader =
+</span>151 <span style=''>      </span><span style='background: #AEF1AE'>Parquet.read(inputFile)
+</span>152 <span style=''></span><span style='background: #AEF1AE'>        .project(projection)
+</span>153 <span style=''></span><span style='background: #AEF1AE'>        .split(task.start(), task.length())
+</span>154 <span style=''></span><span style='background: #AEF1AE'>        .caseSensitive(false)
+</span>155 <span style=''></span><span style='background: #AEF1AE'>        .filter(task.residual())
+</span>156 <span style=''></span><span style='background: #AEF1AE'>        .createReaderFunc(fileSchema =&gt; GenericParquetReaders.buildReader(projection, fileSchema, idToConstant))
+</span>157 <span style=''></span><span style='background: #AEF1AE'>        .build[Record]()</span><span style=''>
+</span>158 <span style=''>    val iter = </span><span style='background: #AEF1AE'>reader.iterator()</span><span style=''>
+</span>159 <span style=''>    </span><span style='background: #AEF1AE'>CloseableIterator(iter.asScala, CloseWithLogging(Seq(iter, reader)))</span><span style=''>
+</span>160 <span style=''>  }
+</span>161 <span style=''>
+</span>162 <span style=''>  private def withResidualColumns(projection: Schema, residual: Expression): Schema = {
+</span>163 <span style=''>    if (</span><span style='background: #AEF1AE'>residual == null</span><span style=''>) {
+</span>164 <span style=''>      </span><span style='background: #F0ADAD'>return projection</span><span style=''>
+</span>165 <span style=''>    }
+</span>166 <span style=''>    val columns = </span><span style='background: #AEF1AE'>projection.columns().asScala</span><span style=''>
+</span>167 <span style=''>    val columnNames = </span><span style='background: #AEF1AE'>columns.map(_.name()).toSet</span><span style=''>
+</span>168 <span style=''>    val toAdd = </span><span style='background: #AEF1AE'>ReferenceVisitor(residual).flatMap { reference =&gt;
+</span>169 <span style=''></span><span style='background: #AEF1AE'>      val column = reference.takeWhile(_ != '.')
+</span>170 <span style=''></span><span style='background: #AEF1AE'>      if (columnNames.contains(column)) { None } else { Option(table.schema().findField(column)) }
+</span>171 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>172 <span style=''>    if (</span><span style='background: #AEF1AE'>toAdd.isEmpty</span><span style=''>) {
+</span>173 <span style=''>      </span><span style='background: #AEF1AE'>projection</span><span style=''>
+</span>174 <span style=''>    } else {
+</span>175 <span style=''>      </span><span style='background: #AEF1AE'>new Schema((columns ++ toAdd).asJava, projection.getAliases, projection.identifierFieldIds())</span><span style=''>
+</span>176 <span style=''>    }
+</span>177 <span style=''>  }
+</span>178 <span style=''>
+</span>179 <span style=''>  private class TaskRunnable(tasks: Seq[FileScanTask]) extends Runnable {
+</span>180 <span style=''>    override def run(): Unit = {
+</span>181 <span style=''>      try {
+</span>182 <span style=''>        </span><span style='background: #AEF1AE'>tasks.foreach { task =&gt;
+</span>183 <span style=''></span><span style='background: #AEF1AE'>          if (!closed.get()) {
+</span>184 <span style=''></span><span style='background: #AEF1AE'>            val deleteFilter = if (task.deletes().isEmpty) { None } else {
+</span>185 <span style=''></span><span style='background: #AEF1AE'>              val filter = new GenericDeleteFilter(table.io(), task, table.schema(), schema.schema)
+</span>186 <span style=''></span><span style='background: #AEF1AE'>              require(!filter.hasEqDeletes,
+</span>187 <span style=''></span><span style='background: #AEF1AE'>                </span><span style='background: #F0ADAD'>s&quot;Only positional deletes are supported, but got equality deletes: ${task.deletes().asScala.map(_.location()).mkString(&quot;, &quot;)}&quot;</span><span style='background: #AEF1AE'>)
+</span>188 <span style=''></span><span style='background: #AEF1AE'>              Some(filter).filter(_.hasPosDeletes)
+</span>189 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>190 <span style=''></span><span style='background: #AEF1AE'>            val residual = task.residual()
+</span>191 <span style=''></span><span style='background: #AEF1AE'>            // we sometimes get residuals that aren't part of the filter, e.g. due to partition spec changes - add them here
+</span>192 <span style=''></span><span style='background: #AEF1AE'>            val projection = withResidualColumns(deleteFilter.fold(schema.schema)(_.requiredSchema()), residual)
+</span>193 <span style=''></span><span style='background: #AEF1AE'>            WithClose(readFile(task, projection)) { iter =&gt;
+</span>194 <span style=''></span><span style='background: #AEF1AE'>              val withDeletes = deleteFilter.fold(iter) { deletes =&gt;
+</span>195 <span style=''></span><span style='background: #AEF1AE'>                val index = deletes.deletedRowPositions()
+</span>196 <span style=''></span><span style='background: #AEF1AE'>                val position = projection.accessorForField(MetadataColumns.ROW_POSITION.fieldId())
+</span>197 <span style=''></span><span style='background: #AEF1AE'>                iter.filterNot(r =&gt; index.isDeleted(position.get(r).asInstanceOf[java.lang.Long]))
+</span>198 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>199 <span style=''></span><span style='background: #AEF1AE'>              val filtered = if (residual == null || residual == Expressions.alwaysTrue()) { withDeletes } else {
+</span>200 <span style=''></span><span style='background: #AEF1AE'>                val filter = new Evaluator(projection.asStruct(), residual, false)
+</span>201 <span style=''></span><span style='background: #AEF1AE'>                val wrapper = new InternalRecordWrapper(projection.asStruct())
+</span>202 <span style=''></span><span style='background: #AEF1AE'>                withDeletes.filter(r =&gt; filter.eval(wrapper.wrap(r)))
+</span>203 <span style=''></span><span style='background: #AEF1AE'>              }
+</span>204 <span style=''></span><span style='background: #AEF1AE'>              filtered.foreach(queue.put)
+</span>205 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>206 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>207 <span style=''></span><span style='background: #AEF1AE'>        }</span><span style=''>
+</span>208 <span style=''>      } catch {
+</span>209 <span style=''>        case e: Throwable </span><span style='background: #AEF1AE'>=&gt;
+</span>210 <span style=''></span><span style='background: #AEF1AE'>          // submit captures all throwables in its Future. Publish even fatal failures to the reader so
+</span>211 <span style=''></span><span style='background: #AEF1AE'>          // a failed task cannot appear to be an empty input (and cause compaction to discard its rows).
+</span>212 <span style=''></span><span style='background: #AEF1AE'>          failure.compareAndSet(null, e)
+</span>213 <span style=''></span><span style='background: #AEF1AE'>          if (NonFatal(e)) {
+</span>214 <span style=''></span><span style='background: #AEF1AE'>            logger.error(&quot;Error running scan task:&quot;, e)
+</span>215 <span style=''></span><span style='background: #AEF1AE'>          } else {
+</span>216 <span style=''></span><span style='background: #AEF1AE'>            throw e
+</span>217 <span style=''></span><span style='background: #AEF1AE'>          }</span><span style=''>
+</span>218 <span style=''>      }
+</span>219 <span style=''>    }
+</span>220 <span style=''>  }
+</span>221 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -238,15 +257,15 @@
         <th>Code</th>
       </tr><tr>
         <td>
-          49
+          50
         </td>
         <td>
-          2188
+          2123
         </td>
         <td>
-          2091
+          2187
           -
-          2133
+          2229
         </td>
         <td>
           Apply
@@ -262,15 +281,15 @@
         </td>
       </tr><tr>
         <td>
-          50
+          51
         </td>
         <td>
-          2189
+          2124
         </td>
         <td>
-          2157
+          2253
           -
-          2181
+          2277
         </td>
         <td>
           Apply
@@ -286,15 +305,15 @@
         </td>
       </tr><tr>
         <td>
-          51
+          52
         </td>
         <td>
-          2190
+          2125
         </td>
         <td>
-          2206
+          2302
           -
-          2238
+          2334
         </td>
         <td>
           Apply
@@ -310,15 +329,15 @@
         </td>
       </tr><tr>
         <td>
-          53
+          54
         </td>
         <td>
-          2191
+          2126
         </td>
         <td>
-          2280
+          2376
           -
-          2286
+          2382
         </td>
         <td>
           Select
@@ -334,15 +353,15 @@
         </td>
       </tr><tr>
         <td>
-          53
+          54
         </td>
         <td>
-          2192
+          2127
         </td>
         <td>
-          2260
+          2356
           -
-          2287
+          2383
         </td>
         <td>
           Apply
@@ -358,15 +377,15 @@
         </td>
       </tr><tr>
         <td>
-          57
+          58
         </td>
         <td>
-          2193
+          2128
         </td>
         <td>
-          2590
+          2686
           -
-          2628
+          2724
         </td>
         <td>
           Select
@@ -382,15 +401,15 @@
         </td>
       </tr><tr>
         <td>
-          59
+          60
         </td>
         <td>
-          2194
+          2129
         </td>
         <td>
-          2683
+          2779
           -
-          2690
+          2786
         </td>
         <td>
           Select
@@ -406,15 +425,15 @@
         </td>
       </tr><tr>
         <td>
-          59
+          60
         </td>
         <td>
-          2195
+          2130
         </td>
         <td>
-          2662
+          2758
           -
-          2691
+          2787
         </td>
         <td>
           Apply
@@ -430,15 +449,15 @@
         </td>
       </tr><tr>
         <td>
-          59
+          60
         </td>
         <td>
-          2240
+          2175
         </td>
         <td>
-          2693
+          2789
           -
-          2693
+          2789
         </td>
         <td>
           Select
@@ -454,15 +473,15 @@
         </td>
       </tr><tr>
         <td>
-          59
+          60
         </td>
         <td>
-          2241
+          2176
         </td>
         <td>
-          2652
+          2748
           -
-          4289
+          4385
         </td>
         <td>
           ApplyToImplicitArgs
@@ -546,15 +565,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
-          2196
+          2131
         </td>
         <td>
-          2810
+          2906
           -
-          2815
+          2911
         </td>
         <td>
           Literal
@@ -570,15 +589,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
-          2197
+          2132
         </td>
         <td>
-          2825
+          2921
           -
-          2838
+          2934
         </td>
         <td>
           Select
@@ -594,15 +613,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
-          2198
+          2133
         </td>
         <td>
-          2847
+          2943
           -
-          2853
+          2949
         </td>
         <td>
           Select
@@ -618,15 +637,15 @@
         </td>
       </tr><tr>
         <td>
-          61
+          62
         </td>
         <td>
-          2199
+          2134
         </td>
         <td>
-          2780
+          2876
           -
-          2854
+          2950
         </td>
         <td>
           Apply
@@ -642,15 +661,15 @@
         </td>
       </tr><tr>
         <td>
-          62
+          63
         </td>
         <td>
-          2200
+          2135
         </td>
         <td>
-          2880
+          2976
           -
-          2896
+          2992
         </td>
         <td>
           Apply
@@ -666,15 +685,15 @@
         </td>
       </tr><tr>
         <td>
-          62
+          63
         </td>
         <td>
-          2201
+          2136
         </td>
         <td>
-          2861
+          2957
           -
-          2897
+          2993
         </td>
         <td>
           Apply
@@ -692,15 +711,15 @@
         </td>
       </tr><tr>
         <td>
-          64
+          65
         </td>
         <td>
-          2202
+          2137
         </td>
         <td>
-          2928
+          3024
           -
-          2944
+          3040
         </td>
         <td>
           Apply
@@ -716,15 +735,15 @@
         </td>
       </tr><tr>
         <td>
-          64
+          65
         </td>
         <td>
-          2230
+          2165
         </td>
         <td>
-          2946
+          3042
           -
-          2946
+          3042
         </td>
         <td>
           Select
@@ -740,15 +759,15 @@
         </td>
       </tr><tr>
         <td>
-          64
+          65
         </td>
         <td>
-          2231
+          2166
         </td>
         <td>
-          2918
+          3014
           -
-          4172
+          4268
         </td>
         <td>
           ApplyToImplicitArgs
@@ -804,15 +823,15 @@
         </td>
       </tr><tr>
         <td>
-          64
+          65
         </td>
         <td>
-          2232
+          2167
         </td>
         <td>
-          2918
+          3014
           -
-          4172
+          4268
         </td>
         <td>
           Block
@@ -868,15 +887,15 @@
         </td>
       </tr><tr>
         <td>
-          65
+          66
         </td>
         <td>
-          2203
+          2138
         </td>
         <td>
-          2976
+          3072
           -
-          2991
+          3087
         </td>
         <td>
           Apply
@@ -892,15 +911,15 @@
         </td>
       </tr><tr>
         <td>
-          65
+          66
         </td>
         <td>
-          2228
+          2163
         </td>
         <td>
-          2993
+          3089
           -
-          2993
+          3089
         </td>
         <td>
           Select
@@ -916,15 +935,15 @@
         </td>
       </tr><tr>
         <td>
-          65
+          66
         </td>
         <td>
-          2229
+          2164
         </td>
         <td>
-          2966
+          3062
           -
-          4162
+          4258
         </td>
         <td>
           ApplyToImplicitArgs
@@ -980,39 +999,15 @@
         </td>
       </tr><tr>
         <td>
-          66
-        </td>
-        <td>
-          2204
-        </td>
-        <td>
-          3032
-          -
-          3033
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          0
-        </td>
-      </tr><tr>
-        <td>
           67
         </td>
         <td>
-          2205
+          2139
         </td>
         <td>
-          3062
+          3128
           -
-          3063
+          3129
         </td>
         <td>
           Literal
@@ -1028,15 +1023,39 @@
         </td>
       </tr><tr>
         <td>
-          69
+          68
         </td>
         <td>
-          2227
+          2140
         </td>
         <td>
-          3121
+          3158
           -
-          4037
+          3159
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          2162
+        </td>
+        <td>
+          3217
+          -
+          4133
         </td>
         <td>
           Apply
@@ -1080,15 +1099,15 @@
         </td>
       </tr><tr>
         <td>
-          70
+          71
         </td>
         <td>
-          2206
+          2141
         </td>
         <td>
-          3184
+          3280
           -
-          3196
+          3292
         </td>
         <td>
           Apply
@@ -1104,15 +1123,15 @@
         </td>
       </tr><tr>
         <td>
-          70
+          71
         </td>
         <td>
-          2207
+          2142
         </td>
         <td>
-          3184
+          3280
           -
-          3210
+          3306
         </td>
         <td>
           Select
@@ -1128,15 +1147,15 @@
         </td>
       </tr><tr>
         <td>
-          71
+          72
         </td>
         <td>
-          2208
+          2143
         </td>
         <td>
-          3245
+          3341
           -
-          3255
+          3351
         </td>
         <td>
           Select
@@ -1152,15 +1171,15 @@
         </td>
       </tr><tr>
         <td>
-          72
+          73
         </td>
         <td>
-          2209
+          2144
         </td>
         <td>
-          3293
+          3389
           -
-          3302
+          3398
         </td>
         <td>
           Ident
@@ -1176,15 +1195,15 @@
         </td>
       </tr><tr>
         <td>
-          74
+          75
         </td>
         <td>
-          2216
+          2151
         </td>
         <td>
-          3356
+          3452
           -
-          3723
+          3819
         </td>
         <td>
           Apply
@@ -1210,15 +1229,15 @@
         </td>
       </tr><tr>
         <td>
-          74
+          75
         </td>
         <td>
-          2217
+          2152
         </td>
         <td>
-          3356
+          3452
           -
-          3723
+          3819
         </td>
         <td>
           Block
@@ -1244,15 +1263,15 @@
         </td>
       </tr><tr>
         <td>
-          75
+          76
         </td>
         <td>
-          2210
+          2145
         </td>
         <td>
-          3428
+          3524
           -
-          3454
+          3550
         </td>
         <td>
           Apply
@@ -1268,15 +1287,15 @@
         </td>
       </tr><tr>
         <td>
-          75
+          76
         </td>
         <td>
-          2211
+          2146
         </td>
         <td>
-          3417
+          3513
           -
-          3455
+          3551
         </td>
         <td>
           Apply
@@ -1292,15 +1311,15 @@
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
-          2212
+          2147
         </td>
         <td>
-          3480
+          3576
           -
-          3484
+          3580
         </td>
         <td>
           Select
@@ -1316,15 +1335,15 @@
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
-          2214
+          2149
         </td>
         <td>
-          3476
+          3572
           -
-          3476
+          3572
         </td>
         <td>
           Literal
@@ -1340,15 +1359,15 @@
         </td>
       </tr><tr>
         <td>
-          76
+          77
         </td>
         <td>
-          2215
+          2150
         </td>
         <td>
-          3476
+          3572
           -
-          3476
+          3572
         </td>
         <td>
           Block
@@ -1364,15 +1383,15 @@
         </td>
       </tr><tr>
         <td>
-          77
+          78
         </td>
         <td>
-          2213
+          2148
         </td>
         <td>
-          3510
+          3606
           -
-          3657
+          3753
         </td>
         <td>
           Typed
@@ -1391,15 +1410,15 @@ else
         </td>
       </tr><tr>
         <td>
-          83
+          84
         </td>
         <td>
-          2218
+          2153
         </td>
         <td>
-          3758
+          3854
           -
-          3780
+          3876
         </td>
         <td>
           Select
@@ -1415,15 +1434,15 @@ else
         </td>
       </tr><tr>
         <td>
-          83
+          84
         </td>
         <td>
-          2224
+          2159
         </td>
         <td>
-          3782
+          3878
           -
-          4023
+          4119
         </td>
         <td>
           Block
@@ -1447,15 +1466,15 @@ else
         </td>
       </tr><tr>
         <td>
-          83
+          84
         </td>
         <td>
-          2225
+          2160
         </td>
         <td>
-          3754
+          3850
           -
-          3754
+          3850
         </td>
         <td>
           Literal
@@ -1471,15 +1490,15 @@ else
         </td>
       </tr><tr>
         <td>
-          83
+          84
         </td>
         <td>
-          2226
+          2161
         </td>
         <td>
-          3754
+          3850
           -
-          3754
+          3850
         </td>
         <td>
           Block
@@ -1495,15 +1514,15 @@ else
         </td>
       </tr><tr>
         <td>
-          85
+          86
         </td>
         <td>
-          2219
+          2154
         </td>
         <td>
-          3896
+          3992
           -
-          3927
+          4023
         </td>
         <td>
           Apply
@@ -1519,15 +1538,15 @@ else
         </td>
       </tr><tr>
         <td>
-          85
+          86
         </td>
         <td>
-          2220
+          2155
         </td>
         <td>
-          3884
+          3980
           -
-          3928
+          4024
         </td>
         <td>
           Apply
@@ -1543,15 +1562,15 @@ else
         </td>
       </tr><tr>
         <td>
-          86
+          87
         </td>
         <td>
-          2221
+          2156
         </td>
         <td>
-          3945
+          4041
           -
-          3959
+          4055
         </td>
         <td>
           Apply
@@ -1567,15 +1586,15 @@ else
         </td>
       </tr><tr>
         <td>
-          87
+          88
         </td>
         <td>
-          2222
+          2157
         </td>
         <td>
-          3989
+          4085
           -
-          4007
+          4103
         </td>
         <td>
           Select
@@ -1591,15 +1610,15 @@ else
         </td>
       </tr><tr>
         <td>
-          87
+          88
         </td>
         <td>
-          2223
+          2158
         </td>
         <td>
-          3976
+          4072
           -
-          4007
+          4103
         </td>
         <td>
           Apply
@@ -1615,15 +1634,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
-          2233
+          2168
         </td>
         <td>
-          4260
+          4356
           -
-          4261
+          4357
         </td>
         <td>
           Ident
@@ -1639,15 +1658,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
-          2234
+          2169
         </td>
         <td>
-          4237
+          4333
           -
-          4237
+          4333
         </td>
         <td>
           Apply
@@ -1663,15 +1682,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
-          2235
+          2170
         </td>
         <td>
-          4216
+          4312
           -
-          4263
+          4359
         </td>
         <td>
           Apply
@@ -1703,15 +1722,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
-          2236
+          2171
         </td>
         <td>
-          4215
+          4311
           -
-          4215
+          4311
         </td>
         <td>
           Select
@@ -1727,15 +1746,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
-          2237
+          2172
         </td>
         <td>
-          4199
+          4295
           -
-          4264
+          4360
         </td>
         <td>
           ApplyToImplicitArgs
@@ -1767,15 +1786,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
-          2238
+          2173
         </td>
         <td>
-          4215
+          4311
           -
-          4215
+          4311
         </td>
         <td>
           Literal
@@ -1791,15 +1810,15 @@ else
         </td>
       </tr><tr>
         <td>
-          94
+          95
         </td>
         <td>
-          2239
+          2174
         </td>
         <td>
-          4199
+          4295
           -
-          4264
+          4360
         </td>
         <td>
           Block
@@ -1834,15 +1853,15 @@ else
         </td>
       </tr><tr>
         <td>
-          102
+          103
         </td>
         <td>
-          2242
+          2177
         </td>
         <td>
-          4377
+          4473
           -
-          4390
+          4486
         </td>
         <td>
           Apply
@@ -1858,15 +1877,15 @@ else
         </td>
       </tr><tr>
         <td>
-          102
+          103
         </td>
         <td>
-          2243
+          2178
         </td>
         <td>
-          4405
+          4501
           -
-          4464
+          4560
         </td>
         <td>
           Throw
@@ -1882,15 +1901,15 @@ else
         </td>
       </tr><tr>
         <td>
-          102
+          103
         </td>
         <td>
-          2244
+          2179
         </td>
         <td>
-          4370
+          4466
           -
-          4465
+          4561
         </td>
         <td>
           Apply
@@ -1906,15 +1925,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
-          2245
+          2180
         </td>
         <td>
-          4474
+          4570
           -
-          4489
+          4585
         </td>
         <td>
           Apply
@@ -1930,15 +1949,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
-          2248
+          2183
         </td>
         <td>
-          4470
+          4566
           -
-          4470
+          4566
         </td>
         <td>
           Literal
@@ -1954,15 +1973,15 @@ else
         </td>
       </tr><tr>
         <td>
-          103
+          104
         </td>
         <td>
-          2249
+          2184
         </td>
         <td>
-          4470
+          4566
           -
-          4470
+          4566
         </td>
         <td>
           Block
@@ -1978,15 +1997,15 @@ else
         </td>
       </tr><tr>
         <td>
-          104
+          105
         </td>
         <td>
-          2246
+          2181
         </td>
         <td>
-          4506
+          4602
           -
-          4510
+          4606
         </td>
         <td>
           Literal
@@ -2002,15 +2021,15 @@ else
         </td>
       </tr><tr>
         <td>
-          104
+          105
         </td>
         <td>
-          2247
+          2182
         </td>
         <td>
-          4499
+          4595
           -
-          4510
+          4606
         </td>
         <td>
           Return
@@ -2026,15 +2045,15 @@ else
         </td>
       </tr><tr>
         <td>
-          106
+          107
         </td>
         <td>
-          2250
+          2185
         </td>
         <td>
-          4531
+          4627
           -
-          4543
+          4639
         </td>
         <td>
           Apply
@@ -2050,15 +2069,15 @@ else
         </td>
       </tr><tr>
         <td>
-          106
+          107
         </td>
         <td>
-          2251
+          2186
         </td>
         <td>
-          4521
+          4617
           -
-          4543
+          4639
         </td>
         <td>
           Apply
@@ -2074,15 +2093,15 @@ else
         </td>
       </tr><tr>
         <td>
-          107
+          108
         </td>
         <td>
-          2252
+          2187
         </td>
         <td>
-          4552
+          4648
           -
-          4567
+          4663
         </td>
         <td>
           Apply
@@ -2098,15 +2117,15 @@ else
         </td>
       </tr><tr>
         <td>
-          107
+          108
         </td>
         <td>
-          2255
+          2190
         </td>
         <td>
-          4548
+          4644
           -
-          4548
+          4644
         </td>
         <td>
           Literal
@@ -2122,15 +2141,15 @@ else
         </td>
       </tr><tr>
         <td>
-          107
+          108
         </td>
         <td>
-          2256
+          2191
         </td>
         <td>
-          4548
+          4644
           -
-          4548
+          4644
         </td>
         <td>
           Block
@@ -2146,15 +2165,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
-          2253
+          2188
         </td>
         <td>
-          4584
+          4680
           -
-          4588
+          4684
         </td>
         <td>
           Literal
@@ -2170,15 +2189,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          109
         </td>
         <td>
-          2254
+          2189
         </td>
         <td>
-          4577
+          4673
           -
-          4588
+          4684
         </td>
         <td>
           Return
@@ -2194,15 +2213,15 @@ else
         </td>
       </tr><tr>
         <td>
-          111
+          112
         </td>
         <td>
-          2257
+          2192
         </td>
         <td>
-          4604
+          4700
           -
-          4616
+          4712
         </td>
         <td>
           Apply
@@ -2218,15 +2237,15 @@ else
         </td>
       </tr><tr>
         <td>
-          112
+          113
         </td>
         <td>
-          2258
+          2193
         </td>
         <td>
-          4626
+          4722
           -
-          4631
+          4727
         </td>
         <td>
           Literal
@@ -2242,15 +2261,15 @@ else
         </td>
       </tr><tr>
         <td>
-          112
+          113
         </td>
         <td>
-          2259
+          2194
         </td>
         <td>
-          4626
+          4722
           -
-          4631
+          4727
         </td>
         <td>
           Block
@@ -2266,15 +2285,15 @@ else
         </td>
       </tr><tr>
         <td>
-          113
+          114
         </td>
         <td>
-          2260
+          2195
         </td>
         <td>
-          4647
+          4743
           -
-          4662
+          4758
         </td>
         <td>
           Apply
@@ -2290,15 +2309,15 @@ else
         </td>
       </tr><tr>
         <td>
-          113
+          114
         </td>
         <td>
-          2267
+          2202
         </td>
         <td>
-          4664
+          4760
           -
-          4824
+          4920
         </td>
         <td>
           Block
@@ -2318,15 +2337,15 @@ else
         </td>
       </tr><tr>
         <td>
-          113
+          114
         </td>
         <td>
-          2282
+          2217
         </td>
         <td>
-          4643
+          4739
           -
-          5078
+          5174
         </td>
         <td>
           If
@@ -2361,15 +2380,15 @@ else
         </td>
       </tr><tr>
         <td>
-          114
+          115
         </td>
         <td>
-          2261
+          2196
         </td>
         <td>
-          4679
+          4775
           -
-          4692
+          4788
         </td>
         <td>
           Apply
@@ -2385,15 +2404,15 @@ else
         </td>
       </tr><tr>
         <td>
-          114
+          115
         </td>
         <td>
-          2262
+          2197
         </td>
         <td>
-          4707
+          4803
           -
-          4766
+          4862
         </td>
         <td>
           Throw
@@ -2409,15 +2428,15 @@ else
         </td>
       </tr><tr>
         <td>
-          114
+          115
         </td>
         <td>
-          2263
+          2198
         </td>
         <td>
-          4672
+          4768
           -
-          4767
+          4863
         </td>
         <td>
           Apply
@@ -2433,15 +2452,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
-          2264
+          2199
         </td>
         <td>
-          4784
+          4880
           -
-          4796
+          4892
         </td>
         <td>
           Apply
@@ -2457,15 +2476,15 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          116
         </td>
         <td>
-          2265
+          2200
         </td>
         <td>
-          4774
+          4870
           -
-          4796
+          4892
         </td>
         <td>
           Apply
@@ -2481,15 +2500,15 @@ else
         </td>
       </tr><tr>
         <td>
-          116
+          117
         </td>
         <td>
-          2266
+          2201
         </td>
         <td>
-          4803
+          4899
           -
-          4818
+          4914
         </td>
         <td>
           Apply
@@ -2505,15 +2524,15 @@ else
         </td>
       </tr><tr>
         <td>
-          117
+          118
         </td>
         <td>
-          2281
+          2216
         </td>
         <td>
-          4830
+          4926
           -
-          5078
+          5174
         </td>
         <td>
           Block
@@ -2541,15 +2560,15 @@ else
         </td>
       </tr><tr>
         <td>
-          118
+          119
         </td>
         <td>
-          2268
+          2203
         </td>
         <td>
-          4856
+          4952
           -
-          4860
+          4956
         </td>
         <td>
           Literal
@@ -2565,15 +2584,15 @@ else
         </td>
       </tr><tr>
         <td>
-          118
+          119
         </td>
         <td>
-          2269
+          2204
         </td>
         <td>
-          4864
+          4960
           -
-          4880
+          4976
         </td>
         <td>
           Select
@@ -2589,15 +2608,15 @@ else
         </td>
       </tr><tr>
         <td>
-          118
+          119
         </td>
         <td>
-          2270
+          2205
         </td>
         <td>
-          4845
+          4941
           -
-          4880
+          4976
         </td>
         <td>
           Apply
@@ -2613,15 +2632,15 @@ else
         </td>
       </tr><tr>
         <td>
-          118
+          119
         </td>
         <td>
-          2274
+          2209
         </td>
         <td>
-          4892
+          4988
           -
-          4940
+          5036
         </td>
         <td>
           Block
@@ -2640,15 +2659,15 @@ else
         </td>
       </tr><tr>
         <td>
-          118
+          119
         </td>
         <td>
-          2275
+          2210
         </td>
         <td>
-          4838
+          4934
           -
-          4838
+          4934
         </td>
         <td>
           Literal
@@ -2664,15 +2683,15 @@ else
         </td>
       </tr><tr>
         <td>
-          118
+          119
         </td>
         <td>
-          2276
+          2211
         </td>
         <td>
-          4838
+          4934
           -
-          4838
+          4934
         </td>
         <td>
           Block
@@ -2688,15 +2707,15 @@ else
         </td>
       </tr><tr>
         <td>
-          119
+          120
         </td>
         <td>
-          2271
+          2206
         </td>
         <td>
-          4902
+          4998
           -
-          4940
+          5036
         </td>
         <td>
           Apply
@@ -2712,15 +2731,15 @@ else
         </td>
       </tr><tr>
         <td>
-          119
+          120
         </td>
         <td>
-          2272
+          2207
         </td>
         <td>
-          4892
+          4988
           -
-          4940
+          5036
         </td>
         <td>
           Apply
@@ -2736,15 +2755,15 @@ else
         </td>
       </tr><tr>
         <td>
-          119
+          120
         </td>
         <td>
-          2273
+          2208
         </td>
         <td>
-          4900
+          4996
           -
-          4900
+          4996
         </td>
         <td>
           Apply
@@ -2760,15 +2779,15 @@ else
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
-          2277
+          2212
         </td>
         <td>
-          4962
+          5058
           -
-          4975
+          5071
         </td>
         <td>
           Apply
@@ -2784,15 +2803,15 @@ else
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
-          2278
+          2213
         </td>
         <td>
-          4990
+          5086
           -
-          5049
+          5145
         </td>
         <td>
           Throw
@@ -2808,15 +2827,15 @@ else
         </td>
       </tr><tr>
         <td>
-          121
+          122
         </td>
         <td>
-          2279
+          2214
         </td>
         <td>
-          4955
+          5051
           -
-          5050
+          5146
         </td>
         <td>
           Apply
@@ -2832,15 +2851,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          123
         </td>
         <td>
-          2280
+          2215
         </td>
         <td>
-          5057
+          5153
           -
-          5072
+          5168
         </td>
         <td>
           Apply
@@ -2856,15 +2875,15 @@ else
         </td>
       </tr><tr>
         <td>
-          127
+          128
         </td>
         <td>
-          2283
+          2218
         </td>
         <td>
-          5133
+          5229
           -
-          5140
+          5236
         </td>
         <td>
           Select
@@ -2880,15 +2899,15 @@ else
         </td>
       </tr><tr>
         <td>
-          127
+          128
         </td>
         <td>
-          2288
+          2223
         </td>
         <td>
-          5142
+          5238
           -
-          5206
+          5302
         </td>
         <td>
           Block
@@ -2908,15 +2927,15 @@ else
         </td>
       </tr><tr>
         <td>
-          128
+          129
         </td>
         <td>
-          2284
+          2219
         </td>
         <td>
-          5161
+          5257
           -
-          5168
+          5264
         </td>
         <td>
           Select
@@ -2932,15 +2951,15 @@ else
         </td>
       </tr><tr>
         <td>
-          128
+          129
         </td>
         <td>
-          2285
+          2220
         </td>
         <td>
-          5150
+          5246
           -
-          5169
+          5265
         </td>
         <td>
           Apply
@@ -2956,15 +2975,15 @@ else
         </td>
       </tr><tr>
         <td>
-          129
+          130
         </td>
         <td>
-          2286
+          2221
         </td>
         <td>
-          5176
+          5272
           -
-          5190
+          5286
         </td>
         <td>
           Apply
@@ -2980,15 +2999,15 @@ else
         </td>
       </tr><tr>
         <td>
-          130
+          131
         </td>
         <td>
-          2287
+          2222
         </td>
         <td>
-          5197
+          5293
           -
-          5200
+          5296
         </td>
         <td>
           Select
@@ -3004,15 +3023,15 @@ else
         </td>
       </tr><tr>
         <td>
-          132
+          133
         </td>
         <td>
-          2289
+          2224
         </td>
         <td>
-          5220
+          5316
           -
-          5239
+          5335
         </td>
         <td>
           Apply
@@ -3028,15 +3047,15 @@ else
         </td>
       </tr><tr>
         <td>
-          132
+          133
         </td>
         <td>
-          2290
+          2225
         </td>
         <td>
-          5220
+          5316
           -
-          5239
+          5335
         </td>
         <td>
           Block
@@ -3052,15 +3071,15 @@ else
         </td>
       </tr><tr>
         <td>
-          137
+          138
         </td>
         <td>
-          2291
+          2226
         </td>
         <td>
-          5292
+          5388
           -
-          5325
+          5421
         </td>
         <td>
           Apply
@@ -3076,15 +3095,15 @@ else
         </td>
       </tr><tr>
         <td>
-          137
+          138
         </td>
         <td>
-          2295
+          2230
         </td>
         <td>
-          5327
+          5423
           -
-          5404
+          5500
         </td>
         <td>
           Block
@@ -3106,42 +3125,18 @@ else
         </td>
       </tr><tr>
         <td>
-          137
+          138
         </td>
         <td>
-          2296
+          2231
         </td>
         <td>
-          5288
+          5384
           -
-          5288
+          5384
         </td>
         <td>
           Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          ()
-        </td>
-      </tr><tr>
-        <td>
-          137
-        </td>
-        <td>
-          2297
-        </td>
-        <td>
-          5288
-          -
-          5288
-        </td>
-        <td>
-          Block
         </td>
         <td>
           &lt;nosymbol&gt;
@@ -3157,12 +3152,36 @@ else
           138
         </td>
         <td>
-          2292
+          2232
         </td>
         <td>
-          5335
+          5384
           -
-          5351
+          5384
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          139
+        </td>
+        <td>
+          2227
+        </td>
+        <td>
+          5431
+          -
+          5447
         </td>
         <td>
           Apply
@@ -3178,15 +3197,15 @@ else
         </td>
       </tr><tr>
         <td>
-          139
+          140
         </td>
         <td>
-          2293
+          2228
         </td>
         <td>
-          5358
+          5454
           -
-          5398
+          5494
         </td>
         <td>
           Apply
@@ -3202,15 +3221,15 @@ else
         </td>
       </tr><tr>
         <td>
-          139
+          140
         </td>
         <td>
-          2294
+          2229
         </td>
         <td>
-          5377
+          5473
           -
-          5377
+          5473
         </td>
         <td>
           Literal
@@ -3226,15 +3245,15 @@ else
         </td>
       </tr><tr>
         <td>
-          145
+          146
         </td>
         <td>
-          2298
+          2233
         </td>
         <td>
-          5679
+          5775
           -
-          5690
+          5786
         </td>
         <td>
           Apply
@@ -3250,15 +3269,15 @@ else
         </td>
       </tr><tr>
         <td>
-          145
+          146
         </td>
         <td>
-          2299
+          2234
         </td>
         <td>
-          5655
+          5751
           -
-          5691
+          5787
         </td>
         <td>
           Apply
@@ -3274,15 +3293,15 @@ else
         </td>
       </tr><tr>
         <td>
-          147
+          148
         </td>
         <td>
-          2300
+          2235
         </td>
         <td>
-          5800
+          5896
           -
-          5835
+          5931
         </td>
         <td>
           ApplyImplicitView
@@ -3298,15 +3317,15 @@ else
         </td>
       </tr><tr>
         <td>
-          147
+          148
         </td>
         <td>
-          2301
+          2236
         </td>
         <td>
-          5837
+          5933
           -
-          5857
+          5953
         </td>
         <td>
           Apply
@@ -3322,15 +3341,15 @@ else
         </td>
       </tr><tr>
         <td>
-          147
+          148
         </td>
         <td>
-          2302
+          2237
         </td>
         <td>
-          5769
+          5865
           -
-          5858
+          5954
         </td>
         <td>
           Apply
@@ -3346,15 +3365,15 @@ else
         </td>
       </tr><tr>
         <td>
-          156
+          157
         </td>
         <td>
-          2303
+          2238
         </td>
         <td>
-          6014
+          6110
           -
-          6311
+          6407
         </td>
         <td>
           Apply
@@ -3370,15 +3389,15 @@ else
         </td>
       </tr><tr>
         <td>
-          157
+          158
         </td>
         <td>
-          2304
+          2239
         </td>
         <td>
-          6327
+          6423
           -
-          6344
+          6440
         </td>
         <td>
           Apply
@@ -3394,15 +3413,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
-          2305
+          2240
         </td>
         <td>
-          6367
+          6463
           -
-          6379
+          6475
         </td>
         <td>
           Select
@@ -3418,15 +3437,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
-          2306
+          2241
         </td>
         <td>
-          6398
+          6494
           -
-          6415
+          6511
         </td>
         <td>
           Apply
@@ -3442,15 +3461,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
-          2307
+          2242
         </td>
         <td>
-          6397
+          6493
           -
-          6397
+          6493
         </td>
         <td>
           Select
@@ -3466,15 +3485,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
-          2308
+          2243
         </td>
         <td>
-          6381
+          6477
           -
-          6416
+          6512
         </td>
         <td>
           ApplyToImplicitArgs
@@ -3490,15 +3509,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
-          2309
+          2244
         </td>
         <td>
-          6397
+          6493
           -
-          6397
+          6493
         </td>
         <td>
           Literal
@@ -3514,15 +3533,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          159
         </td>
         <td>
-          2310
+          2245
         </td>
         <td>
-          6349
+          6445
           -
-          6417
+          6513
         </td>
         <td>
           Apply
@@ -3541,15 +3560,717 @@ else
         </td>
       </tr><tr>
         <td>
+          163
+        </td>
+        <td>
+          2246
+        </td>
+        <td>
+          6615
+          -
+          6631
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          residual.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          2248
+        </td>
+        <td>
+          6611
+          -
+          6611
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          163
+        </td>
+        <td>
+          2249
+        </td>
+        <td>
+          6611
+          -
+          6611
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
           164
         </td>
         <td>
-          2362
+          2247
         </td>
         <td>
-          6550
+          6641
           -
-          8000
+          6658
+        </td>
+        <td>
+          Return
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan.withResidualColumns
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          return projection
+        </td>
+      </tr><tr>
+        <td>
+          166
+        </td>
+        <td>
+          2250
+        </td>
+        <td>
+          6683
+          -
+          6703
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Schema.columns
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          projection.columns()
+        </td>
+      </tr><tr>
+        <td>
+          166
+        </td>
+        <td>
+          2251
+        </td>
+        <td>
+          6683
+          -
+          6711
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsScala.asScala
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.types.Types.NestedField](projection.columns()).asScala
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          2252
+        </td>
+        <td>
+          6746
+          -
+          6754
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.types.Types.NestedField.name
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$1.name()
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          2253
+        </td>
+        <td>
+          6745
+          -
+          6745
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.mutable.Buffer.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          mutable.this.Buffer.canBuildFrom[String]
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          2254
+        </td>
+        <td>
+          6734
+          -
+          6761
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.toSet
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          columns.map[String, scala.collection.mutable.Buffer[String]](((x$1: org.apache.iceberg.types.Types.NestedField) =&gt; x$1.name()))(mutable.this.Buffer.canBuildFrom[String]).toSet[String]
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          2265
+        </td>
+        <td>
+          6813
+          -
+          6813
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.immutable.Set.canBuildFrom
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          immutable.this.Set.canBuildFrom[org.apache.iceberg.types.Types.NestedField]
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          2266
+        </td>
+        <td>
+          6778
+          -
+          6981
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.collection.TraversableLike.flatMap
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergFilterConverter.ReferenceVisitor.apply(residual).flatMap[org.apache.iceberg.types.Types.NestedField, scala.collection.immutable.Set[org.apache.iceberg.types.Types.NestedField]](((reference: String) =&gt; {
+  val column: String = scala.Predef.augmentString(reference).takeWhile(((x$2: Char) =&gt; x$2.!=('.')));
+  if (columnNames.contains(column))
+    scala.this.Option.option2Iterable[Nothing](scala.None)
+  else
+    scala.this.Option.option2Iterable[org.apache.iceberg.types.Types.NestedField](scala.Option.apply[org.apache.iceberg.types.Types.NestedField](IcebergParquetScan.this.table.schema().findField(column)))
+}))(immutable.this.Set.canBuildFrom[org.apache.iceberg.types.Types.NestedField])
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          2255
+        </td>
+        <td>
+          6867
+          -
+          6875
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Char.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$2.!=('.')
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          2256
+        </td>
+        <td>
+          6847
+          -
+          6876
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IndexedSeqOptimized.takeWhile
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.augmentString(reference).takeWhile(((x$2: Char) =&gt; x$2.!=('.')))
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          2257
+        </td>
+        <td>
+          6887
+          -
+          6915
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.SetLike.contains
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          columnNames.contains(column)
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          2258
+        </td>
+        <td>
+          6919
+          -
+          6923
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          2259
+        </td>
+        <td>
+          6919
+          -
+          6923
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Option.option2Iterable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Option.option2Iterable[Nothing](scala.None)
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          2260
+        </td>
+        <td>
+          6919
+          -
+          6923
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Option.option2Iterable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Option.option2Iterable[Nothing](scala.None)
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          2261
+        </td>
+        <td>
+          6940
+          -
+          6972
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Schema.findField
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          IcebergParquetScan.this.table.schema().findField(column)
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          2262
+        </td>
+        <td>
+          6933
+          -
+          6973
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Option.apply[org.apache.iceberg.types.Types.NestedField](IcebergParquetScan.this.table.schema().findField(column))
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          2263
+        </td>
+        <td>
+          6933
+          -
+          6973
+        </td>
+        <td>
+          ApplyImplicitView
+        </td>
+        <td>
+          scala.Option.option2Iterable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Option.option2Iterable[org.apache.iceberg.types.Types.NestedField](scala.Option.apply[org.apache.iceberg.types.Types.NestedField](IcebergParquetScan.this.table.schema().findField(column)))
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          2264
+        </td>
+        <td>
+          6933
+          -
+          6973
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.Option.option2Iterable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.this.Option.option2Iterable[org.apache.iceberg.types.Types.NestedField](scala.Option.apply[org.apache.iceberg.types.Types.NestedField](IcebergParquetScan.this.table.schema().findField(column)))
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          2267
+        </td>
+        <td>
+          6990
+          -
+          7003
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SetLike.isEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          toAdd.isEmpty
+        </td>
+      </tr><tr>
+        <td>
+          173
+        </td>
+        <td>
+          2268
+        </td>
+        <td>
+          7013
+          -
+          7023
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan.projection
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          projection
+        </td>
+      </tr><tr>
+        <td>
+          175
+        </td>
+        <td>
+          2269
+        </td>
+        <td>
+          7055
+          -
+          7071
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.BufferLike.++
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          columns.++(toAdd)
+        </td>
+      </tr><tr>
+        <td>
+          175
+        </td>
+        <td>
+          2270
+        </td>
+        <td>
+          7054
+          -
+          7079
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.convert.Decorators.AsJava.asJava
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.JavaConverters.bufferAsJavaListConverter[org.apache.iceberg.types.Types.NestedField](columns.++(toAdd)).asJava
+        </td>
+      </tr><tr>
+        <td>
+          175
+        </td>
+        <td>
+          2271
+        </td>
+        <td>
+          7081
+          -
+          7102
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Schema.getAliases
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          projection.getAliases()
+        </td>
+      </tr><tr>
+        <td>
+          175
+        </td>
+        <td>
+          2272
+        </td>
+        <td>
+          7104
+          -
+          7135
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Schema.identifierFieldIds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          projection.identifierFieldIds()
+        </td>
+      </tr><tr>
+        <td>
+          175
+        </td>
+        <td>
+          2273
+        </td>
+        <td>
+          7043
+          -
+          7136
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.Schema.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.iceberg.Schema(scala.collection.JavaConverters.bufferAsJavaListConverter[org.apache.iceberg.types.Types.NestedField](columns.++(toAdd)).asJava, projection.getAliases(), projection.identifierFieldIds())
+        </td>
+      </tr><tr>
+        <td>
+          175
+        </td>
+        <td>
+          2274
+        </td>
+        <td>
+          7043
+          -
+          7136
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.apache.iceberg.Schema.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.iceberg.Schema(scala.collection.JavaConverters.bufferAsJavaListConverter[org.apache.iceberg.types.Types.NestedField](columns.++(toAdd)).asJava, projection.getAliases(), projection.identifierFieldIds())
+        </td>
+      </tr><tr>
+        <td>
+          182
+        </td>
+        <td>
+          2327
+        </td>
+        <td>
+          7275
+          -
+          8879
         </td>
         <td>
           Apply
@@ -3568,17 +4289,17 @@ else
     else
       {
         val filter: org.apache.iceberg.data.GenericDeleteFilter = new org.apache.iceberg.data.GenericDeleteFilter(IcebergParquetScan.this.table.io(), task, IcebergParquetScan.this.table.schema(), IcebergParquetScan.this.schema.schema);
-        scala.Predef.require(filter.hasEqDeletes().unary_!, scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$1: org.apache.iceberg.DeleteFile) =&gt; x$1.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)));
-        scala.Some.apply[org.apache.iceberg.data.GenericDeleteFilter](filter).filter(((x$2: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$2.hasPosDeletes()))
+        scala.Predef.require(filter.hasEqDeletes().unary_!, scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$3: org.apache.iceberg.DeleteFile) =&gt; x$3.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)));
+        scala.Some.apply[org.apache.iceberg.data.GenericDeleteFilter](filter).filter(((x$4: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$4.hasPosDeletes()))
       };
-    val projection: org.apache.iceberg.Schema = deleteFilter.fold[org.apache.iceberg.Schema](IcebergParquetScan.this.schema.schema)(((x$3: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$3.requiredSchema()));
+    val residual: org.apache.iceberg.expressions.Expression = task.residual();
+    val projection: org.apache.iceberg.Schema = IcebergParquetScan.this.withResidualColumns(deleteFilter.fold[org.apache.iceberg.Schema](IcebergParquetScan.this.schema.schema)(((x$5: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$5.requiredSchema())), residual);
     org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike], Unit](IcebergParquetScan.this.readFile(task, projection))(((iter: org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike]) =&gt; {
       val withDeletes: org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike] = deleteFilter.fold[org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike]](iter)(((deletes: org.apache.iceberg.data.GenericDeleteFilter) =&gt; {
         val index: org.apache.iceberg.deletes.PositionDeleteIndex = deletes.deletedRowPositions();
         val position: org.apache.iceberg.Accessor[org.apache.iceberg.StructLike] = projection.accessorForField(org.apache.iceberg.MetadataColumns.ROW_POSITION.fieldId());
         iter.filterNot(((r: org.apache.iceberg.StructLike) =&gt; index.isDeleted(scala.Predef.Long2long(position.get(r).asInstanceOf[Long]))))
       }));
-      val residual: org.apache.iceberg.expressions.Expression = task.residual();
       val filtered: org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike] = if (residual.==(null).||(residual.==(org.apache.iceberg.expressions.Expressions.alwaysTrue())))
         withDeletes
       else
@@ -3597,15 +4318,15 @@ else
         </td>
       </tr><tr>
         <td>
-          164
+          182
         </td>
         <td>
-          2363
+          2328
         </td>
         <td>
-          6550
+          7275
           -
-          8000
+          8879
         </td>
         <td>
           Block
@@ -3624,17 +4345,17 @@ else
     else
       {
         val filter: org.apache.iceberg.data.GenericDeleteFilter = new org.apache.iceberg.data.GenericDeleteFilter(IcebergParquetScan.this.table.io(), task, IcebergParquetScan.this.table.schema(), IcebergParquetScan.this.schema.schema);
-        scala.Predef.require(filter.hasEqDeletes().unary_!, scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$1: org.apache.iceberg.DeleteFile) =&gt; x$1.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)));
-        scala.Some.apply[org.apache.iceberg.data.GenericDeleteFilter](filter).filter(((x$2: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$2.hasPosDeletes()))
+        scala.Predef.require(filter.hasEqDeletes().unary_!, scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$3: org.apache.iceberg.DeleteFile) =&gt; x$3.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)));
+        scala.Some.apply[org.apache.iceberg.data.GenericDeleteFilter](filter).filter(((x$4: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$4.hasPosDeletes()))
       };
-    val projection: org.apache.iceberg.Schema = deleteFilter.fold[org.apache.iceberg.Schema](IcebergParquetScan.this.schema.schema)(((x$3: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$3.requiredSchema()));
+    val residual: org.apache.iceberg.expressions.Expression = task.residual();
+    val projection: org.apache.iceberg.Schema = IcebergParquetScan.this.withResidualColumns(deleteFilter.fold[org.apache.iceberg.Schema](IcebergParquetScan.this.schema.schema)(((x$5: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$5.requiredSchema())), residual);
     org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike], Unit](IcebergParquetScan.this.readFile(task, projection))(((iter: org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike]) =&gt; {
       val withDeletes: org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike] = deleteFilter.fold[org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike]](iter)(((deletes: org.apache.iceberg.data.GenericDeleteFilter) =&gt; {
         val index: org.apache.iceberg.deletes.PositionDeleteIndex = deletes.deletedRowPositions();
         val position: org.apache.iceberg.Accessor[org.apache.iceberg.StructLike] = projection.accessorForField(org.apache.iceberg.MetadataColumns.ROW_POSITION.fieldId());
         iter.filterNot(((r: org.apache.iceberg.StructLike) =&gt; index.isDeleted(scala.Predef.Long2long(position.get(r).asInstanceOf[Long]))))
       }));
-      val residual: org.apache.iceberg.expressions.Expression = task.residual();
       val filtered: org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike] = if (residual.==(null).||(residual.==(org.apache.iceberg.expressions.Expressions.alwaysTrue())))
         withDeletes
       else
@@ -3653,15 +4374,15 @@ else
         </td>
       </tr><tr>
         <td>
-          165
+          183
         </td>
         <td>
-          2311
+          2275
         </td>
         <td>
-          6588
+          7313
           -
-          6601
+          7326
         </td>
         <td>
           Select
@@ -3677,15 +4398,15 @@ else
         </td>
       </tr><tr>
         <td>
-          165
+          183
         </td>
         <td>
-          2359
+          2324
         </td>
         <td>
-          6603
+          7328
           -
-          7990
+          8869
         </td>
         <td>
           Block
@@ -3703,17 +4424,17 @@ else
   else
     {
       val filter: org.apache.iceberg.data.GenericDeleteFilter = new org.apache.iceberg.data.GenericDeleteFilter(IcebergParquetScan.this.table.io(), task, IcebergParquetScan.this.table.schema(), IcebergParquetScan.this.schema.schema);
-      scala.Predef.require(filter.hasEqDeletes().unary_!, scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$1: org.apache.iceberg.DeleteFile) =&gt; x$1.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)));
-      scala.Some.apply[org.apache.iceberg.data.GenericDeleteFilter](filter).filter(((x$2: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$2.hasPosDeletes()))
+      scala.Predef.require(filter.hasEqDeletes().unary_!, scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$3: org.apache.iceberg.DeleteFile) =&gt; x$3.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)));
+      scala.Some.apply[org.apache.iceberg.data.GenericDeleteFilter](filter).filter(((x$4: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$4.hasPosDeletes()))
     };
-  val projection: org.apache.iceberg.Schema = deleteFilter.fold[org.apache.iceberg.Schema](IcebergParquetScan.this.schema.schema)(((x$3: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$3.requiredSchema()));
+  val residual: org.apache.iceberg.expressions.Expression = task.residual();
+  val projection: org.apache.iceberg.Schema = IcebergParquetScan.this.withResidualColumns(deleteFilter.fold[org.apache.iceberg.Schema](IcebergParquetScan.this.schema.schema)(((x$5: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$5.requiredSchema())), residual);
   org.locationtech.geomesa.utils.io.`package`.WithClose.apply[org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike], Unit](IcebergParquetScan.this.readFile(task, projection))(((iter: org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike]) =&gt; {
     val withDeletes: org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike] = deleteFilter.fold[org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike]](iter)(((deletes: org.apache.iceberg.data.GenericDeleteFilter) =&gt; {
       val index: org.apache.iceberg.deletes.PositionDeleteIndex = deletes.deletedRowPositions();
       val position: org.apache.iceberg.Accessor[org.apache.iceberg.StructLike] = projection.accessorForField(org.apache.iceberg.MetadataColumns.ROW_POSITION.fieldId());
       iter.filterNot(((r: org.apache.iceberg.StructLike) =&gt; index.isDeleted(scala.Predef.Long2long(position.get(r).asInstanceOf[Long]))))
     }));
-    val residual: org.apache.iceberg.expressions.Expression = task.residual();
     val filtered: org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike] = if (residual.==(null).||(residual.==(org.apache.iceberg.expressions.Expressions.alwaysTrue())))
       withDeletes
     else
@@ -3730,15 +4451,15 @@ else
         </td>
       </tr><tr>
         <td>
-          165
+          183
         </td>
         <td>
-          2360
+          2325
         </td>
         <td>
-          6584
+          7309
           -
-          6584
+          7309
         </td>
         <td>
           Literal
@@ -3754,15 +4475,15 @@ else
         </td>
       </tr><tr>
         <td>
-          165
+          183
         </td>
         <td>
-          2361
+          2326
         </td>
         <td>
-          6584
+          7309
           -
-          6584
+          7309
         </td>
         <td>
           Block
@@ -3778,15 +4499,15 @@ else
         </td>
       </tr><tr>
         <td>
-          166
+          184
         </td>
         <td>
-          2312
+          2276
         </td>
         <td>
-          6640
+          7365
           -
-          6662
+          7387
         </td>
         <td>
           Apply
@@ -3802,15 +4523,15 @@ else
         </td>
       </tr><tr>
         <td>
-          166
+          184
         </td>
         <td>
-          2313
+          2277
         </td>
         <td>
-          6666
+          7391
           -
-          6670
+          7395
         </td>
         <td>
           Select
@@ -3826,15 +4547,15 @@ else
         </td>
       </tr><tr>
         <td>
-          166
+          184
         </td>
         <td>
-          2314
+          2278
         </td>
         <td>
-          6666
+          7391
           -
-          6670
+          7395
         </td>
         <td>
           Block
@@ -3850,15 +4571,15 @@ else
         </td>
       </tr><tr>
         <td>
-          166
+          184
         </td>
         <td>
-          2327
+          2291
         </td>
         <td>
-          6678
+          7403
           -
-          7032
+          7757
         </td>
         <td>
           Block
@@ -3872,21 +4593,21 @@ else
         <td style="background: #AEF1AE">
           {
   val filter: org.apache.iceberg.data.GenericDeleteFilter = new org.apache.iceberg.data.GenericDeleteFilter(IcebergParquetScan.this.table.io(), task, IcebergParquetScan.this.table.schema(), IcebergParquetScan.this.schema.schema);
-  scala.Predef.require(filter.hasEqDeletes().unary_!, scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$1: org.apache.iceberg.DeleteFile) =&gt; x$1.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)));
-  scala.Some.apply[org.apache.iceberg.data.GenericDeleteFilter](filter).filter(((x$2: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$2.hasPosDeletes()))
+  scala.Predef.require(filter.hasEqDeletes().unary_!, scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$3: org.apache.iceberg.DeleteFile) =&gt; x$3.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)));
+  scala.Some.apply[org.apache.iceberg.data.GenericDeleteFilter](filter).filter(((x$4: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$4.hasPosDeletes()))
 }
         </td>
       </tr><tr>
         <td>
-          167
+          185
         </td>
         <td>
-          2315
+          2279
         </td>
         <td>
-          6731
+          7456
           -
-          6741
+          7466
         </td>
         <td>
           Apply
@@ -3902,15 +4623,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          185
         </td>
         <td>
-          2316
+          2280
         </td>
         <td>
-          6749
+          7474
           -
-          6763
+          7488
         </td>
         <td>
           Apply
@@ -3926,15 +4647,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          185
         </td>
         <td>
-          2317
+          2281
         </td>
         <td>
-          6765
+          7490
           -
-          6778
+          7503
         </td>
         <td>
           Select
@@ -3950,15 +4671,15 @@ else
         </td>
       </tr><tr>
         <td>
-          167
+          185
         </td>
         <td>
-          2318
+          2282
         </td>
         <td>
-          6707
+          7432
           -
-          6779
+          7504
         </td>
         <td>
           Apply
@@ -3974,15 +4695,15 @@ else
         </td>
       </tr><tr>
         <td>
-          168
+          186
         </td>
         <td>
-          2319
+          2283
         </td>
         <td>
-          6802
+          7527
           -
-          6822
+          7547
         </td>
         <td>
           Select
@@ -3998,15 +4719,15 @@ else
         </td>
       </tr><tr>
         <td>
-          168
+          186
         </td>
         <td>
-          2324
+          2288
         </td>
         <td>
-          6794
+          7519
           -
-          6967
+          7692
         </td>
         <td>
           Apply
@@ -4018,19 +4739,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          scala.Predef.require(filter.hasEqDeletes().unary_!, scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$1: org.apache.iceberg.DeleteFile) =&gt; x$1.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)))
+          scala.Predef.require(filter.hasEqDeletes().unary_!, scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$3: org.apache.iceberg.DeleteFile) =&gt; x$3.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)))
         </td>
       </tr><tr>
         <td>
-          169
+          187
         </td>
         <td>
-          2320
+          2284
         </td>
         <td>
-          6842
+          7567
           -
-          6908
+          7633
         </td>
         <td>
           Literal
@@ -4046,15 +4767,15 @@ else
         </td>
       </tr><tr>
         <td>
-          169
+          187
         </td>
         <td>
-          2321
+          2285
         </td>
         <td>
-          6965
+          7690
           -
-          6966
+          7691
         </td>
         <td>
           Literal
@@ -4070,15 +4791,15 @@ else
         </td>
       </tr><tr>
         <td>
-          169
+          187
         </td>
         <td>
-          2322
+          2286
         </td>
         <td>
-          6909
+          7634
           -
-          6964
+          7689
         </td>
         <td>
           Apply
@@ -4090,19 +4811,19 @@ else
           
         </td>
         <td style="background: #F0ADAD">
-          scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$1: org.apache.iceberg.DeleteFile) =&gt; x$1.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)
+          scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$3: org.apache.iceberg.DeleteFile) =&gt; x$3.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;)
         </td>
       </tr><tr>
         <td>
-          169
+          187
         </td>
         <td>
-          2323
+          2287
         </td>
         <td>
-          6840
+          7565
           -
-          6966
+          7691
         </td>
         <td>
           Apply
@@ -4114,19 +4835,19 @@ else
           
         </td>
         <td style="background: #F0ADAD">
-          scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$1: org.apache.iceberg.DeleteFile) =&gt; x$1.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;))
+          scala.StringContext.apply(&quot;Only positional deletes are supported, but got equality deletes: &quot;, &quot;&quot;).s(scala.collection.JavaConverters.asScalaBufferConverter[org.apache.iceberg.DeleteFile](task.deletes()).asScala.map[String, scala.collection.mutable.Buffer[String]](((x$3: org.apache.iceberg.DeleteFile) =&gt; x$3.location()))(mutable.this.Buffer.canBuildFrom[String]).mkString(&quot;, &quot;))
         </td>
       </tr><tr>
         <td>
-          170
+          188
         </td>
         <td>
-          2325
+          2289
         </td>
         <td>
-          7002
+          7727
           -
-          7017
+          7742
         </td>
         <td>
           Apply
@@ -4138,19 +4859,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          x$2.hasPosDeletes()
+          x$4.hasPosDeletes()
         </td>
       </tr><tr>
         <td>
-          170
+          188
         </td>
         <td>
-          2326
+          2290
         </td>
         <td>
-          6982
+          7707
           -
-          7018
+          7743
         </td>
         <td>
           Apply
@@ -4162,19 +4883,43 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          scala.Some.apply[org.apache.iceberg.data.GenericDeleteFilter](filter).filter(((x$2: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$2.hasPosDeletes()))
+          scala.Some.apply[org.apache.iceberg.data.GenericDeleteFilter](filter).filter(((x$4: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$4.hasPosDeletes()))
         </td>
       </tr><tr>
         <td>
-          172
+          190
         </td>
         <td>
-          2328
+          2292
         </td>
         <td>
-          7080
+          7785
           -
-          7093
+          7800
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.iceberg.ContentScanTask.residual
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          task.residual()
+        </td>
+      </tr><tr>
+        <td>
+          192
+        </td>
+        <td>
+          2293
+        </td>
+        <td>
+          7993
+          -
+          8006
         </td>
         <td>
           Select
@@ -4190,15 +4935,15 @@ else
         </td>
       </tr><tr>
         <td>
-          172
+          192
         </td>
         <td>
-          2329
+          2294
         </td>
         <td>
-          7095
+          8008
           -
-          7113
+          8026
         </td>
         <td>
           Apply
@@ -4210,19 +4955,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          x$3.requiredSchema()
+          x$5.requiredSchema()
         </td>
       </tr><tr>
         <td>
-          172
+          192
         </td>
         <td>
-          2330
+          2295
         </td>
         <td>
-          7062
+          7975
           -
-          7114
+          8027
         </td>
         <td>
           Apply
@@ -4234,19 +4979,43 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          deleteFilter.fold[org.apache.iceberg.Schema](IcebergParquetScan.this.schema.schema)(((x$3: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$3.requiredSchema()))
+          deleteFilter.fold[org.apache.iceberg.Schema](IcebergParquetScan.this.schema.schema)(((x$5: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$5.requiredSchema()))
         </td>
       </tr><tr>
         <td>
-          173
+          192
         </td>
         <td>
-          2331
+          2296
         </td>
         <td>
-          7137
+          7955
           -
-          7163
+          8038
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.iceberg.IcebergParquetScan.withResidualColumns
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          IcebergParquetScan.this.withResidualColumns(deleteFilter.fold[org.apache.iceberg.Schema](IcebergParquetScan.this.schema.schema)(((x$5: org.apache.iceberg.data.GenericDeleteFilter) =&gt; x$5.requiredSchema())), residual)
+        </td>
+      </tr><tr>
+        <td>
+          193
+        </td>
+        <td>
+          2297
+        </td>
+        <td>
+          8061
+          -
+          8087
         </td>
         <td>
           Apply
@@ -4262,15 +5031,15 @@ else
         </td>
       </tr><tr>
         <td>
-          173
+          193
         </td>
         <td>
-          2357
+          2322
         </td>
         <td>
-          7165
+          8089
           -
-          7165
+          8089
         </td>
         <td>
           Select
@@ -4286,15 +5055,15 @@ else
         </td>
       </tr><tr>
         <td>
-          173
+          193
         </td>
         <td>
-          2358
+          2323
         </td>
         <td>
-          7127
+          8051
           -
-          7978
+          8857
         </td>
         <td>
           ApplyToImplicitArgs
@@ -4312,7 +5081,6 @@ else
     val position: org.apache.iceberg.Accessor[org.apache.iceberg.StructLike] = projection.accessorForField(org.apache.iceberg.MetadataColumns.ROW_POSITION.fieldId());
     iter.filterNot(((r: org.apache.iceberg.StructLike) =&gt; index.isDeleted(scala.Predef.Long2long(position.get(r).asInstanceOf[Long]))))
   }));
-  val residual: org.apache.iceberg.expressions.Expression = task.residual();
   val filtered: org.locationtech.geomesa.utils.collection.CloseableIterator[org.apache.iceberg.StructLike] = if (residual.==(null).||(residual.==(org.apache.iceberg.expressions.Expressions.alwaysTrue())))
     withDeletes
   else
@@ -4328,15 +5096,15 @@ else
         </td>
       </tr><tr>
         <td>
-          174
+          194
         </td>
         <td>
-          2339
+          2305
         </td>
         <td>
-          7207
+          8131
           -
-          7515
+          8439
         </td>
         <td>
           Apply
@@ -4356,15 +5124,15 @@ else
         </td>
       </tr><tr>
         <td>
-          175
+          195
         </td>
         <td>
-          2332
+          2298
         </td>
         <td>
-          7272
+          8196
           -
-          7301
+          8225
         </td>
         <td>
           Apply
@@ -4380,15 +5148,15 @@ else
         </td>
       </tr><tr>
         <td>
-          176
+          196
         </td>
         <td>
-          2333
+          2299
         </td>
         <td>
-          7361
+          8285
           -
-          7399
+          8323
         </td>
         <td>
           Apply
@@ -4404,15 +5172,15 @@ else
         </td>
       </tr><tr>
         <td>
-          176
+          196
         </td>
         <td>
-          2334
+          2300
         </td>
         <td>
-          7333
+          8257
           -
-          7400
+          8324
         </td>
         <td>
           Apply
@@ -4428,15 +5196,15 @@ else
         </td>
       </tr><tr>
         <td>
-          177
+          197
         </td>
         <td>
-          2335
+          2301
         </td>
         <td>
-          7453
+          8377
           -
-          7497
+          8421
         </td>
         <td>
           TypeApply
@@ -4452,15 +5220,15 @@ else
         </td>
       </tr><tr>
         <td>
-          177
+          197
         </td>
         <td>
-          2336
+          2302
         </td>
         <td>
-          7453
+          8377
           -
-          7497
+          8421
         </td>
         <td>
           ApplyImplicitView
@@ -4476,15 +5244,15 @@ else
         </td>
       </tr><tr>
         <td>
-          177
+          197
         </td>
         <td>
-          2337
+          2303
         </td>
         <td>
-          7437
+          8361
           -
-          7498
+          8422
         </td>
         <td>
           Apply
@@ -4500,15 +5268,15 @@ else
         </td>
       </tr><tr>
         <td>
-          177
+          197
         </td>
         <td>
-          2338
+          2304
         </td>
         <td>
-          7417
+          8341
           -
-          7499
+          8423
         </td>
         <td>
           Apply
@@ -4524,39 +5292,15 @@ else
         </td>
       </tr><tr>
         <td>
-          179
+          199
         </td>
         <td>
-          2340
+          2306
         </td>
         <td>
-          7545
+          8485
           -
-          7560
-        </td>
-        <td>
-          Apply
-        </td>
-        <td>
-          org.apache.iceberg.ContentScanTask.residual
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          task.residual()
-        </td>
-      </tr><tr>
-        <td>
-          180
-        </td>
-        <td>
-          2341
-        </td>
-        <td>
-          7606
-          -
-          7610
+          8489
         </td>
         <td>
           Literal
@@ -4572,15 +5316,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          199
         </td>
         <td>
-          2342
+          2307
         </td>
         <td>
-          7626
+          8505
           -
-          7650
+          8529
         </td>
         <td>
           Apply
@@ -4596,15 +5340,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          199
         </td>
         <td>
-          2343
+          2308
         </td>
         <td>
-          7614
+          8493
           -
-          7650
+          8529
         </td>
         <td>
           Apply
@@ -4620,15 +5364,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          199
         </td>
         <td>
-          2344
+          2309
         </td>
         <td>
-          7594
+          8473
           -
-          7650
+          8529
         </td>
         <td>
           Apply
@@ -4644,15 +5388,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          199
         </td>
         <td>
-          2345
+          2310
         </td>
         <td>
-          7654
+          8533
           -
-          7665
+          8544
         </td>
         <td>
           Ident
@@ -4668,15 +5412,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          199
         </td>
         <td>
-          2354
+          2319
         </td>
         <td>
-          7673
+          8552
           -
-          7922
+          8801
         </td>
         <td>
           Block
@@ -4696,15 +5440,15 @@ else
         </td>
       </tr><tr>
         <td>
-          181
+          200
         </td>
         <td>
-          2346
+          2311
         </td>
         <td>
-          7718
+          8597
           -
-          7739
+          8618
         </td>
         <td>
           Apply
@@ -4720,15 +5464,15 @@ else
         </td>
       </tr><tr>
         <td>
-          181
+          200
         </td>
         <td>
-          2347
+          2312
         </td>
         <td>
-          7751
+          8630
           -
-          7756
+          8635
         </td>
         <td>
           Literal
@@ -4744,15 +5488,15 @@ else
         </td>
       </tr><tr>
         <td>
-          181
+          200
         </td>
         <td>
-          2348
+          2313
         </td>
         <td>
-          7704
+          8583
           -
-          7757
+          8636
         </td>
         <td>
           Apply
@@ -4768,15 +5512,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          201
         </td>
         <td>
-          2349
+          2314
         </td>
         <td>
-          7814
+          8693
           -
-          7835
+          8714
         </td>
         <td>
           Apply
@@ -4792,15 +5536,15 @@ else
         </td>
       </tr><tr>
         <td>
-          182
+          201
         </td>
         <td>
-          2350
+          2315
         </td>
         <td>
-          7788
+          8667
           -
-          7836
+          8715
         </td>
         <td>
           Apply
@@ -4816,15 +5560,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          202
         </td>
         <td>
-          2351
+          2316
         </td>
         <td>
-          7889
+          8768
           -
-          7904
+          8783
         </td>
         <td>
           Apply
@@ -4840,15 +5584,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          202
         </td>
         <td>
-          2352
+          2317
         </td>
         <td>
-          7877
+          8756
           -
-          7905
+          8784
         </td>
         <td>
           Apply
@@ -4864,15 +5608,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          202
         </td>
         <td>
-          2353
+          2318
         </td>
         <td>
-          7853
+          8732
           -
-          7906
+          8785
         </td>
         <td>
           Apply
@@ -4888,15 +5632,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          204
         </td>
         <td>
-          2355
+          2320
         </td>
         <td>
-          7954
+          8833
           -
-          7963
+          8842
         </td>
         <td>
           Apply
@@ -4912,15 +5656,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          204
         </td>
         <td>
-          2356
+          2321
         </td>
         <td>
-          7937
+          8816
           -
-          7964
+          8843
         </td>
         <td>
           Apply
@@ -4938,15 +5682,15 @@ else
         </td>
       </tr><tr>
         <td>
-          190
+          209
         </td>
         <td>
-          2369
+          2334
         </td>
         <td>
-          8043
+          8922
           -
-          8432
+          9311
         </td>
         <td>
           Block
@@ -4971,15 +5715,15 @@ else
         </td>
       </tr><tr>
         <td>
-          193
+          212
         </td>
         <td>
-          2364
+          2329
         </td>
         <td>
-          8266
+          9145
           -
-          8296
+          9175
         </td>
         <td>
           Apply
@@ -4995,15 +5739,15 @@ else
         </td>
       </tr><tr>
         <td>
-          194
+          213
         </td>
         <td>
-          2365
+          2330
         </td>
         <td>
-          8311
+          9190
           -
-          8322
+          9201
         </td>
         <td>
           Apply
@@ -5019,15 +5763,15 @@ else
         </td>
       </tr><tr>
         <td>
-          195
+          214
         </td>
         <td>
-          2366
+          2331
         </td>
         <td>
-          8338
+          9217
           -
-          8381
+          9260
         </td>
         <td>
           Typed
@@ -5046,15 +5790,15 @@ else
         </td>
       </tr><tr>
         <td>
-          197
+          216
         </td>
         <td>
-          2367
+          2332
         </td>
         <td>
-          8413
+          9292
           -
-          8420
+          9299
         </td>
         <td>
           Throw
@@ -5070,15 +5814,15 @@ else
         </td>
       </tr><tr>
         <td>
-          197
+          216
         </td>
         <td>
-          2368
+          2333
         </td>
         <td>
-          8413
+          9292
           -
-          8420
+          9299
         </td>
         <td>
           Block
