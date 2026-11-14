@@ -1,0 +1,4539 @@
+<html>
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <title id="title">
+          org/locationtech/geomesa/index/view/filters/RolloverFilterProvider.scala.html
+        </title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/css/theme.default.min.css" type="text/css"/><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.20.1/js/jquery.tablesorter.min.js"></script><link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css" type="text/css"/><script src="https://netdna.bootstrapcdn.com/bootstrap/3.0.3/js/bootstrap.min.js"></script><script type="text/javascript">
+        $(document).ready(function() {$(".tablesorter").tablesorter();});
+      </script>
+        <style>
+          table.codegrid { font-family: monospace; font-size: 12px; width: auto!important; }table.statementlist { width: auto!important; font-size: 13px; } table.codegrid td { padding: 0!important; border: 0!important } table td.linenumber { width: 40px!important; } 
+        </style>
+      </head>
+      <body style="font-family: monospace;">
+        <ul class="nav nav-tabs">
+          <li>
+            <a href="#codegrid" data-toggle="tab">Codegrid</a>
+          </li>
+          <li>
+            <a href="#statementlist" data-toggle="tab">Statement List</a>
+          </li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane active" id="codegrid">
+            <pre style='font-size: 12pt; font-family: courier, monospace;'>1 <span style=''>/***********************************************************************
+</span>2 <span style=''> * Copyright (c) 2013-2026 General Atomics Integrated Intelligence, Inc.
+</span>3 <span style=''> * All rights reserved. This program and the accompanying materials
+</span>4 <span style=''> * are made available under the terms of the Apache License, Version 2.0
+</span>5 <span style=''> * which accompanies this distribution and is available at
+</span>6 <span style=''> * https://www.apache.org/licenses/LICENSE-2.0
+</span>7 <span style=''> ***********************************************************************/
+</span>8 <span style=''>
+</span>9 <span style=''>package org.locationtech.geomesa.index.view.filters
+</span>10 <span style=''>
+</span>11 <span style=''>import org.apache.commons.dbcp2.BasicDataSource
+</span>12 <span style=''>import org.geotools.api.feature.simple.SimpleFeatureType
+</span>13 <span style=''>import org.geotools.api.filter.Filter
+</span>14 <span style=''>import org.locationtech.geomesa.filter.FilterHelper
+</span>15 <span style=''>import org.locationtech.geomesa.index.view.MergedFilterProvider
+</span>16 <span style=''>import org.locationtech.geomesa.index.view.MergedFilterProvider.QueryContext
+</span>17 <span style=''>import org.locationtech.geomesa.utils.io.{CloseWithLogging, WithClose}
+</span>18 <span style=''>
+</span>19 <span style=''>import java.sql.Connection
+</span>20 <span style=''>import java.time.{Duration, Instant, LocalDateTime, ZoneOffset}
+</span>21 <span style=''>import java.util.Date
+</span>22 <span style=''>
+</span>23 <span style=''>/**
+</span>24 <span style=''> * Filter provider for &quot;rollover&quot; scenarios. When using tiered storage, features may be migrated from one store to another
+</span>25 <span style=''> * on a schedule. This provider can read the work log of the rollover process to ensure that the correct boundaries
+</span>26 <span style=''> * are enforced between the different stores, based on feature timestamps.
+</span>27 <span style=''> */
+</span>28 <span style=''>object RolloverFilterProvider {
+</span>29 <span style=''>
+</span>30 <span style=''>  import FilterHelper.ff
+</span>31 <span style=''>
+</span>32 <span style=''>  private val StateKey = </span><span style='background: #AEF1AE'>getClass.getName</span><span style=''>
+</span>33 <span style=''>
+</span>34 <span style=''>  /**
+</span>35 <span style=''>   * Create a coverage table if it does not already exist. The caller manages the connection and transaction.
+</span>36 <span style=''>   * Timestamps are stored without a time zone, using UTC wall-clock values for conversion to and from Instant.
+</span>37 <span style=''>   *
+</span>38 <span style=''>   * @param cx connection
+</span>39 <span style=''>   * @param table table name, optionally qualified with a schema (e.g. `public.rollover`)
+</span>40 <span style=''>   */
+</span>41 <span style=''>  def createTable(cx: Connection, table: String): Unit = {
+</span>42 <span style=''>    val qualifiedTable = </span><span style='background: #AEF1AE'>quoteTable(table)</span><span style=''>
+</span>43 <span style=''>    </span><span style='background: #AEF1AE'>WithClose(cx.createStatement()) { st =&gt;
+</span>44 <span style=''></span><span style='background: #AEF1AE'>      st.executeUpdate(
+</span>45 <span style=''></span><span style='background: #AEF1AE'>        s&quot;CREATE TABLE IF NOT EXISTS $qualifiedTable (&quot; +
+</span>46 <span style=''></span><span style='background: #AEF1AE'>          &quot;typeName text NOT NULL, &quot; +
+</span>47 <span style=''></span><span style='background: #AEF1AE'>          &quot;covered_from timestamp without time zone NOT NULL, &quot; +
+</span>48 <span style=''></span><span style='background: #AEF1AE'>          &quot;covered_through timestamp without time zone NOT NULL, &quot; +
+</span>49 <span style=''></span><span style='background: #AEF1AE'>          &quot;PRIMARY KEY (typeName))&quot;)
+</span>50 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>51 <span style=''>  }
+</span>52 <span style=''>
+</span>53 <span style=''>  /**
+</span>54 <span style=''>   * Insert or replace the coverage interval for a type name. The caller manages the connection and transaction.
+</span>55 <span style=''>   *
+</span>56 <span style=''>   * @param connection connection
+</span>57 <span style=''>   * @param table table name, optionally qualified with a schema
+</span>58 <span style=''>   * @param interval coverage interval
+</span>59 <span style=''>   */
+</span>60 <span style=''>  def insertCoverage(connection: Connection, table: String, interval: CoverageInterval): Unit = {
+</span>61 <span style=''>    val qualifiedTable = </span><span style='background: #AEF1AE'>quoteTable(table)</span><span style=''>
+</span>62 <span style=''>    </span><span style='background: #AEF1AE'>WithClose(connection.prepareStatement(
+</span>63 <span style=''></span><span style='background: #AEF1AE'>      s&quot;INSERT INTO $qualifiedTable (typeName, covered_from, covered_through) VALUES (?, ?, ?) &quot; +
+</span>64 <span style=''></span><span style='background: #AEF1AE'>        &quot;ON CONFLICT (typeName) DO UPDATE SET &quot; +
+</span>65 <span style=''></span><span style='background: #AEF1AE'>        &quot;covered_from = EXCLUDED.covered_from, covered_through = EXCLUDED.covered_through&quot;)) { statement =&gt;
+</span>66 <span style=''></span><span style='background: #AEF1AE'>      statement.setString(1, interval.typeName)
+</span>67 <span style=''></span><span style='background: #AEF1AE'>      statement.setObject(2, interval.from.atOffset(ZoneOffset.UTC).toLocalDateTime)
+</span>68 <span style=''></span><span style='background: #AEF1AE'>      statement.setObject(3, interval.through.atOffset(ZoneOffset.UTC).toLocalDateTime)
+</span>69 <span style=''></span><span style='background: #AEF1AE'>      statement.executeUpdate()
+</span>70 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>71 <span style=''>  }
+</span>72 <span style=''>
+</span>73 <span style=''>  private def quoteTable(table: String): String = {
+</span>74 <span style=''>    </span><span style='background: #AEF1AE'>require(table != null, </span><span style='background: #F0ADAD'>&quot;Table name must not be null&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>75 <span style=''>    val parts = </span><span style='background: #AEF1AE'>table.split(&quot;\\.&quot;, -1)</span><span style=''>
+</span>76 <span style=''>    </span><span style='background: #AEF1AE'>require(parts.length &lt;= 2, s&quot;Invalid table name: $table&quot;)</span><span style=''>
+</span>77 <span style=''>    </span><span style='background: #AEF1AE'>parts.map(quoteIdentifier).mkString(&quot;.&quot;)</span><span style=''>
+</span>78 <span style=''>  }
+</span>79 <span style=''>
+</span>80 <span style=''>  private def quoteIdentifier(identifier: String): String = {
+</span>81 <span style=''>    </span><span style='background: #AEF1AE'>require(identifier != null &amp;&amp; identifier.matches(&quot;[A-Za-z_][A-Za-z0-9_]{0,62}&quot;),
+</span>82 <span style=''></span><span style='background: #AEF1AE'>      s&quot;Invalid SQL identifier: $identifier&quot;)</span><span style=''>
+</span>83 <span style=''>    </span><span style='background: #AEF1AE'>&quot;\&quot;&quot; + identifier + &quot;\&quot;&quot;</span><span style=''>
+</span>84 <span style=''>  }
+</span>85 <span style=''>
+</span>86 <span style=''>  case class CoverageInterval(typeName: String, from: Instant, through: Instant) {
+</span>87 <span style=''>    </span><span style='background: #AEF1AE'>require(typeName != null, </span><span style='background: #F0ADAD'>&quot;Coverage type name must not be null&quot;</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>88 <span style=''>    </span><span style='background: #AEF1AE'>require(from != null &amp;&amp; through != null, &quot;Coverage interval must not have null bounds&quot;)</span><span style=''>
+</span>89 <span style=''>    </span><span style='background: #AEF1AE'>require(from.isBefore(through), &quot;Coverage interval must have from &lt; through&quot;)</span><span style=''>
+</span>90 <span style=''>    </span><span style='background: #AEF1AE'>require(from.getNano % 1000000 == 0 &amp;&amp; through.getNano % 1000000 == 0, &quot;Coverage bounds must have millisecond precision&quot;)</span><span style=''>
+</span>91 <span style=''>  }
+</span>92 <span style=''>
+</span>93 <span style=''>  class SourceProvider extends JdbcRolloverProvider {
+</span>94 <span style=''>    override def apply(sft: SimpleFeatureType, context: QueryContext): Option[Filter] = {
+</span>95 <span style=''>      </span><span style='background: #AEF1AE'>coverage(sft, context).map { interval =&gt;
+</span>96 <span style=''></span><span style='background: #AEF1AE'>        val dtg = ff.property(dtgField(sft))
+</span>97 <span style=''></span><span style='background: #AEF1AE'>        val start = ff.literal(Date.from(interval.from))
+</span>98 <span style=''></span><span style='background: #AEF1AE'>        val end = ff.literal(Date.from(interval.through))
+</span>99 <span style=''></span><span style='background: #AEF1AE'>        ff.or(ff.isNull(dtg), ff.or(ff.less(dtg, start), ff.greaterOrEqual(dtg, end)))
+</span>100 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>101 <span style=''>    }
+</span>102 <span style=''>  }
+</span>103 <span style=''>
+</span>104 <span style=''>  class DestinationProvider extends JdbcRolloverProvider {
+</span>105 <span style=''>    override def apply(sft: SimpleFeatureType, context: QueryContext): Option[Filter] = {
+</span>106 <span style=''>      val filter = </span><span style='background: #AEF1AE'>coverage(sft, context).fold[Filter](Filter.EXCLUDE) { interval =&gt;
+</span>107 <span style=''></span><span style='background: #AEF1AE'>        val dtg = ff.property(dtgField(sft))
+</span>108 <span style=''></span><span style='background: #AEF1AE'>        val start = ff.literal(Date.from(interval.from))
+</span>109 <span style=''></span><span style='background: #AEF1AE'>        val end = ff.literal(Date.from(interval.through))
+</span>110 <span style=''></span><span style='background: #AEF1AE'>        ff.and(ff.greaterOrEqual(dtg, start), ff.less(dtg, end))
+</span>111 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>112 <span style=''>      </span><span style='background: #AEF1AE'>Some(filter)</span><span style=''>
+</span>113 <span style=''>    }
+</span>114 <span style=''>  }
+</span>115 <span style=''>
+</span>116 <span style=''>  trait JdbcRolloverProvider extends MergedFilterProvider {
+</span>117 <span style=''>
+</span>118 <span style=''>    private var source: BasicDataSource = _
+</span>119 <span style=''>    private var sql: String = _
+</span>120 <span style=''>    private var url: String = _
+</span>121 <span style=''>    private var table: String = _
+</span>122 <span style=''>
+</span>123 <span style=''>    override def init(config: Map[String, String]): Unit = {
+</span>124 <span style=''>      def required(k: String): String = </span><span style='background: #AEF1AE'>config.getOrElse(k, </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Missing required key: $k&quot;)</span><span style='background: #AEF1AE'>)</span><span style=''>
+</span>125 <span style=''>
+</span>126 <span style=''>      </span><span style='background: #AEF1AE'>this.url = required(&quot;url&quot;)</span><span style=''>
+</span>127 <span style=''>      </span><span style='background: #AEF1AE'>this.table = s&quot;${quoteIdentifier(required(&quot;schema&quot;))}.${quoteIdentifier(required(&quot;table&quot;))}&quot;</span><span style=''>
+</span>128 <span style=''>      </span><span style='background: #AEF1AE'>this.sql = s&quot;SELECT covered_from, covered_through FROM $table WHERE typeName = ?&quot;</span><span style=''>
+</span>129 <span style=''>      </span><span style='background: #AEF1AE'>source = new BasicDataSource()</span><span style=''>
+</span>130 <span style=''>      </span><span style='background: #AEF1AE'>source.setUrl(url)</span><span style=''>
+</span>131 <span style=''>      </span><span style='background: #AEF1AE'>source.setUsername(required(&quot;username&quot;))</span><span style=''>
+</span>132 <span style=''>      </span><span style='background: #AEF1AE'>source.setPassword(required(&quot;password&quot;))</span><span style=''>
+</span>133 <span style=''>      </span><span style='background: #AEF1AE'>source.setMaxTotal(config.getOrElse(&quot;max-connections&quot;, &quot;2&quot;).toInt)</span><span style=''>
+</span>134 <span style=''>      </span><span style='background: #AEF1AE'>source.setMaxIdle(1)</span><span style=''>
+</span>135 <span style=''>      </span><span style='background: #AEF1AE'>source.setMinIdle(0)</span><span style=''>
+</span>136 <span style=''>      </span><span style='background: #AEF1AE'>source.setMaxWait(Duration.ofSeconds(5))</span><span style=''>
+</span>137 <span style=''>    }
+</span>138 <span style=''>
+</span>139 <span style=''>    protected def coverage(sft: SimpleFeatureType, context: QueryContext): Option[CoverageInterval] = {
+</span>140 <span style=''>      val state = </span><span style='background: #AEF1AE'>context.state.compute(StateKey, (_, existing) =&gt; {
+</span>141 <span style=''></span><span style='background: #AEF1AE'>        if (existing == null) {
+</span>142 <span style=''></span><span style='background: #AEF1AE'>          CoverageState(url, table, dtgField(sft), readCoverage(sft.getTypeName))
+</span>143 <span style=''></span><span style='background: #AEF1AE'>        } else {
+</span>144 <span style=''></span><span style='background: #AEF1AE'>          validate(sft, existing.asInstanceOf[CoverageState])
+</span>145 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>146 <span style=''></span><span style='background: #AEF1AE'>      })</span><span style=''>
+</span>147 <span style=''>      </span><span style='background: #AEF1AE'>state.asInstanceOf[CoverageState].coverage</span><span style=''>
+</span>148 <span style=''>    }
+</span>149 <span style=''>
+</span>150 <span style=''>    private def validate(sft: SimpleFeatureType, existing: CoverageState): CoverageState = {
+</span>151 <span style=''>      val dtg = </span><span style='background: #AEF1AE'>dtgField(sft)</span><span style=''>
+</span>152 <span style=''>      if (</span><span style='background: #AEF1AE'>existing.url != url || existing.table != table</span><span style=''>) {
+</span>153 <span style=''>        </span><span style='background: #AEF1AE'>throw new IllegalArgumentException(
+</span>154 <span style=''></span><span style='background: #AEF1AE'>          s&quot;RolloverFilterProviders are configured to read from different tables: &quot; +
+</span>155 <span style=''></span><span style='background: #AEF1AE'>            s&quot;${existing.url} ${existing.table} vs $url $table&quot;)</span><span style=''>
+</span>156 <span style=''>      } else </span><span style='background: #AEF1AE'>if (existing.dtg != dtg) {
+</span>157 <span style=''></span><span style='background: #AEF1AE'>        throw new IllegalArgumentException(
+</span>158 <span style=''></span><span style='background: #AEF1AE'>          s&quot;RolloverFilterProviders for '${sft.getTypeName}' are using different default date fields: ${existing.dtg} vs $dtg&quot;)
+</span>159 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>160 <span style=''>      existing
+</span>161 <span style=''>    }
+</span>162 <span style=''>
+</span>163 <span style=''>    private def readCoverage(typeName: String): Option[CoverageInterval] = {
+</span>164 <span style=''>      </span><span style='background: #AEF1AE'>WithClose(source.getConnection) { cx =&gt;
+</span>165 <span style=''></span><span style='background: #AEF1AE'>        WithClose(cx.prepareStatement(sql)) { statement =&gt;
+</span>166 <span style=''></span><span style='background: #AEF1AE'>          statement.setQueryTimeout(5)
+</span>167 <span style=''></span><span style='background: #AEF1AE'>          statement.setString(1, typeName)
+</span>168 <span style=''></span><span style='background: #AEF1AE'>          WithClose(statement.executeQuery()) { results =&gt;
+</span>169 <span style=''></span><span style='background: #AEF1AE'>            if (!results.next()) {
+</span>170 <span style=''></span><span style='background: #AEF1AE'>              None
+</span>171 <span style=''></span><span style='background: #AEF1AE'>            } else {
+</span>172 <span style=''></span><span style='background: #AEF1AE'>              val from = Option(results.getObject(1, classOf[LocalDateTime])).map(_.toInstant(ZoneOffset.UTC)).orNull
+</span>173 <span style=''></span><span style='background: #AEF1AE'>              val through = Option(results.getObject(2, classOf[LocalDateTime])).map(_.toInstant(ZoneOffset.UTC)).orNull
+</span>174 <span style=''></span><span style='background: #AEF1AE'>              Some(CoverageInterval(typeName, from, through))
+</span>175 <span style=''></span><span style='background: #AEF1AE'>            }
+</span>176 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>177 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>178 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>179 <span style=''>    }
+</span>180 <span style=''>
+</span>181 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>CloseWithLogging(Option(source))</span><span style=''>
+</span>182 <span style=''>  }
+</span>183 <span style=''>
+</span>184 <span style=''>  /**
+</span>185 <span style=''>   * Previously retrieved coverage for a given query
+</span>186 <span style=''>   *
+</span>187 <span style=''>   * @param url jdbc url
+</span>188 <span style=''>   * @param table qualified table name
+</span>189 <span style=''>   * @param dtg dtg field
+</span>190 <span style=''>   * @param coverage coverage
+</span>191 <span style=''>   */
+</span>192 <span style=''>  private case class CoverageState(url: String, table: String, dtg: String, coverage: Option[CoverageInterval])
+</span>193 <span style=''>}
+</span></pre>
+          </div>
+          <div class="tab-pane" id="statementlist">
+            <table cellspacing="0" cellpadding="0" class="table statementlist">
+      <tr>
+        <th>Line</th>
+        <th>Stmt Id</th>
+        <th>Pos</th>
+        <th>Tree</th>
+        <th>Symbol</th>
+        <th>Tests</th>
+        <th>Code</th>
+      </tr><tr>
+        <td>
+          32
+        </td>
+        <td>
+          20849
+        </td>
+        <td>
+          1449
+          -
+          1465
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Class.getName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RolloverFilterProvider.this.getClass().getName()
+        </td>
+      </tr><tr>
+        <td>
+          42
+        </td>
+        <td>
+          20850
+        </td>
+        <td>
+          1906
+          -
+          1923
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.quoteTable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RolloverFilterProvider.this.quoteTable(table)
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          20851
+        </td>
+        <td>
+          1938
+          -
+          1958
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.Connection.createStatement
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          cx.createStatement()
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          20854
+        </td>
+        <td>
+          1960
+          -
+          1960
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          20855
+        </td>
+        <td>
+          1928
+          -
+          2266
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.sql.Statement, Int](cx.createStatement())(((st: java.sql.Statement) =&gt; st.executeUpdate(scala.StringContext.apply(&quot;CREATE TABLE IF NOT EXISTS &quot;, &quot; (&quot;).s(qualifiedTable).+(&quot;typeName text NOT NULL, &quot;).+(&quot;covered_from timestamp without time zone NOT NULL, &quot;).+(&quot;covered_through timestamp without time zone NOT NULL, &quot;).+(&quot;PRIMARY KEY (typeName))&quot;))))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          43
+        </td>
+        <td>
+          20856
+        </td>
+        <td>
+          1960
+          -
+          1960
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          20853
+        </td>
+        <td>
+          1974
+          -
+          2260
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.Statement.executeUpdate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          st.executeUpdate(scala.StringContext.apply(&quot;CREATE TABLE IF NOT EXISTS &quot;, &quot; (&quot;).s(qualifiedTable).+(&quot;typeName text NOT NULL, &quot;).+(&quot;covered_from timestamp without time zone NOT NULL, &quot;).+(&quot;covered_through timestamp without time zone NOT NULL, &quot;).+(&quot;PRIMARY KEY (typeName))&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          48
+        </td>
+        <td>
+          20852
+        </td>
+        <td>
+          2000
+          -
+          2259
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;CREATE TABLE IF NOT EXISTS &quot;, &quot; (&quot;).s(qualifiedTable).+(&quot;typeName text NOT NULL, &quot;).+(&quot;covered_from timestamp without time zone NOT NULL, &quot;).+(&quot;covered_through timestamp without time zone NOT NULL, &quot;).+(&quot;PRIMARY KEY (typeName))&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          61
+        </td>
+        <td>
+          20857
+        </td>
+        <td>
+          2663
+          -
+          2680
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.quoteTable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RolloverFilterProvider.this.quoteTable(table)
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          20859
+        </td>
+        <td>
+          2695
+          -
+          2964
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.Connection.prepareStatement
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          connection.prepareStatement(scala.StringContext.apply(&quot;INSERT INTO &quot;, &quot; (typeName, covered_from, covered_through) VALUES (?, ?, ?) &quot;).s(qualifiedTable).+(&quot;ON CONFLICT (typeName) DO UPDATE SET &quot;).+(&quot;covered_from = EXCLUDED.covered_from, covered_through = EXCLUDED.covered_through&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          20858
+        </td>
+        <td>
+          2730
+          -
+          2963
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;INSERT INTO &quot;, &quot; (typeName, covered_from, covered_through) VALUES (?, ?, ?) &quot;).s(qualifiedTable).+(&quot;ON CONFLICT (typeName) DO UPDATE SET &quot;).+(&quot;covered_from = EXCLUDED.covered_from, covered_through = EXCLUDED.covered_through&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          20870
+        </td>
+        <td>
+          2966
+          -
+          2966
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          20871
+        </td>
+        <td>
+          2685
+          -
+          3239
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.sql.PreparedStatement, Int](connection.prepareStatement(scala.StringContext.apply(&quot;INSERT INTO &quot;, &quot; (typeName, covered_from, covered_through) VALUES (?, ?, ?) &quot;).s(qualifiedTable).+(&quot;ON CONFLICT (typeName) DO UPDATE SET &quot;).+(&quot;covered_from = EXCLUDED.covered_from, covered_through = EXCLUDED.covered_through&quot;)))(((statement: java.sql.PreparedStatement) =&gt; {
+  statement.setString(1, interval.typeName);
+  statement.setObject(2, interval.from.atOffset(java.time.ZoneOffset.UTC).toLocalDateTime());
+  statement.setObject(3, interval.through.atOffset(java.time.ZoneOffset.UTC).toLocalDateTime());
+  statement.executeUpdate()
+}))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          20872
+        </td>
+        <td>
+          2966
+          -
+          2966
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          20860
+        </td>
+        <td>
+          3007
+          -
+          3008
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          20861
+        </td>
+        <td>
+          3010
+          -
+          3027
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval.typeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          interval.typeName
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          20862
+        </td>
+        <td>
+          2987
+          -
+          3028
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.PreparedStatement.setString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          statement.setString(1, interval.typeName)
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          20863
+        </td>
+        <td>
+          3055
+          -
+          3056
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          2
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          20864
+        </td>
+        <td>
+          3058
+          -
+          3112
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.time.OffsetDateTime.toLocalDateTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          interval.from.atOffset(java.time.ZoneOffset.UTC).toLocalDateTime()
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          20865
+        </td>
+        <td>
+          3035
+          -
+          3113
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.PreparedStatement.setObject
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          statement.setObject(2, interval.from.atOffset(java.time.ZoneOffset.UTC).toLocalDateTime())
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          20866
+        </td>
+        <td>
+          3140
+          -
+          3141
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          3
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          20867
+        </td>
+        <td>
+          3143
+          -
+          3200
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.time.OffsetDateTime.toLocalDateTime
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          interval.through.atOffset(java.time.ZoneOffset.UTC).toLocalDateTime()
+        </td>
+      </tr><tr>
+        <td>
+          68
+        </td>
+        <td>
+          20868
+        </td>
+        <td>
+          3120
+          -
+          3201
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.PreparedStatement.setObject
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          statement.setObject(3, interval.through.atOffset(java.time.ZoneOffset.UTC).toLocalDateTime())
+        </td>
+      </tr><tr>
+        <td>
+          69
+        </td>
+        <td>
+          20869
+        </td>
+        <td>
+          3208
+          -
+          3233
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.PreparedStatement.executeUpdate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          statement.executeUpdate()
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          20873
+        </td>
+        <td>
+          3309
+          -
+          3322
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          table.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          20874
+        </td>
+        <td>
+          3324
+          -
+          3353
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;Table name must not be null&quot;
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          20875
+        </td>
+        <td>
+          3301
+          -
+          3354
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(table.!=(null), &quot;Table name must not be null&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          75
+        </td>
+        <td>
+          20876
+        </td>
+        <td>
+          3371
+          -
+          3393
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.split
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          table.split(&quot;\\.&quot;, -1)
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          20877
+        </td>
+        <td>
+          3406
+          -
+          3423
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.&lt;=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          parts.length.&lt;=(2)
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          20878
+        </td>
+        <td>
+          3425
+          -
+          3454
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;Invalid table name: &quot;, &quot;&quot;).s(table)
+        </td>
+      </tr><tr>
+        <td>
+          76
+        </td>
+        <td>
+          20879
+        </td>
+        <td>
+          3398
+          -
+          3455
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(parts.length.&lt;=(2), scala.StringContext.apply(&quot;Invalid table name: &quot;, &quot;&quot;).s(table))
+        </td>
+      </tr><tr>
+        <td>
+          77
+        </td>
+        <td>
+          20880
+        </td>
+        <td>
+          3460
+          -
+          3500
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.TraversableOnce.mkString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.refArrayOps[String](scala.Predef.refArrayOps[String](parts).map[String, Array[String]]({
+  ((identifier: String) =&gt; RolloverFilterProvider.this.quoteIdentifier(identifier))
+})(scala.this.Array.canBuildFrom[String]((ClassTag.apply[String](classOf[java.lang.String]): scala.reflect.ClassTag[String])))).mkString(&quot;.&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          20881
+        </td>
+        <td>
+          3594
+          -
+          3598
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          20882
+        </td>
+        <td>
+          3602
+          -
+          3651
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.matches
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          identifier.matches(&quot;[A-Za-z_][A-Za-z0-9_]{0,62}&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          20883
+        </td>
+        <td>
+          3580
+          -
+          3651
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          identifier.!=(null).&amp;&amp;(identifier.matches(&quot;[A-Za-z_][A-Za-z0-9_]{0,62}&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          81
+        </td>
+        <td>
+          20885
+        </td>
+        <td>
+          3572
+          -
+          3698
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(identifier.!=(null).&amp;&amp;(identifier.matches(&quot;[A-Za-z_][A-Za-z0-9_]{0,62}&quot;)), scala.StringContext.apply(&quot;Invalid SQL identifier: &quot;, &quot;&quot;).s(identifier))
+        </td>
+      </tr><tr>
+        <td>
+          82
+        </td>
+        <td>
+          20884
+        </td>
+        <td>
+          3659
+          -
+          3697
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;Invalid SQL identifier: &quot;, &quot;&quot;).s(identifier)
+        </td>
+      </tr><tr>
+        <td>
+          83
+        </td>
+        <td>
+          20886
+        </td>
+        <td>
+          3703
+          -
+          3727
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.String.+
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;\&quot;&quot;.+(identifier).+(&quot;\&quot;&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          20887
+        </td>
+        <td>
+          3828
+          -
+          3844
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          CoverageInterval.this.typeName.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          20888
+        </td>
+        <td>
+          3846
+          -
+          3883
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          &quot;Coverage type name must not be null&quot;
+        </td>
+      </tr><tr>
+        <td>
+          87
+        </td>
+        <td>
+          20889
+        </td>
+        <td>
+          3820
+          -
+          3884
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(CoverageInterval.this.typeName.!=(null), &quot;Coverage type name must not be null&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          20890
+        </td>
+        <td>
+          3905
+          -
+          3909
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          20891
+        </td>
+        <td>
+          3913
+          -
+          3928
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          CoverageInterval.this.through.!=(null)
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          20892
+        </td>
+        <td>
+          3897
+          -
+          3928
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          CoverageInterval.this.from.!=(null).&amp;&amp;(CoverageInterval.this.through.!=(null))
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          20893
+        </td>
+        <td>
+          3930
+          -
+          3975
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;Coverage interval must not have null bounds&quot;
+        </td>
+      </tr><tr>
+        <td>
+          88
+        </td>
+        <td>
+          20894
+        </td>
+        <td>
+          3889
+          -
+          3976
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(CoverageInterval.this.from.!=(null).&amp;&amp;(CoverageInterval.this.through.!=(null)), &quot;Coverage interval must not have null bounds&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          20895
+        </td>
+        <td>
+          4003
+          -
+          4010
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval.through
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          CoverageInterval.this.through
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          20896
+        </td>
+        <td>
+          3989
+          -
+          4011
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.time.Instant.isBefore
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          CoverageInterval.this.from.isBefore(CoverageInterval.this.through)
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          20897
+        </td>
+        <td>
+          4013
+          -
+          4057
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;Coverage interval must have from &lt; through&quot;
+        </td>
+      </tr><tr>
+        <td>
+          89
+        </td>
+        <td>
+          20898
+        </td>
+        <td>
+          3981
+          -
+          4058
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(CoverageInterval.this.from.isBefore(CoverageInterval.this.through), &quot;Coverage interval must have from &lt; through&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          20899
+        </td>
+        <td>
+          4086
+          -
+          4093
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          1000000
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          20900
+        </td>
+        <td>
+          4097
+          -
+          4098
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          0
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          20901
+        </td>
+        <td>
+          4102
+          -
+          4132
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Int.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          CoverageInterval.this.through.getNano().%(1000000).==(0)
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          20902
+        </td>
+        <td>
+          4071
+          -
+          4132
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.&amp;&amp;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          CoverageInterval.this.from.getNano().%(1000000).==(0).&amp;&amp;(CoverageInterval.this.through.getNano().%(1000000).==(0))
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          20903
+        </td>
+        <td>
+          4134
+          -
+          4183
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;Coverage bounds must have millisecond precision&quot;
+        </td>
+      </tr><tr>
+        <td>
+          90
+        </td>
+        <td>
+          20904
+        </td>
+        <td>
+          4063
+          -
+          4184
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Predef.require
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.require(CoverageInterval.this.from.getNano().%(1000000).==(0).&amp;&amp;(CoverageInterval.this.through.getNano().%(1000000).==(0)), &quot;Coverage bounds must have millisecond precision&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          95
+        </td>
+        <td>
+          20918
+        </td>
+        <td>
+          4340
+          -
+          4635
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.map
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SourceProvider.this.coverage(sft, context).map[org.geotools.api.filter.Or](((interval: org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval) =&gt; {
+  val dtg: org.geotools.api.filter.expression.PropertyName = org.locationtech.geomesa.filter.FilterHelper.ff.property(SourceProvider.this.dtgField(sft));
+  val start: org.geotools.api.filter.expression.Literal = org.locationtech.geomesa.filter.FilterHelper.ff.literal(java.util.Date.from(interval.from));
+  val end: org.geotools.api.filter.expression.Literal = org.locationtech.geomesa.filter.FilterHelper.ff.literal(java.util.Date.from(interval.through));
+  org.locationtech.geomesa.filter.FilterHelper.ff.or(org.locationtech.geomesa.filter.FilterHelper.ff.isNull(dtg), org.locationtech.geomesa.filter.FilterHelper.ff.or(org.locationtech.geomesa.filter.FilterHelper.ff.less(dtg, start), org.locationtech.geomesa.filter.FilterHelper.ff.greaterOrEqual(dtg, end)))
+}))
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          20905
+        </td>
+        <td>
+          4411
+          -
+          4424
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.MergedFilterProvider.dtgField
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          SourceProvider.this.dtgField(sft)
+        </td>
+      </tr><tr>
+        <td>
+          96
+        </td>
+        <td>
+          20906
+        </td>
+        <td>
+          4399
+          -
+          4425
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.property
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.property(SourceProvider.this.dtgField(sft))
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          20907
+        </td>
+        <td>
+          4467
+          -
+          4480
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval.from
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          interval.from
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          20908
+        </td>
+        <td>
+          4457
+          -
+          4481
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Date.from
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Date.from(interval.from)
+        </td>
+      </tr><tr>
+        <td>
+          97
+        </td>
+        <td>
+          20909
+        </td>
+        <td>
+          4446
+          -
+          4482
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.literal(java.util.Date.from(interval.from))
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          20910
+        </td>
+        <td>
+          4522
+          -
+          4538
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval.through
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          interval.through
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          20911
+        </td>
+        <td>
+          4512
+          -
+          4539
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Date.from
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Date.from(interval.through)
+        </td>
+      </tr><tr>
+        <td>
+          98
+        </td>
+        <td>
+          20912
+        </td>
+        <td>
+          4501
+          -
+          4540
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.literal(java.util.Date.from(interval.through))
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          20913
+        </td>
+        <td>
+          4555
+          -
+          4569
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.isNull
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.isNull(dtg)
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          20914
+        </td>
+        <td>
+          4577
+          -
+          4596
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.less
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.less(dtg, start)
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          20915
+        </td>
+        <td>
+          4598
+          -
+          4625
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.greaterOrEqual
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.greaterOrEqual(dtg, end)
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          20916
+        </td>
+        <td>
+          4571
+          -
+          4626
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.or
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.or(org.locationtech.geomesa.filter.FilterHelper.ff.less(dtg, start), org.locationtech.geomesa.filter.FilterHelper.ff.greaterOrEqual(dtg, end))
+        </td>
+      </tr><tr>
+        <td>
+          99
+        </td>
+        <td>
+          20917
+        </td>
+        <td>
+          4549
+          -
+          4627
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.or
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.or(org.locationtech.geomesa.filter.FilterHelper.ff.isNull(dtg), org.locationtech.geomesa.filter.FilterHelper.ff.or(org.locationtech.geomesa.filter.FilterHelper.ff.less(dtg, start), org.locationtech.geomesa.filter.FilterHelper.ff.greaterOrEqual(dtg, end)))
+        </td>
+      </tr><tr>
+        <td>
+          106
+        </td>
+        <td>
+          20919
+        </td>
+        <td>
+          4851
+          -
+          4865
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.filter.Filter.EXCLUDE
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.filter.Filter.EXCLUDE
+        </td>
+      </tr><tr>
+        <td>
+          106
+        </td>
+        <td>
+          20931
+        </td>
+        <td>
+          4815
+          -
+          5113
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.fold
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          DestinationProvider.this.coverage(sft, context).fold[org.geotools.api.filter.Filter](org.geotools.api.filter.Filter.EXCLUDE)(((interval: org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval) =&gt; {
+  val dtg: org.geotools.api.filter.expression.PropertyName = org.locationtech.geomesa.filter.FilterHelper.ff.property(DestinationProvider.this.dtgField(sft));
+  val start: org.geotools.api.filter.expression.Literal = org.locationtech.geomesa.filter.FilterHelper.ff.literal(java.util.Date.from(interval.from));
+  val end: org.geotools.api.filter.expression.Literal = org.locationtech.geomesa.filter.FilterHelper.ff.literal(java.util.Date.from(interval.through));
+  org.locationtech.geomesa.filter.FilterHelper.ff.and(org.locationtech.geomesa.filter.FilterHelper.ff.greaterOrEqual(dtg, start), org.locationtech.geomesa.filter.FilterHelper.ff.less(dtg, end))
+}))
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          20920
+        </td>
+        <td>
+          4911
+          -
+          4924
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.MergedFilterProvider.dtgField
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          DestinationProvider.this.dtgField(sft)
+        </td>
+      </tr><tr>
+        <td>
+          107
+        </td>
+        <td>
+          20921
+        </td>
+        <td>
+          4899
+          -
+          4925
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.property
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.property(DestinationProvider.this.dtgField(sft))
+        </td>
+      </tr><tr>
+        <td>
+          108
+        </td>
+        <td>
+          20922
+        </td>
+        <td>
+          4967
+          -
+          4980
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval.from
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          interval.from
+        </td>
+      </tr><tr>
+        <td>
+          108
+        </td>
+        <td>
+          20923
+        </td>
+        <td>
+          4957
+          -
+          4981
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Date.from
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Date.from(interval.from)
+        </td>
+      </tr><tr>
+        <td>
+          108
+        </td>
+        <td>
+          20924
+        </td>
+        <td>
+          4946
+          -
+          4982
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.literal(java.util.Date.from(interval.from))
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          20925
+        </td>
+        <td>
+          5022
+          -
+          5038
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval.through
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          interval.through
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          20926
+        </td>
+        <td>
+          5012
+          -
+          5039
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.Date.from
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.util.Date.from(interval.through)
+        </td>
+      </tr><tr>
+        <td>
+          109
+        </td>
+        <td>
+          20927
+        </td>
+        <td>
+          5001
+          -
+          5040
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.literal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.literal(java.util.Date.from(interval.through))
+        </td>
+      </tr><tr>
+        <td>
+          110
+        </td>
+        <td>
+          20928
+        </td>
+        <td>
+          5056
+          -
+          5085
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.greaterOrEqual
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.greaterOrEqual(dtg, start)
+        </td>
+      </tr><tr>
+        <td>
+          110
+        </td>
+        <td>
+          20929
+        </td>
+        <td>
+          5087
+          -
+          5104
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.less
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.less(dtg, end)
+        </td>
+      </tr><tr>
+        <td>
+          110
+        </td>
+        <td>
+          20930
+        </td>
+        <td>
+          5049
+          -
+          5105
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.filter.FilterFactory.and
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.filter.FilterHelper.ff.and(org.locationtech.geomesa.filter.FilterHelper.ff.greaterOrEqual(dtg, start), org.locationtech.geomesa.filter.FilterHelper.ff.less(dtg, end))
+        </td>
+      </tr><tr>
+        <td>
+          112
+        </td>
+        <td>
+          20932
+        </td>
+        <td>
+          5120
+          -
+          5132
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.geotools.api.filter.Filter](filter)
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          20933
+        </td>
+        <td>
+          5469
+          -
+          5532
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Missing required key: &quot;, &quot;&quot;).s(k))
+        </td>
+      </tr><tr>
+        <td>
+          124
+        </td>
+        <td>
+          20934
+        </td>
+        <td>
+          5449
+          -
+          5533
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.MapLike.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          config.getOrElse[String](k, throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Missing required key: &quot;, &quot;&quot;).s(k)))
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          20935
+        </td>
+        <td>
+          5552
+          -
+          5567
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.required
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          required(&quot;url&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          126
+        </td>
+        <td>
+          20936
+        </td>
+        <td>
+          5541
+          -
+          5567
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.url_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          this.url_=(required(&quot;url&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          20937
+        </td>
+        <td>
+          5589
+          -
+          5590
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          20938
+        </td>
+        <td>
+          5627
+          -
+          5629
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;.&quot;
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          20939
+        </td>
+        <td>
+          5665
+          -
+          5666
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;&quot;
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          20940
+        </td>
+        <td>
+          5607
+          -
+          5625
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.required
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          required(&quot;schema&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          20941
+        </td>
+        <td>
+          5591
+          -
+          5626
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.quoteIdentifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RolloverFilterProvider.this.quoteIdentifier(required(&quot;schema&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          20942
+        </td>
+        <td>
+          5646
+          -
+          5663
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.required
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          required(&quot;table&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          20943
+        </td>
+        <td>
+          5630
+          -
+          5664
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.quoteIdentifier
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RolloverFilterProvider.this.quoteIdentifier(required(&quot;table&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          20944
+        </td>
+        <td>
+          5587
+          -
+          5666
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;&quot;, &quot;.&quot;, &quot;&quot;).s(RolloverFilterProvider.this.quoteIdentifier(required(&quot;schema&quot;)), RolloverFilterProvider.this.quoteIdentifier(required(&quot;table&quot;)))
+        </td>
+      </tr><tr>
+        <td>
+          127
+        </td>
+        <td>
+          20945
+        </td>
+        <td>
+          5574
+          -
+          5666
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.table_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          this.table_=(scala.StringContext.apply(&quot;&quot;, &quot;.&quot;, &quot;&quot;).s(RolloverFilterProvider.this.quoteIdentifier(required(&quot;schema&quot;)), RolloverFilterProvider.this.quoteIdentifier(required(&quot;table&quot;))))
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          20946
+        </td>
+        <td>
+          5686
+          -
+          5729
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot;SELECT covered_from, covered_through FROM &quot;
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          20947
+        </td>
+        <td>
+          5734
+          -
+          5754
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          &quot; WHERE typeName = ?&quot;
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          20948
+        </td>
+        <td>
+          5729
+          -
+          5734
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.table
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.table
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          20949
+        </td>
+        <td>
+          5684
+          -
+          5754
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.StringContext.s
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.StringContext.apply(&quot;SELECT covered_from, covered_through FROM &quot;, &quot; WHERE typeName = ?&quot;).s(JdbcRolloverProvider.this.table)
+        </td>
+      </tr><tr>
+        <td>
+          128
+        </td>
+        <td>
+          20950
+        </td>
+        <td>
+          5673
+          -
+          5754
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.sql_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          this.sql_=(scala.StringContext.apply(&quot;SELECT covered_from, covered_through FROM &quot;, &quot; WHERE typeName = ?&quot;).s(JdbcRolloverProvider.this.table))
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          20951
+        </td>
+        <td>
+          5770
+          -
+          5791
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.commons.dbcp2.BasicDataSource.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.apache.commons.dbcp2.BasicDataSource()
+        </td>
+      </tr><tr>
+        <td>
+          129
+        </td>
+        <td>
+          20952
+        </td>
+        <td>
+          5761
+          -
+          5791
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.source_=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.source_=(new org.apache.commons.dbcp2.BasicDataSource())
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          20953
+        </td>
+        <td>
+          5812
+          -
+          5815
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.url
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.url
+        </td>
+      </tr><tr>
+        <td>
+          130
+        </td>
+        <td>
+          20954
+        </td>
+        <td>
+          5798
+          -
+          5816
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.commons.dbcp2.BasicDataSource.setUrl
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.source.setUrl(JdbcRolloverProvider.this.url)
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          20955
+        </td>
+        <td>
+          5842
+          -
+          5862
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.required
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          required(&quot;username&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          131
+        </td>
+        <td>
+          20956
+        </td>
+        <td>
+          5823
+          -
+          5863
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.commons.dbcp2.BasicDataSource.setUsername
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.source.setUsername(required(&quot;username&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          132
+        </td>
+        <td>
+          20957
+        </td>
+        <td>
+          5889
+          -
+          5909
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.required
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          required(&quot;password&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          132
+        </td>
+        <td>
+          20958
+        </td>
+        <td>
+          5870
+          -
+          5910
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.commons.dbcp2.BasicDataSource.setPassword
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.source.setPassword(required(&quot;password&quot;))
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          20959
+        </td>
+        <td>
+          5936
+          -
+          5976
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.MapLike.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          config.getOrElse[String](&quot;max-connections&quot;, &quot;2&quot;)
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          20960
+        </td>
+        <td>
+          5936
+          -
+          5982
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.immutable.StringLike.toInt
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.augmentString(config.getOrElse[String](&quot;max-connections&quot;, &quot;2&quot;)).toInt
+        </td>
+      </tr><tr>
+        <td>
+          133
+        </td>
+        <td>
+          20961
+        </td>
+        <td>
+          5917
+          -
+          5983
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.commons.dbcp2.BasicDataSource.setMaxTotal
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.source.setMaxTotal(scala.Predef.augmentString(config.getOrElse[String](&quot;max-connections&quot;, &quot;2&quot;)).toInt)
+        </td>
+      </tr><tr>
+        <td>
+          134
+        </td>
+        <td>
+          20962
+        </td>
+        <td>
+          5990
+          -
+          6010
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.commons.dbcp2.BasicDataSource.setMaxIdle
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.source.setMaxIdle(1)
+        </td>
+      </tr><tr>
+        <td>
+          135
+        </td>
+        <td>
+          20963
+        </td>
+        <td>
+          6017
+          -
+          6037
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.commons.dbcp2.BasicDataSource.setMinIdle
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.source.setMinIdle(0)
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          20964
+        </td>
+        <td>
+          6062
+          -
+          6083
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.time.Duration.ofSeconds
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.time.Duration.ofSeconds(5L)
+        </td>
+      </tr><tr>
+        <td>
+          136
+        </td>
+        <td>
+          20965
+        </td>
+        <td>
+          6044
+          -
+          6084
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.commons.dbcp2.BasicDataSource.setMaxWait
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.source.setMaxWait(java.time.Duration.ofSeconds(5L))
+        </td>
+      </tr><tr>
+        <td>
+          140
+        </td>
+        <td>
+          20966
+        </td>
+        <td>
+          6236
+          -
+          6244
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.StateKey
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RolloverFilterProvider.this.StateKey
+        </td>
+      </tr><tr>
+        <td>
+          140
+        </td>
+        <td>
+          20978
+        </td>
+        <td>
+          6214
+          -
+          6476
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.util.concurrent.ConcurrentHashMap.compute
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          context.state.compute(RolloverFilterProvider.this.StateKey, ((x$1: String, existing: Any) =&gt; if (existing.==(null))
+  RolloverFilterProvider.this.CoverageState.apply(JdbcRolloverProvider.this.url, JdbcRolloverProvider.this.table, JdbcRolloverProvider.this.dtgField(sft), JdbcRolloverProvider.this.readCoverage(sft.getTypeName()))
+else
+  JdbcRolloverProvider.this.validate(sft, existing.asInstanceOf[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageState])))
+        </td>
+      </tr><tr>
+        <td>
+          141
+        </td>
+        <td>
+          20967
+        </td>
+        <td>
+          6277
+          -
+          6293
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Any.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          existing.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          20968
+        </td>
+        <td>
+          6321
+          -
+          6324
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.url
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.url
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          20969
+        </td>
+        <td>
+          6326
+          -
+          6331
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.table
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.table
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          20970
+        </td>
+        <td>
+          6333
+          -
+          6346
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.MergedFilterProvider.dtgField
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.dtgField(sft)
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          20971
+        </td>
+        <td>
+          6361
+          -
+          6376
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          20972
+        </td>
+        <td>
+          6348
+          -
+          6377
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.readCoverage
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.readCoverage(sft.getTypeName())
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          20973
+        </td>
+        <td>
+          6307
+          -
+          6378
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageState.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RolloverFilterProvider.this.CoverageState.apply(JdbcRolloverProvider.this.url, JdbcRolloverProvider.this.table, JdbcRolloverProvider.this.dtgField(sft), JdbcRolloverProvider.this.readCoverage(sft.getTypeName()))
+        </td>
+      </tr><tr>
+        <td>
+          142
+        </td>
+        <td>
+          20974
+        </td>
+        <td>
+          6307
+          -
+          6378
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageState.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RolloverFilterProvider.this.CoverageState.apply(JdbcRolloverProvider.this.url, JdbcRolloverProvider.this.table, JdbcRolloverProvider.this.dtgField(sft), JdbcRolloverProvider.this.readCoverage(sft.getTypeName()))
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          20975
+        </td>
+        <td>
+          6420
+          -
+          6456
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Any.asInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          existing.asInstanceOf[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageState]
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          20976
+        </td>
+        <td>
+          6406
+          -
+          6457
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.validate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.validate(sft, existing.asInstanceOf[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageState])
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          20977
+        </td>
+        <td>
+          6406
+          -
+          6457
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.validate
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.validate(sft, existing.asInstanceOf[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageState])
+        </td>
+      </tr><tr>
+        <td>
+          147
+        </td>
+        <td>
+          20979
+        </td>
+        <td>
+          6483
+          -
+          6525
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageState.coverage
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          state.asInstanceOf[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageState].coverage
+        </td>
+      </tr><tr>
+        <td>
+          151
+        </td>
+        <td>
+          20980
+        </td>
+        <td>
+          6642
+          -
+          6655
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.MergedFilterProvider.dtgField
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.dtgField(sft)
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          20981
+        </td>
+        <td>
+          6682
+          -
+          6685
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.url
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.url
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          20982
+        </td>
+        <td>
+          6707
+          -
+          6712
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.table
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.table
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          20983
+        </td>
+        <td>
+          6689
+          -
+          6712
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          existing.table.!=(JdbcRolloverProvider.this.table)
+        </td>
+      </tr><tr>
+        <td>
+          152
+        </td>
+        <td>
+          20984
+        </td>
+        <td>
+          6666
+          -
+          6712
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          existing.url.!=(JdbcRolloverProvider.this.url).||(existing.table.!=(JdbcRolloverProvider.this.table))
+        </td>
+      </tr><tr>
+        <td>
+          153
+        </td>
+        <td>
+          20985
+        </td>
+        <td>
+          6724
+          -
+          6910
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;RolloverFilterProviders are configured to read from different tables: &quot;).s().+(scala.StringContext.apply(&quot;&quot;, &quot; &quot;, &quot; vs &quot;, &quot; &quot;, &quot;&quot;).s(existing.url, existing.table, JdbcRolloverProvider.this.url, JdbcRolloverProvider.this.table)))
+        </td>
+      </tr><tr>
+        <td>
+          153
+        </td>
+        <td>
+          20986
+        </td>
+        <td>
+          6724
+          -
+          6910
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;RolloverFilterProviders are configured to read from different tables: &quot;).s().+(scala.StringContext.apply(&quot;&quot;, &quot; &quot;, &quot; vs &quot;, &quot; &quot;, &quot;&quot;).s(existing.url, existing.table, JdbcRolloverProvider.this.url, JdbcRolloverProvider.this.table)))
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          20987
+        </td>
+        <td>
+          6928
+          -
+          6947
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.!=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          existing.dtg.!=(dtg)
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          20990
+        </td>
+        <td>
+          6924
+          -
+          6924
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          20991
+        </td>
+        <td>
+          6924
+          -
+          6924
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          156
+        </td>
+        <td>
+          20992
+        </td>
+        <td>
+          6924
+          -
+          7130
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (existing.dtg.!=(dtg))
+  throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;RolloverFilterProviders for \'&quot;, &quot;\' are using different default date fields: &quot;, &quot; vs &quot;, &quot;&quot;).s(sft.getTypeName(), existing.dtg, dtg))
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          20988
+        </td>
+        <td>
+          6959
+          -
+          7122
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;RolloverFilterProviders for \'&quot;, &quot;\' are using different default date fields: &quot;, &quot; vs &quot;, &quot;&quot;).s(sft.getTypeName(), existing.dtg, dtg))
+        </td>
+      </tr><tr>
+        <td>
+          157
+        </td>
+        <td>
+          20989
+        </td>
+        <td>
+          6959
+          -
+          7122
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;RolloverFilterProviders for \'&quot;, &quot;\' are using different default date fields: &quot;, &quot; vs &quot;, &quot;&quot;).s(sft.getTypeName(), existing.dtg, dtg))
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          20993
+        </td>
+        <td>
+          7246
+          -
+          7266
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.apache.commons.dbcp2.BasicDataSource.getConnection
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.source.getConnection()
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          21019
+        </td>
+        <td>
+          7268
+          -
+          7268
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          164
+        </td>
+        <td>
+          21020
+        </td>
+        <td>
+          7236
+          -
+          7895
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.sql.Connection, Option[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval]](JdbcRolloverProvider.this.source.getConnection())(((cx: java.sql.Connection) =&gt; org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.sql.PreparedStatement, Option[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval]](cx.prepareStatement(JdbcRolloverProvider.this.sql))(((statement: java.sql.PreparedStatement) =&gt; {
+  statement.setQueryTimeout(5);
+  statement.setString(1, typeName);
+  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.sql.ResultSet, Option[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval]](statement.executeQuery())(((results: java.sql.ResultSet) =&gt; if (results.next().unary_!)
+    scala.None
+  else
+    {
+      val from: java.time.Instant = scala.Option.apply[java.time.LocalDateTime](results.getObject[java.time.LocalDateTime](1, classOf[java.time.LocalDateTime])).map[java.time.Instant](((x$2: java.time.LocalDateTime) =&gt; x$2.toInstant(java.time.ZoneOffset.UTC))).orNull[java.time.Instant](scala.Predef.$conforms[Null]);
+      val through: java.time.Instant = scala.Option.apply[java.time.LocalDateTime](results.getObject[java.time.LocalDateTime](2, classOf[java.time.LocalDateTime])).map[java.time.Instant](((x$3: java.time.LocalDateTime) =&gt; x$3.toInstant(java.time.ZoneOffset.UTC))).orNull[java.time.Instant](scala.Predef.$conforms[Null]);
+      scala.Some.apply[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval](RolloverFilterProvider.this.CoverageInterval.apply(typeName, from, through))
+    }))(io.this.IsCloseable.closeableIsCloseable)
+}))(io.this.IsCloseable.closeableIsCloseable)))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          20994
+        </td>
+        <td>
+          7314
+          -
+          7317
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.sql
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.sql
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          20995
+        </td>
+        <td>
+          7294
+          -
+          7318
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.Connection.prepareStatement
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          cx.prepareStatement(JdbcRolloverProvider.this.sql)
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          21017
+        </td>
+        <td>
+          7320
+          -
+          7320
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          165
+        </td>
+        <td>
+          21018
+        </td>
+        <td>
+          7284
+          -
+          7887
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.sql.PreparedStatement, Option[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval]](cx.prepareStatement(JdbcRolloverProvider.this.sql))(((statement: java.sql.PreparedStatement) =&gt; {
+  statement.setQueryTimeout(5);
+  statement.setString(1, typeName);
+  org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.sql.ResultSet, Option[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval]](statement.executeQuery())(((results: java.sql.ResultSet) =&gt; if (results.next().unary_!)
+    scala.None
+  else
+    {
+      val from: java.time.Instant = scala.Option.apply[java.time.LocalDateTime](results.getObject[java.time.LocalDateTime](1, classOf[java.time.LocalDateTime])).map[java.time.Instant](((x$2: java.time.LocalDateTime) =&gt; x$2.toInstant(java.time.ZoneOffset.UTC))).orNull[java.time.Instant](scala.Predef.$conforms[Null]);
+      val through: java.time.Instant = scala.Option.apply[java.time.LocalDateTime](results.getObject[java.time.LocalDateTime](2, classOf[java.time.LocalDateTime])).map[java.time.Instant](((x$3: java.time.LocalDateTime) =&gt; x$3.toInstant(java.time.ZoneOffset.UTC))).orNull[java.time.Instant](scala.Predef.$conforms[Null]);
+      scala.Some.apply[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval](RolloverFilterProvider.this.CoverageInterval.apply(typeName, from, through))
+    }))(io.this.IsCloseable.closeableIsCloseable)
+}))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          166
+        </td>
+        <td>
+          20996
+        </td>
+        <td>
+          7345
+          -
+          7373
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.Statement.setQueryTimeout
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          statement.setQueryTimeout(5)
+        </td>
+      </tr><tr>
+        <td>
+          167
+        </td>
+        <td>
+          20997
+        </td>
+        <td>
+          7384
+          -
+          7416
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.PreparedStatement.setString
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          statement.setString(1, typeName)
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          20998
+        </td>
+        <td>
+          7437
+          -
+          7461
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.PreparedStatement.executeQuery
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          statement.executeQuery()
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          21015
+        </td>
+        <td>
+          7463
+          -
+          7463
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.closeableIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.closeableIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          168
+        </td>
+        <td>
+          21016
+        </td>
+        <td>
+          7427
+          -
+          7877
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.WithClose.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.WithClose.apply[java.sql.ResultSet, Option[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval]](statement.executeQuery())(((results: java.sql.ResultSet) =&gt; if (results.next().unary_!)
+  scala.None
+else
+  {
+    val from: java.time.Instant = scala.Option.apply[java.time.LocalDateTime](results.getObject[java.time.LocalDateTime](1, classOf[java.time.LocalDateTime])).map[java.time.Instant](((x$2: java.time.LocalDateTime) =&gt; x$2.toInstant(java.time.ZoneOffset.UTC))).orNull[java.time.Instant](scala.Predef.$conforms[Null]);
+    val through: java.time.Instant = scala.Option.apply[java.time.LocalDateTime](results.getObject[java.time.LocalDateTime](2, classOf[java.time.LocalDateTime])).map[java.time.Instant](((x$3: java.time.LocalDateTime) =&gt; x$3.toInstant(java.time.ZoneOffset.UTC))).orNull[java.time.Instant](scala.Predef.$conforms[Null]);
+    scala.Some.apply[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval](RolloverFilterProvider.this.CoverageInterval.apply(typeName, from, through))
+  }))(io.this.IsCloseable.closeableIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          169
+        </td>
+        <td>
+          20999
+        </td>
+        <td>
+          7492
+          -
+          7507
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          results.next().unary_!
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          21000
+        </td>
+        <td>
+          7525
+          -
+          7529
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          170
+        </td>
+        <td>
+          21001
+        </td>
+        <td>
+          7525
+          -
+          7529
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.None
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.None
+        </td>
+      </tr><tr>
+        <td>
+          171
+        </td>
+        <td>
+          21014
+        </td>
+        <td>
+          7549
+          -
+          7865
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val from: java.time.Instant = scala.Option.apply[java.time.LocalDateTime](results.getObject[java.time.LocalDateTime](1, classOf[java.time.LocalDateTime])).map[java.time.Instant](((x$2: java.time.LocalDateTime) =&gt; x$2.toInstant(java.time.ZoneOffset.UTC))).orNull[java.time.Instant](scala.Predef.$conforms[Null]);
+  val through: java.time.Instant = scala.Option.apply[java.time.LocalDateTime](results.getObject[java.time.LocalDateTime](2, classOf[java.time.LocalDateTime])).map[java.time.Instant](((x$3: java.time.LocalDateTime) =&gt; x$3.toInstant(java.time.ZoneOffset.UTC))).orNull[java.time.Instant](scala.Predef.$conforms[Null]);
+  scala.Some.apply[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval](RolloverFilterProvider.this.CoverageInterval.apply(typeName, from, through))
+}
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          21002
+        </td>
+        <td>
+          7583
+          -
+          7627
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.ResultSet.getObject
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          results.getObject[java.time.LocalDateTime](1, classOf[java.time.LocalDateTime])
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          21003
+        </td>
+        <td>
+          7645
+          -
+          7659
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.time.ZoneOffset.UTC
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.time.ZoneOffset.UTC
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          21004
+        </td>
+        <td>
+          7633
+          -
+          7660
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.time.chrono.ChronoLocalDateTime.toInstant
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$2.toInstant(java.time.ZoneOffset.UTC)
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          21005
+        </td>
+        <td>
+          7662
+          -
+          7662
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Predef.$conforms
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.$conforms[Null]
+        </td>
+      </tr><tr>
+        <td>
+          172
+        </td>
+        <td>
+          21006
+        </td>
+        <td>
+          7576
+          -
+          7668
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Option.orNull
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Option.apply[java.time.LocalDateTime](results.getObject[java.time.LocalDateTime](1, classOf[java.time.LocalDateTime])).map[java.time.Instant](((x$2: java.time.LocalDateTime) =&gt; x$2.toInstant(java.time.ZoneOffset.UTC))).orNull[java.time.Instant](scala.Predef.$conforms[Null])
+        </td>
+      </tr><tr>
+        <td>
+          173
+        </td>
+        <td>
+          21007
+        </td>
+        <td>
+          7704
+          -
+          7748
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.sql.ResultSet.getObject
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          results.getObject[java.time.LocalDateTime](2, classOf[java.time.LocalDateTime])
+        </td>
+      </tr><tr>
+        <td>
+          173
+        </td>
+        <td>
+          21008
+        </td>
+        <td>
+          7766
+          -
+          7780
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          java.time.ZoneOffset.UTC
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          java.time.ZoneOffset.UTC
+        </td>
+      </tr><tr>
+        <td>
+          173
+        </td>
+        <td>
+          21009
+        </td>
+        <td>
+          7754
+          -
+          7781
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.time.chrono.ChronoLocalDateTime.toInstant
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$3.toInstant(java.time.ZoneOffset.UTC)
+        </td>
+      </tr><tr>
+        <td>
+          173
+        </td>
+        <td>
+          21010
+        </td>
+        <td>
+          7783
+          -
+          7783
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Predef.$conforms
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Predef.$conforms[Null]
+        </td>
+      </tr><tr>
+        <td>
+          173
+        </td>
+        <td>
+          21011
+        </td>
+        <td>
+          7697
+          -
+          7789
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          scala.Option.orNull
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Option.apply[java.time.LocalDateTime](results.getObject[java.time.LocalDateTime](2, classOf[java.time.LocalDateTime])).map[java.time.Instant](((x$3: java.time.LocalDateTime) =&gt; x$3.toInstant(java.time.ZoneOffset.UTC))).orNull[java.time.Instant](scala.Predef.$conforms[Null])
+        </td>
+      </tr><tr>
+        <td>
+          174
+        </td>
+        <td>
+          21012
+        </td>
+        <td>
+          7809
+          -
+          7850
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          RolloverFilterProvider.this.CoverageInterval.apply(typeName, from, through)
+        </td>
+      </tr><tr>
+        <td>
+          174
+        </td>
+        <td>
+          21013
+        </td>
+        <td>
+          7804
+          -
+          7851
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Some.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Some.apply[org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.CoverageInterval](RolloverFilterProvider.this.CoverageInterval.apply(typeName, from, through))
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          21021
+        </td>
+        <td>
+          7960
+          -
+          7966
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.index.view.filters.RolloverFilterProvider.JdbcRolloverProvider.source
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          JdbcRolloverProvider.this.source
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          21022
+        </td>
+        <td>
+          7953
+          -
+          7967
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.Option.apply[org.apache.commons.dbcp2.BasicDataSource](JdbcRolloverProvider.this.source)
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          21023
+        </td>
+        <td>
+          7952
+          -
+          7952
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.IsCloseableImplicits.optionIsCloseable
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          io.this.IsCloseable.optionIsCloseable
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          21024
+        </td>
+        <td>
+          7936
+          -
+          7968
+        </td>
+        <td>
+          ApplyToImplicitArgs
+        </td>
+        <td>
+          org.locationtech.geomesa.utils.io.CloseWithLogging.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.utils.io.`package`.CloseWithLogging.apply[Option[org.apache.commons.dbcp2.BasicDataSource]](scala.Option.apply[org.apache.commons.dbcp2.BasicDataSource](JdbcRolloverProvider.this.source))(io.this.IsCloseable.optionIsCloseable)
+        </td>
+      </tr><tr>
+        <td>
+          181
+        </td>
+        <td>
+          21025
+        </td>
+        <td>
+          7952
+          -
+          7952
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr>
+    </table>
+          </div>
+        </div>
+      </body>
+    </html>
