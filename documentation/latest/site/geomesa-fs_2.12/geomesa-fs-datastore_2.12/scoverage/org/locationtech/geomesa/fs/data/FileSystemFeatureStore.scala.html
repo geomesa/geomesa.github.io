@@ -33,7 +33,7 @@
 </span>9 <span style=''>package org.locationtech.geomesa.fs.data
 </span>10 <span style=''>
 </span>11 <span style=''>import com.typesafe.scalalogging.LazyLogging
-</span>12 <span style=''>import org.geotools.api.data.{FeatureReader, FeatureWriter, Query, QueryCapabilities}
+</span>12 <span style=''>import org.geotools.api.data.{DataStore, FeatureReader, FeatureWriter, Query, QueryCapabilities, Transaction}
 </span>13 <span style=''>import org.geotools.api.feature.simple.{SimpleFeature, SimpleFeatureType}
 </span>14 <span style=''>import org.geotools.api.filter.Filter
 </span>15 <span style=''>import org.geotools.data.simple.DelegateSimpleFeatureReader
@@ -43,196 +43,339 @@
 </span>19 <span style=''>import org.locationtech.geomesa.features.ScalaSimpleFeature
 </span>20 <span style=''>import org.locationtech.geomesa.fs.data.FileSystemDataStore.FileSystemDataStoreConfig
 </span>21 <span style=''>import org.locationtech.geomesa.fs.data.FileSystemFeatureStore._
-</span>22 <span style=''>import org.locationtech.geomesa.fs.storage.core.FileSystemStorage
-</span>23 <span style=''>import org.locationtech.geomesa.index.geotools.{FastSettableFeatureWriter, GeoMesaFeatureWriter}
-</span>24 <span style=''>import org.locationtech.geomesa.index.utils.ThreadManagement.{LowLevelScanner, ManagedScan, Timeout}
-</span>25 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
-</span>26 <span style=''>import org.locationtech.geomesa.utils.json.JsonPathPropertyNameResolver
-</span>27 <span style=''>
-</span>28 <span style=''>import java.io.Closeable
-</span>29 <span style=''>import java.util.concurrent.atomic.AtomicLong
-</span>30 <span style=''>
-</span>31 <span style=''>class FileSystemFeatureStore(
-</span>32 <span style=''>    val storage: FileSystemStorage,
-</span>33 <span style=''>    entry: ContentEntry,
-</span>34 <span style=''>    query: Query,
-</span>35 <span style=''>    config: FileSystemDataStoreConfig,
-</span>36 <span style=''>  ) extends ContentFeatureStore(entry, query) with LazyLogging {
-</span>37 <span style=''>
-</span>38 <span style=''>  override def getWriterInternal(query: Query, flags: Int): FeatureWriter[SimpleFeatureType, SimpleFeature] = {
-</span>39 <span style=''>    // note: check update first as sometimes we get ADD | UPDATE
-</span>40 <span style=''>    if (</span><span style='background: #AEF1AE'>(flags &amp; WRITER_UPDATE) == WRITER_UPDATE</span><span style=''>) {
-</span>41 <span style=''>      </span><span style='background: #AEF1AE'>new FileSystemFeatureWriterModify(storage, query.getFilter, config.readThreads)</span><span style=''>
-</span>42 <span style=''>    } else </span><span style='background: #AEF1AE'>if ((flags &amp; WRITER_ADD) == WRITER_ADD) {
-</span>43 <span style=''></span><span style='background: #AEF1AE'>      new FileSystemFeatureWriterAppend(storage)
-</span>44 <span style=''></span><span style='background: #AEF1AE'>    } else {
-</span>45 <span style=''></span><span style='background: #AEF1AE'>      </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Expected one of $WRITER_ADD or $WRITER_UPDATE, but got: $flags&quot;)</span><span style='background: #AEF1AE'>
-</span>46 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>47 <span style=''>  }
-</span>48 <span style=''>
-</span>49 <span style=''>  override def buildFeatureType(): SimpleFeatureType = </span><span style='background: #AEF1AE'>storage.sft</span><span style=''>
-</span>50 <span style=''>
-</span>51 <span style=''>  override def getBoundsInternal(query: Query): ReferencedEnvelope = </span><span style='background: #AEF1AE'>storage.getBounds(query.getFilter, config.readThreads)</span><span style=''>
+</span>22 <span style=''>import org.locationtech.geomesa.fs.storage.core.StorageTransaction.ConflictException
+</span>23 <span style=''>import org.locationtech.geomesa.fs.storage.core.{FileSystemStorage, StorageTransaction}
+</span>24 <span style=''>import org.locationtech.geomesa.index.geotools.{FastSettableFeatureWriter, GeoMesaFeatureWriter}
+</span>25 <span style=''>import org.locationtech.geomesa.index.utils.ThreadManagement.{LowLevelScanner, ManagedScan, Timeout}
+</span>26 <span style=''>import org.locationtech.geomesa.utils.collection.CloseableIterator
+</span>27 <span style=''>import org.locationtech.geomesa.utils.json.JsonPathPropertyNameResolver
+</span>28 <span style=''>
+</span>29 <span style=''>import java.io.{Closeable, IOException}
+</span>30 <span style=''>import java.util.concurrent.atomic.AtomicLong
+</span>31 <span style=''>import scala.collection.mutable.ArrayBuffer
+</span>32 <span style=''>import scala.util.control.NonFatal
+</span>33 <span style=''>
+</span>34 <span style=''>class FileSystemFeatureStore(
+</span>35 <span style=''>    val storage: FileSystemStorage,
+</span>36 <span style=''>    entry: ContentEntry,
+</span>37 <span style=''>    query: Query,
+</span>38 <span style=''>    config: FileSystemDataStoreConfig,
+</span>39 <span style=''>  ) extends ContentFeatureStore(entry, query) with LazyLogging {
+</span>40 <span style=''>
+</span>41 <span style=''>  override def getWriterInternal(query: Query, flags: Int): FeatureWriter[SimpleFeatureType, SimpleFeature] = {
+</span>42 <span style=''>    val transaction = </span><span style='background: #AEF1AE'>storageTransaction()</span><span style=''>
+</span>43 <span style=''>    // note: check update first as sometimes we get ADD | UPDATE
+</span>44 <span style=''>    if (</span><span style='background: #AEF1AE'>(flags &amp; WRITER_UPDATE) == WRITER_UPDATE</span><span style=''>) {
+</span>45 <span style=''>      </span><span style='background: #AEF1AE'>new FileSystemFeatureWriterModify(storage, transaction, query.getFilter, config.readThreads)</span><span style=''>
+</span>46 <span style=''>    } else </span><span style='background: #AEF1AE'>if ((flags &amp; WRITER_ADD) == WRITER_ADD) {
+</span>47 <span style=''></span><span style='background: #AEF1AE'>      new FileSystemFeatureWriterAppend(storage, transaction)
+</span>48 <span style=''></span><span style='background: #AEF1AE'>    } else {
+</span>49 <span style=''></span><span style='background: #AEF1AE'>      </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Expected one of $WRITER_ADD or $WRITER_UPDATE, but got: $flags&quot;)</span><span style='background: #AEF1AE'>
+</span>50 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>51 <span style=''>  }
 </span>52 <span style=''>
-</span>53 <span style=''>  override def getCountInternal(query: Query): Int = {
-</span>54 <span style=''>    val count = </span><span style='background: #AEF1AE'>storage.getCount(query.getFilter, config.readThreads)</span><span style=''>
-</span>55 <span style=''>    if (</span><span style='background: #AEF1AE'>count.isValidInt</span><span style=''>) { </span><span style='background: #AEF1AE'>count.toInt</span><span style=''> } else { </span><span style='background: #F0ADAD'>Int.MaxValue</span><span style=''> }
-</span>56 <span style=''>  }
-</span>57 <span style=''>
-</span>58 <span style=''>  override def getReaderInternal(original: Query): FeatureReader[SimpleFeatureType, SimpleFeature] = {
-</span>59 <span style=''>    import org.locationtech.geomesa.index.conf.QueryHints._
-</span>60 <span style=''>
-</span>61 <span style=''>    val query = </span><span style='background: #AEF1AE'>new Query(original)</span><span style=''>
-</span>62 <span style=''>    // The type name can sometimes be empty such as Query.ALL
-</span>63 <span style=''>    </span><span style='background: #AEF1AE'>query.setTypeName(storage.sft.getTypeName)</span><span style=''>
-</span>64 <span style=''>
-</span>65 <span style=''>    val reader = </span><span style='background: #AEF1AE'>config.queryTimeout</span><span style=''> match {
-</span>66 <span style=''>      case None =&gt; </span><span style='background: #AEF1AE'>storage.getReader(query, threads = config.readThreads)</span><span style=''>
-</span>67 <span style=''>      case Some(timeout) </span><span style='background: #AEF1AE'>=&gt;
-</span>68 <span style=''></span><span style='background: #AEF1AE'>        val filter = Option(query.getFilter).filter(_ != Filter.INCLUDE)
-</span>69 <span style=''></span><span style='background: #AEF1AE'>        new ManagedScan(new FileSystemScanner(storage, query, config.readThreads), Timeout(timeout), query.getTypeName, filter)</span><span style=''>
-</span>70 <span style=''>    }
-</span>71 <span style=''>
-</span>72 <span style=''>    // get a closeable java iterator that DelegateSimpleFeatureIterator will process correctly
-</span>73 <span style=''>    val iter = </span><span style='background: #AEF1AE'>new FileSystemFeatureIterator(reader)</span><span style=''>
-</span>74 <span style=''>
-</span>75 <span style=''>    // transforms will be set after getting the iterator
-</span>76 <span style=''>    val transformSft = </span><span style='background: #AEF1AE'>query.getHints.getTransformSchema.getOrElse(storage.sft)</span><span style=''>
+</span>53 <span style=''>  /**
+</span>54 <span style=''>   * Gets the storage transaction associated with the current geotools transaction
+</span>55 <span style=''>   *
+</span>56 <span style=''>   * @return storage transaction
+</span>57 <span style=''>   */
+</span>58 <span style=''>  private def storageTransaction(): StorageTransaction = {
+</span>59 <span style=''>    val transaction = </span><span style='background: #AEF1AE'>getTransaction</span><span style=''>
+</span>60 <span style=''>    if (</span><span style='background: #AEF1AE'>transaction == null || transaction == Transaction.AUTO_COMMIT</span><span style=''>) { </span><span style='background: #AEF1AE'>StorageTransaction.AutoCommit</span><span style=''> } else </span><span style='background: #AEF1AE'>{
+</span>61 <span style=''></span><span style='background: #AEF1AE'>      // note: geotools tracks its own state using the content entry as a key, so we have to use something different
+</span>62 <span style=''></span><span style='background: #AEF1AE'>      val key = TransactionKey(getDataStore)
+</span>63 <span style=''></span><span style='background: #AEF1AE'>      val state = transaction.synchronized {
+</span>64 <span style=''></span><span style='background: #AEF1AE'>        transaction.getState(key) match {
+</span>65 <span style=''></span><span style='background: #AEF1AE'>          case null =&gt;
+</span>66 <span style=''></span><span style='background: #AEF1AE'>            val state = new FileSystemTransactionState()
+</span>67 <span style=''></span><span style='background: #AEF1AE'>            transaction.putState(key, state)
+</span>68 <span style=''></span><span style='background: #AEF1AE'>            state
+</span>69 <span style=''></span><span style='background: #AEF1AE'>
+</span>70 <span style=''></span><span style='background: #AEF1AE'>          case state: FileSystemTransactionState =&gt; state
+</span>71 <span style=''></span><span style='background: #AEF1AE'>          case state =&gt; </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(s&quot;Found non-FileSystem state in transaction: $state&quot;)</span><span style='background: #AEF1AE'>
+</span>72 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>73 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>74 <span style=''></span><span style='background: #AEF1AE'>      state.transaction(storage)
+</span>75 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>76 <span style=''>  }
 </span>77 <span style=''>
-</span>78 <span style=''>    // note: DelegateSimpleFeatureIterator will close the iterator by checking that it implements Closeable
-</span>79 <span style=''>    </span><span style='background: #AEF1AE'>new DelegateSimpleFeatureReader(transformSft, new DelegateSimpleFeatureIterator(iter))</span><span style=''>
-</span>80 <span style=''>  }
+</span>78 <span style=''>  override def buildFeatureType(): SimpleFeatureType = </span><span style='background: #AEF1AE'>storage.sft</span><span style=''>
+</span>79 <span style=''>
+</span>80 <span style=''>  override def getBoundsInternal(query: Query): ReferencedEnvelope = </span><span style='background: #AEF1AE'>storage.getBounds(query.getFilter, config.readThreads)</span><span style=''>
 </span>81 <span style=''>
-</span>82 <span style=''>  /**
-</span>83 <span style=''>   * Resolves filter property names against the schema, but preserves JSON paths.
-</span>84 <span style=''>   *
-</span>85 <span style=''>   * The base class runs `DataUtilities.resolvePropertyNames`, whose `PropertyNameResolvingVisitor`
-</span>86 <span style=''>   * evaluates each property name against the feature type and rewrites it to the resolved attribute's
-</span>87 <span style=''>   * local name. A JSON path like `$.props.name` evaluates (via GeoMesa's JSON property accessor) to
-</span>88 <span style=''>   * the `props` descriptor, so the default would collapse the whole path to `props` - losing the nested
-</span>89 <span style=''>   * field that IcebergFilterConverter needs to push down. We keep `$`-prefixed names verbatim and
-</span>90 <span style=''>   * resolve everything else as usual.
-</span>91 <span style=''>   *
-</span>92 <span style=''>   * @param query the query being planned
-</span>93 <span style=''>   * @return the query with non-JSON-path property names resolved
-</span>94 <span style=''>   */
-</span>95 <span style=''>  override protected def resolvePropertyNames(query: Query): Query = {
-</span>96 <span style=''>    val filter = </span><span style='background: #AEF1AE'>query.getFilter</span><span style=''>
-</span>97 <span style=''>    if (</span><span style='background: #AEF1AE'>filter == null || filter == Filter.INCLUDE || filter == Filter.EXCLUDE</span><span style=''>) { </span><span style='background: #AEF1AE'>query</span><span style=''> } else </span><span style='background: #AEF1AE'>{
-</span>98 <span style=''></span><span style='background: #AEF1AE'>      val resolved = filter.accept(new JsonPathPropertyNameResolver(getSchema), null).asInstanceOf[Filter]
-</span>99 <span style=''></span><span style='background: #AEF1AE'>      if (resolved == filter) { query } else </span><span style='background: #F0ADAD'>{
-</span>100 <span style=''></span><span style='background: #F0ADAD'>        val newQuery = new Query(query)
-</span>101 <span style=''></span><span style='background: #F0ADAD'>        newQuery.setFilter(resolved)
-</span>102 <span style=''></span><span style='background: #F0ADAD'>        newQuery
-</span>103 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style='background: #AEF1AE'>
-</span>104 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>105 <span style=''>  }
+</span>82 <span style=''>  override def getCountInternal(query: Query): Int = {
+</span>83 <span style=''>    val count = </span><span style='background: #AEF1AE'>storage.getCount(query.getFilter, config.readThreads)</span><span style=''>
+</span>84 <span style=''>    if (</span><span style='background: #AEF1AE'>count.isValidInt</span><span style=''>) { </span><span style='background: #AEF1AE'>count.toInt</span><span style=''> } else { </span><span style='background: #F0ADAD'>Int.MaxValue</span><span style=''> }
+</span>85 <span style=''>  }
+</span>86 <span style=''>
+</span>87 <span style=''>  override def getReaderInternal(original: Query): FeatureReader[SimpleFeatureType, SimpleFeature] = {
+</span>88 <span style=''>    import org.locationtech.geomesa.index.conf.QueryHints._
+</span>89 <span style=''>
+</span>90 <span style=''>    val query = </span><span style='background: #AEF1AE'>new Query(original)</span><span style=''>
+</span>91 <span style=''>    // The type name can sometimes be empty such as Query.ALL
+</span>92 <span style=''>    </span><span style='background: #AEF1AE'>query.setTypeName(storage.sft.getTypeName)</span><span style=''>
+</span>93 <span style=''>
+</span>94 <span style=''>    val reader = </span><span style='background: #AEF1AE'>config.queryTimeout</span><span style=''> match {
+</span>95 <span style=''>      case None =&gt; </span><span style='background: #AEF1AE'>storage.getReader(query, threads = config.readThreads)</span><span style=''>
+</span>96 <span style=''>      case Some(timeout) </span><span style='background: #AEF1AE'>=&gt;
+</span>97 <span style=''></span><span style='background: #AEF1AE'>        val filter = Option(query.getFilter).filter(_ != Filter.INCLUDE)
+</span>98 <span style=''></span><span style='background: #AEF1AE'>        new ManagedScan(new FileSystemScanner(storage, query, config.readThreads), Timeout(timeout), query.getTypeName, filter)</span><span style=''>
+</span>99 <span style=''>    }
+</span>100 <span style=''>
+</span>101 <span style=''>    // get a closeable java iterator that DelegateSimpleFeatureIterator will process correctly
+</span>102 <span style=''>    val iter = </span><span style='background: #AEF1AE'>new FileSystemFeatureIterator(reader)</span><span style=''>
+</span>103 <span style=''>
+</span>104 <span style=''>    // transforms will be set after getting the iterator
+</span>105 <span style=''>    val transformSft = </span><span style='background: #AEF1AE'>query.getHints.getTransformSchema.getOrElse(storage.sft)</span><span style=''>
 </span>106 <span style=''>
-</span>107 <span style=''>  override def canTransact: Boolean = </span><span style='background: #AEF1AE'>false</span><span style=''>
-</span>108 <span style=''>  override def canEvent: Boolean = </span><span style='background: #AEF1AE'>false</span><span style=''>
-</span>109 <span style=''>  override def canReproject: Boolean = </span><span style='background: #AEF1AE'>false</span><span style=''>
-</span>110 <span style=''>  override def canLimit(query: Query): Boolean = </span><span style='background: #AEF1AE'>true</span><span style=''>
-</span>111 <span style=''>  override def canSort(query: Query): Boolean = </span><span style='background: #AEF1AE'>true</span><span style=''>
-</span>112 <span style=''>  override def canFilter(query: Query): Boolean = </span><span style='background: #AEF1AE'>true</span><span style=''>
-</span>113 <span style=''>  override def canRetype(query: Query): Boolean = </span><span style='background: #AEF1AE'>true</span><span style=''>
-</span>114 <span style=''>
-</span>115 <span style=''>  override protected def buildQueryCapabilities(): QueryCapabilities = </span><span style='background: #F0ADAD'>FileSystemFeatureStore.capabilities</span><span style=''>
-</span>116 <span style=''>}
-</span>117 <span style=''>
-</span>118 <span style=''>object FileSystemFeatureStore {
-</span>119 <span style=''>
-</span>120 <span style=''>  private val capabilities: QueryCapabilities = </span><span style='background: #F0ADAD'>new</span><span style=''> QueryCapabilities() {
-</span>121 <span style=''>    override def isReliableFIDSupported: Boolean = </span><span style='background: #F0ADAD'>true</span><span style=''>
-</span>122 <span style=''>    override def isUseProvidedFIDSupported: Boolean = </span><span style='background: #F0ADAD'>true</span><span style=''>
-</span>123 <span style=''>  }
-</span>124 <span style=''>
-</span>125 <span style=''>  /**
-</span>126 <span style=''>   * Wrapper for managed scans
-</span>127 <span style=''>   *
-</span>128 <span style=''>   * @param storage storage
-</span>129 <span style=''>   * @param query query
-</span>130 <span style=''>   * @param threads query threads
-</span>131 <span style=''>   */
-</span>132 <span style=''>  private class FileSystemScanner(storage: FileSystemStorage, val query: Query, threads: Int)
-</span>133 <span style=''>      extends LowLevelScanner[SimpleFeature] {
-</span>134 <span style=''>
-</span>135 <span style=''>    private var reader: CloseableIterator[SimpleFeature] = _
-</span>136 <span style=''>
-</span>137 <span style=''>    override def iterator: Iterator[SimpleFeature] = </span><span style='background: #AEF1AE'>synchronized {
-</span>138 <span style=''></span><span style='background: #AEF1AE'>      reader = storage.getReader(query, threads = threads)
-</span>139 <span style=''></span><span style='background: #AEF1AE'>      reader
-</span>140 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>141 <span style=''>
-</span>142 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>synchronized {
-</span>143 <span style=''></span><span style='background: #AEF1AE'>      if (reader != null) {
-</span>144 <span style=''></span><span style='background: #AEF1AE'>        reader.close()
-</span>145 <span style=''></span><span style='background: #AEF1AE'>      }
-</span>146 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
-</span>147 <span style=''>  }
+</span>107 <span style=''>    // note: DelegateSimpleFeatureIterator will close the iterator by checking that it implements Closeable
+</span>108 <span style=''>    </span><span style='background: #AEF1AE'>new DelegateSimpleFeatureReader(transformSft, new DelegateSimpleFeatureIterator(iter))</span><span style=''>
+</span>109 <span style=''>  }
+</span>110 <span style=''>
+</span>111 <span style=''>  /**
+</span>112 <span style=''>   * Resolves filter property names against the schema, but preserves JSON paths.
+</span>113 <span style=''>   *
+</span>114 <span style=''>   * The base class runs `DataUtilities.resolvePropertyNames`, whose `PropertyNameResolvingVisitor`
+</span>115 <span style=''>   * evaluates each property name against the feature type and rewrites it to the resolved attribute's
+</span>116 <span style=''>   * local name. A JSON path like `$.props.name` evaluates (via GeoMesa's JSON property accessor) to
+</span>117 <span style=''>   * the `props` descriptor, so the default would collapse the whole path to `props` - losing the nested
+</span>118 <span style=''>   * field that IcebergFilterConverter needs to push down. We keep `$`-prefixed names verbatim and
+</span>119 <span style=''>   * resolve everything else as usual.
+</span>120 <span style=''>   *
+</span>121 <span style=''>   * @param query the query being planned
+</span>122 <span style=''>   * @return the query with non-JSON-path property names resolved
+</span>123 <span style=''>   */
+</span>124 <span style=''>  override protected def resolvePropertyNames(query: Query): Query = {
+</span>125 <span style=''>    val filter = </span><span style='background: #AEF1AE'>query.getFilter</span><span style=''>
+</span>126 <span style=''>    if (</span><span style='background: #AEF1AE'>filter == null || filter == Filter.INCLUDE || filter == Filter.EXCLUDE</span><span style=''>) { </span><span style='background: #AEF1AE'>query</span><span style=''> } else </span><span style='background: #AEF1AE'>{
+</span>127 <span style=''></span><span style='background: #AEF1AE'>      val resolved = filter.accept(new JsonPathPropertyNameResolver(getSchema), null).asInstanceOf[Filter]
+</span>128 <span style=''></span><span style='background: #AEF1AE'>      if (resolved == filter) { query } else </span><span style='background: #F0ADAD'>{
+</span>129 <span style=''></span><span style='background: #F0ADAD'>        val newQuery = new Query(query)
+</span>130 <span style=''></span><span style='background: #F0ADAD'>        newQuery.setFilter(resolved)
+</span>131 <span style=''></span><span style='background: #F0ADAD'>        newQuery
+</span>132 <span style=''></span><span style='background: #F0ADAD'>      }</span><span style='background: #AEF1AE'>
+</span>133 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>134 <span style=''>  }
+</span>135 <span style=''>
+</span>136 <span style=''>  override def canEvent: Boolean = </span><span style='background: #AEF1AE'>false</span><span style=''>
+</span>137 <span style=''>  override def canReproject: Boolean = </span><span style='background: #AEF1AE'>false</span><span style=''>
+</span>138 <span style=''>  override def canTransact: Boolean = </span><span style='background: #AEF1AE'>true</span><span style=''>
+</span>139 <span style=''>  override def canLimit(query: Query): Boolean = </span><span style='background: #AEF1AE'>true</span><span style=''>
+</span>140 <span style=''>  override def canSort(query: Query): Boolean = </span><span style='background: #AEF1AE'>true</span><span style=''>
+</span>141 <span style=''>  override def canFilter(query: Query): Boolean = </span><span style='background: #AEF1AE'>true</span><span style=''>
+</span>142 <span style=''>  override def canRetype(query: Query): Boolean = </span><span style='background: #AEF1AE'>true</span><span style=''>
+</span>143 <span style=''>
+</span>144 <span style=''>  override protected def buildQueryCapabilities(): QueryCapabilities = </span><span style='background: #F0ADAD'>FileSystemFeatureStore.capabilities</span><span style=''>
+</span>145 <span style=''>}
+</span>146 <span style=''>
+</span>147 <span style=''>object FileSystemFeatureStore {
 </span>148 <span style=''>
-</span>149 <span style=''>  /**
-</span>150 <span style=''>    * Iterator for querying file system storage
-</span>151 <span style=''>    *
-</span>152 <span style=''>    * Note: implements Closeable and not AutoCloseable so that DelegateFeatureIterator will close it properly
-</span>153 <span style=''>    *
-</span>154 <span style=''>    * @param iter delegate iterator
-</span>155 <span style=''>    */
-</span>156 <span style=''>  private class FileSystemFeatureIterator(iter: CloseableIterator[SimpleFeature])
-</span>157 <span style=''>      extends java.util.Iterator[SimpleFeature] with Closeable {
-</span>158 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>iter.hasNext</span><span style=''>
-</span>159 <span style=''>    override def next(): SimpleFeature = </span><span style='background: #AEF1AE'>iter.next()</span><span style=''>
-</span>160 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>iter.close()</span><span style=''>
-</span>161 <span style=''>  }
-</span>162 <span style=''>
-</span>163 <span style=''>  /**
-</span>164 <span style=''>   * Appending feature writer
-</span>165 <span style=''>   *
-</span>166 <span style=''>   * @param storage storage instance
-</span>167 <span style=''>   */
-</span>168 <span style=''>  private class FileSystemFeatureWriterAppend(storage: FileSystemStorage) extends FastSettableFeatureWriter {
-</span>169 <span style=''>
-</span>170 <span style=''>    private val writer = </span><span style='background: #AEF1AE'>storage.getMultiPartitionWriter()</span><span style=''>
-</span>171 <span style=''>    private val featureIds = </span><span style='background: #AEF1AE'>new AtomicLong(0)</span><span style=''>
-</span>172 <span style=''>    private var feature: ScalaSimpleFeature = _
-</span>173 <span style=''>
-</span>174 <span style=''>    override def getFeatureType: SimpleFeatureType = </span><span style='background: #AEF1AE'>storage.sft</span><span style=''>
-</span>175 <span style=''>
-</span>176 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>false</span><span style=''>
-</span>177 <span style=''>
-</span>178 <span style=''>    override def next(): ScalaSimpleFeature = {
-</span>179 <span style=''>      </span><span style='background: #AEF1AE'>feature = new ScalaSimpleFeature(storage.sft, featureIds.getAndIncrement().toString)</span><span style=''>
-</span>180 <span style=''>      </span><span style='background: #AEF1AE'>feature</span><span style=''>
-</span>181 <span style=''>    }
-</span>182 <span style=''>
-</span>183 <span style=''>    override def write(): Unit = </span><span style='background: #AEF1AE'>writer.write(GeoMesaFeatureWriter.featureWithFid(feature))</span><span style=''>
-</span>184 <span style=''>
-</span>185 <span style=''>    override def remove(): Unit = </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(&quot;This writer is append only&quot;)</span><span style=''>
-</span>186 <span style=''>
-</span>187 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>writer.close()</span><span style=''>
-</span>188 <span style=''>  }
-</span>189 <span style=''>
-</span>190 <span style=''>  /**
-</span>191 <span style=''>    * Modifying feature writer
-</span>192 <span style=''>    *
-</span>193 <span style=''>    * @param storage instance
-</span>194 <span style=''>    * @param filter query filter
-</span>195 <span style=''>    * @param readThreads read threads
-</span>196 <span style=''>    */
-</span>197 <span style=''>  private class FileSystemFeatureWriterModify(storage: FileSystemStorage, filter: Filter, readThreads: Int)
-</span>198 <span style=''>      extends FeatureWriter[SimpleFeatureType, SimpleFeature] with LazyLogging {
-</span>199 <span style=''>
-</span>200 <span style=''>    private val writer = </span><span style='background: #AEF1AE'>storage.getWriter(filter, threads = readThreads)</span><span style=''>
-</span>201 <span style=''>
-</span>202 <span style=''>    override def getFeatureType: SimpleFeatureType = </span><span style='background: #AEF1AE'>storage.sft</span><span style=''>
+</span>149 <span style=''>  private val capabilities: QueryCapabilities = </span><span style='background: #F0ADAD'>new</span><span style=''> QueryCapabilities() {
+</span>150 <span style=''>    override def isReliableFIDSupported: Boolean = </span><span style='background: #F0ADAD'>true</span><span style=''>
+</span>151 <span style=''>    override def isUseProvidedFIDSupported: Boolean = </span><span style='background: #F0ADAD'>true</span><span style=''>
+</span>152 <span style=''>  }
+</span>153 <span style=''>
+</span>154 <span style=''>  /**
+</span>155 <span style=''>   * Key for tracking transaction state
+</span>156 <span style=''>   *
+</span>157 <span style=''>   * @param ds data store
+</span>158 <span style=''>   */
+</span>159 <span style=''>  private case class TransactionKey(ds: DataStore)
+</span>160 <span style=''>
+</span>161 <span style=''>  /**
+</span>162 <span style=''>   * Holder for an open transaction
+</span>163 <span style=''>   *
+</span>164 <span style=''>   * @param storage storage instance
+</span>165 <span style=''>   * @param tx transaction
+</span>166 <span style=''>   */
+</span>167 <span style=''>  private case class TransactionInstance(storage: FileSystemStorage, tx: StorageTransaction)
+</span>168 <span style=''>
+</span>169 <span style=''>  /**
+</span>170 <span style=''>   * Ties storage transactions to a geotools transaction. A geotools transaction can be committed or rolled back multiple
+</span>171 <span style=''>   * times, while a storage transaction is single-use - so a new storage transaction is started for each set of changes.
+</span>172 <span style=''>   * Any uncommitted changes are rolled back when the geotools transaction is closed.
+</span>173 <span style=''>   *
+</span>174 <span style=''>   * A single state tracks all the feature types in a data store, as geotools hides the type of any failure if
+</span>175 <span style=''>   * more than one state fails to commit.
+</span>176 <span style=''>   */
+</span>177 <span style=''>  private class FileSystemTransactionState extends Transaction.State {
+</span>178 <span style=''>
+</span>179 <span style=''>    // the current storage transactions, if there are any pending changes, keyed by feature type name
+</span>180 <span style=''>    private val current = </span><span style='background: #AEF1AE'>scala.collection.mutable.LinkedHashMap.empty[String, TransactionInstance]</span><span style=''>
+</span>181 <span style=''>
+</span>182 <span style=''>    /**
+</span>183 <span style=''>     * Gets the current storage transaction, starting a new one if needed
+</span>184 <span style=''>     *
+</span>185 <span style=''>     * @param storage storage instance
+</span>186 <span style=''>     * @return
+</span>187 <span style=''>     */
+</span>188 <span style=''>    def transaction(storage: FileSystemStorage): StorageTransaction = </span><span style='background: #AEF1AE'>synchronized {
+</span>189 <span style=''></span><span style='background: #AEF1AE'>      val typeName = storage.sft.getTypeName
+</span>190 <span style=''></span><span style='background: #AEF1AE'>      current.get(typeName) match {
+</span>191 <span style=''></span><span style='background: #AEF1AE'>        case None =&gt;
+</span>192 <span style=''></span><span style='background: #AEF1AE'>          val tx = storage.newTransaction()
+</span>193 <span style=''></span><span style='background: #AEF1AE'>          current.put(typeName, TransactionInstance(storage, tx))
+</span>194 <span style=''></span><span style='background: #AEF1AE'>          tx
+</span>195 <span style=''></span><span style='background: #AEF1AE'>
+</span>196 <span style=''></span><span style='background: #AEF1AE'>        case Some(instance) if instance.storage.eq(storage) =&gt; instance.tx
+</span>197 <span style=''></span><span style='background: #AEF1AE'>
+</span>198 <span style=''></span><span style='background: #AEF1AE'>        case _ =&gt;
+</span>199 <span style=''></span><span style='background: #AEF1AE'>          </span><span style='background: #F0ADAD'>throw new IllegalStateException(
+</span>200 <span style=''></span><span style='background: #F0ADAD'>            s&quot;Schema '$typeName' was modified during the transaction - the transaction must be rolled back&quot;)</span><span style='background: #AEF1AE'>
+</span>201 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>202 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
 </span>203 <span style=''>
-</span>204 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>writer.hasNext</span><span style=''>
-</span>205 <span style=''>    // TODO implement FastSettableFeatureWriter and wire ScalaSimpleFeature all the way through
-</span>206 <span style=''>    override def next(): SimpleFeature = </span><span style='background: #AEF1AE'>writer.next()</span><span style=''>
-</span>207 <span style=''>    override def write(): Unit = </span><span style='background: #AEF1AE'>writer.write()</span><span style=''>
-</span>208 <span style=''>    override def remove(): Unit = </span><span style='background: #AEF1AE'>writer.remove()</span><span style=''>
-</span>209 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>writer.close()</span><span style=''>
-</span>210 <span style=''>  }
-</span>211 <span style=''>}
+</span>204 <span style=''>    override def setTransaction(transaction: Transaction): Unit = {
+</span>205 <span style=''>      if (</span><span style='background: #AEF1AE'>transaction == null</span><span style=''>) {
+</span>206 <span style=''>        // the transaction has been closed
+</span>207 <span style=''>        </span><span style='background: #AEF1AE'>rollback()</span><span style=''>
+</span>208 <span style=''>      }
+</span>209 <span style=''>    }
+</span>210 <span style=''>
+</span>211 <span style=''>    override def addAuthorization(authID: String): Unit = </span><span style='background: #F0ADAD'>{}</span><span style=''>
+</span>212 <span style=''>
+</span>213 <span style=''>    override def commit(): Unit = </span><span style='background: #AEF1AE'>synchronized {
+</span>214 <span style=''></span><span style='background: #AEF1AE'>      val failures = ArrayBuffer.empty[Throwable]
+</span>215 <span style=''></span><span style='background: #AEF1AE'>      current.toList.foreach { case (typeName, instance) =&gt;
+</span>216 <span style=''></span><span style='background: #AEF1AE'>        // note: if the commit fails, the storage transaction is generally left open so it can be re-tried or rolled back
+</span>217 <span style=''></span><span style='background: #AEF1AE'>        try { instance.tx.commit() } catch {
+</span>218 <span style=''></span><span style='background: #AEF1AE'>          case NonFatal(e) =&gt; failures += e
+</span>219 <span style=''></span><span style='background: #AEF1AE'>        } finally {
+</span>220 <span style=''></span><span style='background: #AEF1AE'>          if (!instance.tx.isOpen) {
+</span>221 <span style=''></span><span style='background: #AEF1AE'>            current.remove(typeName)
+</span>222 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>223 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>224 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>225 <span style=''></span><span style='background: #AEF1AE'>      raise(failures.toSeq)
+</span>226 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>227 <span style=''>
+</span>228 <span style=''>    override def rollback(): Unit = </span><span style='background: #AEF1AE'>synchronized {
+</span>229 <span style=''></span><span style='background: #AEF1AE'>      val failures = ArrayBuffer.empty[Throwable]
+</span>230 <span style=''></span><span style='background: #AEF1AE'>      try {
+</span>231 <span style=''></span><span style='background: #AEF1AE'>        current.values.foreach { instance =&gt;
+</span>232 <span style=''></span><span style='background: #AEF1AE'>          try { instance.tx.rollback() } catch {
+</span>233 <span style=''></span><span style='background: #AEF1AE'>            case NonFatal(e) =&gt; </span><span style='background: #F0ADAD'>failures += e</span><span style='background: #AEF1AE'>
+</span>234 <span style=''></span><span style='background: #AEF1AE'>          }
+</span>235 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>236 <span style=''></span><span style='background: #AEF1AE'>      } finally {
+</span>237 <span style=''></span><span style='background: #AEF1AE'>        current.clear()
+</span>238 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>239 <span style=''></span><span style='background: #AEF1AE'>      raise(failures.toSeq)
+</span>240 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>241 <span style=''>
+</span>242 <span style=''>    /**
+</span>243 <span style=''>     * Throws a single exception for any failures. Conflict exceptions take priority, so that they can be
+</span>244 <span style=''>     * handled by the caller - any other failures are added as suppressed exceptions.
+</span>245 <span style=''>     *
+</span>246 <span style=''>     * @param failures failures
+</span>247 <span style=''>     */
+</span>248 <span style=''>    private def raise(failures: Seq[Throwable]): Unit = {
+</span>249 <span style=''>      if (</span><span style='background: #AEF1AE'>failures.nonEmpty</span><span style=''>) </span><span style='background: #AEF1AE'>{
+</span>250 <span style=''></span><span style='background: #AEF1AE'>        val primary = failures.find(_.isInstanceOf[ConflictException]).getOrElse(</span><span style='background: #F0ADAD'>failures.head</span><span style='background: #AEF1AE'>)
+</span>251 <span style=''></span><span style='background: #AEF1AE'>        val e = primary match {
+</span>252 <span style=''></span><span style='background: #AEF1AE'>          case e: IOException =&gt; e
+</span>253 <span style=''></span><span style='background: #AEF1AE'>          case e =&gt; </span><span style='background: #F0ADAD'>new IOException(e.getMessage, e)</span><span style='background: #AEF1AE'>
+</span>254 <span style=''></span><span style='background: #AEF1AE'>        }
+</span>255 <span style=''></span><span style='background: #AEF1AE'>        failures.filterNot(_.eq(primary)).foreach(e.addSuppressed)
+</span>256 <span style=''></span><span style='background: #AEF1AE'>        throw e
+</span>257 <span style=''></span><span style='background: #AEF1AE'>      }</span><span style=''>
+</span>258 <span style=''>    }
+</span>259 <span style=''>  }
+</span>260 <span style=''>
+</span>261 <span style=''>  /**
+</span>262 <span style=''>   * Wrapper for managed scans
+</span>263 <span style=''>   *
+</span>264 <span style=''>   * @param storage storage
+</span>265 <span style=''>   * @param query query
+</span>266 <span style=''>   * @param threads query threads
+</span>267 <span style=''>   */
+</span>268 <span style=''>  private class FileSystemScanner(storage: FileSystemStorage, val query: Query, threads: Int)
+</span>269 <span style=''>      extends LowLevelScanner[SimpleFeature] {
+</span>270 <span style=''>
+</span>271 <span style=''>    private var reader: CloseableIterator[SimpleFeature] = _
+</span>272 <span style=''>
+</span>273 <span style=''>    override def iterator: Iterator[SimpleFeature] = </span><span style='background: #AEF1AE'>synchronized {
+</span>274 <span style=''></span><span style='background: #AEF1AE'>      reader = storage.getReader(query, threads = threads)
+</span>275 <span style=''></span><span style='background: #AEF1AE'>      reader
+</span>276 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>277 <span style=''>
+</span>278 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>synchronized {
+</span>279 <span style=''></span><span style='background: #AEF1AE'>      if (reader != null) {
+</span>280 <span style=''></span><span style='background: #AEF1AE'>        reader.close()
+</span>281 <span style=''></span><span style='background: #AEF1AE'>      }
+</span>282 <span style=''></span><span style='background: #AEF1AE'>    }</span><span style=''>
+</span>283 <span style=''>  }
+</span>284 <span style=''>
+</span>285 <span style=''>  /**
+</span>286 <span style=''>    * Iterator for querying file system storage
+</span>287 <span style=''>    *
+</span>288 <span style=''>    * Note: implements Closeable and not AutoCloseable so that DelegateFeatureIterator will close it properly
+</span>289 <span style=''>    *
+</span>290 <span style=''>    * @param iter delegate iterator
+</span>291 <span style=''>    */
+</span>292 <span style=''>  private class FileSystemFeatureIterator(iter: CloseableIterator[SimpleFeature])
+</span>293 <span style=''>      extends java.util.Iterator[SimpleFeature] with Closeable {
+</span>294 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>iter.hasNext</span><span style=''>
+</span>295 <span style=''>    override def next(): SimpleFeature = </span><span style='background: #AEF1AE'>iter.next()</span><span style=''>
+</span>296 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>iter.close()</span><span style=''>
+</span>297 <span style=''>  }
+</span>298 <span style=''>
+</span>299 <span style=''>  /**
+</span>300 <span style=''>   * Appending feature writer
+</span>301 <span style=''>   *
+</span>302 <span style=''>   * @param storage storage instance
+</span>303 <span style=''>   * @param transaction transaction
+</span>304 <span style=''>   */
+</span>305 <span style=''>  private class FileSystemFeatureWriterAppend(storage: FileSystemStorage, transaction: StorageTransaction)
+</span>306 <span style=''>      extends FastSettableFeatureWriter {
+</span>307 <span style=''>
+</span>308 <span style=''>    private val writer = </span><span style='background: #AEF1AE'>storage.getMultiPartitionWriter(transaction)</span><span style=''>
+</span>309 <span style=''>    private val featureIds = </span><span style='background: #AEF1AE'>new AtomicLong(0)</span><span style=''>
+</span>310 <span style=''>    private var feature: ScalaSimpleFeature = _
+</span>311 <span style=''>
+</span>312 <span style=''>    override def getFeatureType: SimpleFeatureType = </span><span style='background: #AEF1AE'>storage.sft</span><span style=''>
+</span>313 <span style=''>
+</span>314 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>false</span><span style=''>
+</span>315 <span style=''>
+</span>316 <span style=''>    override def next(): ScalaSimpleFeature = {
+</span>317 <span style=''>      </span><span style='background: #AEF1AE'>feature = new ScalaSimpleFeature(storage.sft, featureIds.getAndIncrement().toString)</span><span style=''>
+</span>318 <span style=''>      </span><span style='background: #AEF1AE'>feature</span><span style=''>
+</span>319 <span style=''>    }
+</span>320 <span style=''>
+</span>321 <span style=''>    override def write(): Unit = </span><span style='background: #AEF1AE'>writer.write(GeoMesaFeatureWriter.featureWithFid(feature))</span><span style=''>
+</span>322 <span style=''>
+</span>323 <span style=''>    override def remove(): Unit = </span><span style='background: #F0ADAD'>throw new IllegalArgumentException(&quot;This writer is append only&quot;)</span><span style=''>
+</span>324 <span style=''>
+</span>325 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>writer.close()</span><span style=''>
+</span>326 <span style=''>  }
+</span>327 <span style=''>
+</span>328 <span style=''>  /**
+</span>329 <span style=''>    * Modifying feature writer
+</span>330 <span style=''>    *
+</span>331 <span style=''>    * @param storage instance
+</span>332 <span style=''>    * @param transaction transaction
+</span>333 <span style=''>    * @param filter query filter
+</span>334 <span style=''>    * @param readThreads read threads
+</span>335 <span style=''>    */
+</span>336 <span style=''>  private class FileSystemFeatureWriterModify(
+</span>337 <span style=''>      storage: FileSystemStorage,
+</span>338 <span style=''>      transaction: StorageTransaction,
+</span>339 <span style=''>      filter: Filter,
+</span>340 <span style=''>      readThreads: Int
+</span>341 <span style=''>    ) extends FeatureWriter[SimpleFeatureType, SimpleFeature] with LazyLogging {
+</span>342 <span style=''>
+</span>343 <span style=''>    private val writer = </span><span style='background: #AEF1AE'>storage.getUpdateWriter(filter, readThreads, transaction)</span><span style=''>
+</span>344 <span style=''>
+</span>345 <span style=''>    override def getFeatureType: SimpleFeatureType = </span><span style='background: #AEF1AE'>storage.sft</span><span style=''>
+</span>346 <span style=''>
+</span>347 <span style=''>    override def hasNext: Boolean = </span><span style='background: #AEF1AE'>writer.hasNext</span><span style=''>
+</span>348 <span style=''>    // TODO implement FastSettableFeatureWriter and wire ScalaSimpleFeature all the way through
+</span>349 <span style=''>    override def next(): SimpleFeature = </span><span style='background: #AEF1AE'>writer.next()</span><span style=''>
+</span>350 <span style=''>    override def write(): Unit = </span><span style='background: #AEF1AE'>writer.write()</span><span style=''>
+</span>351 <span style=''>    override def remove(): Unit = </span><span style='background: #AEF1AE'>writer.remove()</span><span style=''>
+</span>352 <span style=''>    override def close(): Unit = </span><span style='background: #AEF1AE'>writer.close()</span><span style=''>
+</span>353 <span style=''>  }
+</span>354 <span style=''>}
 </span></pre>
           </div>
           <div class="tab-pane" id="statementlist">
@@ -247,15 +390,39 @@
         <th>Code</th>
       </tr><tr>
         <td>
-          40
+          42
         </td>
         <td>
           347
         </td>
         <td>
-          2087
+          2261
           -
-          2127
+          2281
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.storageTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemFeatureStore.this.storageTransaction()
+        </td>
+      </tr><tr>
+        <td>
+          44
+        </td>
+        <td>
+          348
+        </td>
+        <td>
+          2355
+          -
+          2395
         </td>
         <td>
           Apply
@@ -271,15 +438,15 @@
         </td>
       </tr><tr>
         <td>
-          41
+          45
         </td>
         <td>
-          348
+          349
         </td>
         <td>
-          2171
+          2439
           -
-          2178
+          2446
         </td>
         <td>
           Select
@@ -295,15 +462,15 @@
         </td>
       </tr><tr>
         <td>
-          41
+          45
         </td>
         <td>
-          349
+          350
         </td>
         <td>
-          2180
+          2461
           -
-          2195
+          2476
         </td>
         <td>
           Apply
@@ -319,15 +486,15 @@
         </td>
       </tr><tr>
         <td>
-          41
+          45
         </td>
         <td>
-          350
+          351
         </td>
         <td>
-          2197
+          2478
           -
-          2215
+          2496
         </td>
         <td>
           Select
@@ -343,15 +510,15 @@
         </td>
       </tr><tr>
         <td>
-          41
+          45
         </td>
         <td>
-          351
+          352
         </td>
         <td>
-          2137
+          2405
           -
-          2216
+          2497
         </td>
         <td>
           Apply
@@ -363,19 +530,19 @@
           
         </td>
         <td style="background: #AEF1AE">
-          new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterModify(FileSystemFeatureStore.this.storage, query.getFilter(), FileSystemFeatureStore.this.config.readThreads)
+          new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterModify(FileSystemFeatureStore.this.storage, transaction, query.getFilter(), FileSystemFeatureStore.this.config.readThreads)
         </td>
       </tr><tr>
         <td>
-          41
+          45
         </td>
         <td>
-          352
+          353
         </td>
         <td>
-          2137
+          2405
           -
-          2216
+          2497
         </td>
         <td>
           Block
@@ -387,19 +554,19 @@
           
         </td>
         <td style="background: #AEF1AE">
-          new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterModify(FileSystemFeatureStore.this.storage, query.getFilter(), FileSystemFeatureStore.this.config.readThreads)
+          new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterModify(FileSystemFeatureStore.this.storage, transaction, query.getFilter(), FileSystemFeatureStore.this.config.readThreads)
         </td>
       </tr><tr>
         <td>
-          42
+          46
         </td>
         <td>
-          353
+          354
         </td>
         <td>
-          2232
+          2513
           -
-          2266
+          2547
         </td>
         <td>
           Apply
@@ -415,15 +582,15 @@
         </td>
       </tr><tr>
         <td>
-          42
+          46
         </td>
         <td>
-          359
+          360
         </td>
         <td>
-          2228
+          2509
           -
-          2445
+          2739
         </td>
         <td>
           If
@@ -436,21 +603,21 @@
         </td>
         <td style="background: #AEF1AE">
           if (flags.&amp;(1).==(1))
-  new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterAppend(FileSystemFeatureStore.this.storage)
+  new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterAppend(FileSystemFeatureStore.this.storage, transaction)
 else
   throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Expected one of &quot;, &quot; or &quot;, &quot;, but got: &quot;, &quot;&quot;).s(1, 2, flags))
         </td>
       </tr><tr>
         <td>
-          43
+          47
         </td>
         <td>
-          354
+          355
         </td>
         <td>
-          2310
+          2591
           -
-          2317
+          2598
         </td>
         <td>
           Select
@@ -466,15 +633,15 @@ else
         </td>
       </tr><tr>
         <td>
-          43
+          47
         </td>
         <td>
-          355
+          356
         </td>
         <td>
-          2276
+          2557
           -
-          2318
+          2612
         </td>
         <td>
           Apply
@@ -486,19 +653,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterAppend(FileSystemFeatureStore.this.storage)
+          new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterAppend(FileSystemFeatureStore.this.storage, transaction)
         </td>
       </tr><tr>
         <td>
-          43
+          47
         </td>
         <td>
-          356
+          357
         </td>
         <td>
-          2276
+          2557
           -
-          2318
+          2612
         </td>
         <td>
           Block
@@ -510,19 +677,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterAppend(FileSystemFeatureStore.this.storage)
+          new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterAppend(FileSystemFeatureStore.this.storage, transaction)
         </td>
       </tr><tr>
         <td>
-          45
+          49
         </td>
         <td>
-          357
+          358
         </td>
         <td>
-          2338
+          2632
           -
-          2439
+          2733
         </td>
         <td>
           Throw
@@ -538,15 +705,15 @@ else
         </td>
       </tr><tr>
         <td>
-          45
+          49
         </td>
         <td>
-          358
+          359
         </td>
         <td>
-          2338
+          2632
           -
-          2439
+          2733
         </td>
         <td>
           Block
@@ -562,15 +729,519 @@ else
         </td>
       </tr><tr>
         <td>
-          49
+          59
         </td>
         <td>
-          360
+          361
         </td>
         <td>
-          2506
+          2959
           -
-          2517
+          2973
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.data.store.ContentFeatureSource.getTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemFeatureStore.this.getTransaction()
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          362
+        </td>
+        <td>
+          2997
+          -
+          3001
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          null
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          363
+        </td>
+        <td>
+          3020
+          -
+          3043
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.geotools.api.data.Transaction.AUTO_COMMIT
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          364
+        </td>
+        <td>
+          3005
+          -
+          3043
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          transaction.==(org.geotools.api.data.Transaction.AUTO_COMMIT)
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          365
+        </td>
+        <td>
+          2982
+          -
+          3043
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Boolean.||
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          transaction.==(null).||(transaction.==(org.geotools.api.data.Transaction.AUTO_COMMIT))
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          366
+        </td>
+        <td>
+          3047
+          -
+          3076
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.StorageTransaction.AutoCommit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.core.StorageTransaction.AutoCommit
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          367
+        </td>
+        <td>
+          3047
+          -
+          3076
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.StorageTransaction.AutoCommit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.storage.core.StorageTransaction.AutoCommit
+        </td>
+      </tr><tr>
+        <td>
+          60
+        </td>
+        <td>
+          380
+        </td>
+        <td>
+          3084
+          -
+          3706
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val key: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionKey = org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionKey.apply(FileSystemFeatureStore.this.getDataStore());
+  val state: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState = transaction.synchronized[org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState](transaction.getState(key) match {
+    case null =&gt; {
+      val state: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState = new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState();
+      transaction.putState(key, state);
+      state
+    }
+    case (state @ (_: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState)) =&gt; state
+    case (state @ _) =&gt; throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Found non-FileSystem state in transaction: &quot;, &quot;&quot;).s(state))
+  });
+  state.transaction(FileSystemFeatureStore.this.storage)
+}
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          368
+        </td>
+        <td>
+          3234
+          -
+          3246
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.data.store.ContentFeatureSource.getDataStore
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemFeatureStore.this.getDataStore()
+        </td>
+      </tr><tr>
+        <td>
+          62
+        </td>
+        <td>
+          369
+        </td>
+        <td>
+          3219
+          -
+          3247
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionKey.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionKey.apply(FileSystemFeatureStore.this.getDataStore())
+        </td>
+      </tr><tr>
+        <td>
+          63
+        </td>
+        <td>
+          377
+        </td>
+        <td>
+          3266
+          -
+          3667
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.synchronized
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          transaction.synchronized[org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState](transaction.getState(key) match {
+  case null =&gt; {
+    val state: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState = new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState();
+    transaction.putState(key, state);
+    state
+  }
+  case (state @ (_: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState)) =&gt; state
+  case (state @ _) =&gt; throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Found non-FileSystem state in transaction: &quot;, &quot;&quot;).s(state))
+})
+        </td>
+      </tr><tr>
+        <td>
+          64
+        </td>
+        <td>
+          370
+        </td>
+        <td>
+          3301
+          -
+          3326
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.Transaction.getState
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          transaction.getState(key)
+        </td>
+      </tr><tr>
+        <td>
+          65
+        </td>
+        <td>
+          373
+        </td>
+        <td>
+          3355
+          -
+          3477
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val state: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState = new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState();
+  transaction.putState(key, state);
+  state
+}
+        </td>
+      </tr><tr>
+        <td>
+          66
+        </td>
+        <td>
+          371
+        </td>
+        <td>
+          3382
+          -
+          3414
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          new org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState()
+        </td>
+      </tr><tr>
+        <td>
+          67
+        </td>
+        <td>
+          372
+        </td>
+        <td>
+          3427
+          -
+          3459
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.data.Transaction.putState
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          transaction.putState(key, state)
+        </td>
+      </tr><tr>
+        <td>
+          70
+        </td>
+        <td>
+          374
+        </td>
+        <td>
+          3531
+          -
+          3536
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.state
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          state
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          375
+        </td>
+        <td>
+          3561
+          -
+          3649
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Found non-FileSystem state in transaction: &quot;, &quot;&quot;).s(state))
+        </td>
+      </tr><tr>
+        <td>
+          71
+        </td>
+        <td>
+          376
+        </td>
+        <td>
+          3561
+          -
+          3649
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new scala.`package`.IllegalArgumentException(scala.StringContext.apply(&quot;Found non-FileSystem state in transaction: &quot;, &quot;&quot;).s(state))
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          378
+        </td>
+        <td>
+          3692
+          -
+          3699
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.storage
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemFeatureStore.this.storage
+        </td>
+      </tr><tr>
+        <td>
+          74
+        </td>
+        <td>
+          379
+        </td>
+        <td>
+          3674
+          -
+          3700
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState.transaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          state.transaction(FileSystemFeatureStore.this.storage)
+        </td>
+      </tr><tr>
+        <td>
+          78
+        </td>
+        <td>
+          381
+        </td>
+        <td>
+          3767
+          -
+          3778
         </td>
         <td>
           Select
@@ -586,15 +1257,15 @@ else
         </td>
       </tr><tr>
         <td>
-          51
+          80
         </td>
         <td>
-          361
+          382
         </td>
         <td>
-          2606
+          3867
           -
-          2621
+          3882
         </td>
         <td>
           Apply
@@ -610,15 +1281,15 @@ else
         </td>
       </tr><tr>
         <td>
-          51
+          80
         </td>
         <td>
-          362
+          383
         </td>
         <td>
-          2623
+          3884
           -
-          2641
+          3902
         </td>
         <td>
           Select
@@ -634,15 +1305,15 @@ else
         </td>
       </tr><tr>
         <td>
-          51
+          80
         </td>
         <td>
-          363
+          384
         </td>
         <td>
-          2588
+          3849
           -
-          2642
+          3903
         </td>
         <td>
           Apply
@@ -658,15 +1329,15 @@ else
         </td>
       </tr><tr>
         <td>
-          54
+          83
         </td>
         <td>
-          364
+          385
         </td>
         <td>
-          2732
+          3993
           -
-          2747
+          4008
         </td>
         <td>
           Apply
@@ -682,15 +1353,15 @@ else
         </td>
       </tr><tr>
         <td>
-          54
+          83
         </td>
         <td>
-          365
+          386
         </td>
         <td>
-          2749
+          4010
           -
-          2767
+          4028
         </td>
         <td>
           Select
@@ -706,15 +1377,15 @@ else
         </td>
       </tr><tr>
         <td>
-          54
+          83
         </td>
         <td>
-          366
+          387
         </td>
         <td>
-          2715
+          3976
           -
-          2768
+          4029
         </td>
         <td>
           Apply
@@ -730,15 +1401,15 @@ else
         </td>
       </tr><tr>
         <td>
-          55
+          84
         </td>
         <td>
-          367
+          388
         </td>
         <td>
-          2777
+          4038
           -
-          2793
+          4054
         </td>
         <td>
           Select
@@ -754,15 +1425,15 @@ else
         </td>
       </tr><tr>
         <td>
-          55
+          84
         </td>
         <td>
-          368
+          389
         </td>
         <td>
-          2797
+          4058
           -
-          2808
+          4069
         </td>
         <td>
           Select
@@ -778,15 +1449,15 @@ else
         </td>
       </tr><tr>
         <td>
-          55
+          84
         </td>
         <td>
-          369
+          390
         </td>
         <td>
-          2797
+          4058
           -
-          2808
+          4069
         </td>
         <td>
           Block
@@ -802,15 +1473,15 @@ else
         </td>
       </tr><tr>
         <td>
-          55
+          84
         </td>
         <td>
-          370
+          391
         </td>
         <td>
-          2818
+          4079
           -
-          2830
+          4091
         </td>
         <td>
           Literal
@@ -826,15 +1497,15 @@ else
         </td>
       </tr><tr>
         <td>
-          55
+          84
         </td>
         <td>
-          371
+          392
         </td>
         <td>
-          2818
+          4079
           -
-          2830
+          4091
         </td>
         <td>
           Block
@@ -850,15 +1521,15 @@ else
         </td>
       </tr><tr>
         <td>
-          61
+          90
         </td>
         <td>
-          372
+          393
         </td>
         <td>
-          3018
+          4279
           -
-          3037
+          4298
         </td>
         <td>
           Apply
@@ -874,15 +1545,15 @@ else
         </td>
       </tr><tr>
         <td>
-          63
+          92
         </td>
         <td>
-          373
+          394
         </td>
         <td>
-          3122
+          4383
           -
-          3145
+          4406
         </td>
         <td>
           Apply
@@ -898,15 +1569,15 @@ else
         </td>
       </tr><tr>
         <td>
-          63
+          92
         </td>
         <td>
-          374
+          395
         </td>
         <td>
-          3104
+          4365
           -
-          3146
+          4407
         </td>
         <td>
           Apply
@@ -922,15 +1593,15 @@ else
         </td>
       </tr><tr>
         <td>
-          65
+          94
         </td>
         <td>
-          375
+          396
         </td>
         <td>
-          3165
+          4426
           -
-          3184
+          4445
         </td>
         <td>
           Select
@@ -946,15 +1617,15 @@ else
         </td>
       </tr><tr>
         <td>
-          66
+          95
         </td>
         <td>
-          376
+          397
         </td>
         <td>
-          3247
+          4508
           -
-          3265
+          4526
         </td>
         <td>
           Select
@@ -970,15 +1641,15 @@ else
         </td>
       </tr><tr>
         <td>
-          66
+          95
         </td>
         <td>
-          377
+          398
         </td>
         <td>
-          3212
+          4473
           -
-          3266
+          4527
         </td>
         <td>
           Apply
@@ -994,15 +1665,15 @@ else
         </td>
       </tr><tr>
         <td>
-          66
+          95
         </td>
         <td>
-          378
+          399
         </td>
         <td>
-          3212
+          4473
           -
-          3266
+          4527
         </td>
         <td>
           Block
@@ -1018,15 +1689,15 @@ else
         </td>
       </tr><tr>
         <td>
-          67
+          96
         </td>
         <td>
-          389
+          410
         </td>
         <td>
-          3292
+          4553
           -
-          3495
+          4756
         </td>
         <td>
           Block
@@ -1045,15 +1716,15 @@ else
         </td>
       </tr><tr>
         <td>
-          68
+          97
         </td>
         <td>
-          379
+          400
         </td>
         <td>
-          3323
+          4584
           -
-          3338
+          4599
         </td>
         <td>
           Apply
@@ -1069,15 +1740,15 @@ else
         </td>
       </tr><tr>
         <td>
-          68
+          97
         </td>
         <td>
-          380
+          401
         </td>
         <td>
-          3352
+          4613
           -
-          3366
+          4627
         </td>
         <td>
           Select
@@ -1093,15 +1764,15 @@ else
         </td>
       </tr><tr>
         <td>
-          68
+          97
         </td>
         <td>
-          381
+          402
         </td>
         <td>
-          3347
+          4608
           -
-          3366
+          4627
         </td>
         <td>
           Apply
@@ -1117,15 +1788,15 @@ else
         </td>
       </tr><tr>
         <td>
-          68
+          97
         </td>
         <td>
-          382
+          403
         </td>
         <td>
-          3316
+          4577
           -
-          3367
+          4628
         </td>
         <td>
           Apply
@@ -1141,15 +1812,15 @@ else
         </td>
       </tr><tr>
         <td>
-          69
+          98
         </td>
         <td>
-          383
+          404
         </td>
         <td>
-          3414
+          4675
           -
-          3421
+          4682
         </td>
         <td>
           Select
@@ -1165,15 +1836,15 @@ else
         </td>
       </tr><tr>
         <td>
-          69
+          98
         </td>
         <td>
-          384
+          405
         </td>
         <td>
-          3430
+          4691
           -
-          3448
+          4709
         </td>
         <td>
           Select
@@ -1189,15 +1860,15 @@ else
         </td>
       </tr><tr>
         <td>
-          69
+          98
         </td>
         <td>
-          385
+          406
         </td>
         <td>
-          3392
+          4653
           -
-          3449
+          4710
         </td>
         <td>
           Apply
@@ -1213,15 +1884,15 @@ else
         </td>
       </tr><tr>
         <td>
-          69
+          98
         </td>
         <td>
-          386
+          407
         </td>
         <td>
-          3451
+          4712
           -
-          3467
+          4728
         </td>
         <td>
           Apply
@@ -1237,15 +1908,15 @@ else
         </td>
       </tr><tr>
         <td>
-          69
+          98
         </td>
         <td>
-          387
+          408
         </td>
         <td>
-          3469
+          4730
           -
-          3486
+          4747
         </td>
         <td>
           Apply
@@ -1261,15 +1932,15 @@ else
         </td>
       </tr><tr>
         <td>
-          69
+          98
         </td>
         <td>
-          388
+          409
         </td>
         <td>
-          3376
+          4637
           -
-          3495
+          4756
         </td>
         <td>
           Apply
@@ -1285,15 +1956,15 @@ else
         </td>
       </tr><tr>
         <td>
-          73
+          102
         </td>
         <td>
-          390
+          411
         </td>
         <td>
-          3613
+          4874
           -
-          3650
+          4911
         </td>
         <td>
           Apply
@@ -1309,15 +1980,15 @@ else
         </td>
       </tr><tr>
         <td>
-          76
+          105
         </td>
         <td>
-          391
+          412
         </td>
         <td>
-          3732
+          4993
           -
-          3746
+          5007
         </td>
         <td>
           Apply
@@ -1333,15 +2004,15 @@ else
         </td>
       </tr><tr>
         <td>
-          76
+          105
         </td>
         <td>
-          392
+          413
         </td>
         <td>
-          3776
+          5037
           -
-          3787
+          5048
         </td>
         <td>
           Select
@@ -1357,15 +2028,15 @@ else
         </td>
       </tr><tr>
         <td>
-          76
+          105
         </td>
         <td>
-          393
+          414
         </td>
         <td>
-          3732
+          4993
           -
-          3788
+          5049
         </td>
         <td>
           Apply
@@ -1381,15 +2052,15 @@ else
         </td>
       </tr><tr>
         <td>
-          79
+          108
         </td>
         <td>
-          394
+          415
         </td>
         <td>
-          3948
+          5209
           -
-          3987
+          5248
         </td>
         <td>
           Apply
@@ -1405,15 +2076,15 @@ else
         </td>
       </tr><tr>
         <td>
-          79
+          108
         </td>
         <td>
-          395
+          416
         </td>
         <td>
-          3902
+          5163
           -
-          3988
+          5249
         </td>
         <td>
           Apply
@@ -1429,15 +2100,15 @@ else
         </td>
       </tr><tr>
         <td>
-          96
+          125
         </td>
         <td>
-          396
+          417
         </td>
         <td>
-          4841
+          6102
           -
-          4856
+          6117
         </td>
         <td>
           Apply
@@ -1453,15 +2124,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          126
         </td>
         <td>
-          397
+          418
         </td>
         <td>
-          4875
+          6136
           -
-          4879
+          6140
         </td>
         <td>
           Literal
@@ -1477,15 +2148,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          126
         </td>
         <td>
-          398
+          419
         </td>
         <td>
-          4893
+          6154
           -
-          4907
+          6168
         </td>
         <td>
           Select
@@ -1501,15 +2172,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          126
         </td>
         <td>
-          399
+          420
         </td>
         <td>
-          4883
+          6144
           -
-          4907
+          6168
         </td>
         <td>
           Apply
@@ -1525,15 +2196,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          126
         </td>
         <td>
-          400
+          421
         </td>
         <td>
-          4921
+          6182
           -
-          4935
+          6196
         </td>
         <td>
           Select
@@ -1549,15 +2220,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          126
         </td>
         <td>
-          401
+          422
         </td>
         <td>
-          4911
+          6172
           -
-          4935
+          6196
         </td>
         <td>
           Apply
@@ -1573,15 +2244,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          126
         </td>
         <td>
-          402
+          423
         </td>
         <td>
-          4865
+          6126
           -
-          4935
+          6196
         </td>
         <td>
           Apply
@@ -1597,15 +2268,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          126
         </td>
         <td>
-          403
+          424
         </td>
         <td>
-          4939
+          6200
           -
-          4944
+          6205
         </td>
         <td>
           Ident
@@ -1621,15 +2292,15 @@ else
         </td>
       </tr><tr>
         <td>
-          97
+          126
         </td>
         <td>
-          413
+          434
         </td>
         <td>
-          4952
+          6213
           -
-          5215
+          6476
         </td>
         <td>
           Block
@@ -1655,15 +2326,15 @@ else
         </td>
       </tr><tr>
         <td>
-          98
+          127
         </td>
         <td>
-          404
+          425
         </td>
         <td>
-          5022
+          6283
           -
-          5031
+          6292
         </td>
         <td>
           Apply
@@ -1679,15 +2350,15 @@ else
         </td>
       </tr><tr>
         <td>
-          98
+          127
         </td>
         <td>
-          405
+          426
         </td>
         <td>
-          4989
+          6250
           -
-          5032
+          6293
         </td>
         <td>
           Apply
@@ -1703,15 +2374,15 @@ else
         </td>
       </tr><tr>
         <td>
-          98
+          127
         </td>
         <td>
-          406
+          427
         </td>
         <td>
-          5034
+          6295
           -
-          5038
+          6299
         </td>
         <td>
           Literal
@@ -1727,15 +2398,15 @@ else
         </td>
       </tr><tr>
         <td>
-          98
+          127
         </td>
         <td>
-          407
+          428
         </td>
         <td>
-          4975
+          6236
           -
-          5060
+          6321
         </td>
         <td>
           TypeApply
@@ -1751,15 +2422,15 @@ else
         </td>
       </tr><tr>
         <td>
-          99
+          128
         </td>
         <td>
-          408
+          429
         </td>
         <td>
-          5071
+          6332
           -
-          5089
+          6350
         </td>
         <td>
           Apply
@@ -1775,15 +2446,15 @@ else
         </td>
       </tr><tr>
         <td>
-          99
+          128
         </td>
         <td>
-          409
+          430
         </td>
         <td>
-          5093
+          6354
           -
-          5098
+          6359
         </td>
         <td>
           Ident
@@ -1799,15 +2470,15 @@ else
         </td>
       </tr><tr>
         <td>
-          99
+          128
         </td>
         <td>
-          412
+          433
         </td>
         <td>
-          5106
+          6367
           -
-          5209
+          6470
         </td>
         <td>
           Block
@@ -1827,15 +2498,15 @@ else
         </td>
       </tr><tr>
         <td>
-          100
+          129
         </td>
         <td>
-          410
+          431
         </td>
         <td>
-          5131
+          6392
           -
-          5147
+          6408
         </td>
         <td>
           Apply
@@ -1851,15 +2522,15 @@ else
         </td>
       </tr><tr>
         <td>
-          101
+          130
         </td>
         <td>
-          411
+          432
         </td>
         <td>
-          5156
+          6417
           -
-          5184
+          6445
         </td>
         <td>
           Apply
@@ -1875,15 +2546,15 @@ else
         </td>
       </tr><tr>
         <td>
-          107
+          136
         </td>
         <td>
-          414
+          435
         </td>
         <td>
-          5259
+          6517
           -
-          5264
+          6522
         </td>
         <td>
           Literal
@@ -1899,15 +2570,15 @@ else
         </td>
       </tr><tr>
         <td>
-          108
+          137
         </td>
         <td>
-          415
+          436
         </td>
         <td>
-          5300
+          6562
           -
-          5305
+          6567
         </td>
         <td>
           Literal
@@ -1923,39 +2594,15 @@ else
         </td>
       </tr><tr>
         <td>
-          109
+          138
         </td>
         <td>
-          416
+          437
         </td>
         <td>
-          5345
+          6606
           -
-          5350
-        </td>
-        <td>
-          Literal
-        </td>
-        <td>
-          &lt;nosymbol&gt;
-        </td>
-        <td>
-          
-        </td>
-        <td style="background: #AEF1AE">
-          false
-        </td>
-      </tr><tr>
-        <td>
-          110
-        </td>
-        <td>
-          417
-        </td>
-        <td>
-          5400
-          -
-          5404
+          6610
         </td>
         <td>
           Literal
@@ -1971,15 +2618,15 @@ else
         </td>
       </tr><tr>
         <td>
-          111
+          139
         </td>
         <td>
-          418
+          438
         </td>
         <td>
-          5453
+          6660
           -
-          5457
+          6664
         </td>
         <td>
           Literal
@@ -1995,15 +2642,15 @@ else
         </td>
       </tr><tr>
         <td>
-          112
+          140
         </td>
         <td>
-          419
+          439
         </td>
         <td>
-          5508
+          6713
           -
-          5512
+          6717
         </td>
         <td>
           Literal
@@ -2019,15 +2666,15 @@ else
         </td>
       </tr><tr>
         <td>
-          113
+          141
         </td>
         <td>
-          420
+          440
         </td>
         <td>
-          5563
+          6768
           -
-          5567
+          6772
         </td>
         <td>
           Literal
@@ -2043,15 +2690,39 @@ else
         </td>
       </tr><tr>
         <td>
-          115
+          142
         </td>
         <td>
-          421
+          441
         </td>
         <td>
-          5640
+          6823
           -
-          5675
+          6827
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          true
+        </td>
+      </tr><tr>
+        <td>
+          144
+        </td>
+        <td>
+          442
+        </td>
+        <td>
+          6900
+          -
+          6935
         </td>
         <td>
           Select
@@ -2067,15 +2738,15 @@ else
         </td>
       </tr><tr>
         <td>
-          120
+          149
         </td>
         <td>
-          424
+          445
         </td>
         <td>
-          5760
+          7020
           -
-          5763
+          7023
         </td>
         <td>
           Apply
@@ -2091,15 +2762,15 @@ else
         </td>
       </tr><tr>
         <td>
-          121
+          150
         </td>
         <td>
-          422
+          443
         </td>
         <td>
-          5837
+          7097
           -
-          5841
+          7101
         </td>
         <td>
           Literal
@@ -2115,15 +2786,15 @@ else
         </td>
       </tr><tr>
         <td>
-          122
+          151
         </td>
         <td>
-          423
+          444
         </td>
         <td>
-          5896
+          7156
           -
-          5900
+          7160
         </td>
         <td>
           Literal
@@ -2139,15 +2810,1619 @@ else
         </td>
       </tr><tr>
         <td>
-          137
+          180
         </td>
         <td>
-          430
+          446
         </td>
         <td>
-          6297
+          8211
           -
-          6389
+          8284
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.mutable.LinkedHashMap.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.LinkedHashMap.empty[String, org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance]
+        </td>
+      </tr><tr>
+        <td>
+          188
+        </td>
+        <td>
+          458
+        </td>
+        <td>
+          8507
+          -
+          9007
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.synchronized
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.synchronized[org.locationtech.geomesa.fs.storage.core.StorageTransaction]({
+  val typeName: String = storage.sft.getTypeName();
+  FileSystemTransactionState.this.current.get(typeName) match {
+    case scala.None =&gt; {
+      val tx: org.locationtech.geomesa.fs.storage.core.StorageTransaction = storage.newTransaction();
+      FileSystemTransactionState.this.current.put(typeName, FileSystemFeatureStore.this.TransactionInstance.apply(storage, tx));
+      tx
+    }
+    case (value: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance)Some[org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance]((instance @ _)) if instance.storage.eq(storage) =&gt; instance.tx
+    case _ =&gt; throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;Schema \'&quot;, &quot;\' was modified during the transaction - the transaction must be rolled back&quot;).s(typeName))
+  }
+})
+        </td>
+      </tr><tr>
+        <td>
+          189
+        </td>
+        <td>
+          447
+        </td>
+        <td>
+          8543
+          -
+          8566
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.geotools.api.feature.simple.SimpleFeatureType.getTypeName
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          storage.sft.getTypeName()
+        </td>
+      </tr><tr>
+        <td>
+          190
+        </td>
+        <td>
+          448
+        </td>
+        <td>
+          8573
+          -
+          8594
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.LinkedHashMap.get
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.current.get(typeName)
+        </td>
+      </tr><tr>
+        <td>
+          191
+        </td>
+        <td>
+          452
+        </td>
+        <td>
+          8621
+          -
+          8746
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val tx: org.locationtech.geomesa.fs.storage.core.StorageTransaction = storage.newTransaction();
+  FileSystemTransactionState.this.current.put(typeName, FileSystemFeatureStore.this.TransactionInstance.apply(storage, tx));
+  tx
+}
+        </td>
+      </tr><tr>
+        <td>
+          192
+        </td>
+        <td>
+          449
+        </td>
+        <td>
+          8643
+          -
+          8667
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.newTransaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          storage.newTransaction()
+        </td>
+      </tr><tr>
+        <td>
+          193
+        </td>
+        <td>
+          450
+        </td>
+        <td>
+          8700
+          -
+          8732
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance.apply
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemFeatureStore.this.TransactionInstance.apply(storage, tx)
+        </td>
+      </tr><tr>
+        <td>
+          193
+        </td>
+        <td>
+          451
+        </td>
+        <td>
+          8678
+          -
+          8733
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.LinkedHashMap.put
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.current.put(typeName, FileSystemFeatureStore.this.TransactionInstance.apply(storage, tx))
+        </td>
+      </tr><tr>
+        <td>
+          196
+        </td>
+        <td>
+          453
+        </td>
+        <td>
+          8779
+          -
+          8807
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.eq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          instance.storage.eq(storage)
+        </td>
+      </tr><tr>
+        <td>
+          196
+        </td>
+        <td>
+          454
+        </td>
+        <td>
+          8811
+          -
+          8822
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance.tx
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          instance.tx
+        </td>
+      </tr><tr>
+        <td>
+          196
+        </td>
+        <td>
+          455
+        </td>
+        <td>
+          8811
+          -
+          8822
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance.tx
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          instance.tx
+        </td>
+      </tr><tr>
+        <td>
+          199
+        </td>
+        <td>
+          456
+        </td>
+        <td>
+          8852
+          -
+          8993
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;Schema \'&quot;, &quot;\' was modified during the transaction - the transaction must be rolled back&quot;).s(typeName))
+        </td>
+      </tr><tr>
+        <td>
+          199
+        </td>
+        <td>
+          457
+        </td>
+        <td>
+          8852
+          -
+          8993
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          throw new java.lang.IllegalStateException(scala.StringContext.apply(&quot;Schema \'&quot;, &quot;\' was modified during the transaction - the transaction must be rolled back&quot;).s(typeName))
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          459
+        </td>
+        <td>
+          9087
+          -
+          9106
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.==
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          transaction.==(null)
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          462
+        </td>
+        <td>
+          9083
+          -
+          9083
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          205
+        </td>
+        <td>
+          463
+        </td>
+        <td>
+          9083
+          -
+          9083
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          207
+        </td>
+        <td>
+          460
+        </td>
+        <td>
+          9161
+          -
+          9171
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState.rollback
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.rollback()
+        </td>
+      </tr><tr>
+        <td>
+          207
+        </td>
+        <td>
+          461
+        </td>
+        <td>
+          9161
+          -
+          9171
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState.rollback
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.rollback()
+        </td>
+      </tr><tr>
+        <td>
+          211
+        </td>
+        <td>
+          464
+        </td>
+        <td>
+          9245
+          -
+          9247
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          213
+        </td>
+        <td>
+          481
+        </td>
+        <td>
+          9283
+          -
+          9776
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.synchronized
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.synchronized[Unit]({
+  val failures: scala.collection.mutable.ArrayBuffer[Throwable] = scala.collection.mutable.ArrayBuffer.empty[Throwable];
+  FileSystemTransactionState.this.current.toList.foreach[Any](((x0$1: (String, org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance)) =&gt; x0$1 match {
+    case (_1: String, _2: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance)(String, org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance)((typeName @ _), (instance @ _)) =&gt; try {
+      instance.tx.commit()
+    } catch {
+      case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; failures.+=(e)
+    } finally if (instance.tx.isOpen.unary_!)
+      {
+        FileSystemTransactionState.this.current.remove(typeName);
+        ()
+      }
+    else
+      ()
+  }));
+  FileSystemTransactionState.this.raise(failures.toSeq)
+})
+        </td>
+      </tr><tr>
+        <td>
+          214
+        </td>
+        <td>
+          465
+        </td>
+        <td>
+          9319
+          -
+          9347
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.ArrayBuffer.empty[Throwable]
+        </td>
+      </tr><tr>
+        <td>
+          215
+        </td>
+        <td>
+          478
+        </td>
+        <td>
+          9354
+          -
+          9742
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.immutable.List.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.current.toList.foreach[Any](((x0$1: (String, org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance)) =&gt; x0$1 match {
+  case (_1: String, _2: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance)(String, org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance)((typeName @ _), (instance @ _)) =&gt; try {
+    instance.tx.commit()
+  } catch {
+    case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; failures.+=(e)
+  } finally if (instance.tx.isOpen.unary_!)
+    {
+      FileSystemTransactionState.this.current.remove(typeName);
+      ()
+    }
+  else
+    ()
+}))
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          466
+        </td>
+        <td>
+          9544
+          -
+          9564
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.StorageTransaction.commit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          instance.tx.commit()
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          467
+        </td>
+        <td>
+          9544
+          -
+          9564
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.StorageTransaction.commit
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          instance.tx.commit()
+        </td>
+      </tr><tr>
+        <td>
+          217
+        </td>
+        <td>
+          477
+        </td>
+        <td>
+          9538
+          -
+          9734
+        </td>
+        <td>
+          Try
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          try {
+  instance.tx.commit()
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; failures.+=(e)
+} finally if (instance.tx.isOpen.unary_!)
+  {
+    FileSystemTransactionState.this.current.remove(typeName);
+    ()
+  }
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          218
+        </td>
+        <td>
+          468
+        </td>
+        <td>
+          9605
+          -
+          9618
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          failures.+=(e)
+        </td>
+      </tr><tr>
+        <td>
+          218
+        </td>
+        <td>
+          469
+        </td>
+        <td>
+          9605
+          -
+          9618
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          failures.+=(e)
+        </td>
+      </tr><tr>
+        <td>
+          220
+        </td>
+        <td>
+          470
+        </td>
+        <td>
+          9653
+          -
+          9672
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.Boolean.unary_!
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          instance.tx.isOpen.unary_!
+        </td>
+      </tr><tr>
+        <td>
+          220
+        </td>
+        <td>
+          474
+        </td>
+        <td>
+          9649
+          -
+          9649
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          220
+        </td>
+        <td>
+          475
+        </td>
+        <td>
+          9649
+          -
+          9649
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          220
+        </td>
+        <td>
+          476
+        </td>
+        <td>
+          9649
+          -
+          9724
+        </td>
+        <td>
+          If
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          if (instance.tx.isOpen.unary_!)
+  {
+    FileSystemTransactionState.this.current.remove(typeName);
+    ()
+  }
+else
+  ()
+        </td>
+      </tr><tr>
+        <td>
+          221
+        </td>
+        <td>
+          471
+        </td>
+        <td>
+          9688
+          -
+          9712
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.LinkedHashMap.remove
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.current.remove(typeName)
+        </td>
+      </tr><tr>
+        <td>
+          221
+        </td>
+        <td>
+          472
+        </td>
+        <td>
+          9702
+          -
+          9702
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          221
+        </td>
+        <td>
+          473
+        </td>
+        <td>
+          9688
+          -
+          9712
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  FileSystemTransactionState.this.current.remove(typeName);
+  ()
+}
+        </td>
+      </tr><tr>
+        <td>
+          225
+        </td>
+        <td>
+          479
+        </td>
+        <td>
+          9755
+          -
+          9769
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SeqLike.toSeq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          failures.toSeq
+        </td>
+      </tr><tr>
+        <td>
+          225
+        </td>
+        <td>
+          480
+        </td>
+        <td>
+          9749
+          -
+          9770
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState.raise
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.raise(failures.toSeq)
+        </td>
+      </tr><tr>
+        <td>
+          228
+        </td>
+        <td>
+          493
+        </td>
+        <td>
+          9814
+          -
+          10136
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.synchronized
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.synchronized[Unit]({
+  val failures: scala.collection.mutable.ArrayBuffer[Throwable] = scala.collection.mutable.ArrayBuffer.empty[Throwable];
+  try {
+    FileSystemTransactionState.this.current.values.foreach[Any](((instance: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance) =&gt; try {
+      instance.tx.rollback()
+    } catch {
+      case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; failures.+=(e)
+    }))
+  } finally FileSystemTransactionState.this.current.clear();
+  FileSystemTransactionState.this.raise(failures.toSeq)
+})
+        </td>
+      </tr><tr>
+        <td>
+          229
+        </td>
+        <td>
+          482
+        </td>
+        <td>
+          9850
+          -
+          9878
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.collection.generic.GenericCompanion.empty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          scala.collection.mutable.ArrayBuffer.empty[Throwable]
+        </td>
+      </tr><tr>
+        <td>
+          231
+        </td>
+        <td>
+          487
+        </td>
+        <td>
+          9899
+          -
+          10052
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.current.values.foreach[Any](((instance: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance) =&gt; try {
+  instance.tx.rollback()
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; failures.+=(e)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          231
+        </td>
+        <td>
+          488
+        </td>
+        <td>
+          9899
+          -
+          10052
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.current.values.foreach[Any](((instance: org.locationtech.geomesa.fs.data.FileSystemFeatureStore.TransactionInstance) =&gt; try {
+  instance.tx.rollback()
+} catch {
+  case scala.util.control.NonFatal.unapply(&lt;unapply-selector&gt;) &lt;unapply&gt; ((e @ _)) =&gt; failures.+=(e)
+}))
+        </td>
+      </tr><tr>
+        <td>
+          232
+        </td>
+        <td>
+          483
+        </td>
+        <td>
+          9952
+          -
+          9974
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.StorageTransaction.rollback
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          instance.tx.rollback()
+        </td>
+      </tr><tr>
+        <td>
+          232
+        </td>
+        <td>
+          484
+        </td>
+        <td>
+          9952
+          -
+          9974
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.StorageTransaction.rollback
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          instance.tx.rollback()
+        </td>
+      </tr><tr>
+        <td>
+          233
+        </td>
+        <td>
+          485
+        </td>
+        <td>
+          10017
+          -
+          10030
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          failures.+=(e)
+        </td>
+      </tr><tr>
+        <td>
+          233
+        </td>
+        <td>
+          486
+        </td>
+        <td>
+          10017
+          -
+          10030
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.mutable.ArrayBuffer.+=
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          failures.+=(e)
+        </td>
+      </tr><tr>
+        <td>
+          237
+        </td>
+        <td>
+          489
+        </td>
+        <td>
+          10079
+          -
+          10094
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.mutable.LinkedHashMap.clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.current.clear()
+        </td>
+      </tr><tr>
+        <td>
+          237
+        </td>
+        <td>
+          490
+        </td>
+        <td>
+          10079
+          -
+          10094
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          scala.collection.mutable.LinkedHashMap.clear
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.current.clear()
+        </td>
+      </tr><tr>
+        <td>
+          239
+        </td>
+        <td>
+          491
+        </td>
+        <td>
+          10115
+          -
+          10129
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.SeqLike.toSeq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          failures.toSeq
+        </td>
+      </tr><tr>
+        <td>
+          239
+        </td>
+        <td>
+          492
+        </td>
+        <td>
+          10109
+          -
+          10130
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState.raise
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemTransactionState.this.raise(failures.toSeq)
+        </td>
+      </tr><tr>
+        <td>
+          249
+        </td>
+        <td>
+          494
+        </td>
+        <td>
+          10453
+          -
+          10470
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.TraversableOnce.nonEmpty
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          failures.nonEmpty
+        </td>
+      </tr><tr>
+        <td>
+          249
+        </td>
+        <td>
+          506
+        </td>
+        <td>
+          10472
+          -
+          10790
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          {
+  val primary: Throwable = failures.find(((x$2: Throwable) =&gt; x$2.isInstanceOf[org.locationtech.geomesa.fs.storage.core.StorageTransaction.ConflictException])).getOrElse[Throwable](failures.head);
+  val e: java.io.IOException = primary match {
+    case (e @ (_: java.io.IOException)) =&gt; e
+    case (e @ _) =&gt; new java.io.IOException(e.getMessage(), e)
+  };
+  failures.filterNot(((x$3: Throwable) =&gt; x$3.eq(primary))).foreach[Unit]({
+    ((x$1: Throwable) =&gt; e.addSuppressed(x$1))
+  });
+  throw e
+}
+        </td>
+      </tr><tr>
+        <td>
+          249
+        </td>
+        <td>
+          507
+        </td>
+        <td>
+          10449
+          -
+          10449
+        </td>
+        <td>
+          Literal
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          249
+        </td>
+        <td>
+          508
+        </td>
+        <td>
+          10449
+          -
+          10449
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          ()
+        </td>
+      </tr><tr>
+        <td>
+          250
+        </td>
+        <td>
+          495
+        </td>
+        <td>
+          10510
+          -
+          10543
+        </td>
+        <td>
+          TypeApply
+        </td>
+        <td>
+          scala.Any.isInstanceOf
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$2.isInstanceOf[org.locationtech.geomesa.fs.storage.core.StorageTransaction.ConflictException]
+        </td>
+      </tr><tr>
+        <td>
+          250
+        </td>
+        <td>
+          496
+        </td>
+        <td>
+          10555
+          -
+          10568
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          scala.collection.IterableLike.head
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          failures.head
+        </td>
+      </tr><tr>
+        <td>
+          250
+        </td>
+        <td>
+          497
+        </td>
+        <td>
+          10496
+          -
+          10569
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.Option.getOrElse
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          failures.find(((x$2: Throwable) =&gt; x$2.isInstanceOf[org.locationtech.geomesa.fs.storage.core.StorageTransaction.ConflictException])).getOrElse[Throwable](failures.head)
+        </td>
+      </tr><tr>
+        <td>
+          252
+        </td>
+        <td>
+          498
+        </td>
+        <td>
+          10635
+          -
+          10636
+        </td>
+        <td>
+          Ident
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemTransactionState.e
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          e
+        </td>
+      </tr><tr>
+        <td>
+          253
+        </td>
+        <td>
+          499
+        </td>
+        <td>
+          10673
+          -
+          10685
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Throwable.getMessage
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          e.getMessage()
+        </td>
+      </tr><tr>
+        <td>
+          253
+        </td>
+        <td>
+          500
+        </td>
+        <td>
+          10657
+          -
+          10689
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.io.IOException.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new java.io.IOException(e.getMessage(), e)
+        </td>
+      </tr><tr>
+        <td>
+          253
+        </td>
+        <td>
+          501
+        </td>
+        <td>
+          10657
+          -
+          10689
+        </td>
+        <td>
+          Block
+        </td>
+        <td>
+          java.io.IOException.&lt;init&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #F0ADAD">
+          new java.io.IOException(e.getMessage(), e)
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          502
+        </td>
+        <td>
+          10727
+          -
+          10740
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Object.eq
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          x$3.eq(primary)
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          503
+        </td>
+        <td>
+          10750
+          -
+          10765
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          java.lang.Throwable.addSuppressed
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          e.addSuppressed(x$1)
+        </td>
+      </tr><tr>
+        <td>
+          255
+        </td>
+        <td>
+          504
+        </td>
+        <td>
+          10708
+          -
+          10766
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          scala.collection.IterableLike.foreach
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          failures.filterNot(((x$3: Throwable) =&gt; x$3.eq(primary))).foreach[Unit]({
+  ((x$1: Throwable) =&gt; e.addSuppressed(x$1))
+})
+        </td>
+      </tr><tr>
+        <td>
+          256
+        </td>
+        <td>
+          505
+        </td>
+        <td>
+          10775
+          -
+          10782
+        </td>
+        <td>
+          Throw
+        </td>
+        <td>
+          &lt;nosymbol&gt;
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          throw e
+        </td>
+      </tr><tr>
+        <td>
+          273
+        </td>
+        <td>
+          514
+        </td>
+        <td>
+          11193
+          -
+          11285
         </td>
         <td>
           Apply
@@ -2166,15 +4441,15 @@ else
         </td>
       </tr><tr>
         <td>
-          138
+          274
         </td>
         <td>
-          425
+          509
         </td>
         <td>
-          6345
+          11241
           -
-          6350
+          11246
         </td>
         <td>
           Select
@@ -2190,15 +4465,15 @@ else
         </td>
       </tr><tr>
         <td>
-          138
+          274
         </td>
         <td>
-          426
+          510
         </td>
         <td>
-          6362
+          11258
           -
-          6369
+          11265
         </td>
         <td>
           Select
@@ -2214,15 +4489,15 @@ else
         </td>
       </tr><tr>
         <td>
-          138
+          274
         </td>
         <td>
-          427
+          511
         </td>
         <td>
-          6327
+          11223
           -
-          6370
+          11266
         </td>
         <td>
           Apply
@@ -2238,15 +4513,15 @@ else
         </td>
       </tr><tr>
         <td>
-          138
+          274
         </td>
         <td>
-          428
+          512
         </td>
         <td>
-          6318
+          11214
           -
-          6370
+          11266
         </td>
         <td>
           Apply
@@ -2262,15 +4537,15 @@ else
         </td>
       </tr><tr>
         <td>
-          139
+          275
         </td>
         <td>
-          429
+          513
         </td>
         <td>
-          6377
+          11273
           -
-          6383
+          11279
         </td>
         <td>
           Select
@@ -2286,15 +4561,15 @@ else
         </td>
       </tr><tr>
         <td>
-          142
+          278
         </td>
         <td>
-          436
+          520
         </td>
         <td>
-          6424
+          11320
           -
-          6503
+          11399
         </td>
         <td>
           Apply
@@ -2313,15 +4588,15 @@ else
         </td>
       </tr><tr>
         <td>
-          143
+          279
         </td>
         <td>
-          431
+          515
         </td>
         <td>
-          6449
+          11345
           -
-          6463
+          11359
         </td>
         <td>
           Apply
@@ -2337,15 +4612,15 @@ else
         </td>
       </tr><tr>
         <td>
-          143
+          279
         </td>
         <td>
-          434
+          518
         </td>
         <td>
-          6445
+          11341
           -
-          6445
+          11341
         </td>
         <td>
           Literal
@@ -2361,15 +4636,15 @@ else
         </td>
       </tr><tr>
         <td>
-          143
+          279
         </td>
         <td>
-          435
+          519
         </td>
         <td>
-          6445
+          11341
           -
-          6445
+          11341
         </td>
         <td>
           Block
@@ -2385,15 +4660,15 @@ else
         </td>
       </tr><tr>
         <td>
-          144
+          280
         </td>
         <td>
-          432
+          516
         </td>
         <td>
-          6475
+          11371
           -
-          6489
+          11385
         </td>
         <td>
           Apply
@@ -2409,15 +4684,15 @@ else
         </td>
       </tr><tr>
         <td>
-          144
+          280
         </td>
         <td>
-          433
+          517
         </td>
         <td>
-          6475
+          11371
           -
-          6489
+          11385
         </td>
         <td>
           Block
@@ -2433,15 +4708,15 @@ else
         </td>
       </tr><tr>
         <td>
-          158
+          294
         </td>
         <td>
-          437
+          521
         </td>
         <td>
-          6911
+          11807
           -
-          6923
+          11819
         </td>
         <td>
           Select
@@ -2457,15 +4732,15 @@ else
         </td>
       </tr><tr>
         <td>
-          159
+          295
         </td>
         <td>
-          438
+          522
         </td>
         <td>
-          6965
+          11861
           -
-          6976
+          11872
         </td>
         <td>
           Apply
@@ -2481,15 +4756,15 @@ else
         </td>
       </tr><tr>
         <td>
-          160
+          296
         </td>
         <td>
-          439
+          523
         </td>
         <td>
-          7010
+          11906
           -
-          7022
+          11918
         </td>
         <td>
           Apply
@@ -2505,15 +4780,39 @@ else
         </td>
       </tr><tr>
         <td>
-          170
+          308
         </td>
         <td>
-          440
+          524
         </td>
         <td>
-          7248
+          12251
           -
-          7281
+          12262
+        </td>
+        <td>
+          Select
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterAppend.transaction
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemFeatureWriterAppend.this.transaction
+        </td>
+      </tr><tr>
+        <td>
+          308
+        </td>
+        <td>
+          525
+        </td>
+        <td>
+          12219
+          -
+          12263
         </td>
         <td>
           Apply
@@ -2525,19 +4824,19 @@ else
           
         </td>
         <td style="background: #AEF1AE">
-          FileSystemFeatureWriterAppend.this.storage.getMultiPartitionWriter()
+          FileSystemFeatureWriterAppend.this.storage.getMultiPartitionWriter(FileSystemFeatureWriterAppend.this.transaction)
         </td>
       </tr><tr>
         <td>
-          171
+          309
         </td>
         <td>
-          441
+          526
         </td>
         <td>
-          7311
+          12293
           -
-          7328
+          12310
         </td>
         <td>
           Apply
@@ -2553,15 +4852,15 @@ else
         </td>
       </tr><tr>
         <td>
-          174
+          312
         </td>
         <td>
-          442
+          527
         </td>
         <td>
-          7431
+          12413
           -
-          7442
+          12424
         </td>
         <td>
           Select
@@ -2577,15 +4876,15 @@ else
         </td>
       </tr><tr>
         <td>
-          176
+          314
         </td>
         <td>
-          443
+          528
         </td>
         <td>
-          7480
+          12462
           -
-          7485
+          12467
         </td>
         <td>
           Literal
@@ -2601,15 +4900,15 @@ else
         </td>
       </tr><tr>
         <td>
-          179
+          317
         </td>
         <td>
-          444
+          529
         </td>
         <td>
-          7574
+          12556
           -
-          7585
+          12567
         </td>
         <td>
           Select
@@ -2625,15 +4924,15 @@ else
         </td>
       </tr><tr>
         <td>
-          179
+          317
         </td>
         <td>
-          445
+          530
         </td>
         <td>
-          7587
+          12569
           -
-          7624
+          12606
         </td>
         <td>
           Apply
@@ -2649,15 +4948,15 @@ else
         </td>
       </tr><tr>
         <td>
-          179
+          317
         </td>
         <td>
-          446
+          531
         </td>
         <td>
-          7551
+          12533
           -
-          7625
+          12607
         </td>
         <td>
           Apply
@@ -2673,15 +4972,15 @@ else
         </td>
       </tr><tr>
         <td>
-          179
+          317
         </td>
         <td>
-          447
+          532
         </td>
         <td>
-          7541
+          12523
           -
-          7625
+          12607
         </td>
         <td>
           Apply
@@ -2697,15 +4996,15 @@ else
         </td>
       </tr><tr>
         <td>
-          180
+          318
         </td>
         <td>
-          448
+          533
         </td>
         <td>
-          7632
+          12614
           -
-          7639
+          12621
         </td>
         <td>
           Select
@@ -2721,15 +5020,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          321
         </td>
         <td>
-          449
+          534
         </td>
         <td>
-          7729
+          12711
           -
-          7736
+          12718
         </td>
         <td>
           Select
@@ -2745,15 +5044,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          321
         </td>
         <td>
-          450
+          535
         </td>
         <td>
-          7693
+          12675
           -
-          7737
+          12719
         </td>
         <td>
           Apply
@@ -2769,15 +5068,15 @@ else
         </td>
       </tr><tr>
         <td>
-          183
+          321
         </td>
         <td>
-          451
+          536
         </td>
         <td>
-          7680
+          12662
           -
-          7738
+          12720
         </td>
         <td>
           Apply
@@ -2793,15 +5092,15 @@ else
         </td>
       </tr><tr>
         <td>
-          185
+          323
         </td>
         <td>
-          452
+          537
         </td>
         <td>
-          7774
+          12756
           -
-          7838
+          12820
         </td>
         <td>
           Throw
@@ -2817,15 +5116,15 @@ else
         </td>
       </tr><tr>
         <td>
-          187
+          325
         </td>
         <td>
-          453
+          538
         </td>
         <td>
-          7873
+          12855
           -
-          7887
+          12869
         </td>
         <td>
           Apply
@@ -2841,15 +5140,15 @@ else
         </td>
       </tr><tr>
         <td>
-          200
+          343
         </td>
         <td>
-          454
+          539
         </td>
         <td>
-          8277
+          13359
           -
-          8283
+          13365
         </td>
         <td>
           Select
@@ -2865,15 +5164,15 @@ else
         </td>
       </tr><tr>
         <td>
-          200
+          343
         </td>
         <td>
-          455
+          540
         </td>
         <td>
-          8295
+          13367
           -
-          8306
+          13378
         </td>
         <td>
           Select
@@ -2889,39 +5188,63 @@ else
         </td>
       </tr><tr>
         <td>
-          200
+          343
         </td>
         <td>
-          456
+          541
         </td>
         <td>
-          8259
+          13380
           -
-          8307
+          13391
         </td>
         <td>
-          Apply
+          Select
         </td>
         <td>
-          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.getWriter
+          org.locationtech.geomesa.fs.data.FileSystemFeatureStore.FileSystemFeatureWriterModify.transaction
         </td>
         <td>
           
         </td>
         <td style="background: #AEF1AE">
-          FileSystemFeatureWriterModify.this.storage.getWriter(FileSystemFeatureWriterModify.this.filter, FileSystemFeatureWriterModify.this.readThreads)
+          FileSystemFeatureWriterModify.this.transaction
         </td>
       </tr><tr>
         <td>
-          202
+          343
         </td>
         <td>
-          457
+          542
         </td>
         <td>
-          8362
+          13335
           -
-          8373
+          13392
+        </td>
+        <td>
+          Apply
+        </td>
+        <td>
+          org.locationtech.geomesa.fs.storage.core.FileSystemStorage.getUpdateWriter
+        </td>
+        <td>
+          
+        </td>
+        <td style="background: #AEF1AE">
+          FileSystemFeatureWriterModify.this.storage.getUpdateWriter(FileSystemFeatureWriterModify.this.filter, FileSystemFeatureWriterModify.this.readThreads, FileSystemFeatureWriterModify.this.transaction)
+        </td>
+      </tr><tr>
+        <td>
+          345
+        </td>
+        <td>
+          543
+        </td>
+        <td>
+          13447
+          -
+          13458
         </td>
         <td>
           Select
@@ -2937,15 +5260,15 @@ else
         </td>
       </tr><tr>
         <td>
-          204
+          347
         </td>
         <td>
-          458
+          544
         </td>
         <td>
-          8411
+          13496
           -
-          8425
+          13510
         </td>
         <td>
           Select
@@ -2961,15 +5284,15 @@ else
         </td>
       </tr><tr>
         <td>
-          206
+          349
         </td>
         <td>
-          459
+          545
         </td>
         <td>
-          8563
+          13648
           -
-          8576
+          13661
         </td>
         <td>
           Apply
@@ -2985,15 +5308,15 @@ else
         </td>
       </tr><tr>
         <td>
-          207
+          350
         </td>
         <td>
-          460
+          546
         </td>
         <td>
-          8610
+          13695
           -
-          8624
+          13709
         </td>
         <td>
           Apply
@@ -3009,15 +5332,15 @@ else
         </td>
       </tr><tr>
         <td>
-          208
+          351
         </td>
         <td>
-          461
+          547
         </td>
         <td>
-          8659
+          13744
           -
-          8674
+          13759
         </td>
         <td>
           Apply
@@ -3033,15 +5356,15 @@ else
         </td>
       </tr><tr>
         <td>
-          209
+          352
         </td>
         <td>
-          462
+          548
         </td>
         <td>
-          8708
+          13793
           -
-          8722
+          13807
         </td>
         <td>
           Apply
